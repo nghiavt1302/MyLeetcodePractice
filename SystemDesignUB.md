@@ -9180,6 +9180,1704 @@ Architecture pattern định hình cấu trúc cấp cao; Web Fundamentals giả
 
 ---
 
+## Phần 5 — Web Concepts in System Design
+
+### Bài 29. Introduction to Web Concepts
+
+#### 1. Vì sao kiến thức Web quan trọng trong System Design?
+
+Hầu hết hệ thống hiện đại — e-commerce, social network, SaaS, cloud service hay internal platform — đều có web/browser/API boundary. Kiến trúc sư cần hiểu không chỉ backend topology mà cả hành vi của:
+
+- browser và HTTP;
+- cookie, session và token;
+- client/server state;
+- serialization/data format;
+- cache và content delivery;
+- authentication/authorization;
+- same-origin policy và CORS;
+- các trust boundary giữa browser, edge và backend.
+
+Những khái niệm này ảnh hưởng trực tiếp tới scalability, latency, bandwidth, security và developer experience. Một lựa chọn nhỏ như đặt session ở memory local hay Redis có thể quyết định cách load balancer failover; một cookie attribute sai có thể mở ra session theft hoặc CSRF.
+
+#### 2. Web concepts không phải kiến thức “frontend trivia”
+
+Trong system design interview, câu hỏi về cookie, CORS, session hoặc serialization đánh giá khả năng suy luận end-to-end:
+
+```text
+Browser
+  │ DNS / TLS / HTTP / Cookie / CORS
+  ▼
+CDN / Reverse Proxy / API Gateway
+  │ auth context / cache / routing
+  ▼
+Application Services
+  │ serialization / session / data access
+  ▼
+Cache / Database / Message Broker
+```
+
+Nếu chỉ nhìn backend service mà không hiểu browser tự gửi cookie khi nào, preflight hoạt động ra sao hoặc token được lưu ở đâu, thiết kế có thể đúng về capacity nhưng sai về security.
+
+#### 3. Những architecture driver của Web
+
+- **State**: dữ liệu nào nằm ở browser, application server, shared store hay database?
+- **Trust**: dữ liệu nào do client kiểm soát và phải xác minh lại?
+- **Identity**: request được gắn với user/device/session thế nào?
+- **Serialization**: format ảnh hưởng payload, compatibility và CPU ra sao?
+- **Origin boundary**: browser cho phép script đọc/gửi request tới domain nào?
+- **Caching**: response có thể dùng chung hay chứa dữ liệu cá nhân?
+- **Failure**: client retry, session store down hoặc token hết hạn thì điều gì xảy ra?
+- **Scale**: state có cản horizontal scaling và multi-region routing không?
+
+#### 4. Lộ trình phần 5
+
+1. **Web sessions và state management** — cookie, server-side session, token và distributed session.
+2. **Serialization** — JSON, XML, Protobuf, Avro và schema evolution.
+3. **Browser security/CORS** — same-origin policy, preflight, credential và cấu hình an toàn.
+4. **Tổng kết** — nối các khái niệm vào kiến trúc web production.
+
+#### 5. Nguyên tắc học phần này
+
+- Phân biệt protocol behavior với application convention.
+- Không tin dữ liệu chỉ vì nó đến từ browser.
+- Security phải bao phủ toàn lifecycle, không chỉ lúc login.
+- “Stateless” không có nghĩa hệ thống không có state.
+- “Client-side” không có nghĩa dữ liệu an toàn hoặc đáng tin.
+- Chọn format/session mechanism theo threat model và workload.
+- Tối ưu performance không được làm sai authorization hoặc cache isolation.
+
+#### Công thức ghi nhớ
+
+> **Web system design bắt đầu ở browser chứ không bắt đầu tại backend. State, identity, serialization và origin policy trên request path quyết định hệ thống có thể scale an toàn hay không.**
+
+---
+
+### Bài 30. Web Sessions — Quản lý trạng thái trong ứng dụng Web
+
+#### 1. Vì sao cần web session?
+
+HTTP là stateless: mỗi request có semantics độc lập và protocol không tự duy trì user context từ request trước. HTTP không cấm server lưu dữ liệu; nó chỉ không cung cấp application session mặc định.
+
+Web session giúp liên kết nhiều request với cùng một user/browser context để:
+
+- duy trì trạng thái đăng nhập;
+- lưu shopping cart hoặc checkout progress;
+- nhớ preference/language;
+- quản lý CSRF state;
+- giới hạn quyền theo authentication context;
+- theo dõi device/session riêng biệt.
+
+Không nên dồn mọi state vào authentication session. Cart dài hạn, preference và business state thường nên được lưu bền vững trong domain database; session chỉ giữ reference/context ngắn hạn.
+
+#### 2. Bốn khái niệm dễ bị trộn lẫn
+
+| Khái niệm | Là gì? | Ví dụ |
+|---|---|---|
+| **Cookie** | Cơ chế browser lưu key/value và tự gửi theo matching rules | Session ID, CSRF cookie |
+| **Server-side session** | State phía server được tra bằng session ID | User ID, login time, auth level |
+| **Token** | Credential/claim do issuer phát; có thể opaque hoặc self-contained | Access token, JWT |
+| **Browser storage** | API lưu client data, không tự gửi với HTTP request | `localStorage`, `sessionStorage` |
+
+Cookie có thể chứa session ID, opaque token hoặc JWT. “Cookie-based” và “token-based” không phải hai nhóm luôn loại trừ nhau; **cách vận chuyển/lưu credential** khác với **dạng credential và nơi giữ state**.
+
+#### 3. Stateless HTTP và stateful user experience
+
+```text
+Request 1: POST /login + credential
+Response : Set-Cookie: session=<opaque-id>
+
+Request 2: GET /account + Cookie: session=<opaque-id>
+Server   : tra session → xác định user/quyền
+```
+
+Mỗi request vẫn tự mang session identifier. Server không nên suy luận user chỉ từ TCP connection hoặc instance đã phục vụ request trước.
+
+Persistent HTTP connection không đồng nghĩa persistent login session. Một connection có thể đóng nhưng session vẫn tồn tại; một connection có thể dùng nhiều request nhưng authentication context vẫn phải được xác định đúng.
+
+---
+
+#### Nhánh A — Server-side sessions
+
+#### 4. Login flow
+
+```text
+Browser                  App Server                  Session Store
+   │ POST /login              │                            │
+   ├─────────────────────────>│ verify credentials         │
+   │                          ├── create session ──────────>│
+   │<── Set-Cookie: sid=R... ─┤                            │
+   │                          │                            │
+   │ GET /profile + sid       │                            │
+   ├─────────────────────────>│── lookup sid ─────────────>│
+   │                          │<─ user/session context ────│
+   │<── profile response ─────│                            │
+```
+
+Session ID nên:
+
+- được sinh bằng cryptographically secure random;
+- có entropy đủ lớn và không đoán được;
+- opaque, không chứa user ID/PII/role có thể sửa;
+- rotate sau login, privilege change và sự kiện rủi ro;
+- chỉ map tới state phía server;
+- có TTL và lifecycle policy.
+
+#### 5. Session record nên chứa gì?
+
+Tối thiểu:
+
+- stable user/principal ID;
+- session creation/last activity;
+- authentication level/method;
+- expiry/idle deadline;
+- device/session metadata vừa đủ cho security;
+- CSRF secret nếu dùng synchronizer token pattern;
+- version/revocation marker khi cần.
+
+Tránh nhét toàn user profile, permission graph hoặc payload lớn nếu có thể lấy từ source/cache riêng. Session store sẽ trở thành hot path của mọi authenticated request.
+
+#### 6. Lifecycle của session
+
+1. **Create** sau authentication thành công.
+2. **Rotate** session ID để chống fixation.
+3. **Use** trên request phù hợp.
+4. **Renew** theo idle policy nhưng không vượt absolute lifetime.
+5. **Step-up authentication** cho action nhạy cảm.
+6. **Revoke** khi logout, password reset, compromise hoặc admin action.
+7. **Expire** theo idle và absolute timeout.
+8. **Cleanup** store/index/device list.
+
+Phân biệt:
+
+- **Idle timeout**: hết hạn sau một khoảng không hoạt động.
+- **Absolute timeout**: hết hạn sau thời gian tối đa kể từ login dù vẫn active.
+
+#### 7. Ưu và nhược điểm
+
+Ưu điểm:
+
+- revoke/logout ngay bằng xóa/disable session;
+- server kiểm soát session state và policy;
+- cookie chỉ cần mang opaque ID nhỏ;
+- dễ cập nhật quyền/context trong lần tra cứu tiếp theo;
+- phù hợp browser web app và high-security session.
+
+Trade-off:
+
+- mỗi request có thể cần session lookup;
+- store trở thành critical dependency;
+- cần replication/failover/capacity/TTL;
+- multi-region session routing/consistency khó;
+- local session cản horizontal scaling.
+
+Server-side session không mặc nhiên an toàn hơn token; session ID bị đánh cắp vẫn là bearer credential. Security phụ thuộc cookie, TLS, rotation, timeout và authorization.
+
+---
+
+#### Nhánh B — Cookies và browser storage
+
+#### 8. Cookie matching
+
+Browser chỉ tự gửi cookie khi request khớp các rule như domain, path, secure transport, expiry và SameSite context.
+
+```http
+Set-Cookie: __Host-session=RANDOM_OPAQUE_ID;
+  Path=/;
+  Secure;
+  HttpOnly;
+  SameSite=Lax;
+  Max-Age=1800
+```
+
+- `Secure`: chỉ gửi qua secure transport như HTTPS.
+- `HttpOnly`: JavaScript không đọc được qua `document.cookie`.
+- `SameSite`: kiểm soát gửi cookie trong cross-site context.
+- `Path`: phạm vi URL path.
+- `Domain`: phạm vi host/subdomain; bỏ `Domain` tạo host-only cookie.
+- `Max-Age`/`Expires`: thời hạn lưu cookie.
+- prefix `__Host-`: yêu cầu `Secure`, `Path=/` và không có `Domain`, giúp giới hạn scope mạnh hơn khi browser hỗ trợ.
+
+`HttpOnly` giảm khả năng XSS đọc cookie nhưng XSS vẫn có thể thực hiện action trong page context. Cần output encoding, CSP, input handling và giảm XSS root cause.
+
+#### 9. SameSite
+
+- `Strict`: cookie không được gửi trong phần lớn cross-site navigation; bảo vệ mạnh nhưng có thể làm hỏng flow từ link ngoài/SSO.
+- `Lax`: cân bằng phổ biến; cho một số top-level safe navigation nhưng hạn chế cross-site subrequest/form POST.
+- `None`: cho phép cross-site context và phải đi cùng `Secure` trong browser hiện đại; cần CSRF defense khác.
+
+SameSite là defense-in-depth, không thay thế CSRF token/origin verification cho mọi use case.
+
+#### 10. Session cookie và persistent cookie
+
+- **Session cookie** không có `Max-Age`/`Expires`; thường tồn tại tới khi browser session kết thúc, nhưng browser restore behavior có thể khác kỳ vọng.
+- **Persistent cookie** có expiry; tồn tại qua browser restart tới khi hết hạn/xóa.
+
+Cookie lifetime không nên dài hơn server-side session validity. Server luôn phải kiểm tra session chưa expire/revoke; không tin chỉ vì browser còn cookie.
+
+#### 11. localStorage và sessionStorage
+
+- `localStorage`: tồn tại theo origin qua browser restart cho tới khi xóa.
+- `sessionStorage`: tồn tại theo origin và tab/window session.
+- Cả hai không tự gửi với request.
+- JavaScript trong origin có thể đọc, nên XSS có thể đánh cắp token/data.
+
+Không lưu long-lived bearer credential trong browser storage theo thói quen mà không threat-model XSS. `sessionStorage` không phải server-side session và không tự an toàn chỉ vì đóng tab sẽ mất.
+
+#### 12. Cookie size và performance
+
+Cookie matching được gửi trên nhiều request tới scope tương ứng. Cookie lớn:
+
+- tăng request bandwidth/latency;
+- có thể bị gửi cả cho asset nếu domain/path quá rộng;
+- chạm browser/server header limits;
+- làm log/proxy surface chứa credential nếu cấu hình sai.
+
+Giữ session cookie nhỏ và scope hẹp. Không nhét profile/cart lớn vào cookie.
+
+---
+
+#### Nhánh C — Token-based authentication
+
+#### 13. Opaque token và self-contained token
+
+**Opaque token:** random value, resource server/gateway tra/introspect state tại authorization server/cache.
+
+**Self-contained token:** chứa claim và được ký, ví dụ JWT; resource server có thể validate signature/claim cục bộ.
+
+```text
+JWT = header.payload.signature
+```
+
+JWT thường **được ký chứ không được mã hóa**. Payload base64url có thể đọc được; không đặt secret/PII nhạy cảm nếu không có encryption/use-case phù hợp.
+
+#### 14. Access token flow khái quát
+
+```text
+Client ── authenticate/authorize ──> Identity Provider
+Client <──── short-lived access token + refresh mechanism
+
+Client ── Authorization: Bearer <access-token> ──> API
+API ── validate signature/issuer/audience/expiry/scope ──> authorize resource
+```
+
+OAuth 2.0 là authorization framework. OpenID Connect bổ sung identity/authentication layer. JWT là token format; access token không bắt buộc là JWT.
+
+#### 15. JWT validation checklist
+
+- Chỉ chấp nhận algorithm dự kiến; không tin `alg` tùy ý.
+- Xác minh signature bằng đúng issuer key.
+- Validate `iss` (issuer).
+- Validate `aud` (audience/service).
+- Validate `exp`, `nbf`, clock skew hợp lý.
+- Validate token type/use (`typ`, scope/purpose theo contract).
+- Xác minh subject/tenant/scope/role nhưng vẫn authorize resource.
+- Xử lý key ID/rotation an toàn; không fetch key từ URL không tin cậy.
+- Giới hạn token lifetime và không log token.
+
+Signature hợp lệ không có nghĩa request được phép truy cập object cụ thể.
+
+#### 16. Statelessness và revocation trade-off
+
+Self-contained access token giảm session lookup nhưng claim có thể stale tới khi token hết hạn:
+
+- user bị khóa;
+- role/permission thay đổi;
+- device bị mất;
+- token bị đánh cắp;
+- logout toàn bộ session.
+
+Mitigation:
+
+- access token ngắn hạn;
+- refresh token rotation/reuse detection;
+- revocation list/token version cho high-risk case;
+- introspection ở boundary cần control mạnh;
+- key rotation chỉ vô hiệu hóa hàng loạt và không phải fine-grained logout;
+- re-check policy/data cho action nhạy cảm.
+
+Một token system vẫn giữ state cho refresh token, consent, revocation hoặc user status. “Stateless authentication” thường chỉ mô tả access-token validation path, không phải toàn identity system.
+
+#### 17. Refresh token
+
+Refresh token dùng để xin access token mới, không nên gửi tới mọi resource service.
+
+Best practices theo loại client/threat model:
+
+- long-lived hơn access token nhưng được bảo vệ mạnh;
+- rotate sau mỗi use và phát hiện reuse;
+- bind với client/device/session nếu phù hợp;
+- revoke khi logout/compromise;
+- lưu server-side hashed/reference state khi thiết kế yêu cầu;
+- giới hạn scope/audience;
+- không đưa vào URL/log.
+
+Browser architecture thường dùng secure HttpOnly cookie hoặc BFF pattern để giảm JavaScript tiếp xúc token; lựa chọn phụ thuộc CSRF/XSS và deployment topology.
+
+#### 18. Sessions và tokens không có bảng thắng thua tuyệt đối
+
+| Tiêu chí | Server-side session | Self-contained access token |
+|---|---|---|
+| Server lookup | Thường có | Có thể không trên mỗi request |
+| Revocation | Trực tiếp | Khó hơn nếu không introspect/denylist |
+| Claim freshness | Có thể cập nhật nhanh | Có thể stale tới expiry |
+| Payload client gửi | Session ID nhỏ | Token thường lớn hơn |
+| Horizontal scale | Cần shared/routed session | Validation phân tán thuận tiện |
+| Failure dependency | Session store | Key distribution/issuer và refresh system |
+| Security | Phụ thuộc lifecycle/cookie/store | Phụ thuộc validation/storage/lifetime |
+
+JWT không mặc nhiên nhanh hơn: token lớn tăng bandwidth/signature CPU; session lookup trong cache có thể rất nhanh. Hãy benchmark và chọn theo control, revocation, client type và trust boundary.
+
+---
+
+#### Nhánh D — Scaling session management
+
+#### 19. Local in-memory session
+
+```text
+Load Balancer
+  ├── App A [Session U1]
+  └── App B [không có U1]
+```
+
+Đơn giản cho một instance, nhưng request sang B hoặc A restart làm mất session. Phù hợp prototype/small deployment nếu chấp nhận limitation.
+
+#### 20. Sticky sessions / session affinity
+
+Load balancer cố định user/session về cùng instance.
+
+Ưu:
+
+- ít thay đổi application;
+- không cần shared lookup trên happy path.
+
+Nhược:
+
+- load skew/hot user;
+- failover làm mất local session;
+- deploy/scale-in/draining khó;
+- multi-region mobility khó;
+- che giấu state coupling.
+
+Sticky session là tactical bridge, không phải high-availability session solution một mình.
+
+#### 21. Session replication
+
+Application/container replicate session giữa nodes.
+
+- failover tốt hơn local-only;
+- nhưng network/memory write amplification tăng;
+- consistency/conflict phức tạp;
+- membership/rebalance cost tăng theo cluster.
+
+Không phù hợp mọi scale; cần hiểu replication mode và failure semantics.
+
+#### 22. Distributed session store
+
+```text
+                 Load Balancer
+             ┌──────┼──────┐
+             ▼      ▼      ▼
+           App A  App B  App C
+             └──────┼──────┘
+                    ▼
+          Distributed Session Store
+```
+
+Mọi app instance tra cùng store như Redis, Memcached hoặc database.
+
+Thiết kế store cần:
+
+- HA/replication/failover;
+- TTL/expiry và eviction policy;
+- capacity theo active sessions × record size × replication;
+- latency p95/p99;
+- connection pooling;
+- encryption/auth/network isolation;
+- cache/store outage behavior;
+- backup chỉ khi business cần session survive disaster;
+- hot key/abuse/rate limit;
+- multi-region consistency/routing.
+
+Không cấu hình eviction tùy tiện làm session hợp lệ biến mất dưới memory pressure. Redis có nhiều capability hơn Memcached nhưng chọn theo requirement, không theo slogan.
+
+#### 23. Database-backed session
+
+Ưu:
+
+- durability, query/audit và transaction khả dụng;
+- có thể tận dụng hạ tầng hiện có.
+
+Nhược:
+
+- database trở thành hot path;
+- cleanup/TTL/index/write amplification;
+- contention và latency lớn hơn cache chuyên dụng trong nhiều workload.
+
+Có thể dùng database làm source of truth và cache làm acceleration nếu lifecycle/consistency được thiết kế rõ.
+
+#### 24. Stateless access token
+
+App instance validate token cục bộ, giảm shared session lookup. Nhưng cần:
+
+- key/config distribution;
+- revocation/refresh architecture;
+- claim freshness policy;
+- token size/bandwidth;
+- protection tại client;
+- clock/key rotation/issuer availability;
+- authorization consistency giữa services.
+
+Giảm một dependency trên request path nhưng tạo complexity khác; không phải “maximum scalability miễn phí”.
+
+#### 25. Hybrid pattern
+
+Thực tế thường kết hợp:
+
+- short-lived access token cho API;
+- server-side refresh/session record để revoke/device management;
+- gateway/BFF giữ token và browser chỉ có secure session cookie;
+- distributed store cho web sessions;
+- database cho user/device/security state bền vững.
+
+Chọn từng lớp theo consumer: browser, mobile, partner API và service account có threat model khác nhau.
+
+#### 26. Capacity planning cho session store
+
+Ước lượng cơ bản:
+
+```text
+Memory ≈ active sessions × average record size × replication factor × overhead
+```
+
+Theo dõi:
+
+- active/new/expired sessions per second;
+- lookup/write latency và error rate;
+- hit/miss;
+- memory/eviction;
+- replication lag/failover;
+- connection count;
+- session size distribution;
+- logout/revocation propagation;
+- login spike sau outage.
+
+Nếu session store down làm mọi request logout/retry login, authentication service có thể bị thundering herd. Cần degrade/recovery và rate limit.
+
+---
+
+#### Nhánh E — Session security
+
+#### 27. Session hijacking
+
+Attacker lấy session ID/token và dùng như bearer credential. Nguồn rò rỉ:
+
+- HTTP không mã hóa;
+- XSS hoặc malicious extension;
+- log, analytics, URL/referer;
+- insecure cookie scope;
+- malware/device compromise;
+- proxy/cache cấu hình sai.
+
+Defense:
+
+- HTTPS/HSTS;
+- `Secure`, `HttpOnly`, `SameSite`;
+- không đặt credential trong URL;
+- short lifetime và rotation;
+- revoke/device session management;
+- CSP/output encoding để giảm XSS;
+- re-auth/step-up cho action nhạy cảm;
+- detect anomalous use nhưng tránh hard-bind IP gây false positive.
+
+#### 28. Session fixation
+
+Attacker khiến victim dùng session ID đã biết trước login; sau login attacker dùng lại ID đó.
+
+Defense cốt lõi: **regenerate session ID sau authentication và privilege elevation**, không chấp nhận session ID từ URL hoặc nguồn không tin cậy, invalidate ID cũ.
+
+#### 29. CSRF
+
+CSRF lợi dụng việc browser tự gửi cookie/credential tới site đích dù request được kích hoạt từ site độc hại.
+
+Defense:
+
+- SameSite phù hợp;
+- synchronizer CSRF token hoặc signed double-submit pattern;
+- kiểm tra `Origin`/`Referer` cho unsafe request;
+- không thay đổi state bằng GET;
+- re-auth/transaction confirmation cho action nhạy cảm;
+- custom header khi API/client architecture phù hợp.
+
+**CORS không phải biện pháp chống CSRF chính.** Same-origin policy thường chặn script đọc response, nhưng form/navigation có thể vẫn gửi request và browser vẫn có thể đính cookie. CORS chỉ kiểm soát việc browser cho origin khác đọc/gửi một số cross-origin request theo policy.
+
+#### 30. XSS và token storage
+
+- HttpOnly cookie ngăn JS đọc credential nhưng XSS vẫn có thể gửi request trong origin.
+- Token trong localStorage/sessionStorage có thể bị script độc hại đọc/exfiltrate.
+- In-memory token giảm persistence nhưng không loại bỏ active XSS.
+- CSP, Trusted Types khi phù hợp, output encoding, dependency hygiene và no inline unsafe script giúp giảm root cause.
+
+Thiết kế phải cân bằng CSRF và XSS; không có một storage option loại bỏ cả hai mà không cần defense khác.
+
+#### 31. Logout và revocation
+
+Logout nên:
+
+- xóa/expire cookie phía client;
+- revoke/delete server session hoặc refresh token;
+- invalidate session ID cũ;
+- tùy chọn revoke một device hoặc tất cả device;
+- ghi audit event;
+- propagate tới service/gateway trong thời gian đã cam kết.
+
+Chỉ xóa JWT khỏi client không ngăn bản sao bị đánh cắp tiếp tục dùng đến expiry. Short-lived access token + revocable refresh/session state là pattern phổ biến.
+
+#### 32. Authentication và authorization trong microservices
+
+```text
+User → Identity Provider / OIDC
+     → Gateway/BFF validates token/session
+     → Service receives verified identity context
+     → Service authorizes action/resource
+```
+
+- Central IdP phát identity/access credential.
+- Gateway có thể validate và chuẩn hóa context.
+- Service phải xác minh nguồn context và enforce authorization riêng.
+- Token audience nên giới hạn đúng resource service.
+- Không đưa refresh token qua mọi service.
+- mTLS/workload identity dành cho service-to-service; user token biểu diễn user delegation.
+- Authz decision có thể cần policy/data mới hơn claim trong token.
+
+SSO giúp dùng một identity session qua nhiều application nhưng tăng criticality của IdP và cần logout/session propagation rõ.
+
+#### 33. Session monitoring và audit
+
+Theo dõi:
+
+- login success/failure/rate;
+- session create/rotate/revoke;
+- concurrent sessions/device;
+- refresh token reuse;
+- invalid/expired token rate;
+- CSRF validation failure;
+- anomalous geography/device/velocity;
+- session store latency/error/eviction;
+- authorization denial theo resource;
+- key rotation/validation failure.
+
+Không log raw password, session ID, access token, refresh token hoặc sensitive claims.
+
+---
+
+#### 34. Câu hỏi phỏng vấn từ tài liệu phụ
+
+**Q1. Vì sao HTTP stateless?**  
+Mỗi request có semantics độc lập và HTTP không tự giữ application session. Server vẫn có thể lưu state qua session/database.
+
+**Q2. Web app duy trì state thế nào?**  
+Cookie/session ID, server-side session, opaque/self-contained token và browser storage cho non-secret client state. Mỗi cơ chế có transport/security khác nhau.
+
+**Q3. Server session khác client token thế nào?**  
+Session tra state phía server và revoke dễ; token tự chứa claim có thể validate phân tán nhưng revocation/claim freshness khó hơn. Không thể kết luận bên nào an toàn/nhanh hơn nếu chưa có threat model và benchmark.
+
+**Q4. Khi nào dùng JWT thay session?**  
+Khi nhiều resource server cần validate short-lived access token độc lập và claim staleness/revocation trade-off chấp nhận được. Không dùng JWT chỉ vì “microservices”.
+
+**Q5. Cookie và session phối hợp thế nào?**  
+Server tạo opaque session ID, lưu session record, gửi ID trong secure cookie; browser tự gửi cookie theo matching rules; server lookup và authorize request.
+
+**Q6. Session hijacking và phòng chống?**  
+Kẻ tấn công lấy bearer session credential. Dùng TLS, secure cookie, no URL/log credential, rotation, timeout, revoke, XSS defense và step-up auth.
+
+**Q7. CSRF khai thác session ra sao?**  
+Browser tự đính cookie vào request bị site khác kích hoạt. Giảm bằng SameSite, CSRF token, Origin check và không dùng GET cho state change; CORS không đủ.
+
+**Q8. Vì sao dùng Secure, HttpOnly và SameSite?**  
+Secure hạn chế transport, HttpOnly hạn chế JS đọc cookie, SameSite hạn chế cross-site sending. Chúng là defense-in-depth, không chữa mọi XSS/CSRF.
+
+**Q9. Scale session trong distributed system?**  
+Sticky session, replication, distributed store, database hoặc token/hybrid. Chọn theo availability, revocation, region, cost và security.
+
+**Q10. Load-balanced system xử lý session storage thế nào?**  
+Externalize session vào shared HA store hoặc dùng token validation; sticky session chỉ là tactical option và cần failover strategy.
+
+**Q11. Authentication xuyên microservices thế nào?**  
+Central IdP/OIDC, short-lived audience-bound access token, gateway/context verification, service-level authorization, refresh/session state tập trung và workload identity cho service calls.
+
+**Q12. Large-scale application quản lý session ra sao?**  
+Không có một đáp án chung. Thường kết hợp distributed session, short-lived token, refresh rotation, SSO/IdP, device management, regional routing và observability theo threat model.
+
+#### 35. Các lỗi tư duy thường gặp
+
+- Hiểu HTTP stateless là server không được lưu state.
+- Đồng nhất cookie với session.
+- Nghĩ token phải nằm trong localStorage hoặc JWT phải nằm trong header.
+- Cho rằng JWT luôn encrypted, nhanh và an toàn hơn session.
+- Đưa role/permission dài hạn vào token sống lâu rồi không xử lý stale claim.
+- Chỉ xóa token phía client và gọi đó là revocation.
+- Lưu session ID/token trong URL.
+- Không rotate session ID sau login, dẫn tới fixation.
+- Dùng `SameSite=None` mà không hiểu cross-site credential risk.
+- Coi CORS là CSRF protection.
+- Dùng sticky session nhưng không có failover/session loss plan.
+- Để session store eviction làm user logout ngẫu nhiên.
+- Gateway authenticate rồi service bỏ object-level authorization.
+- Log raw session/token để debug.
+
+#### 36. Câu hỏi tư duy thêm
+
+1. User đổi role: session và JWT phản ánh thay đổi nhanh thế nào?
+2. Session store down: fail open, fail closed hay degraded mode?
+3. Logout một device khác logout mọi device ra sao?
+4. Multi-region session cần consistency và routing mức nào?
+5. Refresh token bị replay: rotation/reuse detection phản ứng thế nào?
+6. Browser app dùng cookie auth cần CSRF defense gì?
+7. Token trong localStorage và HttpOnly cookie có threat model khác nhau ra sao?
+8. 10 triệu active session × 2 KB × replication factor 3 cần bao nhiêu memory trước overhead?
+9. Session ID nên rotate ở những sự kiện nào ngoài login?
+10. BFF pattern giảm token exposure nhưng thêm dependency nào?
+
+#### 37. Ý chính cần nhớ
+
+- HTTP stateless nhưng web application vẫn duy trì state bằng explicit mechanisms.
+- Cookie là browser transport/storage; session là server state; token là credential/claim.
+- Server-side session cho revoke/control tốt nhưng cần shared availability khi scale.
+- Self-contained token giảm lookup nhưng làm revocation và claim freshness khó hơn.
+- JWT thường được ký, không mặc nhiên encrypted.
+- Secure, HttpOnly và SameSite chỉ là các lớp phòng vệ, không thay thế XSS/CSRF design.
+- CORS không phải CSRF defense chính.
+- Sticky session đơn giản nhưng giảm failover/flexibility.
+- Distributed session store là critical dependency cần TTL, HA, capacity và monitoring.
+- Session security bao phủ create, rotate, use, expire, refresh, logout và revoke.
+
+#### Công thức ghi nhớ
+
+> **HTTP không nhớ user; application phải mang một credential để nối các request. Session giữ quyền kiểm soát phía server, token phân phối context tới client/service — và cả hai chỉ an toàn khi lifecycle, storage, revocation và authorization được thiết kế đầy đủ.**
+
+---
+
+### Bài 31. Serialization — Định dạng trao đổi và lưu trữ dữ liệu
+
+#### 1. Serialization giải quyết vấn đề gì?
+
+Trong application, dữ liệu tồn tại dưới dạng object, struct, collection hoặc graph trong bộ nhớ. Representation này phụ thuộc vào ngôn ngữ, runtime và layout bộ nhớ nên không thể gửi nguyên trạng qua network hay lưu bền vững một cách portable.
+
+**Serialization** chuyển dữ liệu thành representation có thể truyền hoặc lưu, chẳng hạn byte sequence hay text document. **Deserialization** thực hiện chiều ngược lại: đọc representation và dựng thành cấu trúc dữ liệu mà chương trình có thể sử dụng.
+
+```text
+Object/Struct
+    │ serialize
+    ▼
+JSON text / Protobuf bytes / Avro record / ...
+    │ network, file, cache, broker, database
+    ▼
+Serialized payload
+    │ deserialize
+    ▼
+Object/Struct ở phía nhận
+```
+
+Serialization tạo ra contract tại mọi ranh giới:
+
+- client ↔ API;
+- service ↔ service;
+- producer ↔ message broker ↔ consumer;
+- application ↔ cache;
+- application ↔ database/file/object storage;
+- process hiện tại ↔ dữ liệu được đọc lại trong tương lai.
+
+Vì vậy, đây không chỉ là thao tác chuyển đổi dữ liệu. Lựa chọn format tác động đến bandwidth, latency, CPU, memory, storage cost, interoperability, debuggability và khả năng nâng cấp hệ thống.
+
+#### 2. Một payload không chỉ có “format”
+
+Khi thiết kế data exchange, cần tách các lớp sau:
+
+| Lớp | Câu hỏi |
+|---|---|
+| **Logical model** | Dữ liệu và ý nghĩa nghiệp vụ là gì? |
+| **Schema/contract** | Field, type, requiredness và compatibility rule nào được áp dụng? |
+| **Encoding** | Dữ liệu được biểu diễn thành text/binary như thế nào? |
+| **Framing** | Receiver biết message bắt đầu/kết thúc ở đâu? |
+| **Compression** | Payload có được nén không, bằng thuật toán nào? |
+| **Transport/storage** | HTTP, gRPC, Kafka, Redis, file hay database? |
+| **Security** | Integrity, confidentiality, authentication và input validation ra sao? |
+
+Format nhỏ không tự động tạo request nhanh. End-to-end latency còn gồm network round trip, queueing, compression, allocation, validation và business logic.
+
+#### 3. Các tiêu chí lựa chọn
+
+- **Human readability**: có cần đọc payload trực tiếp trong log, browser hoặc CLI không?
+- **Payload size**: bandwidth, cache memory và storage có nhạy cảm không?
+- **Encode/decode cost**: throughput, CPU budget và tail latency ra sao?
+- **Schema discipline**: cần type safety, validation, code generation hay schema registry không?
+- **Evolution**: producer/consumer có được deploy độc lập và nhiều version cùng tồn tại không?
+- **Interoperability**: browser, đối tác và nhiều ngôn ngữ có cần hỗ trợ dễ dàng không?
+- **Random access/queryability**: chỉ truyền message hay cần database/query engine hiểu field?
+- **Tooling**: debug, observability, ecosystem và operational skill của đội ngũ thế nào?
+- **Security**: parser có an toàn, giới hạn kích thước/depth và loại dữ liệu ra sao?
+
+Không có format tốt nhất cho mọi workload. Cần benchmark bằng payload và thư viện thực tế thay vì suy luận chỉ từ nhãn “text” hay “binary”.
+
+---
+
+#### Nhánh A — Các format phổ biến
+
+#### 4. JSON
+
+JSON là text format phổ biến cho Web API nhờ cú pháp tương đối đơn giản, ecosystem rộng và browser/tooling hỗ trợ tốt.
+
+```json
+{
+  "orderId": "ord-123",
+  "amount": 125000,
+  "currency": "VND"
+}
+```
+
+**Ưu điểm**
+
+- dễ đọc, log và debug;
+- hỗ trợ gần như mọi ngôn ngữ;
+- phù hợp public REST API và browser client;
+- không bắt buộc code generation.
+
+**Hạn chế**
+
+- lặp field name nên payload thường lớn hơn compact binary format;
+- number model và cách map type khác nhau giữa runtime;
+- date/time, decimal, bytes và enum cần convention rõ ràng;
+- parser text và allocation có thể tốn CPU/memory ở tải lớn;
+- bản thân JSON không bắt buộc schema.
+
+> JSON **có thể** được kiểm tra bằng JSON Schema hoặc application validation. Nói “JSON không có schema” nên hiểu là encoding không yêu cầu schema để đọc, không phải JSON không thể dùng schema.
+
+#### 5. XML
+
+XML là text markup format có element, attribute, namespace và hệ sinh thái schema/query/transform phong phú như XSD, XPath, XSLT.
+
+**Phù hợp khi:** tích hợp SOAP/enterprise/legacy, document có mixed content, namespace hoặc validation phức tạp.
+
+**Đánh đổi:** verbose, parser/configuration phức tạp hơn và cần cấu hình an toàn để tránh các lớp tấn công như external entity expansion. XML không chỉ là “JSON cũ”; nó có document model và tooling khác.
+
+#### 6. Protocol Buffers (Protobuf)
+
+Protobuf dùng schema `.proto`, field number và binary wire format. Compiler sinh type/code cho nhiều ngôn ngữ.
+
+```proto
+message Order {
+  string order_id = 1;
+  int64 amount = 2;
+  string currency = 3;
+}
+```
+
+**Ưu điểm**
+
+- payload thường compact, encode/decode hiệu quả;
+- type contract rõ và hỗ trợ code generation;
+- phù hợp gRPC và internal service communication;
+- hỗ trợ schema evolution nếu tuân thủ field-number rule.
+
+**Đánh đổi**
+
+- không đọc trực tiếp bằng mắt, cần schema/tooling;
+- quản lý schema và generated code tạo thêm quy trình;
+- không nên tái sử dụng field number đã xóa; nên đánh dấu `reserved`;
+- đổi type/semantics sai cách vẫn phá compatibility dù wire format đọc được.
+
+Protobuf là mặc định phổ biến của gRPC, nhưng gRPC có thể dùng codec khác. “gRPC bắt buộc Protobuf” là phát biểu quá tuyệt đối.
+
+#### 7. Avro
+
+Avro là schema-based binary format thường dùng trong data pipeline và event streaming. Dữ liệu được đọc bằng cách đối chiếu **writer schema** với **reader schema**; schema có thể đi kèm file/container hoặc được tham chiếu qua registry.
+
+**Ưu điểm**
+
+- compact, phù hợp throughput lớn;
+- schema evolution là mối quan tâm trung tâm;
+- thuận lợi cho Kafka/data lake/Hadoop ecosystem;
+- không cần field name lặp trong từng record khi schema được quản lý riêng.
+
+**Đánh đổi**
+
+- cần schema distribution/registry và compatibility policy;
+- debug cần decoder/tooling;
+- thay đổi default, union/type và semantic vẫn phải được quản lý cẩn thận.
+
+#### 8. BSON
+
+BSON là binary document representation được MongoDB dùng, hỗ trợ thêm type như date, binary và các numeric type cụ thể. Nó giúp database parse/traverse document theo data model của MongoDB.
+
+Không nên kết luận BSON luôn nhỏ hơn JSON. Type metadata, length prefix và field name vẫn tạo overhead; với một số document, BSON có thể lớn hơn JSON. Lợi ích chính là richer types và database-oriented representation, không phải nén dữ liệu mặc định.
+
+#### 9. So sánh ở mức định hướng
+
+| Tiêu chí | JSON | XML | Protobuf | Avro |
+|---|---|---|---|---|
+| Representation | Text | Text | Binary | Binary |
+| Đọc trực tiếp | Tốt | Tốt nhưng verbose | Cần tooling/schema | Cần tooling/schema |
+| Schema bắt buộc để decode | Không | Không | Có | Có reader/writer schema |
+| Kích thước điển hình | Trung bình | Lớn | Nhỏ | Nhỏ |
+| Web/browser ecosystem | Rất mạnh | Có, thiên enterprise | Hạn chế hơn | Không phải lựa chọn Web phổ biến |
+| Điểm mạnh | Simplicity, interoperability | Document/schema/tooling phong phú | Typed RPC, compact wire | Streaming/data evolution |
+| Use case thường gặp | Public REST API | SOAP, enterprise document | gRPC, internal API | Kafka, big data pipeline |
+
+Các nhận xét về size/speed là xu hướng, không phải định luật. Kết quả phụ thuộc cấu trúc dữ liệu, implementation, compression, hardware và workload.
+
+---
+
+#### Nhánh B — Schema evolution và compatibility
+
+#### 10. Vì sao evolution quan trọng?
+
+Trong distributed system, producer và consumer hiếm khi nâng cấp cùng lúc. Một message mới có thể được đọc bởi consumer cũ; dữ liệu cũ trong broker/file có thể được xử lý lại bằng code mới.
+
+Ba câu hỏi phải tách riêng:
+
+- **Backward compatibility**: reader/consumer mới đọc được dữ liệu do writer/producer cũ tạo.
+- **Forward compatibility**: reader/consumer cũ đọc được dữ liệu do writer/producer mới tạo.
+- **Full compatibility**: cả hai chiều trong phạm vi version policy.
+
+Thuật ngữ có thể được platform diễn đạt theo subject/version direction khác nhau; khi phỏng vấn nên định nghĩa rõ ai là reader, ai là writer.
+
+#### 11. Quy tắc evolution thực tế
+
+- thêm optional field với default hợp lý;
+- receiver bỏ qua unknown field;
+- không đổi ý nghĩa của field cũ;
+- không tái sử dụng Protobuf field number;
+- tránh đổi type không tương thích;
+- phân biệt “wire-compatible” với “semantically compatible”;
+- version schema/contract và kiểm tra compatibility trong CI;
+- có migration plan cho dữ liệu lưu dài hạn và event replay;
+- deploy theo thứ tự expand → migrate → contract khi cần.
+
+Ví dụ, đổi `amount` từ đơn vị đồng sang nghìn đồng mà giữ nguyên field name/type có thể hoàn toàn wire-compatible nhưng phá business semantics.
+
+#### 12. Schema Registry
+
+Schema Registry quản lý schema version, subject và compatibility rule. Producer có thể gửi schema ID thay vì toàn bộ schema; consumer lấy/cache schema tương ứng để decode.
+
+```text
+Producer ── register/check schema ──> Schema Registry
+   │                                      ▲
+   └── schema-id + binary record ──> Broker ──> Consumer
+                                             lookup/cache schema
+```
+
+Registry trở thành control-plane dependency. Cần availability, cache, access control, rollout policy và disaster recovery; không nên để mọi request data-plane buộc phải gọi registry từ xa.
+
+---
+
+#### Nhánh C — Ứng dụng trong kiến trúc thực tế
+
+#### 13. API và service communication
+
+- **Public/browser API**: JSON thường thắng về accessibility và tooling.
+- **Internal high-throughput RPC**: Protobuf/gRPC thường phù hợp vì contract typed và payload compact.
+- **Partner/enterprise integration**: JSON, XML hoặc industry-specific standard tùy ecosystem.
+- **Long-lived event**: Avro/Protobuf/JSON đều dùng được, nhưng schema governance quan trọng hơn tên format.
+
+API cần định nghĩa `Content-Type`, character encoding, versioning, maximum body size và behavior khi gặp unknown/missing field.
+
+#### 14. Cache như Redis
+
+Format ảnh hưởng:
+
+- memory trên mỗi entry và tổng cache capacity;
+- CPU encode/decode;
+- network transfer tới remote cache;
+- khả năng partial update/query;
+- compatibility khi application version thay đổi;
+- debugging khi cache corruption/mismatch xảy ra.
+
+Cache key nên phản ánh schema/version khi representation thay đổi không tương thích, ví dụ `user:v2:{id}`. Compression chỉ đáng dùng khi byte tiết kiệm đủ bù CPU và latency; payload nhỏ có thể lớn hơn vì header/metadata.
+
+#### 15. Event broker và data pipeline
+
+Event sống lâu hơn request-response và thường có nhiều consumer độc lập. Vì vậy cần:
+
+- stable event semantics;
+- schema ID/version;
+- backward/forward compatibility policy;
+- event envelope và content type;
+- replay/upcasting strategy;
+- quarantine/DLQ cho payload không decode được;
+- observability theo schema/version và deserialization failure.
+
+Không publish object nội bộ của domain/framework trực tiếp làm public event contract. Nếu class đổi tên hoặc implementation thay đổi, consumer và dữ liệu lịch sử có thể vỡ.
+
+#### 16. Database và storage
+
+Serialization cho storage khác serialization cho RPC:
+
+- storage cần đọc được dữ liệu nhiều năm và qua nhiều software version;
+- columnar analytics format như Parquet tối ưu scan/aggregation, không giống row/message format;
+- file/container format còn cần block, index, metadata, compression và corruption recovery;
+- database representation cần hỗ trợ query/index, không chỉ compact bytes.
+
+Không nên serialize object graph bằng runtime-native mechanism rồi lưu lâu dài nếu format gắn chặt với class/runtime và không có migration contract.
+
+#### 17. Performance model
+
+Chi phí end-to-end có thể hình dung:
+
+```text
+Tổng latency
+= encode + compress + queue/network + decompress + decode + validate + allocation
+```
+
+Các metric nên benchmark:
+
+- serialized bytes/message;
+- encode/decode throughput;
+- p50/p95/p99 latency;
+- CPU cycles và allocation/GC;
+- memory peak khi parse;
+- compression ratio và break-even payload size;
+- cold-start/schema lookup cost;
+- failure behavior với payload lớn hoặc malformed.
+
+Binary format thường compact và nhanh, nhưng optimized JSON library có thể đủ nhanh; compression có thể thu hẹp chênh lệch bandwidth; code generation có thể tăng build/deployment complexity. Đo trên representative dataset mới có ý nghĩa.
+
+---
+
+#### Nhánh D — Security và độ tin cậy
+
+#### 18. Insecure deserialization
+
+Rủi ro lớn nhất xuất hiện khi deserializer dựng arbitrary object/type hoặc kích hoạt constructor, callback/gadget chain từ dữ liệu không tin cậy. Hậu quả có thể gồm:
+
+- remote code execution;
+- denial of service do payload lớn, sâu hoặc recursive;
+- memory/CPU exhaustion;
+- injection và business-rule bypass;
+- data tampering hoặc type confusion.
+
+Không deserialize dữ liệu không tin cậy bằng native object serialization cho phép polymorphic/arbitrary type. Ưu tiên data-only format, allowlist type và map vào DTO giới hạn.
+
+#### 19. Các lớp phòng vệ
+
+- giới hạn request/message size, nesting depth, collection length và processing time;
+- validate syntax **và** schema **và** business invariant;
+- từ chối unknown field khi context nhạy cảm, hoặc định nghĩa rõ policy bỏ qua;
+- dùng parser/library được cập nhật và cấu hình an toàn;
+- tắt XML external entities/DTD nếu không cần;
+- tránh dynamic type metadata từ client;
+- xác thực integrity/authenticity bằng MAC/signature khi threat model yêu cầu;
+- mã hóa TLS cho dữ liệu trên đường truyền và encryption at rest khi cần;
+- sandbox/quarantine malformed payload, rate limit và monitor failure;
+- không log nguyên payload chứa secret/PII.
+
+TLS ngăn kẻ nghe lén/sửa dữ liệu trên đường truyền trong mô hình phù hợp, nhưng không làm payload của client trở nên đáng tin và không ngăn insecure deserialization tại endpoint. Encryption cũng không thay validation.
+
+#### 20. Data fidelity
+
+Serialization có thể làm mất hoặc đổi ý nghĩa dữ liệu:
+
+- integer lớn bị mất chính xác khi đi qua runtime dùng floating-point number;
+- decimal tiền tệ bị rounding;
+- timestamp mất timezone/precision;
+- `null`, missing field và default bị đồng nhất;
+- enum mới không được consumer cũ xử lý;
+- map ordering hoặc duplicate key được hiểu khác nhau;
+- binary data bị encode/decode sai convention.
+
+Với tiền, ID, timestamp và security claim, cần contract type/convention rõ và test round-trip/cross-language.
+
+---
+
+#### 21. Câu hỏi phỏng vấn và câu trả lời ngắn
+
+**Q1. Serialization là gì và vì sao cần?**  
+Là quá trình biến object/data structure thành representation có thể truyền/lưu và dựng lại. Nó tạo khả năng interoperability qua process, language, network và thời gian.
+
+**Q2. Format ảnh hưởng data exchange/storage thế nào?**  
+Ảnh hưởng bytes, CPU, memory, latency, fidelity, compatibility, tooling và chi phí vận hành.
+
+**Q3. JSON, XML, Protobuf và Avro khác nhau ra sao?**  
+JSON ưu tiên simplicity/Web interoperability; XML có document/schema/namespace tooling mạnh; Protobuf ưu tiên typed compact RPC; Avro phù hợp data streaming và writer/reader schema evolution.
+
+**Q4. Khi nào chọn Protobuf thay JSON?**  
+Khi internal contract typed, throughput/bandwidth hoặc gRPC quan trọng và tổ chức chấp nhận schema/codegen/tooling. Chọn JSON khi public/browser accessibility và debug đơn giản quan trọng hơn.
+
+**Q5. Serialization tác động API performance thế nào?**  
+Qua payload size, encode/decode CPU, allocation/GC và compression. Tuy nhiên phải đo end-to-end; database/network/business logic có thể mới là bottleneck.
+
+**Q6. Vì sao gRPC thường dùng Protobuf?**  
+Vì schema typed, code generation, compact binary encoding và streaming/RPC tooling kết hợp tốt. Đây là mặc định phổ biến chứ không phải codec duy nhất về mặt khái niệm.
+
+**Q7. Serialization ảnh hưởng caching ra sao?**  
+Nó quyết định memory/transfer cost, decode latency, compatibility và khả năng debug. Cần version key/payload và đánh giá compression threshold.
+
+**Q8. Đánh đổi readability, efficiency và compatibility?**  
+Text dễ quan sát nhưng thường verbose; binary thường compact nhưng cần tooling/schema. Compatibility không tự sinh từ format mà đến từ rule, governance và cách thay đổi semantics.
+
+**Q9. Ảnh hưởng CPU/memory?**  
+Parsing, allocation, copy và object construction tiêu tốn tài nguyên. Binary thường có lợi nhưng không bảo đảm; benchmark implementation và representative payload.
+
+**Q10. Avro có lợi gì trong big data?**  
+Compact record, writer/reader schema resolution và ecosystem data pipeline. Hiệu quả phụ thuộc schema registry/governance và workload.
+
+**Q11. Vì sao MongoDB dùng BSON?**  
+Để có binary document model với richer data type và representation phù hợp storage/query. BSON không mặc nhiên nhỏ hơn JSON.
+
+**Q12. Rủi ro bảo mật nào liên quan serialization?**  
+Insecure deserialization, parser exploit, resource exhaustion, injection, tampering và leak dữ liệu nhạy cảm.
+
+**Q13. Giảm rủi ro deserialization thế nào?**  
+Dùng data-only format, allowlist/DTO, schema và business validation, resource limit, parser an toàn/cập nhật, integrity protection và không tin input dù đã qua TLS.
+
+#### 22. Các lỗi tư duy thường gặp
+
+- Chọn format theo benchmark trên payload “hello world”.
+- Khẳng định binary luôn nhanh và nhỏ hơn text.
+- Nói JSON không thể có schema.
+- Nghĩ schema tồn tại đồng nghĩa compatibility tự động.
+- Đổi semantics nhưng chỉ kiểm tra wire compatibility.
+- Dùng JSON number cho mọi integer/decimal mà không xét cross-language fidelity.
+- Publish runtime object/class trực tiếp làm durable event.
+- Nén mọi payload kể cả message rất nhỏ.
+- Không version cache value và stored blob.
+- Cho phép arbitrary type/polymorphic deserialization từ input ngoài.
+- Dùng encryption thay cho validation và integrity/authentication.
+- Log payload chứa token, password hoặc PII.
+
+#### 23. Checklist thiết kế
+
+1. Ai là producer/consumer và họ được deploy độc lập không?
+2. Dữ liệu sống trong một request hay nhiều năm?
+3. Payload size/distribution thực tế là gì?
+4. Readability/debugging hay throughput quan trọng hơn?
+5. Schema nằm ở đâu và ai sở hữu?
+6. Backward/forward compatibility được định nghĩa và test thế nào?
+7. Missing, unknown, null, default và enum mới được xử lý ra sao?
+8. Có giới hạn size, depth, count và timeout không?
+9. Dữ liệu cần integrity, confidentiality và authenticity mức nào?
+10. Khi decode thất bại, retry, DLQ, quarantine và alert ra sao?
+11. Có benchmark cross-language và production-like payload chưa?
+12. Có migration/replay plan cho dữ liệu cũ không?
+
+#### 24. Ý chính cần nhớ
+
+- Serialization biến in-memory data thành representation có thể truyền/lưu; deserialization dựng lại dữ liệu.
+- Format là một phần của contract, không chỉ là chi tiết implementation.
+- JSON mạnh về Web interoperability; XML về document/enterprise tooling; Protobuf về typed RPC; Avro về data pipeline/schema resolution.
+- Text so với binary là đánh đổi theo workload, không phải bảng xếp hạng tuyệt đối.
+- Schema evolution phải xét cả wire syntax và business semantics.
+- Dữ liệu durable cần migration/replay strategy dài hạn.
+- Serialization tác động bandwidth, CPU, memory, cache capacity và storage cost.
+- Deserialization là trust boundary: giới hạn, validate và không dựng arbitrary object từ input.
+- TLS/encryption không thay thế validation hay authorization.
+- Quyết định đúng đến từ representative benchmark và operational constraints.
+
+#### Công thức ghi nhớ
+
+> **Chọn serialization format theo consumer, lifecycle và workload: contract phải tiến hóa an toàn, encoding phải đủ hiệu quả, dữ liệu phải giữ đúng ý nghĩa, và mọi bước deserialization phải được xem là một trust boundary.**
+
+---
+
+### Bài 32. CORS — Cross-Origin Resource Sharing & Web Security
+
+#### 1. Bài toán CORS giải quyết
+
+Một frontend tại `https://app.example.com` có thể cần gọi API tại `https://api.example.com`. Đây là hai **origin** khác nhau, dù cùng site `example.com`.
+
+Browser áp dụng **Same-Origin Policy (SOP)** để hạn chế script từ một origin đọc hoặc tương tác với tài nguyên thuộc origin khác. Nếu không có ranh giới này, JavaScript trên trang độc hại có thể lợi dụng phiên đăng nhập của user để đọc dữ liệu từ nhiều website khác.
+
+**CORS** là protocol dựa trên HTTP header cho phép server tuyên bố origin nào được browser chia sẻ response. Browser gửi `Origin`, đọc policy trong response và quyết định JavaScript có được truy cập response hay không.
+
+```text
+JavaScript ở app.example.com
+          │ cross-origin fetch
+          ▼
+Browser ───────────────> api.example.com
+   │                         │
+   │<── CORS response headers┤
+   │
+   └─ cho JS đọc response hoặc chặn theo policy
+```
+
+Điểm cần nhớ:
+
+- server phát policy qua header;
+- browser thực thi policy;
+- CORS không áp dụng như một access-control boundary cho `curl`, mobile app hoặc server-to-server client;
+- CORS không thay authentication, authorization, CSRF protection hoặc input validation.
+
+#### 2. Origin là gì?
+
+Origin là bộ ba:
+
+```text
+scheme + hostname + port
+```
+
+| URL A | URL B | Same origin? | Lý do |
+|---|---|---:|---|
+| `https://app.com/a` | `https://app.com/b` | Có | Cùng scheme, host, port mặc định |
+| `https://app.com` | `http://app.com` | Không | Khác scheme |
+| `https://app.com` | `https://api.app.com` | Không | Khác hostname |
+| `https://app.com` | `https://app.com:8443` | Không | Khác port |
+
+**Same-origin** khác **same-site**. Cookie `SameSite`, CSRF và SOP/CORS dùng các khái niệm boundary không hoàn toàn giống nhau; không nên thay thế thuật ngữ này cho thuật ngữ kia.
+
+#### 3. SOP thực sự chặn điều gì?
+
+Nói “browser chặn cross-origin request” là cách rút gọn dễ gây hiểu nhầm. Browser từ lâu vẫn cho phép nhiều cross-origin resource/request như:
+
+- `<img src="...">`, `<script src="...">`, stylesheet;
+- navigation và form submission;
+- một số `fetch`/request ở chế độ phù hợp.
+
+SOP chủ yếu hạn chế script **đọc response** hoặc truy cập document/data của origin khác. Với một số request cần preflight, browser có thể không gửi actual request nếu preflight thất bại. Nhưng một “simple” cross-origin POST có thể đã đến server dù JavaScript không đọc được response.
+
+Đây là lý do CORS không phải lớp chống CSRF chính: không đọc được response không đồng nghĩa side effect chưa xảy ra.
+
+---
+
+#### Nhánh A — CORS request flow
+
+#### 4. Simple request
+
+Một request được CORS xem là **simple** khi đáp ứng các điều kiện safelist, tiêu biểu:
+
+- method là `GET`, `HEAD` hoặc `POST`;
+- chỉ dùng CORS-safelisted request headers;
+- nếu có `Content-Type`, giá trị thuộc `application/x-www-form-urlencoded`, `multipart/form-data` hoặc `text/plain`;
+- không sử dụng các tính năng khiến request rời safelist.
+
+Browser gửi simple request ngay, kèm `Origin`. Server trả response, ví dụ:
+
+```http
+GET /profile HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+```
+
+```http
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: https://app.example.com
+Content-Type: application/json
+```
+
+Nếu `Access-Control-Allow-Origin` không phù hợp, JavaScript nhận lỗi CORS và không đọc được response. Request vẫn có thể đã được server xử lý.
+
+> “Simple” chỉ là thuật ngữ của CORS, không có nghĩa request an toàn, read-only hoặc không tạo side effect. `POST` có thể là simple request.
+
+#### 5. Preflight request
+
+Với request ngoài safelist, browser gửi `OPTIONS` để hỏi trước. Các nguyên nhân thường gặp:
+
+- method như `PUT`, `PATCH`, `DELETE`;
+- `Authorization` hoặc custom request header;
+- `Content-Type: application/json`;
+- các request option không thuộc safelist.
+
+```http
+OPTIONS /orders/123 HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: authorization, content-type
+```
+
+Server có thể trả:
+
+```http
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET, POST, PUT
+Access-Control-Allow-Headers: Authorization, Content-Type
+Access-Control-Max-Age: 600
+Vary: Origin
+```
+
+Nếu policy khớp, browser mới gửi actual `PUT`. Preflight là permission negotiation của browser, không chứng minh user đã được authorize cho resource `orders/123`.
+
+#### 6. CORS headers quan trọng
+
+| Header | Hướng | Vai trò |
+|---|---|---|
+| `Origin` | Request | Origin khởi tạo request |
+| `Access-Control-Request-Method` | Preflight request | Method dự định dùng |
+| `Access-Control-Request-Headers` | Preflight request | Các header dự định gửi |
+| `Access-Control-Allow-Origin` | Response | Origin được phép đọc response |
+| `Access-Control-Allow-Methods` | Preflight response | Method được phép cho actual request |
+| `Access-Control-Allow-Headers` | Preflight response | Request header được phép gửi |
+| `Access-Control-Allow-Credentials` | Response | Cho browser expose credentialed response khi policy khác cũng hợp lệ |
+| `Access-Control-Expose-Headers` | Response | Response header ngoài safelist mà JS được phép đọc |
+| `Access-Control-Max-Age` | Preflight response | Browser có thể cache kết quả preflight bao lâu |
+| `Vary: Origin` | Response/cache metadata | Báo cache rằng representation/header thay đổi theo `Origin` |
+
+`Access-Control-Allow-Headers` không làm lộ response header. Nó cho phép client **gửi request header** đã liệt kê. Muốn JavaScript đọc custom response header như `X-Request-Id`, dùng `Access-Control-Expose-Headers`.
+
+#### 7. Preflight và performance
+
+Preflight thêm một round trip trước actual request, đặc biệt đáng kể trên mobile/high-latency network. Các cách giảm chi phí:
+
+- dùng `Access-Control-Max-Age` hợp lý;
+- xử lý `OPTIONS` nhanh tại edge/gateway;
+- giữ policy ổn định để browser reuse cache;
+- dùng same-origin reverse proxy/BFF khi kiến trúc phù hợp;
+- tránh custom header không cần thiết, nhưng không làm yếu security chỉ để né preflight.
+
+Preflight cache là cache riêng của browser, không đơn giản là HTTP response cache thông thường. Browser cũng có thể áp giới hạn riêng lên `Max-Age`.
+
+---
+
+#### Nhánh B — Credentials và CORS policy
+
+#### 8. Credentialed request
+
+Credential có thể gồm cookie, TLS client certificate hoặc HTTP authentication information. Với Fetch, cross-origin credential thường cần client opt-in, ví dụ:
+
+```javascript
+fetch("https://api.example.com/me", {
+  credentials: "include"
+});
+```
+
+Server phải trả policy cụ thể:
+
+```http
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+Vary: Origin
+```
+
+Không thể dùng `Access-Control-Allow-Origin: *` để browser chia sẻ response cho request dùng credentials. Ngoài CORS, cookie vẫn chịu các rule `Domain`, `Path`, `Secure` và `SameSite`; CORS không ép browser gửi cookie trái với cookie policy.
+
+#### 9. Wildcard không mặc nhiên là lỗ hổng
+
+```http
+Access-Control-Allow-Origin: *
+```
+
+Wildcard phù hợp với public resource thật sự công khai, không dùng browser credential và không chứa dữ liệu nhạy cảm theo caller. Nó không tự động “mở server cho Internet” — endpoint vốn đã có thể bị gọi bằng non-browser client.
+
+Rủi ro xuất hiện khi:
+
+- response có dữ liệu không nên cho mọi website đọc;
+- server phản chiếu origin tùy ý rồi cho credentials;
+- authentication/authorization dựa sai vào Origin/CORS;
+- cache trộn response/policy giữa các origin;
+- allowlist quá rộng hoặc regex/subdomain matching sai.
+
+#### 10. Dynamic origin allowlist
+
+Khi hỗ trợ nhiều trusted origin, server có thể kiểm tra request `Origin` rồi phản hồi chính xác origin đó nếu được phép:
+
+```text
+allowed = exactMatch(origin, configuredOrigins)
+if allowed:
+    Access-Control-Allow-Origin = origin
+    Vary = Origin
+```
+
+Không phản chiếu `Origin` vô điều kiện. Cần:
+
+- parse URL chuẩn thay vì suffix/string contains;
+- chỉ cho scheme/host/port chính xác;
+- thận trọng với wildcard subdomain và dangling DNS;
+- định nghĩa policy cho `null` origin;
+- không tin Origin như bằng chứng authentication;
+- có test cho allow/deny và cache behavior.
+
+Ví dụ, kiểm tra “hostname kết thúc bằng `example.com`” sai cách có thể chấp nhận `attackerexample.com`.
+
+#### 11. `Origin: null`
+
+Một số sandboxed iframe, local file hoặc opaque origin có thể gửi `Origin: null`. Cho phép literal `null` rộng rãi có thể biến các context không tin cậy thành origin được cấp quyền. Chỉ cho phép khi có use case được xác định và có lớp kiểm soát khác.
+
+#### 12. CORS policy theo loại API
+
+Không nên dùng một policy cho toàn platform:
+
+| Loại endpoint | Định hướng policy |
+|---|---|
+| Public static/data API | Có thể `*`, không credential, rate limit phù hợp |
+| First-party user API | Exact trusted origins, credentials khi cần, CSRF defense |
+| Partner API | Thường dùng auth mạnh; CORS chỉ cần nếu partner gọi từ browser |
+| Internal service API | CORS không bảo vệ server-to-server; dùng network/workload identity/authz |
+| Admin API | Allowlist hẹp, auth mạnh, audit và thường tách boundary |
+
+---
+
+#### Nhánh C — CORS trong kiến trúc thực tế
+
+#### 13. REST và GraphQL
+
+CORS phụ thuộc browser/origin, không phụ thuộc REST hay GraphQL.
+
+- REST frontend và API khác origin thường cần CORS.
+- GraphQL `POST` với `application/json`, `Authorization` hoặc custom headers thường preflight.
+- GraphQL chỉ có một endpoint không làm giảm yêu cầu authentication, field/object authorization hay CSRF protection.
+- WebSocket handshake có `Origin` nhưng không dùng CORS theo đúng cơ chế Fetch; server WebSocket phải tự validate Origin và authentication theo threat model.
+
+#### 14. Reverse proxy và same-origin routing
+
+Reverse proxy có thể phục vụ frontend và proxy `/api` dưới cùng public origin:
+
+```text
+https://app.example.com/       ──> Frontend
+https://app.example.com/api/*  ──> Reverse Proxy ──> Backend service
+```
+
+Browser thấy same-origin nên frontend không cần CORS cho path này. Lợi ích:
+
+- đơn giản hóa browser policy và cookie scope;
+- ẩn topology nội bộ;
+- tập trung TLS, routing, limits và observability.
+
+Nhưng proxy không tự tạo security: backend vẫn cần authentication, authorization, CSRF defense, input validation và network policy.
+
+#### 15. API Gateway
+
+Gateway có thể tập trung:
+
+- origin allowlist;
+- preflight/`OPTIONS` response;
+- method/header policy;
+- consistent `Vary`/cache behavior;
+- authentication, rate limit và audit;
+- metrics cho rejected origin/preflight.
+
+Đánh đổi là policy drift giữa gateway và service, route-specific requirements, vendor configuration và nguy cơ gateway thêm header cho cả error response không đúng cách. Cần một nguồn cấu hình rõ ràng và integration test từ browser perspective.
+
+#### 16. CDN và cache
+
+Nếu response thay đổi `Access-Control-Allow-Origin` theo request origin, shared cache phải phân biệt đúng variant, thường qua:
+
+```http
+Vary: Origin
+```
+
+Nếu không, cache có thể trả header dành cho origin A cho origin B, gây lỗi hoặc tạo exposure tùy cấu hình. Cần cân nhắc cache-key cardinality khi có rất nhiều origin; gateway/CDN policy phải nhất quán với origin allowlist.
+
+#### 17. Backend-for-Frontend (BFF)
+
+BFF cho phép browser chỉ nói chuyện với same-origin backend; BFF giữ access token phía server và gọi downstream services. Mẫu này có thể giảm token exposure trong JavaScript và giảm CORS complexity, nhưng tạo thêm state/dependency, CSRF concern với cookie session và operational hop.
+
+#### 18. JSONP không phải giải pháp hiện đại
+
+JSONP lợi dụng `<script>` để tải cross-origin JavaScript và chỉ hỗ trợ mô hình GET. Response được thực thi như code, không có security model thích hợp cho API hiện đại. Nó đã lỗi thời; không dùng thay CORS.
+
+---
+
+#### Nhánh D — Quan hệ với các cơ chế bảo mật khác
+
+#### 19. CORS và authentication/authorization
+
+CORS trả lời:
+
+> Browser có cho script của origin này đọc response không?
+
+Authentication/authorization trả lời:
+
+> Caller là ai và có quyền thực hiện action trên resource này không?
+
+API phải kiểm tra quyền bất kể CORS header. Attacker có thể gọi API trực tiếp ngoài browser, và CORS không hề ngăn việc đó.
+
+#### 20. CORS và CSRF
+
+CSRF lợi dụng credential mà browser tự gửi, thường là cookie, để tạo request ngoài ý muốn. Vì simple request có thể được gửi mà không preflight, CORS không phải biện pháp chống CSRF đầy đủ.
+
+Phòng vệ thường kết hợp:
+
+- `SameSite` cookie phù hợp;
+- anti-CSRF token;
+- kiểm tra `Origin`/`Referer` như defense-in-depth;
+- yêu cầu custom header cho API flow được thiết kế cẩn thận;
+- re-authentication cho action nhạy cảm;
+- không dùng `GET` cho state-changing action.
+
+Preflight/custom header có thể tăng rào cản với một số CSRF flow, nhưng vẫn không thay thế CSRF design và authorization.
+
+#### 21. CORS và XSS
+
+Nếu attacker chạy JavaScript trong một **trusted allowed origin** do XSS, CORS thường không cứu được hệ thống: script đang hoạt động với origin đã được cho phép và có thể gửi request/đọc response theo quyền của user.
+
+Phòng XSS cần output encoding, safe DOM API, CSP, dependency hygiene và tránh unsafe HTML/script execution. `HttpOnly` bảo vệ việc đọc cookie nhưng không ngăn script XSS thực hiện request dưới phiên user.
+
+#### 22. Các browser security header liên quan
+
+CORS chỉ là một phần của web security model:
+
+- **Content-Security-Policy (CSP)**: giới hạn nguồn script/resource và giảm tác động XSS.
+- **Cross-Origin-Resource-Policy (CORP)**: resource chỉ định ai được phép nhúng/đọc theo mode nhất định.
+- **Cross-Origin-Opener-Policy (COOP)** và **Cross-Origin-Embedder-Policy (COEP)**: tạo cross-origin isolation cho document khi cấu hình phù hợp.
+- **Fetch Metadata** (`Sec-Fetch-*`): giúp server suy luận context như site/mode/destination để từ chối request đáng ngờ.
+- **Frame protections**: CSP `frame-ancestors` chống clickjacking tốt hơn cấu hình frame legacy.
+
+Các cơ chế này bổ trợ nhau; không header đơn lẻ nào thay thế thiết kế trust boundary đầy đủ.
+
+#### 23. Các misconfiguration phổ biến
+
+- Phản chiếu mọi `Origin` và bật credentials.
+- Cho phép `null` origin không có lý do.
+- Match allowlist bằng substring/suffix sai.
+- Dùng `*` cho user-specific sensitive response.
+- Quên `Vary: Origin` khi response thay đổi theo origin.
+- Chỉ thêm CORS header cho response thành công, khiến lỗi/401 khó debug.
+- Bắt `OPTIONS` phải có user credential trong khi preflight không mang credential như actual flow mong đợi.
+- Redirect preflight/actual request qua origin khác mà không kiểm thử browser behavior.
+- Cho rằng chặn JavaScript đọc response nghĩa server chưa xử lý request.
+- Dùng CORS thay authentication, authorization hoặc CSRF protection.
+- Cho phép production origin kiểu `*.example.com` trong khi subdomain có thể bị takeover.
+- Config gateway và application mâu thuẫn, tạo header trùng hoặc policy khó đoán.
+
+---
+
+#### 24. Câu hỏi phỏng vấn và trả lời ngắn
+
+**Q1. Same-Origin Policy là gì, vì sao tồn tại?**  
+Là browser policy cô lập document/script theo scheme-host-port, chủ yếu hạn chế cross-origin read/DOM access để website độc hại không đọc dữ liệu trong phiên của user ở origin khác.
+
+**Q2. CORS cho phép cross-origin request thế nào?**  
+Browser gửi `Origin`; server trả `Access-Control-*` policy; browser quyết định có chia sẻ response với JavaScript không. Một số request cần preflight trước actual request.
+
+**Q3. Preflight là gì và khi nào cần?**  
+Là `OPTIONS` request mang intended method/header khi request nằm ngoài CORS safelist, ví dụ `PUT`, `Authorization` hoặc `application/json`.
+
+**Q4. Cấu hình CORS trên server thế nào?**  
+Validate origin bằng allowlist, trả exact `Access-Control-Allow-Origin`, các method/header cần thiết, credentials nếu thực sự dùng, `Vary: Origin`, và xử lý `OPTIONS`/error response nhất quán.
+
+**Q5. Rủi ro CORS phổ biến?**  
+Arbitrary origin reflection với credentials, allowlist sai, wildcard cho sensitive response, cache không vary theo origin và nhầm CORS là authorization.
+
+**Q6. Có thể tránh CORS bằng cách nào?**  
+Dùng same-origin reverse proxy/BFF. JSONP là giải pháp legacy không an toàn và không nên dùng. Non-browser server-to-server call vốn không chịu browser CORS enforcement.
+
+**Q7. Gateway/reverse proxy giúp gì?**  
+Tập trung routing/policy, trả preflight nhanh và giảm cấu hình phân tán. Nhưng vẫn cần authn/authz, CSRF và service security.
+
+**Q8. Vì sao Postman/curl chạy nhưng browser báo CORS?**  
+Vì CORS do browser thực thi; generic HTTP client không áp SOP/CORS như browser.
+
+**Q9. `Access-Control-Allow-Headers` và `Expose-Headers` khác gì?**  
+`Allow-Headers` cho phép request header trong preflight; `Expose-Headers` cho phép JavaScript đọc response header ngoài safelist.
+
+**Q10. CORS có ngăn CSRF không?**  
+Không đầy đủ. Simple credentialed request có thể đến server dù response bị chặn đọc. Dùng SameSite, CSRF token, Origin checking và authorization theo threat model.
+
+**Q11. Có được dùng wildcard với credentials không?**  
+Không dùng `Access-Control-Allow-Origin: *` để chia sẻ credentialed response; phải trả origin cụ thể được tin cậy và `Access-Control-Allow-Credentials: true`.
+
+**Q12. CORS áp dụng cho microservice nội bộ không?**  
+Chỉ có ý nghĩa khi browser trực tiếp gọi cross-origin endpoint. Service-to-service cần workload identity, TLS/network policy và authorization riêng.
+
+#### 25. Quy trình debug CORS
+
+1. Xác định chính xác page origin và target origin.
+2. Kiểm tra browser Network panel: có `OPTIONS` không?
+3. Xem `Origin`, requested method/header trong preflight.
+4. Kiểm tra response status và toàn bộ `Access-Control-*` headers.
+5. Nếu dùng cookie, kiểm tra `credentials`, `SameSite`, `Secure`, domain/path.
+6. Kiểm tra redirect, CDN/cache và `Vary: Origin`.
+7. Xác minh `OPTIONS` không bị auth middleware/routing chặn sai.
+8. Kiểm tra actual response, kể cả 4xx/5xx, có policy nhất quán không.
+9. Thử bằng origin được phép và bị từ chối; không dùng việc `curl` thành công làm bằng chứng CORS đúng.
+10. Sau khi sửa CORS, vẫn kiểm tra authn/authz/CSRF độc lập.
+
+#### 26. Checklist production
+
+- Exact allowlist, owner và quy trình cập nhật rõ ràng.
+- Không phản chiếu origin tùy ý.
+- Credentials chỉ bật cho endpoint/origin thực sự cần.
+- Allowed methods/headers theo least privilege.
+- `Vary: Origin` và cache key đúng.
+- `Max-Age` cân bằng latency với tốc độ thay đổi/revoke policy.
+- `OPTIONS`, success và error response được kiểm thử.
+- Không dùng CORS làm API authorization.
+- CSRF, XSS, cookie và CSP được thiết kế riêng.
+- Gateway/service không sinh header trùng hoặc mâu thuẫn.
+- Metrics/log không chứa token nhưng đủ thấy origin, route, decision và failure.
+- Automated browser integration test cho các origin quan trọng.
+
+#### 27. Ý chính cần nhớ
+
+- Origin = scheme + hostname + port; same-origin khác same-site.
+- SOP chủ yếu hạn chế cross-origin read/interaction, không ngăn mọi request được gửi.
+- CORS là server-declared, browser-enforced response-sharing protocol.
+- Simple request đi thẳng; request ngoài safelist thường cần `OPTIONS` preflight.
+- Preflight không phải authentication hay authorization.
+- `Allow-Headers` áp dụng cho request header; `Expose-Headers` áp dụng cho response header JS đọc được.
+- Credentialed response cần explicit origin và `Access-Control-Allow-Credentials: true`.
+- Wildcard phù hợp với public non-credentialed resource, không phù hợp cho dữ liệu user nhạy cảm.
+- CORS không bảo vệ non-browser client và không thay CSRF/XSS defense.
+- Reverse proxy, gateway và BFF có thể tập trung hoặc loại bỏ cross-origin browser path.
+- Dynamic origin policy cần allowlist chính xác và `Vary: Origin`.
+- Security phải được kiểm tra end-to-end ở browser, edge, gateway và application.
+
+#### Công thức ghi nhớ
+
+> **SOP dựng hàng rào giữa các origin; CORS mở một cánh cửa có điều kiện để browser cho script đọc response. Cánh cửa đó không xác thực người dùng, không cấp quyền trên tài nguyên và không thay thế CSRF/XSS protection.**
+
+---
+
+### Bài 33. Tổng kết — Web Concepts in System Design
+
+#### 1. Bức tranh tổng thể
+
+Các khái niệm Web không tồn tại độc lập. Trong một request production, session, serialization, browser security, routing và authorization phối hợp trên cùng một đường đi:
+
+```text
+Browser
+  │ Cookie / token / Origin
+  │ Serialized HTTP request
+  ▼
+CDN / Reverse Proxy / API Gateway
+  │ TLS, CORS, routing, rate limit, authentication
+  ▼
+Application Service
+  │ Session lookup, authorization, validation
+  │ Serialize / deserialize
+  ▼
+Cache / Database / Message Broker
+```
+
+Một thiết kế Web tốt phải trả lời đồng thời:
+
+- Client và server giao tiếp theo contract nào?
+- User identity và state được nối qua các request ra sao?
+- Credential được lưu, gửi, rotate và revoke thế nào?
+- Dữ liệu được serialize bằng format nào và tiến hóa ra sao?
+- Browser được phép giao tiếp giữa những origin nào?
+- Trust boundary nằm ở đâu và thành phần nào thực thi policy?
+- Khi traffic, dữ liệu hoặc số service tăng, kiến trúc còn vận hành được không?
+
+#### 2. State trên một protocol stateless
+
+HTTP không tự ghi nhớ user giữa các request. Application tạo trải nghiệm stateful bằng cookie, server-side session, token hoặc mô hình hybrid.
+
+Các lựa chọn này ảnh hưởng trực tiếp tới kiến trúc:
+
+| Lựa chọn | Lợi ích | Đánh đổi chính |
+|---|---|---|
+| Local server session | Đơn giản ở quy mô nhỏ | Khó failover và horizontal scaling |
+| Distributed session store | Shared state, revoke nhanh | Thêm critical dependency và network hop |
+| Self-contained access token | Giảm lookup trên request path | Revocation và stale claim khó hơn |
+| Hybrid session/token | Cân bằng control và phân phối context | Lifecycle phức tạp hơn |
+
+Không nên chỉ hỏi “session hay JWT?”. Cần xét threat model, browser/mobile client, revoke requirement, multi-region, latency, consistency và khả năng vận hành.
+
+#### 3. Data contract qua ranh giới hệ thống
+
+Serialization biến in-memory object thành representation có thể truyền hoặc lưu. Format được chọn sẽ ảnh hưởng:
+
+- payload size và bandwidth;
+- CPU, allocation và latency encode/decode;
+- khả năng debug và interoperability;
+- schema validation và type fidelity;
+- backward/forward compatibility;
+- replay/migration của dữ liệu dài hạn.
+
+JSON, XML, Protobuf và Avro tối ưu cho những mục tiêu khác nhau. Quyết định đúng không đến từ việc format nào “nhanh nhất” nói chung, mà từ consumer, lifecycle, ecosystem và benchmark trên workload thực tế.
+
+#### 4. Browser security và cross-origin communication
+
+Same-Origin Policy tạo ranh giới mặc định giữa các origin. CORS cho server tuyên bố trường hợp browser được chia sẻ cross-origin response với JavaScript.
+
+Cần giữ đúng phạm vi trách nhiệm:
+
+- CORS không thay authentication hoặc authorization;
+- CORS không phải lớp chống CSRF đầy đủ;
+- CORS không bảo vệ API trước non-browser client;
+- `HttpOnly`, `SameSite`, CSP và CSRF token giải quyết những phần khác nhau của threat model;
+- reverse proxy, API Gateway hoặc BFF có thể tập trung policy và tạo same-origin browser path.
+
+Security không phải một header hay middleware riêng lẻ. Nó phải bao phủ credential lifecycle, input validation, data exposure, object-level authorization, cache isolation và observability.
+
+#### 5. Các mối liên hệ quan trọng
+
+| Quyết định ban đầu | Tác động tiếp theo |
+|---|---|
+| Session lưu local | Load balancer cần affinity hoặc user mất state khi đổi instance |
+| Session đưa vào Redis | Scale dễ hơn nhưng Redis trở thành availability/capacity concern |
+| Token sống lâu | Giảm refresh nhưng tăng cửa sổ rủi ro và stale authorization |
+| Cookie tự gửi | Tiện cho browser nhưng phải thiết kế CSRF và SameSite |
+| JSON public API | Dễ tích hợp nhưng cần schema/convention và kiểm soát payload |
+| Binary internal API | Giảm payload nhưng tăng schema/tooling dependency |
+| Dynamic CORS origin | Hỗ trợ nhiều frontend nhưng cần allowlist và cache `Vary` đúng |
+| Same-origin reverse proxy | Giảm CORS complexity nhưng thêm routing/security responsibility ở proxy |
+
+Architectural thinking bắt đầu khi nhìn thấy các tác động bậc hai này, thay vì tối ưu từng component riêng lẻ.
+
+#### 6. Một request được thiết kế an toàn
+
+Ví dụ browser gọi API dùng cookie session:
+
+1. DNS/TLS đưa request tới edge đáng tin cậy.
+2. Browser áp cookie scope, `Secure`, `SameSite` và CORS behavior.
+3. Gateway kiểm tra route, size, rate limit và CORS policy.
+4. Application tra session trong shared store.
+5. Authorization được kiểm tra trên action và resource cụ thể.
+6. Payload được deserialize với size/schema/business validation.
+7. Service đọc/ghi cache hoặc database theo consistency requirement.
+8. Response được serialize, gắn cache/security header phù hợp.
+9. Log, metric và trace ghi nhận kết quả mà không làm lộ credential/PII.
+
+Không bước nào đơn lẻ đủ bảo vệ toàn hệ thống. Độ an toàn đến từ nhiều lớp có trách nhiệm rõ ràng.
+
+#### 7. Checklist ôn tập Phần 5
+
+- Phân biệt HTTP stateless với application state.
+- Phân biệt cookie, session, browser storage và token.
+- Giải thích server-side session, JWT/access token và hybrid pattern.
+- Nêu được cách scale session qua sticky routing, shared store hoặc token.
+- Thiết kế timeout, rotation, logout và revocation.
+- So sánh JSON, XML, Protobuf, Avro theo workload.
+- Giải thích schema evolution và compatibility.
+- Nhận diện insecure deserialization và data fidelity risk.
+- Xác định origin bằng scheme, hostname và port.
+- Phân biệt simple CORS request với preflight request.
+- Giải thích credentialed CORS và giới hạn của wildcard.
+- Phân biệt CORS với authentication, authorization, CSRF và XSS.
+- Biết khi nào reverse proxy, API Gateway hoặc BFF giúp đơn giản hóa browser architecture.
+- Suy luận end-to-end từ browser tới storage thay vì nhìn từng công nghệ riêng lẻ.
+
+#### 8. Các câu hỏi tự kiểm tra
+
+1. Vì sao HTTP stateless nhưng application vẫn có thể lưu server-side session?
+2. Khi nào distributed session store phù hợp hơn self-contained token?
+3. User đổi quyền thì session và access token phản ánh thay đổi khác nhau thế nào?
+4. Vì sao JSON dễ tích hợp nhưng vẫn cần contract governance?
+5. Một thay đổi wire-compatible có thể phá business semantics như thế nào?
+6. Simple cross-origin POST thất bại CORS có thể vẫn tạo side effect không?
+7. Vì sao `Access-Control-Allow-Origin` không phải authorization rule?
+8. Cookie `SameSite`, CSRF token và CORS bảo vệ những boundary nào khác nhau?
+9. Khi đưa CORS lên API Gateway, service còn trách nhiệm bảo mật gì?
+10. Traffic tăng gấp mười lần sẽ gây áp lực trước tiên lên session store, serialization CPU hay gateway trong workload của bạn?
+
+#### 9. Chuyển sang Scalability
+
+Phần tiếp theo đi sâu vào khả năng hệ thống tiếp tục đáp ứng khi user, traffic và dữ liệu tăng. Những khái niệm Web vừa học sẽ trở thành đầu vào cho các quyết định scale:
+
+- session state quyết định khả năng thêm application instance;
+- serialization ảnh hưởng bandwidth, CPU và storage capacity;
+- proxy/gateway trở thành điểm routing, policy và observability;
+- cache giúp giảm work phía backend nhưng tạo consistency concern;
+- security policy phải duy trì đúng khi hệ thống phân tán qua nhiều instance hoặc region.
+
+Các chủ đề tiếp theo gồm scaling strategy, load distribution, autoscaling, cloud-native architecture và những đánh đổi giữa performance, reliability, cost và operational complexity.
+
+#### Ý chính cần nhớ
+
+- Web concepts là nền móng của distributed system, không phải chi tiết frontend.
+- State, identity, data contract và browser security cùng tồn tại trên một request path.
+- Mỗi lựa chọn đều có tác động tới scalability, reliability, security và vận hành.
+- Policy cần được đặt tại boundary rõ ràng nhưng vẫn kiểm tra defense-in-depth.
+- Thiết kế production phải xử lý lifecycle, failure, compatibility và observability.
+- Tư duy kiến trúc là khả năng nối các quyết định nhỏ thành hành vi end-to-end của hệ thống.
+
+#### Công thức ghi nhớ
+
+> **Một Web system vững chắc phải quản lý đúng state, trao đổi dữ liệu bằng contract có thể tiến hóa, bảo vệ browser boundary và duy trì các thuộc tính đó khi tải tăng.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -9609,3 +11307,69 @@ Architecture pattern định hình cấu trúc cấp cao; Web Fundamentals giả
 | **Upcaster** | Logic chuyển event schema cũ sang representation mới khi đọc/replay. |
 | **Change Data Capture** | Ghi nhận thay đổi trong database log/table và phát chúng sang pipeline khác. |
 | **Tombstone** | Record biểu thị xóa key/state trong log hoặc compacted stream. |
+| **Web session** | Context liên kết nhiều web request với cùng user/browser interaction. |
+| **Session ID** | Opaque random identifier dùng để tra session state phía server. |
+| **Session cookie** | Cookie không có persistent expiry, thường tồn tại trong browser session. |
+| **Persistent cookie** | Cookie có Max-Age/Expires và có thể tồn tại qua browser restart. |
+| **Cookie Domain** | Attribute xác định host/subdomain scope mà cookie có thể được gửi tới. |
+| **Cookie Path** | Attribute giới hạn URL path mà cookie được gửi kèm. |
+| **Secure cookie** | Cookie chỉ được browser gửi qua secure transport như HTTPS. |
+| **HttpOnly cookie** | Cookie không thể được đọc qua JavaScript document.cookie. |
+| **SameSite** | Cookie attribute kiểm soát việc gửi cookie trong cross-site context. |
+| **Idle timeout** | Session hết hạn sau một khoảng không có hoạt động. |
+| **Absolute timeout** | Session hết hạn sau thời gian tối đa kể từ lúc tạo/login dù vẫn active. |
+| **Session rotation** | Cấp session ID mới và vô hiệu ID cũ tại sự kiện nhạy cảm. |
+| **Session fixation** | Tấn công buộc victim dùng session ID attacker đã biết trước authentication. |
+| **Session hijacking** | Chiếm session credential để giả mạo user. |
+| **CSRF** | Tấn công lợi dụng browser tự gửi credential để thực hiện request ngoài ý muốn của user. |
+| **CSRF token** | Giá trị khó đoán được server kiểm tra để xác minh unsafe request đến từ flow hợp lệ. |
+| **localStorage** | Browser storage theo origin tồn tại tới khi bị xóa và JavaScript có thể truy cập. |
+| **sessionStorage** | Browser storage theo origin/tab session, JavaScript có thể truy cập. |
+| **Opaque token** | Token không tự bộc lộ claim; server cần lookup/introspection để hiểu state. |
+| **Self-contained token** | Token mang claim và có thể được xác minh mà không cần lookup mỗi request. |
+| **Access token** | Credential cho phép client truy cập resource theo scope/audience/thời hạn. |
+| **Refresh token** | Credential dùng để xin access token mới, cần bảo vệ và revoke/rotate. |
+| **Token introspection** | Cơ chế resource server hỏi authorization server về trạng thái/metadata token. |
+| **Token revocation** | Vô hiệu credential/session trước thời điểm hết hạn tự nhiên. |
+| **Refresh token rotation** | Thay refresh token sau mỗi lần dùng và vô hiệu token cũ. |
+| **Reuse detection** | Phát hiện refresh/session credential cũ bị dùng lại sau rotation. |
+| **Single Sign-On** | Cho phép một identity session dùng để đăng nhập nhiều application tin cậy. |
+| **Identity Provider** | Hệ thống xác thực danh tính và phát identity/authentication assertions hoặc token. |
+| **Step-up authentication** | Yêu cầu xác thực mạnh/bổ sung trước action có rủi ro cao. |
+| **Bearer credential** | Credential mà bên sở hữu có thể sử dụng; bị đánh cắp đồng nghĩa có thể bị mạo danh. |
+| **BFF token pattern** | Backend-for-Frontend giữ token phía server, browser dùng secure session cookie với BFF. |
+| **Serialization** | Chuyển object/data structure thành representation có thể truyền hoặc lưu. |
+| **Deserialization** | Đọc serialized representation và dựng thành cấu trúc dữ liệu cho application. |
+| **Encoding** | Quy tắc biểu diễn logical data thành text hoặc bytes. |
+| **Framing** | Cách xác định ranh giới bắt đầu/kết thúc của message trên stream/storage. |
+| **Avro** | Schema-based binary serialization format phổ biến trong data pipeline và event streaming. |
+| **BSON** | Binary document representation với richer data types, được MongoDB sử dụng. |
+| **JSON Schema** | Cơ chế mô tả và kiểm tra cấu trúc/constraint của JSON document. |
+| **Writer schema** | Schema mà producer dùng khi ghi một Avro record. |
+| **Reader schema** | Schema mà consumer dùng để đọc và resolve Avro record. |
+| **Forward compatibility** | Khả năng reader/consumer cũ xử lý dữ liệu do writer/producer mới tạo. |
+| **Full compatibility** | Compatibility theo cả backward và forward direction trong policy đã định. |
+| **Wire compatibility** | Hai version vẫn encode/decode được trên wire, chưa chắc giữ đúng business semantics. |
+| **Semantic compatibility** | Thay đổi vẫn giữ cách hiểu và hành vi nghiệp vụ mà consumer kỳ vọng. |
+| **Insecure deserialization** | Deserialization dữ liệu không tin cậy theo cách có thể tạo object/hành vi nguy hiểm. |
+| **Data fidelity** | Mức độ dữ liệu giữ nguyên giá trị, kiểu, precision và ý nghĩa qua round-trip. |
+| **Same-Origin Policy** | Browser policy cô lập document/script theo origin và hạn chế cross-origin data access. |
+| **Simple request** | Cross-origin request thỏa CORS safelist nên được gửi mà không cần preflight trước. |
+| **Preflight request** | `OPTIONS` request để browser hỏi server về method/header của actual cross-origin request. |
+| **CORS-safelisted request header** | Nhóm request header/value được phép trong simple CORS request theo điều kiện của chuẩn. |
+| **Access-Control-Allow-Origin** | Response header chỉ origin mà browser được phép chia sẻ response. |
+| **Access-Control-Allow-Methods** | Preflight response header liệt kê method được phép. |
+| **Access-Control-Allow-Headers** | Preflight response header liệt kê request header được phép gửi. |
+| **Access-Control-Allow-Credentials** | Response header cho phép browser expose credentialed CORS response khi policy hợp lệ. |
+| **Access-Control-Expose-Headers** | Response header liệt kê custom response header mà JavaScript được phép đọc. |
+| **Access-Control-Max-Age** | Thời gian browser có thể cache kết quả preflight. |
+| **Vary: Origin** | Chỉ dẫn cache rằng response representation/header phụ thuộc request `Origin`. |
+| **Credentialed request** | Request có browser credential như cookie hoặc HTTP authentication information. |
+| **Origin allowlist** | Danh sách origin được kiểm tra chính xác trước khi cấp CORS access. |
+| **Opaque origin** | Origin không có tuple scheme-host-port thông thường và có thể serialize thành `null`. |
+| **JSONP** | Kỹ thuật legacy tải cross-origin data như script; không phù hợp API hiện đại. |
+| **Content Security Policy** | Response policy giới hạn nguồn và hành vi resource/script để giảm các lớp tấn công như XSS. |
+| **Cross-Origin Resource Policy** | Header cho resource khai báo phạm vi cross-origin có thể tải/nhúng tài nguyên. |
+| **Cross-Origin Opener Policy** | Policy cô lập browsing context khỏi cross-origin opener. |
+| **Cross-Origin Embedder Policy** | Policy yêu cầu resource nhúng đáp ứng điều kiện cross-origin phù hợp. |
+| **Fetch Metadata** | Nhóm `Sec-Fetch-*` header mô tả context của request để server áp dụng policy. |
