@@ -10878,6 +10878,3389 @@ Các chủ đề tiếp theo gồm scaling strategy, load distribution, autoscal
 
 ---
 
+## Phần 6 — Scalability in System Design
+
+### Bài 34. Introduction to Scalability
+
+#### 1. Scalability là gì?
+
+**Scalability** là khả năng hệ thống tiếp nhận mức tải ngày càng tăng mà vẫn duy trì các mục tiêu chấp nhận được về performance, reliability, availability và cost, đồng thời không phải thiết kế lại toàn bộ kiến trúc.
+
+```text
+Load tăng
+   │
+   ▼
+Thêm hoặc tái phân bổ capacity
+   │
+   ▼
+SLO vẫn đạt: latency, throughput, error rate, availability, cost
+```
+
+Một hệ thống không được gọi là scalable chỉ vì nó “chịu được nhiều user”. Cần nói rõ:
+
+- workload nào tăng;
+- tăng đến mức nào và trong bao lâu;
+- resource nào được bổ sung;
+- service-level objective nào phải giữ;
+- chi phí và độ phức tạp tăng ra sao.
+
+Ví dụ, “hệ thống scale được tới 100.000 request/giây, p99 dưới 300 ms, error rate dưới 0,1%, khi chạy qua hai availability zone” có ý nghĩa hơn “hệ thống rất scalable”.
+
+#### 2. Những chiều tăng trưởng của hệ thống
+
+Growth không chỉ là số user:
+
+| Chiều tăng trưởng | Ví dụ áp lực tạo ra |
+|---|---|
+| **Traffic** | Request/second, connection, message/event rate |
+| **Concurrency** | User/session/socket/job cùng hoạt động |
+| **Data volume** | Storage, index size, backup, replication, scan time |
+| **Data velocity** | Write ingestion, streaming, CDC, analytics pipeline |
+| **Geography** | Latency đường dài, data residency, multi-region consistency |
+| **Feature/tenant** | Query phức tạp, noisy neighbor, metadata/configuration growth |
+| **Team/organization** | Ownership, deployment coordination, service boundary |
+
+Một kiến trúc có thể scale tốt theo một chiều nhưng kém ở chiều khác. Stateless API tier dễ thêm instance, trong khi database write throughput hoặc một partition nóng vẫn giới hạn toàn hệ thống.
+
+#### 3. Scalability không đồng nghĩa performance
+
+- **Performance** mô tả hệ thống nhanh hoặc xử lý được bao nhiêu tại một cấu hình/tải cụ thể.
+- **Scalability** mô tả output/SLO thay đổi thế nào khi tăng load và tăng resource.
+- **Elasticity** là khả năng điều chỉnh resource theo demand, thường tự động và có thể scale cả lên lẫn xuống.
+
+Một server cực nhanh chưa chắc scalable nếu không thể bổ sung capacity. Ngược lại, một hệ thống có thể scale tuyến tính nhưng latency cơ sở vẫn kém.
+
+#### 4. Vì sao hệ thống cần scale?
+
+Các động lực phổ biến:
+
+- user/product tăng trưởng từ nghìn lên hàng triệu người dùng;
+- mở rộng sang thị trường hoặc region mới;
+- log, event, transaction và IoT data tích lũy liên tục;
+- traffic spike do flash sale, mở bán vé hoặc nội dung viral;
+- batch/analytics cạnh tranh resource với online workload;
+- SLA/SLO buộc latency và availability không được giảm khi tải tăng;
+- business muốn tăng doanh thu mà cost trên mỗi transaction không tăng mất kiểm soát.
+
+Scalability biến thành công từ một rủi ro vận hành thành khả năng tăng trưởng có kế hoạch.
+
+#### 5. Steady growth và burst khác nhau
+
+```text
+Load
+ ▲                    /
+ │  steady growth    /
+ │                  /
+ │        spike  /\
+ │              /  \____
+ └────────────────────────> time
+```
+
+- **Steady growth** cho phép capacity planning, migration và mua/provision resource trước.
+- **Predictable peak** có thể chuẩn bị theo lịch, pre-scale và warm cache.
+- **Unpredictable burst** cần headroom, elasticity, queue, load shedding và graceful degradation.
+
+Autoscaling không phản ứng tức thì: provisioning, boot, scheduling, health check và warm-up đều có độ trễ. Nếu spike tăng nhanh hơn thời gian scale-out, hệ thống vẫn cần capacity dự phòng hoặc cơ chế hấp thụ tải.
+
+#### 6. Đo scalability bằng gì?
+
+Không chỉ nhìn CPU. Một bộ đo thường gồm:
+
+- request/transaction/message per second;
+- concurrent users/connections/jobs;
+- latency p50, p95, p99;
+- error, timeout và rejection rate;
+- saturation của CPU, memory, disk, network, thread/connection pool;
+- queue depth, age of oldest job và consumer lag;
+- database QPS, lock wait, replication lag và hot partition;
+- cost trên request, user, GB hoặc transaction;
+- time-to-scale, cooldown và capacity headroom.
+
+Average có thể che giấu tail latency. Khi fan-out tới nhiều dependency, một downstream chậm có thể kéo p99 của toàn request lên mạnh dù mean vẫn đẹp.
+
+#### 7. Capacity, load và utilization
+
+Một mô hình đơn giản:
+
+```text
+required capacity ≈ peak load × safety factor
+instance count    ≈ required capacity / safe capacity per instance
+```
+
+Ví dụ:
+
+```text
+Peak dự kiến                 = 24.000 RPS
+Safety factor                = 1,5
+Safe capacity mỗi instance  = 1.200 RPS
+
+Số instance ≈ 24.000 × 1,5 / 1.200 = 30
+```
+
+“Safe capacity” phải được đo tại SLO mong muốn, không phải throughput tối đa trước khi process sập. Cũng cần trừ capacity mất khi một zone/node bị lỗi hoặc khi deployment đang diễn ra.
+
+#### 8. Scaling luôn theo bottleneck
+
+Throughput end-to-end bị giới hạn bởi thành phần bão hòa đầu tiên:
+
+```text
+Client → Edge → API → Service → Cache → Database → External dependency
+                        ▲                    ▲
+                 thêm instance dễ      write bottleneck
+```
+
+Thêm application server không giúp nếu database connection pool, lock, storage IOPS hoặc third-party quota đã chạm trần. Quy trình đúng là:
+
+1. xác định workload và SLO;
+2. đo utilization/saturation;
+3. tìm bottleneck hiện tại;
+4. giảm work hoặc tăng capacity tại đúng điểm;
+5. load test lại vì bottleneck sẽ dịch chuyển.
+
+#### 9. Những thách thức khi scale
+
+**Latency**
+
+- thêm network hop, serialization và queueing;
+- fan-out làm tail latency tích lũy;
+- cross-region call làm tăng RTT.
+
+**Bottleneck và contention**
+
+- database write leader, global lock, hot key/partition;
+- shared connection/thread pool;
+- singleton coordinator hoặc sequential stage.
+
+**Reliability và availability**
+
+- nhiều component tạo thêm failure mode;
+- retry có thể khuếch đại overload;
+- deployment/scale event cần readiness và connection draining.
+
+**State và consistency**
+
+- state cục bộ cản request distribution;
+- replication/sharding tạo stale read, conflict và coordination cost;
+- transaction xuyên partition/service khó hơn.
+
+**Cost**
+
+- overprovision lãng phí, underprovision vi phạm SLO;
+- data transfer, managed service và observability có thể tăng nhanh;
+- hiệu quả trên mỗi request quan trọng không kém tổng capacity.
+
+**Operational complexity**
+
+- monitoring, incident response, configuration và deployment nhiều node;
+- capacity model phải tính failure, maintenance và traffic skew;
+- đội ngũ cần đủ năng lực vận hành distributed system.
+
+#### 10. Hai hướng scale cơ bản
+
+- **Vertical scaling (scale up/down)**: tăng hoặc giảm CPU, memory, storage, IOPS hay network capacity của một node.
+- **Horizontal scaling (scale out/in)**: tăng hoặc giảm số node/instance cùng chia workload.
+
+Hầu hết hệ thống thực tế kết hợp cả hai theo từng component và từng giai đoạn.
+
+#### 11. Nguyên tắc kiến trúc
+
+- Tối ưu work trước khi thêm resource: query, cache, batching, indexing, algorithm.
+- Đo theo bottleneck và SLO, không scale theo một metric tiện nhìn.
+- Giữ application tier stateless khi có lợi, nhưng không giả vờ state biến mất.
+- Tách workload có đặc điểm khác nhau để scale độc lập.
+- Thiết kế overload behavior: queue, rate limit, backpressure, shed load, degrade.
+- Capacity phải bao phủ spike, failure và deployment, không chỉ average traffic.
+- Tự động hóa chỉ sau khi hiểu signal, lag và failure mode.
+- Không over-engineer cho quy mô chưa có, nhưng giữ đường tiến hóa rõ ràng.
+
+#### 12. Câu hỏi phỏng vấn nền tảng
+
+**Q1. Scalability là gì?**  
+Khả năng tăng capacity để xử lý load tăng mà vẫn giữ SLO và economics chấp nhận được.
+
+**Q2. Vì sao performance tốt chưa chắc scalable?**  
+Performance đo tại một điểm; scalability đo cách hệ thống phản ứng khi cả load và resource thay đổi.
+
+**Q3. Dấu hiệu một hệ thống không scale tốt?**  
+Latency/error tăng phi tuyến, thêm resource không tăng throughput tương ứng, cost mỗi request tăng mạnh hoặc một shared component bão hòa.
+
+**Q4. Nên scale component nào trước?**  
+Component đang giới hạn SLO/throughput theo đo đạc. Không mặc định scale application tier.
+
+**Q5. Làm sao chuẩn bị traffic spike?**  
+Forecast/pre-scale, headroom, cache, queue/backpressure, rate limit/load shedding, dependency quota và thử nghiệm peak/failure.
+
+#### 13. Nội dung phỏng vấn bổ sung từ PDF
+
+**Q6. Nêu ví dụ thực tế về scalability thành công hoặc thất bại.**  
+PDF dùng Twitter thời kỳ “Fail Whale” và Zoom trong giai đoạn COVID-19 để minh họa. Cách trả lời tốt không dừng ở tên công ty mà nêu được chuỗi nhân quả:
+
+```text
+Demand thay đổi mạnh
+→ bottleneck/SLO bị phá
+→ kiến trúc/capacity/process phải thay đổi
+→ đo được kết quả và trade-off mới
+```
+
+Không nên quy toàn bộ thành công hoặc thất bại cho một nhãn như “monolith”, “microservices”, “cloud-native” hay “autoscaling”. Production outcome còn phụ thuộc workload, data architecture, operational maturity và rất nhiều thay đổi qua thời gian. Con số “daily participants” cũng không đồng nghĩa số user duy nhất.
+
+**Q7. Quy trình xác định bottleneck nên diễn ra thế nào?**
+
+1. Chọn SLO và workload đại diện thay vì chỉ nhìn dashboard ngẫu nhiên.
+2. Tạo baseline về throughput, latency percentile, error và utilization.
+3. Tăng tải có kiểm soát cho tới khi SLO bắt đầu suy giảm.
+4. Tìm resource có saturation/queue tăng cùng thời điểm.
+5. Dùng distributed trace/profile/query plan để định vị thời gian và work.
+6. Thay đổi một yếu tố: thêm capacity, cache, index hoặc giới hạn concurrency.
+7. Chạy lại cùng test để xác nhận throughput/SLO cải thiện.
+
+CPU hoặc memory spike chỉ là tương quan. Bottleneck được xác nhận khi thay đổi capacity/work tại điểm đó làm kết quả end-to-end thay đổi như dự đoán.
+
+**Q8. Vì sao latency thường tăng khi hệ thống lớn hơn?**  
+Không phải scale tự động buộc phải thêm microservice/hop. Latency tăng khi thiết kế đưa thêm network call, fan-out, coordination, cross-partition aggregation hoặc queueing vào critical path. Giảm bằng cache, async non-critical work, tối ưu query, batching, giảm chatty call, edge/CDN và deadline/latency budget.
+
+**Q9. Cân bằng scalability và cloud cost thế nào?**  
+Kết hợp right-sizing, autoscaling có min/max, tiered caching, baseline commitment phù hợp, interruptible capacity cho workload chịu ngắt và theo dõi unit cost. Serverless/FaaS không mặc nhiên rẻ: còn phụ thuộc request duration, concurrency, cold start, data transfer và steady utilization.
+
+**Q10. “Scalable system tăng tuyến tính hoặc elastic” có phải định nghĩa bắt buộc?**  
+Không. Linear scalability là kết quả lý tưởng trong một range, không phải điều kiện định nghĩa. Hệ thống vẫn có thể được xem là scalable nếu capacity tăng hữu ích và SLO/cost chấp nhận được dù efficiency giảm vì coordination, contention hoặc phần tuần tự.
+
+#### 14. Ý chính cần nhớ
+
+- Scalability là duy trì SLO và cost khi demand tăng, không chỉ “thêm server”.
+- Growth gồm traffic, concurrency, data, geography và organizational scale.
+- Performance, scalability và elasticity là ba khái niệm liên quan nhưng khác nhau.
+- Hệ thống scale theo bottleneck nhỏ nhất; bottleneck sẽ dịch chuyển sau mỗi tối ưu.
+- Average load không đại diện peak, burst hoặc tail latency.
+- Capacity planning phải tính headroom, failure và thời gian scale.
+- State, consistency, reliability, cost và vận hành là phần của bài toán scale.
+- Vertical và horizontal scaling là hai công cụ nền tảng, thường được phối hợp.
+
+#### Công thức ghi nhớ
+
+> **Scalability = tăng demand + tăng capacity có kiểm soát + vẫn giữ SLO và economics chấp nhận được.**
+
+---
+
+### Bài 35. Scaling Strategies — Horizontal, Vertical & Diagonal
+
+#### 1. Ba chiến lược tổng quát
+
+```text
+Vertical scaling       Horizontal scaling       Diagonal scaling
+
+   ┌───────┐             ┌───┐ ┌───┐ ┌───┐       ┌─────┐ ┌─────┐
+   │       │             │   │ │   │ │   │       │     │ │     │
+   │ BIGGER│             └───┘ └───┘ └───┘       │     │ │     │
+   │ NODE  │              MORE NODES             └─────┘ └─────┘
+   └───────┘                                      BIGGER + MORE
+```
+
+- **Vertical**: làm một node mạnh hơn.
+- **Horizontal**: thêm nhiều node để chia tải.
+- **Diagonal**: tăng kích thước node tới một ngưỡng hợp lý rồi mở rộng số node; hoặc phối hợp cả hai theo thời gian.
+
+“Diagonal scaling” là cách gọi thông dụng, không phải một primitive kỹ thuật hoàn toàn tách biệt. Nó mô tả chiến lược kết hợp vertical và horizontal scaling.
+
+---
+
+#### Nhánh A — Vertical scaling
+
+#### 2. Scale up và scale down
+
+Vertical scaling tăng capacity của một node bằng:
+
+- thêm CPU/core;
+- tăng RAM;
+- dùng storage nhanh/lớn hơn hoặc tăng provisioned IOPS;
+- nâng network bandwidth;
+- chuyển sang machine class mạnh hơn.
+
+Chiều ngược lại là **scale down** để giảm resource/cost khi capacity dư thừa.
+
+#### 3. Ưu điểm
+
+- thay đổi kiến trúc ít nhất;
+- nhanh triển khai trong giai đoạn đầu;
+- không cần phân phối state/data ngay;
+- transaction và consistency trong một node/process đơn giản hơn;
+- giảm số node cần deploy, monitor và patch;
+- phù hợp software/license hoặc database workload khó phân mảnh.
+
+#### 4. Giới hạn và rủi ro
+
+- có trần phần cứng/cloud instance;
+- high-end machine thường có giá tăng không tuyến tính;
+- resize có thể cần restart/downtime/failover;
+- failure blast radius lớn vì nhiều capacity tập trung;
+- một node không tự tạo redundancy;
+- process/application có thể không tận dụng thêm core/RAM;
+- scale-up không giải quyết giới hạn software lock, algorithm hay external dependency.
+
+Vertical scaling không mặc nhiên đồng nghĩa single point of failure. Có thể chạy nhiều replica lớn hoặc HA database pair. Tuy nhiên, nếu toàn workload chỉ nằm trên một node, node đó rõ ràng vẫn là failure domain tập trung.
+
+#### 5. Khi nào nên chọn?
+
+- MVP hoặc traffic còn nhỏ và chưa chắc chắn;
+- cần capacity nhanh với engineering effort thấp;
+- monolith/stateful workload chưa sẵn sàng phân phối;
+- database cần thêm RAM để tăng cache hit hoặc IOPS;
+- license/operational overhead tính theo node;
+- scale-up vẫn còn rẻ hơn chi phí xây/vận hành distributed architecture.
+
+#### 6. Điểm dừng của vertical scaling
+
+Nên chuẩn bị chuyển chiến lược khi:
+
+- gần chạm machine class lớn nhất;
+- cost/performance xấu dần;
+- maintenance/failure của một node ảnh hưởng quá lớn;
+- cần availability qua nhiều failure domain;
+- một node không đủ peak throughput;
+- tốc độ tăng demand vượt khả năng resize thủ công;
+- business cần deploy/scale từng workload độc lập.
+
+---
+
+#### Nhánh B — Horizontal scaling
+
+#### 7. Scale out và scale in
+
+Horizontal scaling thêm node/instance vào pool để chia workload; **scale in** loại bớt node khi không cần.
+
+```text
+Client
+  │
+  ▼
+Load Balancer
+  ├── Instance A
+  ├── Instance B
+  ├── Instance C
+  └── Instance D
+```
+
+Thêm node chỉ hữu ích khi traffic/data có thể được phân phối và shared dependency còn capacity.
+
+#### 8. Điều kiện để scale-out hiệu quả
+
+- có load balancer/routing/discovery;
+- instance có readiness/liveness và connection draining;
+- application state được externalize, replicate hoặc partition hợp lý;
+- request/job có thể xử lý song song;
+- database/cache/broker không trở thành bottleneck mới;
+- idempotency và retry được thiết kế;
+- telemetry cho từng instance và toàn pool;
+- deployment/configuration đồng nhất;
+- traffic không skew mạnh vào một key/tenant/partition.
+
+#### 9. Stateless compute là trường hợp dễ nhất
+
+Nếu instance không giữ session/local state cần thiết cho request tiếp theo, load balancer có thể gửi request tới bất kỳ replica khỏe mạnh nào. Scale-out/in và failover trở nên linh hoạt.
+
+State không biến mất; nó chuyển sang:
+
+- distributed cache/session store;
+- database;
+- object storage;
+- message broker;
+- client/token khi phù hợp.
+
+Vì vậy, stateless application tier thường đổi local simplicity lấy dependency và network cost ở lớp state bên dưới.
+
+#### 10. Stateful system khó scale hơn
+
+Database, broker và storage cần thêm quyết định:
+
+- **replication** để tăng availability/read capacity;
+- **partitioning/sharding** để chia data/write load;
+- leader/follower hoặc multi-leader coordination;
+- rebalancing khi thêm/bớt node;
+- consistency và quorum;
+- backup/restore và disaster recovery;
+- hot partition, skew và cross-shard query/transaction.
+
+Không thể chỉ đặt load balancer trước một database rồi coi như đã scale ngang an toàn.
+
+#### 11. Ưu điểm
+
+- growth ceiling cao hơn nhờ thêm nhiều commodity node;
+- tăng redundancy và khả năng chịu node failure;
+- scale theo traffic và thường hỗ trợ autoscaling;
+- rolling deployment và fault isolation tốt hơn khi thiết kế đúng;
+- có thể phân phối qua zone/region;
+- từng service/workload có thể scale độc lập.
+
+#### 12. Đánh đổi
+
+- distributed coordination, consistency và partial failure;
+- load balancing, discovery và health management;
+- network/serialization overhead;
+- state synchronization, replication và partitioning;
+- quan sát/debug phức tạp hơn;
+- retry storm, duplicate work và thundering herd;
+- data transfer và platform cost;
+- hiệu quả không tuyến tính vì contention và coordination overhead.
+
+Nếu tăng số node gấp đôi nhưng shared database vẫn cố định, throughput toàn hệ thống hiếm khi tăng đúng gấp đôi.
+
+#### 13. Scale out khác high availability
+
+Nhiều instance không tự động tạo HA nếu:
+
+- tất cả nằm trong cùng rack/zone/failure domain;
+- load balancer hoặc database là single point of failure;
+- deploy/config sai đồng loạt;
+- shared dependency hết capacity;
+- dữ liệu không được replicate/backup;
+- health check đánh dấu instance lỗi là khỏe.
+
+Scalability và availability hỗ trợ nhau nhưng phải được thiết kế, đo và thử nghiệm riêng.
+
+---
+
+#### Nhánh C — Diagonal scaling
+
+#### 14. Cách hoạt động
+
+Diagonal scaling thường đi theo lộ trình:
+
+```text
+1 node nhỏ
+   │ scale up
+1 node lớn hơn
+   │ chuẩn hóa stateless/routing/state
+N node vừa hoặc lớn
+   │ scale out + selective scale up
+Nhiều pool/service scale độc lập
+```
+
+Vertical scaling **mua thời gian** và giữ hệ thống đơn giản. Horizontal scaling mở rộng trần capacity và resilience. Diagonal scaling là con đường thực dụng nối hai giai đoạn.
+
+#### 15. Vì sao phổ biến trên cloud?
+
+- machine size thay đổi dễ hơn hạ tầng vật lý;
+- container/task/node pool có thể vừa resize vừa thay replica count;
+- managed database hỗ trợ đổi instance class và read replica/sharding;
+- autoscaler có thể scale workload horizontally, trong khi node provisioner chọn machine size;
+- team có thể trì hoãn distributed complexity tới khi business thật sự cần.
+
+#### 16. Ví dụ theo component
+
+| Component | Vertical | Horizontal | Diagonal |
+|---|---|---|---|
+| Web/API tier | Instance lớn hơn | Thêm replica sau LB | Chọn size hiệu quả rồi autoscale replica |
+| Relational DB | Tăng RAM/CPU/IOPS | Read replica, partition/shard | Scale primary trước, thêm replica rồi shard khi cần |
+| Cache | Node nhiều memory hơn | Cluster/shard | Resize node rồi tăng shard/replica |
+| Message consumer | Worker mạnh hơn | Thêm consumer theo partition | Chọn worker size rồi scale consumer group |
+| Search/analytics | Heap/CPU lớn hơn | Thêm data/compute node | Cân bằng node size, shard count và replica |
+
+Không nhất thiết mọi component dùng cùng chiến lược. API có thể scale ngang trong khi primary database vẫn scale dọc và dùng read replica.
+
+#### 17. Rủi ro của diagonal scaling
+
+- trì hoãn partitioning quá lâu khiến migration khẩn cấp;
+- kết hợp hai cơ chế nhưng không có capacity model rõ;
+- node quá lớn làm bin-packing kém và blast radius cao;
+- node quá nhỏ làm tăng coordination/network/operational overhead;
+- vertical autoscaler và horizontal autoscaler phản ứng xung đột;
+- resize/rebalance stateful node tạo performance dip.
+
+Diagonal không phải “tốt nhất của cả hai” miễn phí; nó kế thừa cả ưu điểm lẫn failure mode của hai hướng.
+
+---
+
+#### Nhánh D — Chọn chiến lược theo trade-off
+
+#### 18. So sánh nhanh
+
+| Tiêu chí | Vertical | Horizontal | Diagonal |
+|---|---|---|---|
+| Thay đổi kiến trúc | Ít | Nhiều hơn | Tăng dần |
+| Tốc độ có thêm capacity | Thường nhanh đến một ngưỡng | Phụ thuộc automation/warm-up | Linh hoạt |
+| Trần tăng trưởng | Giới hạn bởi node lớn nhất | Cao hơn | Cao nếu có đường scale-out |
+| Resilience | Không tự có | Có thể tốt hơn qua replica/failure domain | Tùy giai đoạn |
+| State management | Đơn giản hơn | Khó hơn | Chuyển đổi dần |
+| Cost curve | Có thể tăng mạnh ở high-end | Tốn platform/operations | Tối ưu theo giai đoạn |
+| Operational complexity | Thấp hơn | Cao | Trung bình rồi tăng |
+| Use case điển hình | MVP, monolith, DB scale-up | Internet-scale stateless/distributed workload | Cloud system phát triển theo thời gian |
+
+#### 19. Cost không chỉ là hóa đơn hạ tầng
+
+Total cost gồm:
+
+```text
+Infrastructure
++ engineering effort
++ operational/on-call burden
++ migration risk
++ downtime/SLO violation
++ licensing/data transfer
+```
+
+Một cụm node rẻ hơn trên bảng giá có thể đắt hơn nếu cần nhiều tháng engineering và vận hành. Ngược lại, một máy lớn đơn giản có thể trở nên đắt/rủi ro khi demand và availability requirement tăng.
+
+#### 20. Diminishing returns
+
+Scale không tuyến tính vô hạn. Phần tuần tự, shared lock, coordination và contention giới hạn speedup:
+
+```text
+Resource tăng:      1x   2x   4x   8x
+Throughput thực tế: 1x  1,8x 3,1x 4,7x   (ví dụ)
+```
+
+Cần đo marginal throughput và marginal cost của lần scale tiếp theo. Khi thêm node gần như không tăng output, hãy tìm bottleneck/coordination thay vì tiếp tục scale mù quáng.
+
+#### 21. Theo giai đoạn sản phẩm
+
+**MVP/early stage**
+
+- ưu tiên simplicity và tốc độ học từ thị trường;
+- monolith + một database có HA/backup hợp lý;
+- scale up và tối ưu query/cache trước;
+- tránh xây distributed system cho traffic chưa tồn tại.
+
+**Growing product**
+
+- load test và thiết lập SLO/capacity model;
+- làm application tier stateless, thêm load balancer;
+- tách background job, cache và read replica nếu bottleneck yêu cầu;
+- tự động deployment, observability và recovery.
+
+**Large/mature platform**
+
+- scale từng workload theo bottleneck;
+- partition data/traffic, multi-zone/region khi business cần;
+- backpressure, load shedding, quota và failure isolation;
+- cost efficiency, governance và organizational ownership trở thành driver lớn.
+
+Ví dụ tên công ty chỉ minh họa xu hướng. Không nên suy luận rằng một platform chuyển trực tiếp từ monolith sang microservices chỉ vì horizontal scaling; sự tiến hóa thực tế thường gồm nhiều bước và chịu ảnh hưởng của tổ chức, sản phẩm lẫn dữ liệu.
+
+#### 22. Decision framework
+
+1. **Xác định demand**: steady, spike, seasonal; RPS, data, concurrency.
+2. **Đặt SLO**: latency, availability, error và cost target.
+3. **Đo bottleneck**: CPU, memory, I/O, lock, connection, dependency quota.
+4. **Giảm work**: optimize, cache, batch, async, index trước khi mua capacity.
+5. **Đánh giá vertical headroom**: trần, giá, downtime, blast radius.
+6. **Đánh giá parallelism**: workload/state có chia được không?
+7. **Tính distributed cost**: LB, replication, consistency, observability, on-call.
+8. **Chọn bước nhỏ nhất đủ dùng**: vertical, horizontal hoặc phối hợp.
+9. **Thiết kế scale-down/failure**: drain, rebalance, cooldown, rollback.
+10. **Load/failure test** và cập nhật model từ production telemetry.
+
+#### 23. Các anti-pattern phổ biến
+
+- Scale tất cả component cùng tỷ lệ dù bottleneck chỉ ở một nơi.
+- Dùng average CPU làm signal duy nhất.
+- Thêm replica nhưng giữ session trong local memory.
+- Scale application trong khi database connection đã cạn.
+- Dùng sticky session thay cho kế hoạch availability của state.
+- Cho rằng nhiều instance tự động đồng nghĩa HA.
+- Autoscale quá nhanh gây oscillation hoặc scale-out khi dependency đang lỗi.
+- Scale in không drain connection/job.
+- Chọn shard count theo hiện tại nhưng không có đường rebalance.
+- Dùng máy lớn để che query/algorithm kém vô thời hạn.
+- Xây microservices/sharding quá sớm cho tải chưa có.
+- Chỉ tính infrastructure cost, bỏ qua engineering và operations.
+
+#### 24. Câu hỏi phỏng vấn và câu trả lời ngắn
+
+**Q1. Vertical và horizontal scaling khác gì?**  
+Vertical tăng resource một node; horizontal tăng số node và phân phối workload. Vertical đơn giản nhưng có trần; horizontal có trần cao hơn nhưng đưa vào distributed complexity.
+
+**Q2. Diagonal scaling là gì?**  
+Chiến lược kết hợp: resize node tới mức hiệu quả rồi thêm node, hoặc phối hợp cả hai theo từng component/giai đoạn.
+
+**Q3. Khi nào scale up trước?**  
+Khi còn headroom kinh tế, cần capacity nhanh, workload stateful/monolithic và chi phí phân phối lớn hơn lợi ích hiện tại.
+
+**Q4. Điều gì cản scale out?**  
+Local state, sequential work, shared database/lock, hot partition, coordination, license hoặc dependency quota.
+
+**Q5. Horizontal scaling có luôn rẻ hơn không?**  
+Không. Commodity nodes có thể rẻ nhưng LB, network, replication, platform, observability và nhân lực làm tăng total cost.
+
+**Q6. Vì sao stateless service dễ scale ngang?**  
+Request không phụ thuộc instance trước nên có thể route tới replica bất kỳ và loại/thêm node linh hoạt.
+
+**Q7. Làm sao biết đã tới lúc chuyển từ vertical sang horizontal?**  
+Khi gần trần node, marginal cost xấu, failure/maintenance impact quá lớn, cần multi-zone resilience hoặc demand tăng nhanh hơn khả năng resize.
+
+**Q8. Có thể scale database ngang giống web server không?**  
+Không đơn giản. Database cần replication/partitioning, consistency, transaction, rebalancing và data ownership strategy.
+
+**Q9. Autoscaling liên quan thế nào?**  
+Autoscaling tự động điều chỉnh capacity; nó có thể scale ngang replica hoặc scale dọc resource. Cần signal, cooldown, warm-up và overload plan.
+
+**Q10. Scaling tốt được đánh giá thế nào?**  
+SLO giữ ổn định, throughput tăng đủ theo resource, failure vẫn chịu được và marginal/total cost hợp lý.
+
+#### 25. Nội dung phỏng vấn bổ sung từ PDF
+
+**Q11. Khi nào horizontal scaling không giúp?**
+
+- workload có phần tuần tự hoặc global lock lớn;
+- bottleneck là singleton/shared dependency không scale theo;
+- request không thể chia độc lập;
+- database write path vẫn tập trung;
+- traffic dồn vào một hot key/partition;
+- state cục bộ làm request chỉ chạy đúng trên một node;
+- coordination overhead lớn hơn parallelism thu được.
+
+Thêm node trong các trường hợp này có thể làm tăng connection, contention và chi phí nhưng throughput gần như không đổi.
+
+**Q12. State management khi scale ngang nên xử lý thế nào?**  
+Các lựa chọn gồm externalize session vào shared store, client/token phù hợp, partition state theo key hoặc replicate state theo consistency requirement. Sticky session chỉ giúp route cùng client về một node; nó không tạo durability, không giải quyết node failure và có thể gây skew.
+
+**Q13. “Dùng distributed transaction, eventual consistency hoặc CQRS” có phải một bộ giải pháp thay thế tương đương?**  
+Không. Đây là các công cụ giải quyết vấn đề khác nhau:
+
+- distributed transaction bảo vệ atomicity trong một số boundary với availability/coordination cost;
+- eventual consistency chấp nhận độ trễ hội tụ khi business invariant cho phép;
+- CQRS tách read/write model, không tự giải quyết consistency;
+- saga/compensation phù hợp một số workflow dài qua service.
+
+Chọn từ invariant và failure semantics, không chọn theo danh sách công nghệ.
+
+**Q14. Horizontal scaling có gần tuyến tính không?**  
+Chỉ trong một khoảng khi work parallelizable, traffic cân bằng, shared dependency còn headroom và coordination nhỏ. Scalability efficiency có thể đo gần đúng:
+
+```text
+efficiency(N) = throughput(N) / (N × throughput(1))
+```
+
+Ví dụ 4 node đạt 3,2 lần throughput một node thì efficiency khoảng 80%, không phải 100%.
+
+**Q15. Diagonal scaling có phù hợp burst vì vertical scaling phản ứng nhanh không?**  
+Không mặc định. Resize VM/database có thể cần restart, failover hoặc lâu hơn việc thêm replica đã warm. Với burst, cách phù hợp thường là giữ baseline size hợp lý, pre-scale/scale-out và có queue/headroom. “Vertical trước, horizontal sau” là roadmap tổ chức phổ biến, không phải quy luật tốc độ runtime.
+
+**Q16. Orchestrator và service discovery có bắt buộc cho scale ngang không?**  
+Không ở mọi quy mô. Một pool VM nhỏ sau managed load balancer có thể scale ngang mà không cần Kubernetes. Khi số workload, deployment và scheduling constraint tăng, orchestrator giúp tự động hóa nhưng cũng thêm control-plane complexity.
+
+#### 26. Ý chính cần nhớ
+
+- Vertical = bigger node; horizontal = more nodes; diagonal = kết hợp theo lộ trình.
+- Vertical scaling nhanh và đơn giản nhưng có hardware/economic/failure-domain limit.
+- Horizontal scaling tăng capacity/resilience tiềm năng nhưng cần phân phối traffic, state và data.
+- Stateless compute dễ scale out; stateful storage cần replication/partitioning/consistency.
+- Thêm node không bảo đảm throughput tuyến tính hoặc high availability.
+- Mỗi component có thể dùng một chiến lược khác nhau.
+- Diagonal scaling là cách tiến hóa thực dụng, không phải lợi ích miễn phí.
+- Chọn theo product stage, bottleneck, SLO, team capability và total cost.
+- Scale-down, failure và rebalancing quan trọng như scale-up.
+- Tối ưu đúng workload trước khi thêm resource.
+
+#### Công thức ghi nhớ
+
+> **Vertical scaling mua thời gian; horizontal scaling nâng trần tăng trưởng; diagonal scaling tạo con đường chuyển đổi thực dụng — nhưng chỉ đo bottleneck, SLO và total cost mới cho biết bước tiếp theo đúng là gì.**
+
+---
+
+### Bài 36. Understanding Load Balancers — Types, Algorithms & Cloud Solutions
+
+#### 1. Vì sao horizontal scaling cần load balancer?
+
+Khi chỉ có một server, client có một endpoint nhưng hệ thống có hai giới hạn:
+
+- capacity bị giới hạn bởi một máy;
+- máy đó là single point of failure.
+
+Load balancer tạo một entry point ổn định trước một pool backend động:
+
+```text
+Clients
+   │ stable endpoint
+   ▼
+Load Balancer
+   ├── Backend A
+   ├── Backend B
+   ├── Backend C
+   └── Backend D
+```
+
+Các trách nhiệm cốt lõi:
+
+- chọn backend cho connection/request;
+- chỉ route tới backend đủ khỏe và sẵn sàng;
+- thêm/bớt instance mà client không đổi endpoint;
+- hỗ trợ failover, deployment và connection draining;
+- phân phối tải phù hợp với capacity;
+- có thể terminate/proxy TLS và thực hiện application-aware routing;
+- cung cấp metrics về traffic, latency và backend health.
+
+Load balancer là **enabler** của horizontal scaling, không phải phép màu khiến mọi component tự scale. Nếu session nằm cục bộ, database đã bão hòa hoặc request không thể song song, thêm backend có thể không tăng capacity hữu ích.
+
+#### 2. Request flow cơ bản
+
+```text
+1. Client resolve public endpoint
+2. Client mở connection/gửi request tới load-balancer tier
+3. Load balancer áp listener, route, health và balancing policy
+4. Load balancer chọn một healthy backend
+5. Connection/request được forward tới backend
+6. Backend trả response trực tiếp hoặc qua load balancer
+7. Telemetry cập nhật health/load/latency signal
+```
+
+Tùy implementation, load balancer có thể là full proxy, NAT-based forwarding, direct server return hoặc distributed data plane. Không nên mặc định mọi load balancer đều xử lý response theo cùng một đường.
+
+#### 3. Control plane và data plane
+
+- **Control plane** quản lý listener, route, certificate, backend membership, weight và policy.
+- **Data plane** trực tiếp nhận, phân loại và chuyển traffic.
+
+Control plane chậm hoặc tạm lỗi không nhất thiết làm traffic đang chạy dừng nếu data plane còn cached configuration. Ngược lại, rollout cấu hình sai có thể tác động đồng loạt lên nhiều data-plane instance. Cần versioning, validation, staged rollout và rollback cho policy.
+
+---
+
+#### Nhánh A — Phân loại load balancer
+
+#### 4. Layer 4 load balancing
+
+Layer 4 làm việc chủ yếu với TCP/UDP flow và thông tin như source/destination IP, port, protocol.
+
+**Ưu điểm**
+
+- ít application parsing, throughput cao và latency thấp;
+- phù hợp TCP/UDP protocol không phải HTTP;
+- có thể giữ end-to-end TLS nếu dùng passthrough;
+- xử lý connection lớn hoặc network service tổng quát.
+
+**Giới hạn**
+
+- không route theo URL path, HTTP header, cookie hay method nếu không terminate/hiểu application protocol;
+- health/application semantics thường ít sâu hơn;
+- đơn vị balance thường là flow/connection.
+
+L4 không luôn “nhanh hơn tuyệt đối”; performance phụ thuộc kiến trúc proxy/NAT, TLS, hardware offload, packet size và feature đang bật.
+
+#### 5. Layer 7 load balancing
+
+Layer 7 hiểu application protocol như HTTP/HTTPS và có thể route theo:
+
+- hostname;
+- path, method và query trong phạm vi policy;
+- header hoặc cookie;
+- content type, tenant hoặc API version;
+- weight giữa các deployment/version.
+
+Ví dụ:
+
+```text
+/products/* ──> Catalog pool
+/checkout/* ──> Checkout pool
+/images/*   ──> Static/media pool
+Host admin.example.com ──> Admin pool
+```
+
+L7 hỗ trợ TLS termination, redirect, header normalization, WAF/rate limit integration và observability phong phú hơn. Đổi lại, proxy phải parse protocol, quản lý connection hai phía và thường dùng nhiều CPU/memory hơn.
+
+#### 6. Hardware, software và managed load balancer
+
+| Mô hình | Điểm mạnh | Đánh đổi |
+|---|---|---|
+| **Hardware appliance** | Specialized networking, enterprise feature/performance | Chi phí, procurement, capacity planning và vendor operations |
+| **Software LB** | Linh hoạt, chạy trên commodity VM/container, kiểm soát cao | Đội ngũ tự scale, patch, HA và vận hành |
+| **Cloud-managed LB** | Managed data plane, integration cloud, elasticity/HA thuận tiện | Chi phí dịch vụ, quota, feature/behavior theo provider và lock-in |
+
+Ví dụ software phổ biến gồm NGINX, HAProxy và Envoy. Các cloud lớn cung cấp managed load-balancing family cho application, network và global/edge traffic; tên sản phẩm và chi tiết khả năng có thể thay đổi, nên chọn theo semantics thay vì chỉ nhớ tên dịch vụ.
+
+#### 7. External, internal, local và global
+
+- **External/public LB** nhận traffic từ Internet.
+- **Internal/private LB** phân phối traffic trong private network/VPC.
+- **Local/regional LB** chọn backend trong một region/cluster/failure domain.
+- **Global load balancing/traffic steering** chọn region/edge endpoint trước, thường dựa trên anycast, DNS hoặc global proxy.
+
+Một kiến trúc lớn có nhiều tầng:
+
+```text
+User
+  │
+  ▼
+Global traffic steering
+  ├── Region A → Regional LB → Service pool
+  └── Region B → Regional LB → Service pool
+```
+
+Global routing phải cân bằng latency, regional health, capacity, data residency và consistency. Không nên route user sang region “gần nhất” nếu region đó không có data hoặc không đủ capacity.
+
+---
+
+#### Nhánh B — Thuật toán phân phối tải
+
+#### 8. Chọn đúng đơn vị tải
+
+“Chia đều request” chưa chắc chia đều work. Một request có thể kéo dài 5 ms, request khác 30 giây; một connection HTTP/2 có thể mang nhiều stream; một response có thể 1 KB hoặc 1 GB.
+
+Trước khi chọn thuật toán, cần xác định đơn vị gây saturation:
+
+- connection đang mở;
+- request đang xử lý;
+- queue/outstanding work;
+- CPU/memory;
+- bytes/second;
+- response time;
+- tenant/key/partition;
+- backend capacity tương đối.
+
+#### 9. Round Robin
+
+```text
+Request 1 → A
+Request 2 → B
+Request 3 → C
+Request 4 → A
+```
+
+Phù hợp khi backend gần đồng nhất và request có cost tương tự.
+
+**Ưu:** đơn giản, deterministic, ít telemetry.  
+**Nhược:** không phản ánh connection duration, request cost hoặc backend đang chậm.
+
+#### 10. Weighted Round Robin
+
+Mỗi backend/pool nhận traffic theo weight, ví dụ A:B:C = 4:2:1. Dùng khi:
+
+- máy có capacity khác nhau;
+- canary/blue-green traffic split;
+- region/pool có capacity khác nhau;
+- backend mới cần tăng traffic dần.
+
+Weight tĩnh cần được cập nhật khi performance thực tế đổi; weight không chính xác có thể tạo hotspot.
+
+#### 11. Least Connections
+
+Chọn backend có ít active connection hơn. Hữu ích khi connection có duration khác nhau, như long polling hoặc TCP session.
+
+Hạn chế:
+
+- số connection không phản ánh work bên trong connection;
+- HTTP/2/gRPC multiplex nhiều request/stream trên một connection;
+- backend vừa khởi động có 0 connection nên có thể nhận burst nếu không slow start;
+- cần state/counter chính xác trong phạm vi load-balancer node hoặc toàn tier.
+
+#### 12. Least Outstanding Requests / Least Load
+
+Chọn backend có ít request/work đang xử lý hơn; đôi khi kết hợp weight/capacity. Nó phản ánh request-level pressure tốt hơn least connections cho HTTP workload, nhưng vẫn cần đo đúng và xử lý delayed/stale signal.
+
+#### 13. Least Response Time
+
+Ưu tiên backend có observed latency thấp, thường kết hợp active connection. Có thể thích ứng với backend chậm nhưng dễ tạo feedback loop:
+
+```text
+Backend chậm → nhận ít traffic → hồi phục
+Backend nhanh → nhận nhiều traffic → có thể bị quá tải
+```
+
+Metrics phải làm mượt, giới hạn tốc độ thay đổi và tránh đánh giá backend chỉ từ ít sample.
+
+#### 14. Random và Power of Two Choices
+
+- **Random** chọn ngẫu nhiên một backend khỏe; đơn giản và tránh global coordination lớn.
+- **Power of Two Choices** lấy ngẫu nhiên hai backend rồi chọn backend ít tải hơn. Với pool lớn, cách này thường cân bằng tốt hơn random trong khi tránh phải biết state chính xác của mọi node.
+
+#### 15. IP hash và session affinity
+
+Hash source IP để cùng client thường tới cùng backend:
+
+```text
+backend = hash(client_ip) mod N
+```
+
+Hữu ích cho cache locality hoặc legacy local session, nhưng có vấn đề:
+
+- nhiều user sau NAT/proxy có cùng IP và tạo skew;
+- mobile client đổi IP;
+- thêm/bớt backend làm nhiều mapping thay đổi;
+- backend lỗi khiến affinity bị mất;
+- client IP cần được lấy từ trusted proxy chain.
+
+Cookie-based affinity có thể chính xác ở session hơn IP hash nhưng vẫn tạo uneven load và coupling vào instance.
+
+> Session affinity là tactical routing optimization, không phải chiến lược durability/availability của session state.
+
+#### 16. Consistent và rendezvous hashing
+
+Hash-based routing theo key như tenant, cache key hoặc object ID có thể tăng locality. **Consistent hashing** hoặc **rendezvous hashing** giảm tỷ lệ key phải remap khi membership thay đổi so với modulo hash đơn giản.
+
+Đánh đổi:
+
+- hot key vẫn tạo hot backend;
+- weight/rebalancing phức tạp hơn;
+- membership phải nhất quán đủ mức cần thiết;
+- affinity/locality có thể đối lập với load balance tức thời.
+
+#### 17. Adaptive load balancing
+
+Adaptive policy có thể kết hợp:
+
+- active requests/connections;
+- latency/error rate;
+- CPU/memory/queue depth;
+- backend health và outlier score;
+- preconfigured weight/capacity;
+- locality và network cost.
+
+Nhiều signal không tự động tốt hơn. Telemetry có delay, metric có thể nhiễu, và feedback controller có thể oscillate. Policy cần bounded adjustment, smoothing, cooldown, fallback và observability.
+
+#### 18. Bảng chọn thuật toán
+
+| Workload | Điểm khởi đầu hợp lý | Cần lưu ý |
+|---|---|---|
+| Request ngắn, backend đồng nhất | Round robin | Theo dõi request cost/skew |
+| Backend capacity khác nhau | Weighted round robin | Calibrate weight |
+| TCP/long-lived connection | Least connections | Connection không luôn bằng load |
+| HTTP request cost biến động | Least outstanding/load | Signal delay và queue |
+| Pool rất lớn | Power of two choices | Local view có thể đủ |
+| Cần key/cache locality | Consistent/rendezvous hash | Hot key, membership change |
+| Canary rollout | Weighted routing | Guardrail và rollback |
+
+Không có thuật toán tốt nhất. Nên bắt đầu đơn giản, đo imbalance/SLO rồi chỉ tăng tính thích ứng khi workload chứng minh cần thiết.
+
+---
+
+#### Nhánh C — Health, lifecycle và reliability
+
+#### 19. Active và passive health check
+
+**Active health check** chủ động gửi probe định kỳ:
+
+- TCP connect;
+- HTTP `/health` hoặc `/ready`;
+- protocol-specific probe.
+
+**Passive health check/outlier detection** suy ra trạng thái từ traffic thật:
+
+- timeout/reset tăng;
+- consecutive 5xx;
+- latency lệch xa pool;
+- connection failure.
+
+Kết hợp cả hai giúp phát hiện process chết lẫn backend “vẫn trả health 200 nhưng request thật liên tục lỗi”.
+
+#### 20. Liveness, readiness và deep health
+
+- **Liveness:** process có sống hay cần restart?
+- **Readiness:** instance hiện có nên nhận traffic mới không?
+- **Deep health:** kiểm tra dependency/business flow sâu hơn.
+
+Readiness endpoint nên phản ánh khả năng phục vụ nhưng không phụ thuộc mù quáng vào mọi shared dependency. Nếu database tạm chậm làm tất cả instance cùng fail readiness, load balancer có thể loại toàn pool và khuếch đại outage.
+
+#### 21. Threshold và hysteresis
+
+Không nên eject backend sau một probe lỗi ngẫu nhiên hoặc đưa lại ngay sau một probe thành công. Dùng:
+
+- unhealthy threshold;
+- healthy threshold;
+- interval/timeout;
+- success/error window;
+- eject duration và maximum ejection percentage.
+
+Hysteresis giúp tránh backend liên tục flap giữa healthy/unhealthy.
+
+#### 22. Slow start và warm-up
+
+Backend mới có thể cần:
+
+- JIT/runtime warm-up;
+- connection pool establishment;
+- cache warming;
+- model/data loading.
+
+Nếu nhận full share ngay khi healthy, nó có thể quá tải rồi lại bị eject. **Slow start** tăng weight/traffic dần cho tới mức bình thường.
+
+#### 23. Connection draining
+
+Khi deploy/scale in:
+
+1. đánh dấu backend draining/not ready;
+2. dừng connection/request mới;
+3. cho request/stream hiện tại hoàn tất trong grace period;
+4. timeout/close phần còn lại;
+5. dừng instance.
+
+Đặc biệt quan trọng với upload, WebSocket, SSE, gRPC stream và long-running request. Grace period quá ngắn làm lỗi client; quá dài làm rollout/scale-in chậm.
+
+#### 24. Failover và capacity sau lỗi
+
+Loại backend lỗi chỉ hữu ích nếu phần còn lại đủ capacity:
+
+```text
+N backend × safe capacity
+- capacity của failure domain lớn nhất
+≥ peak load cần phục vụ
+```
+
+Nếu chạy 4 node ở 80% tải, mất một node khiến ba node còn lại vượt 100%. Load balancer có route đúng vẫn không cứu được. Cần headroom, autoscaling, load shedding và priority policy.
+
+#### 25. Load balancer cũng có thể là bottleneck/SPOF
+
+Load-balancer tier cần:
+
+- nhiều data-plane instance qua failure domain;
+- stable discovery/failover như managed service, anycast hoặc DNS;
+- capacity và connection/packet-per-second headroom;
+- configuration distribution an toàn;
+- DDoS/connection exhaustion protection;
+- metrics, alert và tested failure behavior.
+
+Một “HA load balancer” đặt trước một database đơn lẻ vẫn không tạo end-to-end HA.
+
+---
+
+#### Nhánh D — Connection, protocol và security
+
+#### 26. Connection-level và request-level balancing
+
+L4 thường chọn backend khi flow được tạo; mọi dữ liệu của connection đó tiếp tục tới cùng backend. L7 proxy có thể chọn theo request/stream, nhưng hành vi phụ thuộc protocol và upstream connection pool.
+
+Ví dụ:
+
+- HTTP/1.1 keep-alive có nhiều request tuần tự trên connection;
+- HTTP/2/gRPC multiplex nhiều stream trên một connection;
+- WebSocket là connection dài sau handshake;
+- QUIC có connection semantics khác TCP và connection migration.
+
+Nếu chỉ có vài persistent connection từ upstream proxy tới backend, “round robin theo connection” có thể phân phối kém dù request count rất lớn. Cần quan sát đúng layer.
+
+#### 27. TLS termination, passthrough và re-encryption
+
+| Mô hình | Đặc điểm |
+|---|---|
+| **TLS termination** | LB giải mã client TLS, có thể L7 route và quản lý certificate |
+| **TLS passthrough** | LB chuyển encrypted flow, backend terminate TLS |
+| **TLS re-encryption** | LB terminate phía client rồi tạo TLS mới tới backend |
+
+Termination tập trung certificate/WAF/routing nhưng load balancer trở thành plaintext trust boundary. Kết nối backend cần network isolation, authentication/mTLS hoặc re-encryption theo threat model.
+
+#### 28. Client IP và trusted proxy chain
+
+Khi proxy đứng giữa, backend có thể thấy IP của proxy. L7 thường truyền metadata như `X-Forwarded-For` hoặc standardized `Forwarded`; một số L4 setup dùng proxy protocol hoặc preserve source IP.
+
+Backend chỉ nên tin header client identity/address do **trusted proxy** ghi/chuẩn hóa. Nếu chấp nhận `X-Forwarded-For` do Internet client tự gửi, rate limit, audit hoặc allowlist có thể bị bypass.
+
+#### 29. Security responsibilities
+
+Load balancer có thể tích hợp:
+
+- TLS/certificate management;
+- WAF và DDoS protection;
+- IP/network policy;
+- authentication hook ở một số kiến trúc;
+- request size/header limit;
+- rate limiting và bot controls;
+- security logging.
+
+Nhưng backend vẫn cần authentication, object/action authorization, input validation và safe business logic. Entry-layer filtering là defense-in-depth, không thay service security.
+
+#### 30. Timeout, retry và overload
+
+Các timeout cần phối hợp:
+
+- client timeout/deadline;
+- load balancer request/idle/connect timeout;
+- backend timeout;
+- stream/keep-alive duration.
+
+Retry tại load balancer chỉ an toàn khi operation retryable/idempotent và còn time budget. Retry quá mức biến lỗi backend thành load amplification. Cần retry budget, backoff, attempt limit và không retry request body không thể replay an toàn.
+
+Khi toàn pool bão hòa, route “thông minh” không tạo thêm capacity. Load balancer nên hỗ trợ queue giới hạn, rate limit, load shedding hoặc trả lỗi nhanh để tránh resource collapse.
+
+---
+
+#### Nhánh E — Cloud solutions và lựa chọn kiến trúc
+
+#### 31. Managed cloud load balancing
+
+Cloud providers thường cung cấp nhiều family thay vì một load balancer duy nhất:
+
+- L4 network load balancing cho TCP/UDP/high throughput;
+- L7 application load balancing cho HTTP routing/TLS;
+- internal/private load balancing;
+- regional và global/edge load balancing;
+- gateway/appliance insertion cho network/security virtual appliance;
+- integration với autoscaling, service discovery, certificate, WAF và logging.
+
+Các tên thường gặp trong hệ sinh thái cloud gồm AWS Elastic Load Balancing, Google Cloud Load Balancing và Azure Load Balancer/Application Gateway/Front Door. Khi thiết kế, ánh xạ requirement vào capability thay vì giả định các sản phẩm cùng semantics.
+
+#### 32. Câu hỏi cần hỏi khi chọn managed service
+
+- L4 hay L7; protocol/version nào được hỗ trợ?
+- Regional hay global; external hay internal?
+- Proxy hay passthrough; client IP được bảo toàn thế nào?
+- TLS termination, certificate và mTLS ra sao?
+- Health check, outlier detection, draining và slow start có gì?
+- Thuật toán/routing/weight/affinity được hỗ trợ tới đâu?
+- Connection, rule, target, bandwidth và request quota/limit là gì?
+- Cross-zone/region data transfer và pricing thế nào?
+- Log/metric/trace có đủ cho SLO và incident response không?
+- Failure/maintenance semantics và SLA của control/data plane ra sao?
+- Có thể export/migrate configuration hay bị lock-in tới mức nào?
+
+#### 33. Software LB khi nào phù hợp?
+
+Chọn software LB khi cần:
+
+- protocol/filter/routing tùy biến;
+- chạy on-premises, hybrid hoặc multi-cloud nhất quán;
+- kiểm soát version/configuration và data path;
+- sidecar/ingress/service proxy trong platform;
+- economics hợp lý ở quy mô/traffic cụ thể.
+
+Đổi lại, team sở hữu HA, scaling, patching, certificate, CVE, metrics, tuning kernel/network và on-call.
+
+#### 34. Hardware appliance khi nào phù hợp?
+
+Có thể hợp lý với data center lớn, compliance, specialized network integration, legacy enterprise feature hoặc performance/offload rất cụ thể. Không nên chọn chỉ vì “hardware luôn nhanh hơn”; cần so total cost, failure model, procurement time và operational skill.
+
+#### 35. Decision framework
+
+1. Xác định protocol và đơn vị balance: packet, flow, connection, request hay key.
+2. Đặt SLO, peak traffic, connection count và failure requirement.
+3. Xác định cần L7 routing/TLS/WAF hay chỉ L4 forwarding.
+4. Mô tả backend: đồng nhất hay khác capacity; short hay long-lived work.
+5. Chọn thuật toán đơn giản nhất phù hợp workload.
+6. Thiết kế health, warm-up, drain và failure headroom.
+7. Quyết định affinity/state; ưu tiên shared/durable state khi cần availability.
+8. Chọn deployment model theo team capability, compliance và total cost.
+9. Kiểm tra LB tier, control plane và downstream đều không là SPOF/bottleneck.
+10. Load/failure test với traffic skew, backend chậm, zone loss và config rollback.
+
+#### 36. Failure modes thường gặp
+
+| Failure mode | Hậu quả | Hướng xử lý |
+|---|---|---|
+| Health check quá nông | Backend lỗi logic vẫn nhận traffic | Passive signal, check đúng readiness |
+| Health check quá sâu | Shared dependency lỗi làm eject toàn pool | Tách liveness/readiness, threshold |
+| Backend mới nhận full load | Cold instance quá tải/flap | Slow start, warm-up |
+| Sticky session + node lỗi | User mất state | Shared session/recovery strategy |
+| Long-lived connection skew | Một backend nóng | Connection-aware policy/rebalance design |
+| Retry mọi lỗi | Retry storm | Budget, idempotency, deadline |
+| LB đủ capacity, DB không đủ | Backend đẩy DB quá tải | End-to-end capacity model |
+| LB một instance | Entry point SPOF | HA/multi-zone/managed data plane |
+| Config rollout sai | Global traffic outage | Validate, canary, version, rollback |
+| Tin client-supplied proxy header | Bypass audit/rate limit | Trusted proxy chain, overwrite header |
+| Thiếu failure headroom | Eject node gây cascading overload | N+failure capacity, shed load |
+
+#### 37. Câu hỏi phỏng vấn và trả lời ngắn
+
+**Q1. Load balancer giải quyết gì?**  
+Tạo entry point ổn định, phân phối traffic qua healthy backends, hỗ trợ scale-out, failover và deployment mà client không biết topology.
+
+**Q2. Layer 4 và Layer 7 khác nhau thế nào?**  
+L4 route flow dựa vào network/transport metadata; L7 hiểu application protocol và route theo HTTP attributes. L7 linh hoạt hơn nhưng parse/proxy nhiều hơn.
+
+**Q3. Round robin và least connections dùng khi nào?**  
+Round robin cho backend/request tương đối đồng nhất; least connections hữu ích với connection duration khác nhau, nhưng connection count không luôn phản ánh work.
+
+**Q4. Weighted balancing dùng làm gì?**  
+Phản ánh backend capacity khác nhau hoặc chia traffic cho canary/region theo tỷ lệ.
+
+**Q5. IP hash có nhược điểm gì?**  
+NAT gây skew, client đổi IP, membership change remap và backend failure phá affinity.
+
+**Q6. Load balancer phát hiện backend lỗi thế nào?**  
+Active health probe kết hợp passive observation/outlier detection, với threshold và recovery hysteresis.
+
+**Q7. Load balancer có tạo high availability không?**  
+Chỉ khi LB tier, backend, shared dependency và data đều có redundancy qua failure domain, cùng đủ capacity sau lỗi.
+
+**Q8. Tại sao sticky session không phải giải pháp scale tốt dài hạn?**  
+Nó tạo coupling/skew và mất state khi node lỗi; shared/durable session state thường linh hoạt hơn.
+
+**Q9. Vì sao HTTP/2 làm least-connections khó diễn giải?**  
+Một connection có thể mang nhiều concurrent streams, nên ít connection chưa chắc ít request/load.
+
+**Q10. Managed hay self-hosted LB?**  
+Managed giảm operational burden; self-hosted tăng control/customization. Chọn theo feature, SLO, compliance, team và total cost.
+
+**Q11. Nếu tất cả backend đều quá tải thì thuật toán nào tốt nhất?**  
+Không thuật toán nào tạo capacity. Cần autoscaling/headroom, admission control, backpressure, load shedding và graceful degradation.
+
+**Q12. Cần theo dõi metric gì?**  
+Traffic/connection, LB latency/error, backend latency/error/outstanding work, healthy target count, eject rate, queue/rejection, TLS/network saturation và distribution skew.
+
+#### 38. Nội dung phỏng vấn bổ sung từ PDF
+
+**Q13. Active-active và active-passive load-balancer tier khác gì?**
+
+- **Active-active:** nhiều LB instance cùng nhận traffic; capacity được dùng tốt hơn nhưng cần state/config/traffic distribution phù hợp.
+- **Active-passive:** standby tiếp quản khi active lỗi; đơn giản hơn ở một số môi trường nhưng có failover delay và capacity nhàn rỗi.
+
+Dù dùng mô hình nào, virtual/public endpoint, health/failover mechanism và configuration plane đều phải tránh trở thành single point of failure.
+
+**Q14. Session persistence hỗ trợ failover thế nào?**  
+Affinity giữ client trên cùng backend khi backend còn khỏe, nhưng khi node lỗi, mapping phải chuyển và local session có thể mất. High availability cần shared/replicated session hoặc khả năng tạo lại state; persistence không phải failover strategy đầy đủ.
+
+**Q15. Thiết kế load balancing cho e-commerce lớn ra sao?**
+
+```text
+Users
+  ▼
+DNS / Anycast / Global traffic steering
+  ▼
+CDN + DDoS/WAF controls
+  ▼
+Multi-zone L7 Load Balancer tier
+  ├── Catalog/Search pool
+  ├── Cart pool
+  ├── Checkout/Payment pool
+  └── Static/Media origin pool
+         │
+         ▼
+Cache / Queue / Database / External payment
+```
+
+Thiết kế cần multi-zone healthy capacity, autoscaling, endpoint-specific timeout/rate limit, connection draining, idempotent checkout, shared cart/session, downstream budgets và graceful degradation. Không chọn Round Robin chỉ vì “static” hay Least Connections chỉ vì “dynamic”; phải đo cost/connection/request thực tế.
+
+**Q16. Có nên dùng Layer 4 load balancer cho database connection?**  
+Có thể, nhưng “database → L4” không phải quy luật. Database proxy/load balancer còn phải hiểu primary/replica role, transaction/session semantics, connection pool, failover và read/write routing. Một TCP balancer mù có thể gửi write tới read replica hoặc phá connection state nếu topology không được quản lý đúng.
+
+**Q17. Load balancer cải thiện security tới đâu?**  
+LB có thể tạo enforcement point cho TLS, network ACL, rate limit và tích hợp DDoS/WAF. Bản thân load balancing không tự phát hiện mọi DDoS, ngăn SQL injection hay XSS. WAF chỉ giảm một số pattern; application vẫn phải validate input, encode output và authorize đúng object/action.
+
+**Q18. Compression/minification có phải load-balancing strategy không?**  
+Không. Chúng là content-delivery/performance optimization. Compression có thể giảm bandwidth nhưng tăng CPU và có security/cache trade-off; minification thường là build-time concern cho static asset. Không nên trộn chúng với thuật toán chọn backend.
+
+**Q19. Weighted Load Balancing khác priority/failover thế nào?**  
+Weight chia traffic theo tỷ lệ giữa các backend đang active. Priority/failover thường ưu tiên một pool và chỉ chuyển sang pool khác khi điều kiện xảy ra. Cần xác định rõ semantics vì “trọng số cao” không luôn đồng nghĩa “primary”.
+
+#### 39. Ý chính cần nhớ
+
+- Load balancer tách client khỏi topology backend và là nền tảng của scale-out.
+- L4 balance flow/connection; L7 hiểu application request và route linh hoạt hơn.
+- Hardware, software và managed cloud LB khác nhau ở ownership, feature, cost và operations.
+- Thuật toán phải phù hợp đơn vị tải thực, không chỉ số request.
+- Round robin đơn giản; least-load thích ứng hơn; hashing ưu tiên locality/affinity.
+- HTTP/2, gRPC, WebSocket và long-lived connection thay đổi cách hiểu “load”.
+- Health cần active/passive signal, threshold, slow start và draining.
+- Session affinity không thay thế shared/durable state.
+- LB tier cũng cần HA, capacity, secure config rollout và overload protection.
+- TLS/client-IP handling tạo trust boundary cần cấu hình rõ.
+- Managed cloud service giảm vận hành nhưng vẫn có quota, pricing và provider semantics.
+- Availability phải được đánh giá end-to-end tới database/dependency, không chỉ backend pool.
+
+#### Công thức ghi nhớ
+
+> **Load balancer không chỉ chia traffic: nó chọn đúng healthy capacity, che giấu topology động và điều phối lifecycle của backend. Nhưng nó chỉ tạo scalability và resilience khi state, downstream capacity, failure domains và chính load-balancer tier cũng được thiết kế đúng.**
+
+---
+
+### Bài 37. Autoscaling & Best Practices in Cloud Environments
+
+#### 1. Autoscaling là gì?
+
+**Autoscaling** là cơ chế tự động điều chỉnh capacity của hệ thống dựa trên demand và policy nhằm giữ cân bằng giữa:
+
+- performance/SLO;
+- availability và failure headroom;
+- resource utilization;
+- infrastructure cost.
+
+```text
+Demand tăng → thêm capacity → giữ latency/error trong SLO
+Demand giảm → bớt capacity → giảm tài nguyên nhàn rỗi và chi phí
+```
+
+Autoscaling không chỉ là “thấy CPU cao thì thêm server”. Một hệ thống production cần chọn đúng signal, tính đúng capacity, phối hợp lifecycle và bảo vệ downstream khi capacity chưa kịp xuất hiện.
+
+#### 2. Autoscaling là một feedback control loop
+
+```text
+Workload
+   │
+   ▼
+System ──> Metrics ──> Policy/Controller ──> Scaling action
+   ▲                                            │
+   └──────────────── new capacity ──────────────┘
+```
+
+Vòng điều khiển gồm:
+
+1. **Observe:** thu thập CPU, request rate, queue depth, latency...
+2. **Aggregate:** làm mượt và tổng hợp theo window.
+3. **Decide:** so metric với target/forecast/policy.
+4. **Actuate:** thêm/bớt replica hoặc resource.
+5. **Provision:** scheduler/cloud tạo capacity.
+6. **Warm:** application khởi động, load data/cache và mở connection.
+7. **Register:** readiness đạt, load balancer/broker bắt đầu giao việc.
+8. **Re-evaluate:** đo ảnh hưởng và quyết định vòng tiếp theo.
+
+Autoscaling không phản ứng tức thời. Tổng độ trễ có thể hình dung:
+
+```text
+reaction lag
+= metric collection
++ aggregation/evaluation
++ provisioning/scheduling
++ boot/startup
++ warm-up/readiness
++ traffic redistribution
+```
+
+Nếu traffic spike nhanh hơn reaction lag, hệ thống vẫn cần minimum capacity, headroom, queue, cache, admission control hoặc load shedding.
+
+#### 3. Scaling và healing là hai mục tiêu khác nhau
+
+- **Autoscaling** thay đổi capacity theo demand.
+- **Auto-healing** thay thế/restart instance không khỏe để giữ desired capacity.
+
+CPU thấp vì nhiều instance đã crash không phải tín hiệu để scale in. Controller cần health/desired-state logic tách với workload scaling logic.
+
+#### 4. Các chiều autoscaling
+
+| Chiều | Hành động | Điểm cần lưu ý |
+|---|---|---|
+| **Horizontal** | Tăng/giảm replica, VM, container, worker | Cần phân phối traffic/work và quản lý state |
+| **Vertical** | Tăng/giảm CPU, RAM, IOPS của workload/node | Có thể restart/reschedule, phản ứng chậm hơn |
+| **Cluster/node** | Thêm/bớt compute node cho scheduler | Workload replica chỉ chạy khi cluster có chỗ |
+| **Concurrency/serverless** | Tạo execution environment theo request/event | Cold start, quota, downstream connection |
+| **Storage/data tier** | Replica, throughput unit, partition hoặc instance class | Stateful, rebalance và consistency nên scale chậm/cẩn thận |
+
+Trong container platform, workload autoscaler có thể tăng pod nhưng pod vẫn `Pending` nếu node pool hết capacity. Vì vậy workload scaling và infrastructure scaling phải phối hợp.
+
+---
+
+#### Nhánh A — Chọn scaling signal
+
+#### 5. Infrastructure metrics
+
+- CPU utilization;
+- memory working set/pressure;
+- disk IOPS, throughput và queue;
+- network bandwidth/packet/connection;
+- GPU/accelerator utilization;
+- node/pod resource request và saturation.
+
+Ưu điểm là dễ thu thập, nhưng chúng không luôn đại diện demand hoặc user experience.
+
+#### 6. Application và workload metrics
+
+- request/transaction rate;
+- concurrent request/connection;
+- in-flight/outstanding work;
+- queue depth và age of oldest message;
+- consumer lag;
+- latency và error rate;
+- thread/connection pool utilization;
+- cache miss/DB connection pressure;
+- event ingestion/processing rate.
+
+Các metric gần nguyên nhân gây work thường là scaling signal tốt hơn metric hậu quả. Ví dụ request rate hoặc queue backlog có thể dự báo capacity cần trước khi latency tăng.
+
+#### 7. Business metrics
+
+- orders/checkouts per minute;
+- active tenants/users/sessions;
+- video transcoding jobs;
+- files/pages cần xử lý;
+- device telemetry rate.
+
+Business metric hữu ích khi tương quan ổn định với resource consumption. Nếu mỗi order có cost rất khác nhau, đếm order đơn thuần có thể gây scale sai.
+
+#### 8. CPU khi nào tốt, khi nào kém?
+
+CPU target phù hợp với CPU-bound stateless workload và mỗi replica có resource/cost tương đối đồng nhất.
+
+CPU có thể gây hiểu sai khi:
+
+- workload I/O-bound, chờ database/network nên CPU thấp dù latency cao;
+- request queue nằm trước service nên instance chưa thấy work;
+- GC/lock contention làm performance kém không tỷ lệ thuận CPU;
+- mỗi tenant/request có cost rất khác nhau;
+- downstream bị throttle, service chỉ chờ;
+- resource request/limit cấu hình sai làm utilization denominator sai.
+
+#### 9. Memory không phải signal scale-down đơn giản
+
+Application cache và runtime thường giữ memory dù traffic giảm. Scale theo memory có thể chỉ tăng replica mà tổng memory/cache duplication còn lớn hơn. Cần hiểu working set, leak, cache behavior và giới hạn memory; memory leak cần sửa hoặc restart policy, không phải scale-out vô hạn.
+
+#### 10. Queue-based autoscaling
+
+Queue giúp tách arrival rate khỏi processing rate. Một ước lượng worker đơn giản:
+
+```text
+workers cần thiết
+≈ arrival rate × average processing time / target utilization
+```
+
+Ví dụ:
+
+```text
+Arrival rate             = 600 jobs/s
+Average processing time  = 0,2 s/job
+Target utilization       = 0,75
+
+Workers ≈ 600 × 0,2 / 0,75 = 160
+```
+
+Chỉ dùng queue depth có thể không đủ:
+
+- 1.000 job × 10 ms khác 1.000 job × 10 phút;
+- backlog 0 không có nghĩa đủ capacity nếu arrival tăng rất nhanh;
+- poison message có thể giữ queue age cao;
+- retry/requeue làm sai signal.
+
+Nên kết hợp arrival rate, processing time, backlog per worker, queue age và completion/error rate.
+
+#### 11. Latency và error rate là guardrail hơn là signal duy nhất
+
+Latency/error trực tiếp phản ánh user impact nhưng thường xuất hiện sau khi saturation đã xảy ra. Nếu scale chỉ khi p99 vi phạm, phản ứng có thể quá muộn. Chúng phù hợp làm:
+
+- SLO guardrail;
+- trigger khẩn cấp kết hợp demand metric;
+- tín hiệu xác minh policy có hiệu quả;
+- điều kiện rollback hoặc load shedding.
+
+Error tăng vì code bug/dependency outage mà autoscaler thêm replica có thể chỉ khuếch đại traffic và chi phí.
+
+#### 12. Đặc tính của scaling signal tốt
+
+- có quan hệ nhân quả tương đối ổn định với capacity cần;
+- xuất hiện đủ sớm trước SLO violation;
+- có thể chuẩn hóa theo replica/capacity;
+- không quá nhiễu và không dễ bị thao túng;
+- có metric pipeline đáng tin cậy;
+- đo được cả tăng và giảm demand;
+- không khiến nhiều autoscaler phản ứng ngược nhau.
+
+---
+
+#### Nhánh B — Scaling policies
+
+#### 13. Threshold/reactive scaling
+
+Ví dụ:
+
+```text
+Nếu average CPU > 70% trong 5 phút → thêm 2 replica
+Nếu average CPU < 30% trong 15 phút → bớt 1 replica
+```
+
+Đơn giản, dễ hiểu nhưng threshold cứng có thể oscillate quanh biên. Dùng window, hysteresis, cooldown và scale-up/scale-down behavior khác nhau.
+
+#### 14. Target tracking
+
+Controller điều chỉnh replica để giữ metric gần target, ví dụ average CPU 60% hoặc 100 outstanding request/replica.
+
+Mô hình trực giác:
+
+```text
+desired replicas
+≈ current replicas × current metric / target metric
+```
+
+Ví dụ 10 replica đang ở 90% CPU, target 60%:
+
+```text
+desired ≈ 10 × 90 / 60 = 15 replica
+```
+
+Thực tế controller còn làm tròn, giới hạn tốc độ, stabilization và xét missing/unready replica.
+
+#### 15. Step scaling
+
+Mức scale phụ thuộc độ lệch:
+
+```text
+CPU 70–80%  → +2 replica
+CPU 80–90%  → +5 replica
+CPU > 90%   → +10 replica
+```
+
+Cho phản ứng mạnh hơn với spike lớn, nhưng nhiều threshold khó tune và dễ tạo overshoot nếu signal trễ.
+
+#### 16. Scheduled scaling
+
+Thêm capacity theo lịch đã biết:
+
+- giờ làm việc;
+- batch window;
+- chiến dịch marketing;
+- mở bán vé/flash sale;
+- seasonal event.
+
+Scheduled scaling nên bổ sung reactive policy vì demand thực tế có thể lệch dự báo.
+
+#### 17. Predictive scaling
+
+Dùng historical pattern/forecast để provision trước demand. Phù hợp workload tuần/ngày có tính lặp lại.
+
+Rủi ro:
+
+- product launch hoặc sự kiện bất thường phá pattern;
+- concept drift làm model lỗi thời;
+- forecast quá thấp vi phạm SLO, quá cao lãng phí;
+- metric/data pipeline lỗi;
+- không phản ứng tốt với incident hoặc viral spike chưa từng có.
+
+Predictive policy cần confidence/guardrail, fallback reactive scaling và thường xuyên đánh giá forecast error.
+
+#### 18. Event-driven scaling
+
+Scale theo external work source như queue/topic/event stream. Worker count có thể liên hệ với backlog, lag và target processing time. Nó phù hợp background job, consumer và event-driven system hơn CPU-only scaling.
+
+#### 19. Minimum, maximum và desired capacity
+
+- **Minimum capacity** bảo đảm baseline, availability và giảm cold-start risk.
+- **Maximum capacity** giới hạn blast radius/cost và bảo vệ downstream quota.
+- **Desired capacity** là capacity controller đang cố duy trì.
+
+Maximum không chỉ là cost guardrail. Nếu database chỉ chịu 200 connection, scale app lên 1.000 replica có thể làm outage nặng hơn. Limit phải dựa trên end-to-end capacity.
+
+#### 20. Scale-up và scale-down nên bất đối xứng
+
+Thông thường:
+
+- scale up nhanh để bảo vệ SLO;
+- scale down chậm để tránh oscillation và giữ headroom.
+
+```text
+Scale up:   window ngắn, bước lớn hơn
+Scale down: window dài, stabilization, bước nhỏ hơn
+```
+
+Scale down phải drain connection/job và cân nhắc cache locality, rebalance, minimum replica qua zone.
+
+#### 21. Cooldown, warm-up và stabilization
+
+- **Cooldown:** khoảng tạm không thực hiện thêm một số action sau scale.
+- **Warm-up:** thời gian instance mới chưa được xem là cung cấp full capacity.
+- **Stabilization window:** xem lịch sử recommendation để tránh thay đổi quá nhanh.
+
+Cooldown quá dài làm phản ứng chậm; quá ngắn gây thrashing. Warm-up phải phản ánh startup thật của application, không dùng con số mặc định thiếu kiểm chứng.
+
+#### 22. Rate limit cho scaling action
+
+Giới hạn:
+
+- số replica hoặc phần trăm thay đổi mỗi window;
+- tốc độ scale in/out;
+- số concurrent provisioning operation;
+- maximum surge khi rollout;
+- minimum lifetime trước termination.
+
+Mục tiêu là tránh overshoot, API quota exhaustion và simultaneous churn.
+
+---
+
+#### Nhánh C — Kiến trúc để autoscale an toàn
+
+#### 23. Stateless application tier
+
+Instance dễ scale-out/in nhất khi không giữ state bắt buộc cho request tiếp theo. Session/business state cần externalize hoặc replicate phù hợp.
+
+Local cache vẫn có thể dùng, nhưng instance mới có cold cache và scale-in làm mất cache locality. Cache-warming traffic có thể tăng tải origin/database đúng lúc spike.
+
+#### 24. Phối hợp với load balancer
+
+Scale-out lifecycle:
+
+```text
+Provision → Start → Warm → Ready → Register → Slow-start traffic
+```
+
+Scale-in lifecycle:
+
+```text
+Select → Mark unready/draining → Stop new traffic
+       → Finish/timeout in-flight work → Deregister → Terminate
+```
+
+Không route traffic khi process mới chỉ “đã chạy” nhưng chưa ready. Không terminate instance còn giữ WebSocket, upload hoặc job chưa checkpoint.
+
+#### 25. Downstream capacity và connection storm
+
+Thêm 100 replica có thể tạo:
+
+- hàng nghìn database connection mới;
+- cache miss/warm-up storm;
+- authentication/config/secrets lookup burst;
+- message partition contention;
+- third-party API quota violation.
+
+Cần connection pool budget, startup jitter, warm-up rate limit, shared cache, dependency quota và maximum scaling step.
+
+Autoscaling app tier phải bị giới hạn bởi capacity của bottleneck downstream hoặc kết hợp backpressure/load shedding.
+
+#### 26. Backpressure và admission control
+
+Autoscaling là capacity response chậm; backpressure là overload response nhanh hơn.
+
+Khi capacity chưa kịp tăng:
+
+- queue work có giới hạn;
+- rate limit/quota;
+- reject sớm request ưu tiên thấp;
+- shed optional feature;
+- degrade response/cache stale data;
+- giảm fan-out;
+- trả retry hint có jitter.
+
+Queue không vô hạn: backlog lớn chỉ chuyển outage thành latency dài và recovery kéo dài.
+
+#### 27. Idempotency và worker termination
+
+Scale-in hoặc spot interruption có thể dừng worker giữa job. Worker cần:
+
+- acknowledgement đúng thời điểm;
+- idempotent processing/deduplication;
+- checkpoint hoặc lease/visibility timeout;
+- graceful shutdown và termination notice;
+- retry/DLQ policy;
+- giới hạn thời gian job so với termination grace period.
+
+#### 28. Stateful workloads
+
+Stateful system scale chậm hơn vì cần replicate/rebalance data. Trước khi autoscale:
+
+- xác định partition/replica placement;
+- tính migration bandwidth và thời gian;
+- ngăn nhiều rebalance chồng nhau;
+- bảo vệ quorum/availability;
+- scale storage và network cùng compute;
+- hiểu scale-in có thể nguy hiểm hơn scale-out.
+
+Database thường cần planned/scheduled/predictive capacity, read replica hoặc managed throughput policy hơn là phản ứng nhanh như stateless web tier.
+
+#### 29. Multiple autoscalers và control-loop interaction
+
+Ví dụ một hệ thống có:
+
+- horizontal workload autoscaler;
+- vertical resource recommender/autoscaler;
+- node/cluster autoscaler;
+- database autoscaling;
+- queue consumer scaler.
+
+Nếu HPA tăng pod vì CPU cao trong khi vertical autoscaler đồng thời tăng CPU request, denominator/signal đổi; cluster autoscaler lại thêm node. Các vòng điều khiển có thể tranh chấp hoặc oscillate.
+
+Cần owner, priority, boundary và test cho tương tác giữa controller; tránh để nhiều policy cùng điều khiển một resource từ signal mâu thuẫn.
+
+#### 30. Multi-zone và availability
+
+Autoscaler cần duy trì:
+
+- minimum replica qua nhiều failure domain;
+- capacity sau mất một zone/node pool;
+- topology spread/anti-affinity;
+- quota đủ ở từng zone;
+- không scale-in hết một zone vì traffic tạm lệch;
+- load balancer health/routing phù hợp.
+
+Autoscaling theo average toàn region có thể che giấu một zone/pool đã bão hòa.
+
+#### 31. Deployments và autoscaling
+
+Rolling/canary deployment làm capacity và metric thay đổi:
+
+- old/new version có efficiency khác nhau;
+- rollout surge dùng thêm resource;
+- cold instance làm latency tăng;
+- lỗi version mới có thể kích autoscaler thêm replica sai hướng.
+
+Capacity plan phải tính deployment surge; policy cần version-aware telemetry và guardrail để rollback code/config thay vì chỉ scale lỗi.
+
+---
+
+#### Nhánh D — Failure modes và observability
+
+#### 32. Oscillation/thrashing
+
+```text
+Load tăng → scale out quá mạnh → utilization giảm
+→ scale in nhanh → utilization tăng → scale out lại
+```
+
+Nguyên nhân: threshold sát nhau, window ngắn, reaction lag, warm-up không tính, noisy metric. Giải pháp: hysteresis, stabilization, asymmetric policy, smoothing và bounded scaling rate.
+
+#### 33. Scaling too late
+
+Nguyên nhân:
+
+- metric là lagging indicator;
+- evaluation window/cooldown quá dài;
+- provisioning/warm-up chậm;
+- quota/capacity cloud không đủ;
+- image/dependency lớn;
+- readiness sai.
+
+Giải pháp: demand-leading signal, scheduled/predictive pre-scale, minimum headroom, tối ưu startup và overload protection.
+
+#### 34. Scaling too early hoặc sai nguyên nhân
+
+- CPU spike ngắn gây overprovision;
+- error do dependency outage kích thêm replica;
+- memory leak kích scale-out vô hạn;
+- retry storm làm request rate tăng giả;
+- metric không normalize theo capacity;
+- business event không tạo work tương ứng.
+
+Cần multi-signal guardrail, max capacity, anomaly/runaway alert và root-cause telemetry.
+
+#### 35. Metric pipeline failure
+
+Nếu metric mất, trễ hoặc sai, autoscaler có thể giữ nguyên, scale theo stale data hoặc đi về default. Cần định nghĩa:
+
+- fail-safe behavior;
+- missing-data treatment;
+- alert khi controller không có fresh metric;
+- minimum capacity;
+- manual override/runbook;
+- audit log cho recommendation/action.
+
+#### 36. Cloud quota và capacity shortage
+
+Autoscaling policy đúng vẫn thất bại nếu:
+
+- đạt account/project/region quota;
+- instance type hết capacity;
+- subnet hết IP;
+- image registry/secrets/service discovery lỗi;
+- scheduler không tìm được node phù hợp;
+- load balancer target/rule limit đạt trần.
+
+Theo dõi quota, dùng nhiều instance type/pool khi phù hợp, reservation cho critical baseline và diễn tập scale-out failure.
+
+#### 37. Cold start và scale-to-zero
+
+Scale-to-zero tiết kiệm khi idle nhưng request đầu phải chờ:
+
+- provision runtime;
+- tải code/image/dependency;
+- initialize framework/model;
+- mở connection và warm cache.
+
+Phù hợp asynchronous, dev/test hoặc workload chấp nhận startup latency. Với latency-sensitive API, giữ minimum warm capacity hoặc dùng pre-warming/scheduled scale.
+
+#### 38. Observability cho autoscaling
+
+Dashboard/alert nên nối ba lớp:
+
+**Demand**
+
+- arrival/request/event rate;
+- concurrency, queue depth/age;
+- traffic theo tenant/route/region.
+
+**Decision/action**
+
+- current/desired/min/max capacity;
+- recommendation, scale event và reason;
+- provisioning/warm-up/readiness time;
+- failed/limited action, quota và cooldown.
+
+**Outcome**
+
+- utilization/saturation;
+- latency/error/SLO;
+- throughput/completion rate;
+- cost và unit cost;
+- downstream pressure.
+
+Chỉ quan sát replica count không đủ để biết autoscaling đúng hay chỉ đang che một bottleneck.
+
+---
+
+#### Nhánh E — Cost optimization và cloud practices
+
+#### 39. Right-sizing trước khi autoscaling
+
+Replica quá lớn gây lãng phí và scale granularity thô; replica quá nhỏ tăng overhead, connection và scheduling churn. Benchmark nhiều size để tìm vùng hiệu quả theo throughput/SLO/cost.
+
+Resource request/limit sai cũng ảnh hưởng scheduling và utilization signal. Right-sizing cần được xem lại khi code, workload hoặc dependency đổi.
+
+#### 40. Base capacity và burst capacity
+
+Một mô hình thực dụng:
+
+```text
+Predictable baseline → stable/committed capacity
+Variable burst       → on-demand autoscaled capacity
+Interruptible work   → spot/preemptible capacity
+```
+
+Không dùng interruptible capacity cho toàn bộ critical serving tier nếu không có diversity, fallback và graceful interruption handling.
+
+#### 41. Spot/preemptible capacity
+
+Phù hợp:
+
+- batch/ETL;
+- retryable background jobs;
+- stateless replica có on-demand baseline;
+- distributed compute có checkpoint.
+
+Cần:
+
+- đa dạng instance type/zone;
+- interruption signal và graceful shutdown;
+- idempotency/checkpoint;
+- fallback capacity;
+- không giả định discount luôn có sẵn.
+
+Tên thương mại khác nhau theo provider, nhưng bản chất là capacity giá thấp đổi lấy khả năng bị thu hồi.
+
+#### 42. Guardrail chống runaway cost
+
+- maximum replicas/capacity;
+- quota theo environment/team/tenant;
+- budget và cost anomaly alert;
+- rate limit cho scaling action;
+- policy-as-code và approval cho limit lớn;
+- tag/label/owner đầy đủ;
+- kill switch/manual override;
+- dev/staging schedule hoặc auto-pause;
+- monitor cost per request/job/tenant.
+
+Maximum quá thấp gây outage; maximum quá cao có thể phá downstream và ngân sách. Guardrail phải gắn với capacity test.
+
+#### 43. Scale-to-zero và auto-pause
+
+Hiệu quả cho workload idle dài, nhưng cần đánh giá:
+
+- startup latency/SLO;
+- concurrent burst đầu tiên;
+- state/connection initialization;
+- minimum billing unit;
+- metric/event có thể đánh thức workload không;
+- dependency vẫn phát sinh fixed cost không.
+
+Scale-to-zero không phải lúc nào rẻ hơn nếu cold start khiến retry, timeout hoặc overprovision downstream.
+
+#### 44. Unit economics
+
+Theo dõi:
+
+```text
+cost / request
+cost / successful order
+cost / active user
+cost / processed event or GB
+```
+
+Tổng hóa đơn tăng cùng business có thể bình thường; dấu hiệu xấu là unit cost tăng do scaling efficiency giảm, overprovision, data transfer hoặc bottleneck.
+
+#### 45. Cloud-neutral principles
+
+AWS, Azure, Google Cloud và các nền tảng container/serverless cung cấp autoscaling với tên dịch vụ khác nhau. Kiến thức bền vững là:
+
+- workload-to-signal mapping;
+- feedback-loop stability;
+- provisioning/warm-up lag;
+- stateless/stateful boundary;
+- downstream protection;
+- quota/failure behavior;
+- cost and SLO guardrails.
+
+Monitoring service tích hợp hoặc Prometheus/Grafana có thể cung cấp signal/visibility, nhưng dashboard không tự biến metric thành policy đúng.
+
+#### 46. Best-practice checklist
+
+1. Định nghĩa workload, peak/burst và SLO.
+2. Load test để đo safe capacity mỗi replica.
+3. Chọn leading signal gần work, dùng latency/error làm guardrail.
+4. Đặt min/max/desired capacity theo availability, quota và downstream.
+5. Scale up nhanh hơn scale down; thêm hysteresis/stabilization.
+6. Đo startup, warm-up và time-to-ready thực tế.
+7. Phối hợp readiness, slow start và connection draining với load balancer.
+8. Bảo vệ database/cache/external API bằng pool, quota và backpressure.
+9. Thiết kế idempotency/checkpoint cho worker và interruption.
+10. Tính zone failure, deployment surge và cloud quota.
+11. Quan sát demand → decision → outcome → cost.
+12. Test spike, metric loss, quota exhaustion, dependency outage và scale-in.
+13. Có manual override, rollback và incident runbook.
+14. Rà soát right-sizing và unit economics định kỳ.
+
+#### 47. Câu hỏi phỏng vấn và trả lời ngắn
+
+**Q1. Autoscaling là gì?**  
+Feedback loop tự điều chỉnh capacity theo workload/policy để giữ SLO, availability và cost mục tiêu.
+
+**Q2. Reactive, scheduled và predictive khác gì?**  
+Reactive đáp lại metric hiện tại; scheduled provision theo lịch; predictive forecast demand. Production thường kết hợp và luôn cần fallback/guardrail.
+
+**Q3. CPU có phải metric tốt nhất?**  
+Không. Nó tốt cho CPU-bound workload; queue, concurrency hoặc request rate có thể phù hợp hơn với I/O/event workload.
+
+**Q4. Cooldown để làm gì?**  
+Cho action trước có thời gian tác động và tránh thay đổi liên tục; phải tune cùng warm-up và stabilization.
+
+**Q5. Vì sao scale up nhanh, scale down chậm?**  
+Thiếu capacity phá SLO ngay; capacity dư tạm thời chủ yếu tốn cost. Scale-down chậm giữ headroom và tránh oscillation.
+
+**Q6. Autoscaling có thay capacity planning không?**  
+Không. Vẫn phải biết peak, safe capacity, reaction lag, quota, failure headroom và downstream limit.
+
+**Q7. Làm sao autoscale queue consumer?**  
+Dùng arrival rate, average processing time, backlog/age và target drain time; không chỉ CPU hoặc queue length thô.
+
+**Q8. Scale-to-zero khi nào phù hợp?**  
+Khi idle dài và workload chấp nhận cold start hoặc asynchronous. Latency-sensitive serving thường cần minimum warm capacity.
+
+**Q9. Spot instance dùng thế nào an toàn?**  
+Dùng cho interruptible/idempotent/checkpointable work, có diversified pool, baseline/fallback và graceful termination.
+
+**Q10. Autoscaler có thể làm outage nặng hơn thế nào?**  
+Scale theo error/retry storm, mở quá nhiều DB connection, oscillate, terminate job sớm hoặc thêm replica khi shared dependency đã quá tải.
+
+**Q11. Metric nào cho biết policy hoạt động tốt?**  
+SLO giữ ổn định, backlog/lag được kiểm soát, time-to-scale đủ nhanh, ít oscillation, downstream an toàn và unit cost hợp lý.
+
+**Q12. Autoscaling và load balancing liên hệ thế nào?**  
+Autoscaler tạo/loại capacity; load balancer chỉ đưa traffic tới instance ready và drain instance bị loại. Lifecycle phải được phối hợp.
+
+#### 48. Nội dung phỏng vấn bổ sung từ PDF
+
+**Q13. Autoscaling được ánh xạ thế nào trên các cloud?**  
+PDF đưa các ví dụ sau để minh họa cùng một control-loop concept:
+
+| Lớp workload | AWS examples | Azure examples | Google Cloud examples |
+|---|---|---|---|
+| VM fleet | Auto Scaling Groups | Virtual Machine Scale Sets | Managed Instance Groups |
+| Container/Kubernetes | ECS/EKS scaling | AKS scaling | GKE/HPA |
+| Serverless/container service | Lambda | Functions/App Service ecosystem | Cloud Functions/Cloud Run |
+| Metrics | CloudWatch | Azure Monitor | Cloud Monitoring |
+
+Tên và capability dịch vụ thay đổi theo thời gian. Khi phỏng vấn, nên giải thích signal → policy → capacity → readiness thay vì chỉ liệt kê sản phẩm.
+
+**Q14. Thiết kế autoscaling cho containerized application thế nào?**
+
+1. Đặt resource request/limit từ load test.
+2. Chọn HPA/custom/external metric gần workload.
+3. Cấu hình min/max, scale-up/down behavior và stabilization.
+4. Bảo đảm cluster/node autoscaler có quota và instance type phù hợp.
+5. Dùng readiness/startup probe, LB registration và graceful termination.
+6. Phân bố replica qua zone/node, giữ availability khi scale-in.
+7. Theo dõi pending pod, time-to-ready, desired/current replica và SLO.
+8. Bảo vệ database/queue bằng connection/concurrency budget.
+
+HPA tăng pod không tạo node capacity ngay; node autoscaler và scheduler là các vòng điều khiển riêng.
+
+**Q15. Metrics nào cần theo dõi để autoscale hiệu quả?**  
+Phân thành bốn nhóm:
+
+- **Demand:** request rate, concurrency, queue arrival/depth/age, consumer lag.
+- **Capacity:** CPU, memory, connection, ready replica và node headroom.
+- **Outcome:** latency, error, throughput/completion rate và SLO.
+- **Economics:** current/desired capacity, spend và cost per unit.
+
+Không scale trực tiếp theo business metric nếu mối quan hệ với work không ổn định.
+
+**Q16. Thách thức của autoscaling cho real-time system?**  
+Connection dài và state/presence làm scale-in khó; cold start và provisioning lag làm scale-out muộn; reconnect storm có thể tạo demand giả; moving connection giữa node thường không trong suốt. Cần minimum warm capacity, connection registry/routing, graceful drain, reconnect jitter và capacity theo concurrent connection/fan-out chứ không chỉ CPU.
+
+**Q17. Predictive autoscaling có cần machine learning không?**  
+Không bắt buộc. Forecast có thể dùng mô hình thống kê/scheduled pattern đơn giản. Giá trị nằm ở việc provision trước reaction lag và đo forecast error; “có ML” không bảo đảm dự báo chính xác.
+
+**Q18. Reserved/committed và spot/preemptible capacity khác vai trò gì?**  
+Committed capacity phù hợp baseline dự đoán được và đổi flexibility lấy chiết khấu; spot/preemptible phù hợp phần interruptible, có thể bị thu hồi. Autoscaling quyết định lượng capacity; purchasing model quyết định economics/availability của capacity đó.
+
+**Q19. Autoscaling có bảo đảm high availability không?**  
+Không. Nó có thể thay instance lỗi hoặc thêm capacity, nhưng HA còn cần multi-zone placement, load balancing, healthy dependencies, state replication, quota và đủ headroom trong thời gian scale.
+
+#### 49. Những lỗi tư duy thường gặp
+
+- Nghĩ autoscaling tạo capacity ngay lập tức.
+- Chỉ dùng average CPU cho mọi workload.
+- Scale khi latency/error đã vi phạm mà không có leading signal.
+- Không tính startup/warm-up và readiness.
+- Scale app vượt capacity database hoặc external quota.
+- Scale out để “sửa” memory leak hay dependency outage.
+- Cho queue tăng vô hạn trong lúc chờ capacity.
+- Scale in không drain/checkpoint.
+- Dùng spot cho toàn bộ critical baseline.
+- Đặt max replica theo ngân sách nhưng không theo SLO/downstream.
+- Nhiều autoscaler cùng điều khiển resource mà không phối hợp.
+- Không kiểm thử metric mất, quota hết hoặc cloud capacity shortage.
+- Chỉ nhìn tổng cost, không theo dõi unit economics.
+
+#### 50. Ý chính cần nhớ
+
+- Autoscaling là feedback loop, không chỉ là threshold rule.
+- Mọi action có metric, provisioning, startup và warm-up lag.
+- Chọn signal gần nguồn work; latency/error thường là guardrail trễ.
+- Horizontal, vertical, cluster và serverless scaling có lifecycle khác nhau.
+- Reactive, scheduled, predictive và event-driven policy có thể phối hợp.
+- Scale-up và scale-down nên bất đối xứng để bảo vệ SLO và tránh thrashing.
+- Min/max capacity phải tính availability, quota, cost và downstream limits.
+- Stateless tier dễ autoscale; stateful tier cần rebalance/consistency cẩn thận.
+- Load balancer, readiness, slow start và draining phải đi cùng autoscaler.
+- Backpressure/load shedding bảo vệ hệ thống trong thời gian capacity chưa kịp tới.
+- Right-sizing, spot capacity, scale-to-zero và unit economics tối ưu chi phí theo workload.
+- Observability phải nối demand, decision, action, outcome và cost.
+
+#### Công thức ghi nhớ
+
+> **Autoscaling tốt không phải thêm máy thật nhanh, mà là dùng đúng signal để tạo đúng capacity trước khi SLO vỡ, đưa capacity vào phục vụ an toàn, rồi thu hồi chậm và có kiểm soát — trong giới hạn downstream, quota và chi phí.**
+
+---
+
+### Bài 38. Tổng kết — Scalability in System Design
+
+#### 1. Scalability là tập hợp quyết định kiến trúc
+
+Scalability không phải một công nghệ hoặc một nút “bật tự động”. Đó là khả năng hệ thống hấp thụ sự tăng trưởng của traffic, concurrency và dữ liệu trong khi vẫn giữ:
+
+- latency, throughput và error rate trong SLO;
+- availability và reliability mong muốn;
+- chi phí trên mỗi đơn vị sử dụng hợp lý;
+- độ phức tạp mà đội ngũ có thể vận hành.
+
+```text
+Demand tăng
+   │
+   ▼
+Quan sát bottleneck và SLO
+   │
+   ├── Tối ưu lượng work
+   ├── Scale up / scale out
+   ├── Phân phối traffic
+   ├── Tự động điều chỉnh capacity
+   └── Bảo vệ khi overload
+          │
+          ▼
+Performance + Reliability + Cost vẫn chấp nhận được
+```
+
+#### 2. Ba chiến lược scaling
+
+| Chiến lược | Ý tưởng | Điểm mạnh | Giới hạn |
+|---|---|---|---|
+| **Vertical** | Làm một node mạnh hơn | Nhanh, ít thay đổi kiến trúc | Trần phần cứng, cost curve, blast radius |
+| **Horizontal** | Thêm nhiều node chia tải | Capacity ceiling và resilience cao hơn | State, consistency và distributed complexity |
+| **Diagonal** | Kết hợp scale up rồi scale out | Lộ trình tiến hóa thực dụng | Kế thừa failure mode của cả hai hướng |
+
+Không có chiến lược đúng cho mọi component. API tier có thể scale ngang, primary database scale dọc, cache scale theo shard và worker scale theo queue backlog.
+
+#### 3. Load balancing biến capacity thành khả năng phục vụ
+
+Thêm instance chỉ có giá trị khi traffic/work được phân phối tới đúng healthy capacity. Load balancer cung cấp:
+
+- stable entry point;
+- Layer 4 hoặc Layer 7 routing;
+- thuật toán phân phối theo request, connection, load hoặc key;
+- health check, failover, slow start và draining;
+- traffic splitting cho deployment;
+- integration với TLS, security và observability.
+
+Load balancer không tạo capacity và không chữa bottleneck downstream. Nếu database bão hòa hoặc toàn pool quá tải, hệ thống cần backpressure, admission control, load shedding và graceful degradation.
+
+#### 4. Autoscaling đóng vòng điều khiển capacity
+
+Autoscaler nối demand với scaling action:
+
+```text
+Metrics → Policy → Provision → Warm → Ready → Serve → Re-evaluate
+```
+
+Một policy tốt cần:
+
+- signal gần nguyên nhân tạo work;
+- min/max capacity và failure headroom;
+- scale-up đủ nhanh, scale-down có stabilization;
+- tính provisioning/warm-up lag;
+- phối hợp readiness/draining với load balancer;
+- giới hạn theo database, quota và external dependency;
+- observability cho recommendation, action, outcome và cost.
+
+Autoscaling không thay capacity planning. Nó chỉ tự động thực hiện trong những boundary đã được thiết kế.
+
+#### 5. Chuỗi phụ thuộc của scalability
+
+```text
+Traffic
+  ▼
+Load Balancer
+  ▼
+Application Replicas
+  ▼
+Cache / Queue / Database / External API
+```
+
+Capacity hữu dụng end-to-end bị giới hạn bởi mắt xích bão hòa đầu tiên. Khi tăng application replica:
+
+- database connection có thể cạn;
+- cache miss/warm-up có thể tạo spike;
+- queue partition giới hạn parallelism;
+- third-party quota có thể bị vượt;
+- network và serialization trở thành bottleneck mới.
+
+Sau mỗi lần scale hoặc tối ưu, bottleneck có thể dịch chuyển. Vì vậy cần đo lại thay vì tiếp tục thêm cùng một loại resource.
+
+#### 6. Bốn lớp của một thiết kế scalable
+
+**Capacity**
+
+- đo safe capacity và peak demand;
+- giữ headroom cho spike, deployment và failure;
+- scale đúng bottleneck.
+
+**Distribution**
+
+- load balancing, partitioning và queueing;
+- giảm hotspot, skew và local-state coupling;
+- scale từng workload độc lập.
+
+**Protection**
+
+- timeout, retry budget và circuit breaker;
+- rate limit, backpressure và load shedding;
+- graceful degradation khi thiếu capacity.
+
+**Control & Operations**
+
+- metrics, SLO và capacity forecast;
+- autoscaling policy ổn định;
+- tested deployment, failover và rollback;
+- unit economics và cloud quota.
+
+#### 7. Những trade-off xuyên suốt
+
+| Muốn cải thiện | Chi phí hoặc rủi ro thường phát sinh |
+|---|---|
+| Thêm replica | Network, coordination và downstream load |
+| Giảm latency bằng cache | Consistency, invalidation và warm-up |
+| Sticky session | Traffic skew và failover kém linh hoạt |
+| Predictive scaling | Forecast error và overprovision |
+| Scale-to-zero | Cold-start latency |
+| Multi-region | Data consistency, routing và transfer cost |
+| Nhiều health check sâu | Probe load và cascading ejection |
+| Capacity headroom lớn | Chi phí tài nguyên nhàn rỗi |
+
+Vai trò của architect không phải tối đa hóa một thuộc tính, mà chọn điểm cân bằng phù hợp với business stage, SLO, threat/failure model và năng lực vận hành.
+
+#### 8. Checklist ôn tập Phần 6
+
+- Định nghĩa scalability bằng workload, capacity, SLO và cost cụ thể.
+- Phân biệt performance, scalability và elasticity.
+- Tìm bottleneck bằng saturation/queue/tail-latency thay vì phỏng đoán.
+- Giải thích vertical, horizontal và diagonal scaling cùng trade-off.
+- Nhận biết stateless workload dễ scale-out hơn stateful workload vì sao.
+- Phân biệt Layer 4 với Layer 7 load balancing.
+- Chọn thuật toán balancing theo đơn vị tải thực.
+- Thiết kế health check, slow start, draining và failure headroom.
+- Chọn autoscaling signal theo workload, không mặc định CPU.
+- Giải thích reactive, scheduled, predictive và event-driven scaling.
+- Tính provisioning/warm-up lag, cooldown và stabilization.
+- Bảo vệ downstream bằng connection budget, quota và backpressure.
+- Thiết kế overload behavior trước khi traffic vượt capacity.
+- Theo dõi cost trên request/order/user, không chỉ tổng hóa đơn.
+- Load test và failure test toàn request path.
+
+#### 9. Câu hỏi tự kiểm tra
+
+1. Vì sao thêm gấp đôi instance không bảo đảm throughput tăng gấp đôi?
+2. Khi nào scale up hợp lý hơn scale out?
+3. Session state cục bộ ảnh hưởng load balancing và scale-in thế nào?
+4. HTTP/2/gRPC làm thuật toán least-connections khó diễn giải ra sao?
+5. Health check quá sâu có thể khuếch đại outage như thế nào?
+6. Vì sao CPU thấp vẫn có thể đi cùng latency cao?
+7. Queue consumer nên scale theo những signal nào?
+8. Autoscaler cần làm gì nếu metric pipeline mất dữ liệu?
+9. Mất một availability zone thì phần capacity còn lại có giữ được peak SLO không?
+10. Unit cost thay đổi thế nào khi hệ thống scale và bottleneck dịch chuyển?
+
+#### 10. Chuyển sang Database & Storage
+
+Compute tier thường là phần dễ scale nhất. Dữ liệu khó hơn vì phải duy trì durability, consistency, queryability và ownership khi volume/throughput tăng.
+
+Phần tiếp theo sẽ đi sâu vào:
+
+- cách tổ chức và lựa chọn data store;
+- relational và non-relational model;
+- indexing, partitioning và sharding;
+- replication và consistency;
+- transaction và distributed data;
+- storage capacity, availability và failure recovery.
+
+Các nguyên tắc scalability vẫn tiếp tục áp dụng, nhưng data tier bổ sung một ràng buộc quan trọng: không chỉ xử lý thêm work, hệ thống còn phải bảo toàn và diễn giải đúng state lâu dài.
+
+#### Ý chính cần nhớ
+
+- Scalability là tập hợp quyết định về capacity, distribution, protection và operations.
+- Vertical, horizontal và diagonal scaling là công cụ, không phải mục tiêu.
+- Load balancer đưa traffic tới healthy capacity nhưng không loại bỏ downstream bottleneck.
+- Autoscaling là feedback loop có độ trễ và boundary, không thay capacity planning.
+- State, database và shared dependency thường quyết định trần scale thật sự.
+- Scale-up phải đi cùng scale-down, failure handling và overload behavior.
+- Mọi tối ưu đều làm bottleneck dịch chuyển; cần quan sát và kiểm thử lại.
+- Thiết kế tốt cân bằng SLO, reliability, complexity và unit economics.
+
+#### Công thức ghi nhớ
+
+> **Scalability bền vững = capacity phù hợp + phân phối đúng + bảo vệ khi overload + vòng điều khiển ổn định + dữ liệu/downstream không trở thành nút thắt mới.**
+
+---
+
+## Phần 7 — Storage & Databases
+
+### Bài 39. Introduction to Storage in System Design & CAP Theorem
+
+#### 1. Vì sao storage là quyết định kiến trúc nền tảng?
+
+Khi dữ liệu phải tồn tại lâu hơn một request, process hoặc server restart, storage trở thành một phần của system contract. User và business kỳ vọng:
+
+- dữ liệu đã xác nhận không bị mất;
+- dữ liệu được truy xuất trong latency chấp nhận được;
+- hệ thống tiếp tục phục vụ khi disk/node/zone lỗi;
+- quyền truy cập và lịch sử thay đổi được kiểm soát;
+- dữ liệu tăng trưởng mà chi phí không mất kiểm soát;
+- schema, format và query có thể tiến hóa.
+
+```text
+Users create data
+      │
+      ▼
+Application validates and transforms
+      │
+      ▼
+Storage persists, indexes, replicates, protects and serves
+      │
+      ├── Online reads/writes
+      ├── Search/analytics
+      ├── Events/audit
+      └── Backup/archive/recovery
+```
+
+Một application nhanh nhưng storage chậm sẽ bị giới hạn bởi I/O/query. Một storage nhanh nhưng không durable có thể biến lỗi nhỏ thành mất dữ liệu vĩnh viễn. Vì vậy storage ảnh hưởng đồng thời tới performance, reliability, availability, scalability, security và cost.
+
+#### 2. Bắt đầu từ data và access pattern, không bắt đầu từ tên sản phẩm
+
+Trước khi chọn database/storage, cần trả lời:
+
+- Dữ liệu có hình dạng và quan hệ thế nào?
+- Read/write ratio và peak throughput là bao nhiêu?
+- Point lookup, range scan, join, full-text hay aggregate?
+- Record/object size và tổng volume tăng ra sao?
+- Update in place, append-only hay immutable?
+- Cần transaction/constraint ở boundary nào?
+- Consistency nào cần cho từng operation?
+- Latency p99 và availability target là gì?
+- Retention, audit, backup và delete requirement thế nào?
+- Một region hay nhiều region; data residency ra sao?
+- Cost theo GB, IOPS, request và data transfer là bao nhiêu?
+
+Hai workload có cùng “structured data” vẫn có thể cần storage khác nhau nếu access pattern khác nhau.
+
+---
+
+#### Nhánh A — Data models và các loại storage
+
+#### 3. Structured, semi-structured và unstructured data
+
+| Nhóm | Đặc điểm | Ví dụ |
+|---|---|---|
+| **Structured** | Schema/type/constraint rõ, các record có shape kiểm soát | Account, order, inventory, ledger |
+| **Semi-structured** | Có key/tag/schema linh hoạt hoặc thay đổi giữa record | JSON document, event, log record |
+| **Unstructured** | Nội dung không thuận tiện biểu diễn thành field để query trực tiếp | Image, video, audio, PDF |
+
+Phân loại này không tuyệt đối:
+
+- ảnh là unstructured content nhưng metadata ảnh là structured/semi-structured;
+- social post có text tự do nhưng author, timestamp, visibility là field rõ ràng;
+- log text thô có thể được parse thành structured event;
+- JSON có thể được kiểm tra bằng schema.
+
+“Unstructured” không có nghĩa không có cấu trúc byte hoặc không thể index; nó chỉ nói data model/query không phù hợp với bảng field truyền thống ở cấp nội dung.
+
+#### 4. Database
+
+Database cung cấp data model, query, index, concurrency và durability/transaction semantics. Các nhóm thường gặp:
+
+- relational/SQL;
+- key-value;
+- document;
+- wide-column;
+- graph;
+- time-series;
+- search/index engine;
+- analytical/columnar warehouse.
+
+Database không chỉ dành cho structured data. Document database lưu semi-structured JSON/BSON; relational database cũng có JSON/blob type; metadata của unstructured asset thường nằm trong database.
+
+Database có thể được xây trên block, file hoặc object storage. Vì vậy “database” và “block/file/object” không phải bốn tầng loại trừ hoàn toàn; một bên là data service/interface, bên kia mô tả storage abstraction phía dưới.
+
+#### 5. Object storage
+
+Object storage lưu object theo key/ID trong namespace/bucket, thường qua HTTP/API:
+
+```text
+key       → products/42/image-v7.jpg
+metadata  → content-type, size, checksum, tags
+data      → object bytes
+```
+
+**Phù hợp**
+
+- image, video, document và static asset;
+- backup, archive, data lake và raw logs;
+- immutable/versioned artifact;
+- khối lượng object rất lớn và durability cao.
+
+**Đánh đổi**
+
+- không cung cấp POSIX file semantics đầy đủ;
+- thường thao tác theo whole object/range hơn là random block update;
+- rename/folder có thể chỉ là key-prefix convention;
+- latency và request cost khác local/block disk;
+- query nội dung cần metadata/index/catalog riêng.
+
+Không nên lưu binary lớn trực tiếp trong transactional database chỉ để “mọi thứ ở một chỗ” nếu access, backup và cost không phù hợp. Pattern phổ biến là database giữ metadata/ownership/status, object storage giữ bytes.
+
+#### 6. File storage
+
+File storage cung cấp hierarchy thư mục/file và filesystem semantics, thường qua NFS/SMB hoặc distributed filesystem.
+
+**Phù hợp**
+
+- shared directories;
+- legacy/application cần filesystem API;
+- home directory, content collaboration;
+- workload cần file locking/path semantics;
+- một số ML/HPC/shared-data workflow.
+
+**Đánh đổi**
+
+- metadata/path/lock có thể là bottleneck;
+- scale namespace và concurrent access phức tạp;
+- semantics caching/locking qua network cần hiểu rõ;
+- không mặc nhiên durable/HA chỉ vì được mount bởi nhiều máy.
+
+#### 7. Block storage
+
+Block storage trình bày volume như dãy block raw cho host. Filesystem hoặc database phía trên quyết định layout, page, log và index.
+
+**Phù hợp**
+
+- VM boot/data disk;
+- database volume;
+- low-latency random I/O;
+- application cần kiểm soát filesystem/storage engine.
+
+**Đánh đổi**
+
+- attach/mount và multi-writer semantics bị giới hạn theo hệ thống;
+- volume thường gắn với zone/failure domain cụ thể;
+- user tự quản filesystem, corruption, snapshot/backup và resize;
+- block device không tự cung cấp query/schema/transaction.
+
+#### 8. So sánh object, file và block
+
+| Thuộc tính | Object | File | Block |
+|---|---|---|---|
+| Interface | Object API/key | File/path + filesystem call | Raw block/device |
+| Đơn vị thao tác | Object/range | File/byte range | Block |
+| Namespace | Flat/key prefix | Hierarchical directory | Do filesystem/DB quản lý |
+| Shared access | Qua API | Tự nhiên cho shared filesystem | Phụ thuộc attach/cluster FS |
+| Scale điển hình | Rất lớn về object/capacity | Tùy metadata/filesystem design | Theo volume/array/service |
+| Update pattern | Whole-object/immutable thuận lợi | File mutation | Random read/write |
+| Use case | Media, backup, lake | Shared directory, legacy | DB, VM, I/O-intensive app |
+
+“Object luôn scalable”, “block luôn nhanh” chỉ là xu hướng. Kết quả phụ thuộc service class, network, access pattern, concurrency và durability settings.
+
+#### 9. Storage stack có nhiều lớp
+
+```text
+Application data model
+        ▼
+Database / filesystem / object API
+        ▼
+Storage engine / cache / log / index
+        ▼
+Block, file or object substrate
+        ▼
+Disk/SSD/network/replication
+```
+
+Đánh giá đúng layer rất quan trọng. Database latency có thể đến từ query plan hoặc lock chứ không phải disk; object upload chậm có thể do network/concurrency; filesystem issue có thể nằm ở metadata server.
+
+---
+
+#### Nhánh B — Thuộc tính và guarantee của storage
+
+#### 10. Persistence và durability
+
+- **Persistence**: state tồn tại ngoài lifetime của process/session.
+- **Durability**: sau khi operation được báo thành công, dữ liệu tồn tại qua failure trong failure model đã cam kết.
+
+Durability không phải cảm giác “đã ghi xuống disk”. Cần biết:
+
+- acknowledgement xảy ra sau memory, local disk hay quorum replication?
+- power loss, disk/node/zone/region loss có nằm trong guarantee?
+- checksum/scrubbing phát hiện corruption thế nào?
+- backup/PITR có phục hồi lỗi logic/ransomware không?
+- retention/versioning/delete policy ra sao?
+
+Replication tăng khả năng sống qua hardware failure nhưng có thể sao chép ngay dữ liệu bị xóa/corrupt. Backup độc lập mới hỗ trợ phục hồi về trạng thái trước đó.
+
+#### 11. Availability
+
+Operational availability thường được đo bằng tỷ lệ/thời gian request hợp lệ được phục vụ theo SLO. Nó phụ thuộc:
+
+- redundancy và failover;
+- health/routing;
+- quorum và leader election;
+- dependency/network;
+- capacity sau failure;
+- maintenance/deployment;
+- recovery process.
+
+Storage trả response lỗi nhanh vẫn là “response” ở nghĩa HTTP, nhưng không nhất thiết đáp ứng availability SLO. Trong CAP, availability có định nghĩa lý thuyết cụ thể hơn sẽ được tách ở phần sau.
+
+#### 12. Consistency
+
+Consistency không chỉ có mạnh hoặc eventual. Các guarantee thường gặp:
+
+- linearizable/strong read;
+- serializable transaction;
+- snapshot isolation;
+- read-your-writes;
+- monotonic reads;
+- causal consistency;
+- bounded staleness;
+- eventual consistency.
+
+Cần phát biểu theo operation và scope:
+
+> “Sau khi cập nhật profile thành công, chính user đọc lại ở region đó phải thấy giá trị mới trong 1 giây” rõ hơn “database consistent”.
+
+#### 13. Atomicity
+
+Atomicity là all-or-nothing trong một transaction boundary: hoặc mọi thay đổi commit, hoặc không thay đổi nào được nhìn thấy như đã commit.
+
+Ví dụ chuyển tiền cần debit và credit cùng transaction/invariant. Nhưng trong distributed workflow, “rollback” không luôn hoàn nguyên vật lý mọi side effect. Có thể cần saga, compensation, idempotency hoặc reconciliation.
+
+Atomicity khác consistency:
+
+- atomicity nói một nhóm operation commit cùng nhau;
+- consistency có thể nói database constraint, read visibility hoặc distributed replica guarantee tùy context.
+
+#### 14. Reliability, durability và availability khác nhau
+
+| Khái niệm | Câu hỏi |
+|---|---|
+| **Durability** | Dữ liệu đã xác nhận có sống qua failure không? |
+| **Availability** | Hệ thống có phục vụ operation trong SLO không? |
+| **Reliability** | Hệ thống có thực hiện đúng và ổn định trong khoảng thời gian không? |
+| **Recoverability** | Sau sự cố/lỗi logic, phục hồi state/service nhanh và đúng tới đâu? |
+
+Một hệ thống có thể durable nhưng tạm unavailable; available nhưng trả stale data; replicated nhưng không recover được accidental deletion.
+
+#### 15. Latency, throughput và IOPS
+
+- **Latency**: thời gian hoàn tất một operation, cần nhìn percentile.
+- **Throughput**: bytes hoặc operation hoàn tất trên đơn vị thời gian.
+- **IOPS**: số I/O operation mỗi giây, ý nghĩa phụ thuộc block size/read-write mix.
+
+Sequential throughput cao không bảo đảm random I/O latency thấp. Benchmark phải phản ánh:
+
+- read/write ratio;
+- request/block/object size;
+- sequential/random;
+- concurrency/queue depth;
+- cache hit/miss;
+- sync/durability level;
+- compaction/checkpoint/backup chạy nền;
+- dataset lớn hơn memory hay không.
+
+#### 16. Scalability và elasticity của storage
+
+Storage scale theo nhiều dimension:
+
+- capacity bytes/object/row;
+- read throughput;
+- write throughput;
+- query complexity/index;
+- partition/shard count;
+- connection/concurrency;
+- geographic replicas.
+
+Thêm capacity không mặc nhiên tăng throughput; thêm read replica không tăng write capacity; shard nhiều hơn có thể tăng fan-out/rebalance. Stateful scaling cần data movement, consistency và recovery planning.
+
+#### 17. Security, privacy và governance
+
+Storage design phải bao phủ:
+
+- encryption in transit/at rest và key management;
+- authentication, authorization và least privilege;
+- tenant/data isolation;
+- audit log và tamper resistance;
+- data classification/PII;
+- retention, legal hold và deletion;
+- residency/sovereignty;
+- backup access và secret exposure;
+- masking/tokenization cho analytics/non-production.
+
+Encrypted storage vẫn có thể bị đọc bởi principal có quyền sai; encryption không thay authorization và audit.
+
+#### 18. Replication, backup và snapshot
+
+| Cơ chế | Mục tiêu chính | Không tự giải quyết |
+|---|---|---|
+| **Replication** | Availability, read scale, hardware failure | Lỗi logic/xóa dữ liệu bị replicate |
+| **Snapshot** | Point-in-time copy nhanh theo storage semantics | Independence/long-term retention nếu cùng failure domain |
+| **Backup** | Recovery độc lập, giữ nhiều restore point | Immediate failover/zero downtime |
+| **PITR** | Restore tới thời điểm qua base backup + log | Recovery tức thì hoặc không mất dữ liệu nếu log thiếu |
+
+Backup chỉ có giá trị khi restore được kiểm thử. Cần encrypt, immutable/isolated copy, retention và access control.
+
+#### 19. RPO và RTO
+
+- **RPO (Recovery Point Objective):** có thể chấp nhận mất tối đa bao nhiêu dữ liệu theo thời gian.
+- **RTO (Recovery Time Objective):** dịch vụ phải phục hồi trong bao lâu.
+
+```text
+failure at 12:00
+latest recoverable state 11:55 → RPO = 5 phút
+service restored 12:30         → RTO = 30 phút
+```
+
+RPO/RTO là business requirement để thiết kế replication, backup frequency, failover và recovery automation; không phải con số tự sinh từ công nghệ.
+
+---
+
+#### Nhánh C — Storage trade-offs và lựa chọn
+
+#### 20. Scalability, reliability, performance và cost
+
+Các mục tiêu thường kéo theo trade-off:
+
+- sync replication tăng failure tolerance nhưng tăng write latency;
+- nhiều replica tăng availability/read scale nhưng tăng cost và lag/conflict concern;
+- nhiều index tăng read/query performance nhưng làm write/storage/maintenance đắt hơn;
+- cache giảm latency nhưng tạo staleness/invalidation;
+- compression giảm bytes nhưng tốn CPU;
+- multi-region giảm user latency/tăng disaster resilience nhưng làm consistency và data transfer phức tạp;
+- high durability/availability tier thường có giá cao hơn archive tier.
+
+Câu hỏi đúng là “requirement nào cần guarantee nào với cost nào?”, không phải “storage tốt nhất là gì?”.
+
+#### 21. Access-pattern checklist
+
+| Dimension | Câu hỏi thiết kế |
+|---|---|
+| Read | Point/range/scan/search/aggregate? |
+| Write | Insert/update/append; sync hay async? |
+| Ratio | Read-heavy, write-heavy hay balanced? |
+| Size | Record/object và working set bao nhiêu? |
+| Locality | Key/time/geography có locality không? |
+| Transaction | Invariant và atomic boundary ở đâu? |
+| Consistency | Operation nào cần latest; stale bao lâu? |
+| Retention | TTL, archive, legal hold, delete? |
+| Scale | Peak RPS, bytes/day, growth và skew? |
+| Recovery | Failure model, RPO, RTO? |
+| Cost | Storage, request, I/O, egress và operations? |
+
+#### 22. Hot, warm và cold storage
+
+- **Hot:** dữ liệu truy cập thường xuyên, latency thấp, giá cao hơn.
+- **Warm:** ít truy cập hơn, latency/throughput trung gian.
+- **Cold/archive:** truy cập hiếm, retrieval chậm/fee/constraint cao hơn nhưng lưu rẻ.
+
+Lifecycle policy có thể chuyển log/media/backup theo tuổi. Cần tính retrieval time/cost, minimum retention, delete và compliance; không chuyển dữ liệu xuống cold tier nếu incident/audit cần đọc nhanh.
+
+#### 23. Polyglot persistence
+
+Một hệ thống có thể dùng:
+
+```text
+Orders/payments     → relational transactional DB
+Sessions/hot keys   → distributed cache/key-value
+Images/videos       → object storage + CDN
+Search              → search index
+Events              → durable log/broker
+Analytics           → object lake + columnar engine
+```
+
+Lợi ích là fit theo workload; chi phí là nhiều contract, pipeline, consistency, security, backup, skill và operational surface. Không dùng nhiều storage chỉ vì công nghệ hấp dẫn; mỗi store cần owner và source-of-truth rõ.
+
+#### 24. Source of truth và derived data
+
+Phân biệt:
+
+- **system of record/source of truth:** state có thẩm quyền;
+- **derived projection/index/cache:** có thể tái tạo từ nguồn hoặc event;
+- **archive/backup:** phục vụ recovery/compliance;
+- **analytical copy:** tối ưu scan/aggregation, có freshness lag.
+
+Nếu search index và database khác nhau, phải xác định cái nào thắng khi conflict và cách rebuild/reconcile.
+
+#### 25. Tránh chọn storage chỉ theo data shape
+
+“Structured → SQL, unstructured → object, scale lớn → NoSQL” là heuristic quá thô. Cần thêm:
+
+- transaction/invariant;
+- query và index;
+- consistency;
+- latency/throughput;
+- data lifecycle;
+- scale pattern;
+- team/managed-service capability;
+- migration/exit strategy.
+
+SQL system có thể scale lớn; NoSQL có thể hỗ trợ strong consistency/transaction trong scope; object storage có metadata/query integration. Product category không thay requirement analysis.
+
+---
+
+#### Nhánh D — CAP Theorem
+
+#### 26. Phát biểu CAP chính xác hơn
+
+Trong một distributed read/write data system, **khi network partition xảy ra**, không thể đồng thời bảo đảm cả:
+
+- **C — Consistency:** theo ngữ cảnh CAP thường là single-copy/linearizable behavior; mọi operation trông như tác động lên một bản sao duy nhất theo thứ tự hợp lệ.
+- **A — Availability:** mọi request tới non-failing node cuối cùng nhận non-error response, không phụ thuộc việc response có phải dữ liệu mới nhất.
+- **P — Partition tolerance:** hệ thống tiếp tục có behavior được định nghĩa dù message giữa các nhóm node bị mất hoặc trì hoãn vô hạn.
+
+Cách nói “chọn hai trong ba” dễ sai. Khi không partition, hệ thống có thể cung cấp cả C và A. Khi partition chia các replica có thể nhận request, thiết kế phải hy sinh availability của một số operation/nodes hoặc cho phép behavior không còn linearizable.
+
+#### 27. Network partition là gì?
+
+```text
+          network link broken/delayed
+Replica A  X────────────────X  Replica B
+    │                             │
+ Client A                      Client B
+```
+
+Hai phía không biết chắc peer đã chết hay network chỉ chậm. Nếu cả hai nhận write độc lập, chúng có thể diverge. Nếu chỉ một phía được phép write để giữ consistency, phía kia phải reject/wait — giảm CAP availability.
+
+Partition không chỉ là cáp đứt: packet loss, firewall/config, route issue, overload, long pause hoặc region isolation có thể tạo hiệu ứng tương tự trong time window của hệ thống.
+
+#### 28. CP behavior
+
+Khi partition, CP-oriented operation ưu tiên single-copy consistency:
+
+- chỉ quorum/leader side tiếp tục;
+- minority/isolate side reject hoặc chờ;
+- một số request timeout/unavailable;
+- tránh conflicting committed write.
+
+Phù hợp khi sai state gây hậu quả lớn, ví dụ unique allocation, leader metadata hoặc một số transaction/inventory invariant. Nhưng “CP database” vẫn có thể có stale read option hoặc operation khác với guarantee khác.
+
+#### 29. AP behavior
+
+Khi partition, AP-oriented operation ưu tiên nhận và trả lời request ở nhiều phía:
+
+- write có thể được nhận ở các partition;
+- read có thể stale;
+- replica diverge tạm thời;
+- cần merge/conflict resolution/reconciliation sau khi heal.
+
+Phù hợp khi offline/continued operation quan trọng và conflict có semantics xử lý được, như một số feed, preference, cart hoặc telemetry workload. “Eventual consistency” không nói conflict được giải quyết đúng nghiệp vụ; application phải định nghĩa merge/invariant.
+
+#### 30. CA có phải loại database thứ ba không?
+
+CA thường không phải lựa chọn hữu ích cho một distributed system phải chịu partition. Single-node database không có inter-node partition nên CAP trade-off giữa replicas không được kích hoạt; gọi nó “CA database” dễ khiến hiểu nhầm.
+
+Một cluster trong mạng “tốt” vẫn phải quyết định behavior nếu communication bị chia cắt. Vì vậy đừng phân loại sản phẩm bằng ba nhãn cố định mà hãy hỏi operation/topology/configuration ứng xử thế nào khi partition.
+
+#### 31. CAP availability khác availability SLO
+
+CAP availability là thuộc tính mô hình rất mạnh cho mọi request tới non-failing node. Operational availability thường đo theo tỷ lệ, time window và operation class, ví dụ 99,99% successful reads mỗi tháng.
+
+Một CP system có thể đạt availability SLO cực cao vì partition hiếm và failover nhanh. Một AP system có thể vẫn outage do bug, overload hoặc mất quorum metadata. CAP label không dự báo toàn bộ uptime thực tế.
+
+#### 32. Trade-off không phải lựa chọn vĩnh viễn cho toàn hệ thống
+
+Quyết định có thể khác theo:
+
+- read so với write;
+- key/partition;
+- endpoint/business operation;
+- consistency level client yêu cầu;
+- local region so với cross-region;
+- normal mode so với degraded mode.
+
+Ví dụ catalog read có thể cho stale data, nhưng inventory reservation cần reject khi không xác nhận được authoritative stock.
+
+#### 33. PACELC mở rộng góc nhìn
+
+CAP tập trung lúc partition. PACELC nhắc rằng:
+
+```text
+If Partition: trade off Availability vs Consistency
+Else:         trade off Latency vs Consistency
+```
+
+Ngay khi network khỏe, synchronous coordination qua nhiều replica/region để lấy strong consistency vẫn có thể tăng latency. Đây là trade-off thường xuyên hơn partition và cần đo theo user geography/SLO.
+
+PACELC là mnemonic/model bổ sung, không thay thế việc đọc guarantee cụ thể của storage.
+
+#### 34. Cách trả lời câu hỏi CAP trong phỏng vấn
+
+1. Định nghĩa C, A, P trong đúng ngữ cảnh CAP.
+2. Nói trade-off bị ép khi partition, không phải mọi lúc.
+3. Chọn một operation/business invariant cụ thể.
+4. Mô tả behavior của từng phía partition.
+5. Nêu failure/timeout/conflict/recovery semantics.
+6. Phân biệt CAP availability với uptime/SLA.
+7. Tránh gắn database cố định vào CP/AP nếu chưa nói configuration/operation.
+
+#### 35. CAP không bao phủ mọi storage concern
+
+CAP không trực tiếp giải quyết:
+
+- durability và data loss;
+- transaction isolation/atomicity;
+- backup/recovery;
+- latency/throughput/cost;
+- security/compliance;
+- disk corruption/software bug;
+- schema/query/index;
+- exactly-once business effect.
+
+Một storage design tốt không thể kết thúc sau câu “chọn CP hay AP”.
+
+---
+
+#### Nhánh E — Real-world storage composition
+
+#### 36. E-commerce
+
+```text
+Users / Products / Orders / Payments → transactional database(s)
+Product images / invoices           → object storage + CDN
+Cart/session hot state               → key-value/cache with persistence policy
+Product search                       → derived search index
+Events/audit                         → durable log + archive
+Analytics                            → object lake/warehouse
+```
+
+Inventory và payment cần invariant/consistency mạnh hơn product description/feed. Search/index/cache là derived views và cần freshness/rebuild strategy.
+
+#### 37. Photo-sharing application
+
+**Photo bytes**
+
+- direct/multipart upload tới object storage;
+- unique immutable object key/version;
+- checksum, content-type, size và malware processing;
+- lifecycle/replication/CDN;
+- authorization qua service hoặc signed URL.
+
+**Metadata**
+
+- owner, visibility, caption, object key, state;
+- likes/comments/relationship/query theo access pattern;
+- transactional DB, document/wide-column hoặc kết hợp;
+- database record không nên công bố asset trước khi upload/processing hoàn tất;
+- orphan object/metadata cần reconciliation.
+
+#### 38. Streaming platform
+
+- media segment/master → object storage;
+- global delivery → CDN/cache;
+- user/profile/subscription → transactional database;
+- playback position/history → high-write data store;
+- recommendation feature/event → event log + analytical storage;
+- entitlement/DRM metadata → strongly controlled data path.
+
+Media bytes và user/payment metadata có durability, latency, query và security requirement khác nhau.
+
+#### 39. Logs, metrics và analytics
+
+```text
+Agents → Buffer/Broker → Hot search/time-series store
+                  └───→ Raw object storage/data lake
+                              └── batch/columnar analytics
+```
+
+Cần cân nhắc:
+
+- append/ingestion throughput;
+- partition theo time/tenant;
+- high-cardinality field;
+- retention và downsampling;
+- compression/columnar format;
+- late/out-of-order data;
+- hot search window và cold archive;
+- PII redaction/access control;
+- replay/backfill.
+
+Object storage cho raw logs, time-series/search/columnar engine cho query nhanh là pattern thường gặp, không phải rule duy nhất.
+
+---
+
+#### 40. 13 câu hỏi phỏng vấn từ tài liệu phụ
+
+**Q1. Vì sao storage quan trọng trong system design?**  
+Nó giữ state qua request/failure và quyết định performance, durability, availability, scalability, security, recovery và cost.
+
+**Q2. Structured và unstructured data khác gì?**  
+Structured có schema/field rõ; unstructured là content khó query trực tiếp theo field. Thực tế còn semi-structured và một asset thường có unstructured bytes cùng structured metadata.
+
+**Q3. Các loại storage chính và use case?**  
+Database cho query/transaction theo data model; object cho media/backup/lake; file cho hierarchy/shared filesystem; block cho raw random I/O của DB/VM. Các lớp có thể chồng lên nhau.
+
+**Q4. Durability, availability và consistency là gì?**  
+Durability giữ acknowledged data qua failure model; availability phục vụ operation trong guarantee/SLO; consistency xác định visibility/order của state giữa operation/replica.
+
+**Q5. Atomicity là gì?**  
+All-or-nothing trong transaction boundary. Distributed business workflow có thể cần saga/compensation thay vì rollback toàn cục.
+
+**Q6. Hệ thống có thể vừa highly available vừa strongly consistent không?**  
+Có trong normal operation và có thể đạt uptime cao. Nhưng khi partition chia các replica nhận request, CAP không cho bảo đảm đồng thời linearizability và availability theo định nghĩa CAP ở mọi phía.
+
+**Q7. CAP theorem là gì?**  
+Trong partitioned distributed data system, phải hy sinh CAP availability của một số operation hoặc single-copy consistency; partition tolerance là failure condition phải xử lý.
+
+**Q8. CP và AP khác gì?**  
+CP reject/wait ở phía không thể xác nhận authoritative state; AP tiếp tục đáp ứng nhưng có thể diverge/stale và cần conflict resolution. Hành vi phụ thuộc operation/configuration.
+
+**Q9. Vì sao CA hiếm/không thực dụng?**  
+Vì distributed replicas có thể partition. Single-node không phải ví dụ “CA distributed system”; theorem không bị kích hoạt giữa node nếu chỉ có một node.
+
+**Q10. Chọn consistency hay availability thế nào?**  
+Theo invariant và hậu quả: sai/duplicate/oversell nguy hiểm hơn reject hay không; conflict có merge được không; stale tối đa bao lâu; degraded mode và reconciliation thế nào.
+
+**Q11. Photo và metadata lưu thế nào?**  
+Photo bytes ở object storage/CDN; metadata/quyền/quan hệ ở database theo query/transaction requirement, liên kết qua stable object key và lifecycle state.
+
+**Q12. Storage cho logs/metrics analytics?**  
+Buffer/broker để ingest, object storage cho raw/retention, time-series/search/columnar store cho query; partition, tiering và retention theo workload.
+
+**Q13. Object khác file và block ra sao?**  
+Object dùng key/API và object semantics; file dùng hierarchy/filesystem; block cung cấp raw blocks cho filesystem/DB. Chọn theo interface, mutation, sharing, latency và scale.
+
+#### 41. Những lỗi tư duy thường gặp
+
+- Nói mọi data chỉ structured hoặc unstructured, bỏ qua semi-structured.
+- Nghĩ database chỉ lưu structured data.
+- Xem database, object, file và block như bốn loại loại trừ nhau.
+- Cho rằng object storage là filesystem có folder thật.
+- Lưu large blob trong database mà không xét backup/query/cost.
+- Đồng nhất replication với backup.
+- Chưa test restore nhưng tin backup sẽ dùng được.
+- Nói consistency luôn có nghĩa “đọc latest” mà không nêu model/scope.
+- Đồng nhất atomicity với distributed rollback mọi side effect.
+- Học CAP thành “chọn hai trong ba” ở mọi thời điểm.
+- Coi P là một feature tùy chọn có thể bỏ trong distributed deployment.
+- Gắn cả database cố định vào CP hoặc AP không xét operation/configuration.
+- Gọi single-node database là CA distributed system.
+- Nghĩ AP đồng nghĩa dữ liệu sai mà không cần merge/reconciliation design.
+- Nghĩ CP đồng nghĩa uptime production thấp.
+- Chọn store theo trend thay vì access pattern và invariant.
+
+#### 42. Storage design checklist
+
+1. Data model và source of truth là gì?
+2. Access pattern/read-write ratio/peak throughput?
+3. Record/object/working-set và growth rate?
+4. Transaction/invariant boundary?
+5. Consistency guarantee cho từng operation?
+6. Latency percentile và availability SLO?
+7. Failure model: disk, node, zone, region, partition, corruption?
+8. Durability acknowledgement/quorum thế nào?
+9. Replication, backup, PITR, RPO và RTO?
+10. Partition/shard key, hot key và rebalance path?
+11. Index/query và write amplification?
+12. Retention, archive, delete, residency và compliance?
+13. Encryption, access control, audit và tenant isolation?
+14. Capacity/cost theo storage, I/O, request và transfer?
+15. Migration, schema evolution và vendor exit/rebuild?
+16. Monitoring: latency, error, saturation, lag, storage growth, restore test?
+
+#### 43. Ý chính cần nhớ
+
+- Storage bắt đầu từ data, access pattern, invariant và lifecycle.
+- Structured, semi-structured và unstructured thường cùng tồn tại.
+- Database là data service; object/file/block là storage abstractions có thể làm nền cho nhau.
+- Durability, availability, consistency, atomicity và recoverability là guarantee khác nhau.
+- Replication không thay backup; backup phải được restore-test.
+- RPO/RTO biến yêu cầu business thành recovery architecture.
+- Storage performance phải đo đúng mix, size, concurrency và durability level.
+- Polyglot persistence hữu ích khi mỗi store có vai trò/source-of-truth rõ.
+- CAP trade-off C/A chỉ bị ép trong network partition.
+- CAP consistency gần với linearizability; CAP availability khác uptime percentage.
+- CP/AP là behavior theo operation/topology/configuration, không chỉ nhãn database.
+- PACELC nhắc tới latency-consistency trade-off ngay cả khi không partition.
+- Chọn storage là chọn trade-off phù hợp, không phải tìm công nghệ tốt nhất tuyệt đối.
+
+#### Công thức ghi nhớ
+
+> **Thiết kế storage tốt = hiểu data và access pattern + chọn interface/guarantee đúng + chuẩn bị failure/recovery + chấp nhận rõ trade-off về consistency, availability, latency và cost.**
+
+---
+
+### Bài 40. Understanding Database Models — SQL vs. NoSQL
+
+#### 1. Database model trả lời câu hỏi gì?
+
+Database không chỉ là nơi “cất dữ liệu”. Nó cung cấp một **data model** và một tập guarantee để application:
+
+- biểu diễn entity và quan hệ;
+- kiểm tra constraint/invariant;
+- đọc, ghi và truy vấn dữ liệu;
+- xử lý concurrent updates;
+- duy trì durability, replication và recovery;
+- mở rộng theo traffic, data volume và topology.
+
+Vì vậy, chọn database không nên bắt đầu bằng câu hỏi “SQL hay NoSQL tốt hơn?”, mà bằng:
+
+1. Dữ liệu có hình dạng và quan hệ như thế nào?
+2. Invariant nào tuyệt đối không được vi phạm?
+3. Access pattern chính là gì?
+4. Transaction cần bao phủ bao nhiêu record/partition/service?
+5. Consistency, latency, availability, scale và cost cần tới mức nào?
+
+> **SQL và NoSQL không phải hai mức chất lượng, cũng không phải hai phía loại trừ nhau. Chúng là các nhóm mô hình với thế mạnh và trade-off khác nhau.**
+
+Lưu ý thêm: **SQL** vốn là ngôn ngữ truy vấn, còn **relational** là mô hình dữ liệu. Trong thực tế, “SQL database” thường được dùng như cách gọi ngắn cho relational database có hỗ trợ SQL.
+
+---
+
+#### 2. Relational/SQL database
+
+Relational database biểu diễn dữ liệu bằng các **relation**, thường được trình bày dưới dạng bảng:
+
+- **row**: một record;
+- **column**: một thuộc tính có type/domain;
+- **primary key**: định danh duy nhất cho row;
+- **foreign key**: tham chiếu tới row ở bảng khác;
+- **constraint**: quy tắc như `NOT NULL`, `UNIQUE`, `CHECK`, referential integrity.
+
+Ví dụ rút gọn:
+
+```text
+customers(customer_id, name, email)
+orders(order_id, customer_id, status, total)
+order_items(order_id, product_id, quantity, unit_price)
+```
+
+`orders.customer_id` tham chiếu `customers.customer_id`; mỗi đơn hàng có nhiều dòng trong `order_items`. Database có thể bảo vệ một phần tính hợp lệ ngay tại data layer thay vì hoàn toàn phụ thuộc application.
+
+##### 2.1 Schema-first và migration
+
+Relational database thường theo hướng **schema-on-write**: cấu trúc, type và constraint được định nghĩa trước hoặc được kiểm tra khi ghi.
+
+Ưu điểm:
+
+- dữ liệu nhất quán về shape và type;
+- lỗi bị chặn gần nguồn;
+- dễ dùng constraint, join, reporting và công cụ BI;
+- contract dữ liệu rõ ràng cho nhiều consumer.
+
+Chi phí:
+
+- thay đổi schema cần migration và compatibility plan;
+- migration lớn có thể lock, rewrite data hoặc gây tải;
+- deploy application và schema phải phối hợp an toàn.
+
+Schema “cố định” không có nghĩa không thể đổi. Hệ thống production thường dùng migration có version, thay đổi tương thích ngược, backfill theo batch, quan sát rollout rồi mới xóa field/index cũ.
+
+##### 2.2 Join, normalization và denormalization
+
+**Join** kết hợp dữ liệu liên quan giữa các relation. **Normalization** chia dữ liệu theo entity/dependency để giảm trùng lặp và update anomaly.
+
+Ví dụ: thông tin khách hàng nằm ở `customers`, không copy toàn bộ vào từng `orders`. Khi email đổi, chỉ một nguồn chính cần cập nhật.
+
+Tuy nhiên, normalization không phải mục tiêu tuyệt đối. **Denormalization** có chủ đích có thể:
+
+- giảm join trên hot read path;
+- tạo read model/materialized view;
+- giữ snapshot lịch sử, ví dụ địa chỉ giao hàng tại thời điểm đặt đơn;
+- tối ưu báo cáo hoặc phân phối dữ liệu.
+
+Đổi lại, dữ liệu lặp cần cơ chế cập nhật, versioning hoặc reconciliation rõ ràng.
+
+##### 2.3 ACID chính xác là gì?
+
+Một transaction thường được mô tả bởi **ACID**:
+
+| Thuộc tính | Ý nghĩa thực tế |
+|---|---|
+| **Atomicity** | Các thay đổi trong transaction cùng commit hoặc cùng rollback trong transaction boundary. |
+| **Consistency** | Transaction hợp lệ đưa database từ một state thỏa các constraint/invariant đã khai báo sang state hợp lệ khác. Database không tự biết mọi quy tắc nghiệp vụ nếu ta không biểu diễn/kiểm tra chúng. |
+| **Isolation** | Quy định mức độ transaction đồng thời quan sát và ảnh hưởng lẫn nhau. Guarantee cụ thể phụ thuộc isolation level. |
+| **Durability** | Sau khi database xác nhận commit, dữ liệu tồn tại qua các failure nằm trong durability contract đã cam kết. |
+
+Hai điểm rất dễ nhầm:
+
+- **Consistency trong ACID** nói về tính hợp lệ của state/invariant; **consistency trong CAP** gần với linearizability/single-copy behavior. Chúng không phải cùng một khái niệm.
+- “Có ACID” không đồng nghĩa mọi transaction chạy ở mức `SERIALIZABLE`. `READ COMMITTED`, snapshot isolation và serializable có anomaly, concurrency và cost khác nhau.
+
+ACID cũng không dừng ở SQL. Nhiều document, key-value hoặc distributed database hỗ trợ transaction với boundary và guarantee riêng.
+
+##### 2.4 Thế mạnh điển hình
+
+Relational database thường phù hợp khi:
+
+- có nhiều quan hệ và truy vấn kết hợp linh hoạt;
+- constraint và referential integrity quan trọng;
+- cần multi-row/multi-table transaction;
+- cần ad-hoc query, aggregation, reporting hoặc ecosystem SQL;
+- data model tương đối rõ và cần governance mạnh.
+
+Ví dụ: ledger, order/inventory, billing, ERP, booking và hệ thống quản lý nghiệp vụ.
+
+##### 2.5 Giới hạn — nhưng không nên học thành định kiến
+
+Các khó khăn thường gặp:
+
+- join phân tán và cross-shard transaction đắt hơn local operation;
+- scale write ngang đòi hỏi partition/sharding strategy tốt;
+- schema migration trên bảng rất lớn cần thận trọng;
+- một node hoặc một primary có thể trở thành bottleneck nếu topology không phù hợp;
+- ORM/query/index kém vẫn làm một SQL system chậm dù model đúng.
+
+Nhưng “SQL chỉ scale dọc” là sai. Relational database có thể dùng read replica, partitioning, sharding, caching và distributed SQL. Đổi lại, càng phân tán thì coordination, latency, rebalancing và vận hành càng phức tạp.
+
+---
+
+#### 3. NoSQL là một họ database, không phải một model duy nhất
+
+**NoSQL** thường được hiểu là “Not Only SQL”: nhóm database không bị giới hạn ở relational tables và SQL interface truyền thống. Mỗi họ tối ưu cho một cách biểu diễn/truy cập khác nhau.
+
+NoSQL không mặc định có tất cả các đặc tính sau:
+
+- schema-less;
+- eventual consistency;
+- không transaction;
+- scale ngang vô hạn;
+- nhanh hơn SQL.
+
+Guarantee thực tế phụ thuộc product, topology, operation và cấu hình.
+
+##### 3.1 Document database
+
+Lưu một aggregate dưới dạng document, thường gần với JSON/BSON:
+
+```json
+{
+  "productId": "p-42",
+  "name": "Running Shoes",
+  "attributes": {
+    "size": [39, 40, 41],
+    "material": "mesh"
+  },
+  "tags": ["sport", "summer"]
+}
+```
+
+Phù hợp khi:
+
+- dữ liệu tự nhiên là aggregate lồng nhau;
+- các document có optional/evolving fields;
+- phần lớn operation đọc/ghi trọn aggregate theo ID hoặc index đã biết;
+- muốn mapping gần với object của application.
+
+Ví dụ: product catalog, content, user profile, configuration. MongoDB là ví dụ phổ biến.
+
+Trade-off cần xét:
+
+- embed quá nhiều làm document lớn và update contention;
+- reference nhiều lại tạo join/application-side composition;
+- unique/referential constraint xuyên document khó hơn;
+- shard key và query/index vẫn phải thiết kế từ đầu.
+
+##### 3.2 Key-value database
+
+Mô hình logic tối giản:
+
+```text
+key -> value
+```
+
+Phù hợp khi access pattern chính là get/put/delete theo key:
+
+- cache;
+- session/state ngắn hạn;
+- feature/config lookup;
+- idempotency key;
+- shopping cart hoặc metadata lookup tùy guarantee.
+
+Redis và DynamoDB đều có thể được mô tả là key-value-oriented nhưng **không thể coi là thay thế trực tiếp**: persistence model, query capability, transaction, consistency, topology và failure behavior rất khác nhau.
+
+##### 3.3 Wide-column database
+
+Wide-column store như Cassandra hoặc HBase thường tổ chức dữ liệu quanh row/partition key và column family, hỗ trợ row thưa và phân phối lớn. Data model thường được thiết kế **từ query/access pattern**, với denormalization có chủ đích.
+
+Phù hợp cho:
+
+- write throughput lớn;
+- time-ordered/event/IoT data;
+- truy vấn đã biết theo partition key và clustering/order key;
+- triển khai nhiều node/region khi consistency model phù hợp.
+
+Cần tránh partition quá lớn, hot partition, scan ngoài access pattern và secondary index không phù hợp.
+
+> **Wide-column không đồng nghĩa analytical columnar database.** Cassandra/HBase tổ chức dữ liệu phân tán theo row/partition và column family; các analytical column store/columnar format lại đặt giá trị cùng cột gần nhau để scan, compression và aggregation hiệu quả.
+
+##### 3.4 Graph database
+
+Biểu diễn dữ liệu bằng:
+
+- **node/vertex**: thực thể;
+- **edge/relationship**: quan hệ có hướng/loại/thuộc tính;
+- **property**: metadata của node hoặc edge.
+
+Phù hợp khi traversal nhiều bước là truy vấn trung tâm:
+
+- mạng xã hội;
+- fraud ring;
+- knowledge graph;
+- dependency/authorization graph;
+- recommendation dựa trên quan hệ.
+
+Graph database không tự động tốt hơn relational cho mọi dữ liệu có quan hệ. Cần đánh giá traversal depth, update rate, partitioning, query language, transaction và operational ecosystem. Neo4j là ví dụ phổ biến.
+
+##### 3.5 “Schema-less” thực chất là gì?
+
+Document hoặc key-value store có thể không ép mọi record cùng shape ở storage layer, nhưng dữ liệu vẫn có schema ngầm trong:
+
+- application code;
+- validation rule;
+- API contract;
+- serializer/deserializer;
+- index và query;
+- downstream analytics.
+
+Vì vậy “schema-less” thường nghĩa là **schema linh hoạt hoặc được kiểm tra ở nơi khác**, không phải không có schema. Linh hoạt quá mức có thể tạo mixed types, field trùng nghĩa, version khó hiểu và migration bị dồn sang read path.
+
+---
+
+#### 4. BASE và eventual consistency
+
+**BASE** là một mnemonic không chặt như ACID:
+
+- **Basically Available**: thiết kế ưu tiên tiếp tục phục vụ trong phạm vi đã chọn;
+- **Soft State**: state quan sát được có thể thay đổi do propagation/convergence dù không có input mới trực tiếp;
+- **Eventually Consistent**: nếu không còn update mới và các điều kiện cần được đáp ứng, replica cuối cùng hội tụ.
+
+Không nên hiểu BASE là “luôn trả lời, dữ liệu sai cũng được”. Một thiết kế eventual consistency cần trả lời:
+
+- stale tối đa bao lâu?
+- read-your-writes có cần không?
+- update đồng thời có conflict thế nào?
+- merge theo last-write-wins, version/vector clock, CRDT hay business rule?
+- duplicate/reorder xử lý ra sao?
+- reconciliation và observability nằm ở đâu?
+
+ACID và BASE không loại trừ nhau. Một hệ thống có thể dùng ACID transaction trong một partition/document, rồi replicate hoặc cập nhật view khác theo eventual consistency.
+
+---
+
+#### 5. So sánh cân bằng SQL và NoSQL
+
+| Khía cạnh | Relational/SQL | NoSQL |
+|---|---|---|
+| **Data model** | Relation, row, column, key và constraint | Document, key-value, wide-column, graph hoặc model chuyên biệt |
+| **Schema** | Thường schema-on-write, migration rõ | Thường linh hoạt hơn; schema có thể do app/validator quản lý |
+| **Quan hệ** | Join và referential integrity là năng lực cốt lõi | Thường embed, denormalize hoặc traversal tùy model |
+| **Transaction** | Mature multi-row/table transaction | Có thể có transaction nhưng boundary/cost khác nhau theo product |
+| **Query** | SQL chuẩn hóa tương đối, mạnh cho ad-hoc query | API/query language phụ thuộc store; thường tối ưu access pattern đã biết |
+| **Scale** | Scale dọc và ngang đều có thể; distributed coordination có giá | Nhiều hệ được thiết kế scale ngang; shard key/hotspot/rebalance vẫn là bài toán khó |
+| **Consistency** | Thường strong trong một primary/transaction boundary; replication có thể lag | Có thể strong, eventual hoặc tunable theo operation/configuration |
+| **Modeling** | Thường entity/relationship và normalization trước | Thường query/access-pattern-first, embed/denormalize nhiều hơn |
+| **Vận hành** | Ecosystem/migration/query tooling trưởng thành | Mỗi product có semantics và công cụ riêng, dễ tăng cognitive/operational load |
+| **Dùng khi** | Invariant, relationship, transaction, reporting quan trọng | Shape/access pattern chuyên biệt hoặc scale/topology cần model phù hợp |
+
+Đây là xu hướng, không phải định luật. PostgreSQL có `JSONB`; MongoDB có validation, index và transaction; distributed SQL có scale ngang; nhiều NoSQL store cung cấp strong consistency cho một số operation.
+
+---
+
+#### 6. CAP liên quan thế nào đến SQL/NoSQL?
+
+Không nên gắn nhãn cứng:
+
+```text
+SQL = CP
+NoSQL = AP
+```
+
+CAP chỉ ép trade-off khi có **network partition** trong một distributed deployment. Khi đó, với một operation cụ thể, hệ thống phải chọn giữa:
+
+- giữ linearizable/single-copy behavior và từ chối/chờ ở phía không đủ điều kiện (**CP behavior**);
+- tiếp tục đáp ứng ở nhiều phía nhưng chấp nhận state có thể stale/diverge (**AP behavior**).
+
+Database có thể thay đổi behavior theo:
+
+- read/write concern hoặc consistency level;
+- quorum size;
+- leader/follower routing;
+- topology và replication mode;
+- operation (read, write, metadata, transaction);
+- failure đang xảy ra.
+
+Vì vậy, các câu như “MongoDB là CP”, “Cassandra là AP”, “Neo4j là CP” chỉ có giá trị khi kèm deployment, configuration, operation và failure scenario. CAP cũng không nói mọi điều về latency, durability, isolation hay recovery; dùng thêm PACELC và workload-specific guarantees để đánh giá.
+
+---
+
+#### 7. Chọn database theo yêu cầu
+
+##### 7.1 Checklist quyết định
+
+1. **Entity và relationship:** dữ liệu là aggregate độc lập hay graph/quan hệ chéo dày đặc?
+2. **Invariant:** điều gì tuyệt đối không được sai — số dư, tồn kho, uniqueness, quyền?
+3. **Access pattern:** point lookup, range scan, traversal, search, aggregation hay full scan?
+4. **Transaction boundary:** một row/document, nhiều record, nhiều shard hay nhiều service?
+5. **Consistency:** strong ở đâu, stale bao lâu, session guarantee nào?
+6. **Scale:** read/write throughput, data size, growth, hot key và geographic distribution?
+7. **Schema evolution:** tốc độ thay đổi shape, compatibility và backfill?
+8. **Availability/recovery:** SLO, RPO, RTO, multi-zone/region và degraded mode?
+9. **Vận hành:** kỹ năng đội ngũ, managed service, backup/restore, monitoring và migration?
+10. **Cost:** compute, storage, I/O, network, license và chi phí phức tạp?
+
+##### 7.2 Ba tình huống thường gặp trong phỏng vấn
+
+**Financial ledger**
+
+- Thường chọn relational hoặc distributed transactional database.
+- Cần atomic transaction, uniqueness, auditability và reconciliation.
+- Nên dùng double-entry/append-only ledger; balance có thể là derived view.
+- “Dùng SQL” chưa đủ: phải nêu isolation, idempotency, durability, backup và invariant.
+
+**Product catalog**
+
+- Document model hợp lý khi thuộc tính thay đổi mạnh theo category và thường đọc cả product aggregate.
+- Relational + `JSONB` cũng có thể phù hợp nếu vẫn cần constraint, join, reporting và ecosystem PostgreSQL.
+- Search index thường là derived store; catalog database vẫn là source of truth.
+
+**Real-time chat**
+
+- Message bền vững có thể partition theo conversation/channel và sequence/time trong relational, document hoặc wide-column store.
+- Presence, typing indicator và ephemeral session state hợp với in-memory/key-value store.
+- Broker/stream hỗ trợ fan-out và xử lý bất đồng bộ.
+- Không nên trả lời “Redis cho toàn bộ chat” nếu chưa làm rõ durability, history, ordering, retention và recovery.
+
+##### 7.3 MongoDB hay PostgreSQL?
+
+Ưu tiên MongoDB khi aggregate document là boundary tự nhiên, shape biến đổi nhiều, query đã biết phù hợp index/shard key và đội ngũ chấp nhận semantics/vận hành của document store.
+
+Ưu tiên PostgreSQL khi có relationship, constraint, transaction chéo entity, ad-hoc query/reporting hoặc hệ sinh thái SQL là trọng tâm.
+
+Không chọn MongoDB chỉ vì input là JSON: PostgreSQL có `JSONB`. Cũng không loại MongoDB chỉ vì cần transaction: nó có transaction, nhưng cần đánh giá boundary, latency và scale cost. Quyết định cuối cùng nên dựa trên workload test, failure behavior và khả năng vận hành.
+
+---
+
+#### 8. Polyglot persistence
+
+Một hệ thống có thể dùng nhiều store, mỗi store cho một nhiệm vụ:
+
+```text
+Order service       -> relational DB (transaction/source of truth)
+Product catalog     -> document DB
+Session/cache       -> key-value store
+Search              -> search index
+Analytics/raw logs  -> object storage + columnar analytics engine
+Recommendation      -> graph/feature store tùy bài toán
+```
+
+Lợi ích:
+
+- dùng data model phù hợp access pattern;
+- scale từng workload độc lập;
+- tránh ép một database xử lý mọi loại truy vấn.
+
+Chi phí:
+
+- nhiều công nghệ, kỹ năng, backup và monitoring hơn;
+- consistency giữa store trở thành bài toán application/distributed systems;
+- dual write có thể tạo partial failure;
+- migration, data ownership và incident response phức tạp hơn.
+
+Mỗi dataset phải có **một source of truth rõ ràng**. Các cache, index và projection nên được coi là derived data có thể rebuild. Đồng bộ thường dùng outbox/CDC/event, kèm idempotency, retry, lag monitoring và reconciliation — không dựa vào hai lệnh ghi độc lập rồi hy vọng cùng thành công.
+
+---
+
+#### 9. 10 câu hỏi phỏng vấn từ tài liệu phụ
+
+**Q1. Khác biệt chính giữa SQL và NoSQL là gì?**  
+SQL/relational tập trung vào relation, schema, constraint, join và transaction; NoSQL là họ document, key-value, wide-column, graph... thường tối ưu model/access pattern chuyên biệt. Không dùng các cặp tuyệt đối như fixed/flexible, vertical/horizontal hay ACID/BASE nếu chưa nói product và cấu hình.
+
+**Q2. Giải thích ACID và BASE.**  
+ACID mô tả atomicity, invariant consistency, isolation và durability của transaction. BASE là mnemonic cho thiết kế ưu tiên availability/soft state/eventual convergence. Một hệ có thể dùng cả hai ở các boundary khác nhau.
+
+**Q3. Có những loại NoSQL nào và dùng khi nào?**  
+Document cho aggregate lồng nhau; key-value cho lookup theo key; wide-column cho workload phân tán theo partition/access pattern; graph cho traversal quan hệ. “Columnar analytics” là nhánh khác wide-column.
+
+**Q4. Khi nào chọn MongoDB thay PostgreSQL?**  
+Khi document aggregate, schema evolution, access pattern và shard strategy phù hợp MongoDB hơn. Vẫn phải so transaction, constraint, join/reporting, consistency, vận hành và benchmark; JSON một mình không đủ để quyết định.
+
+**Q5. CAP trade-off là gì?**  
+Khi network partition, một distributed data operation không thể vừa bảo đảm linearizable consistency vừa bảo đảm CAP availability ở mọi non-failing node. Hệ thống chọn reject/wait hoặc tiếp tục với khả năng stale/divergent state.
+
+**Q6. SQL và NoSQL nằm ở đâu trong CAP?**  
+Không có mapping theo nhãn SQL/NoSQL. Phải mô tả deployment, operation, quorum/consistency setting và behavior khi partition.
+
+**Q7. Chọn model nào cho ledger, catalog và chat?**  
+Ledger thường cần transactional relational store; catalog có thể document hoặc relational + JSON; chat thường kết hợp durable message store, key-value cho ephemeral state và broker cho fan-out. Nêu invariant và access pattern quan trọng hơn tên sản phẩm.
+
+**Q8. Relational database có hạn chế gì trong distributed systems?**  
+Cross-shard join/transaction, rebalancing và global coordination có thể đắt; schema migration lớn khó. Tuy nhiên relational database vẫn scale ngang được, còn NoSQL cũng có hotspot, consistency và operational challenges.
+
+**Q9. Polyglot persistence là gì?**  
+Dùng nhiều data store theo capability. Nó hữu ích nếu source of truth, ownership và synchronization semantics rõ; nếu không, lợi ích dễ bị nuốt bởi complexity và inconsistency.
+
+**Q10. Data modeling khác nhau thế nào?**  
+Relational thường bắt đầu từ entity, dependency, constraint và normalization; NoSQL thường bắt đầu từ access pattern, partition key, aggregate và denormalization. Cả hai vẫn có thể kết hợp normalization/denormalization theo mục tiêu.
+
+---
+
+#### 10. Những ngộ nhận và lỗi thiết kế thường gặp
+
+- Chọn database theo độ phổ biến thay vì requirement và access pattern.
+- Nói SQL là một data model thay vì phân biệt SQL language với relational model.
+- Tin SQL chỉ scale dọc hoặc NoSQL tự động scale ngang vô hạn.
+- Đồng nhất SQL với ACID/strong consistency và NoSQL với BASE/eventual consistency.
+- Nhầm consistency của ACID với consistency của CAP.
+- Nghĩ “ACID” mặc định nghĩa là serializable isolation.
+- Hiểu “schema-less” là không cần schema governance hay migration.
+- Dùng flexible schema để đẩy mọi validation sang production data.
+- Nhầm wide-column store với analytical column store.
+- Chọn document DB chỉ vì API dùng JSON.
+- Embed document không giới hạn hoặc tạo partition/hot key quá lớn.
+- Normalization hay denormalization cực đoan mà không xét read/write path.
+- Gắn nhãn database cố định là CP/AP, bỏ qua operation và cấu hình.
+- Dùng cache/index làm source of truth mà không có recovery/rebuild strategy.
+- Dùng nhiều database nhưng không quy định ownership, propagation và reconciliation.
+- Dual-write trực tiếp vào hai store mà không thiết kế partial failure.
+- Chỉ benchmark happy path, không thử failover, partition, lag, restore và rebalancing.
+
+---
+
+#### 11. Database design checklist
+
+1. Source of truth và owner của từng dataset?
+2. Entity, aggregate, relationship và lifecycle?
+3. Business invariant/constraint cần database bảo vệ?
+4. Query/read/write pattern và percentile latency?
+5. Transaction boundary và isolation level?
+6. Consistency/session guarantees theo từng operation?
+7. Schema evolution, versioning, backfill và rollback?
+8. Primary/partition/shard key có phân bố đều và hỗ trợ query không?
+9. Index nào cần thiết; write/storage amplification chấp nhận được không?
+10. Read replica, cache hoặc derived view có stale/rebuild semantics gì?
+11. Multi-zone/region, failover và partition behavior?
+12. Backup, PITR, restore test, RPO và RTO?
+13. Encryption, access control, audit, retention và data residency?
+14. Capacity, cost và growth plan?
+15. Observability cho latency, error, saturation, replication lag và hot partition?
+16. Migration/exit plan nếu model hoặc product không còn phù hợp?
+
+#### 12. Ý chính cần nhớ
+
+- Chọn database là chọn data model và guarantee phù hợp requirement.
+- SQL/relational mạnh về relation, constraint, transaction và query ecosystem.
+- NoSQL là một họ model; document, key-value, wide-column và graph giải các access pattern khác nhau.
+- Schema linh hoạt không có nghĩa không có schema.
+- ACID và BASE không phải hai phe loại trừ; guarantee phải nêu theo boundary.
+- Consistency trong ACID khác consistency trong CAP.
+- SQL có thể scale ngang; NoSQL vẫn có shard key, hotspot, transaction và vận hành phức tạp.
+- Wide-column khác analytical columnar storage.
+- CP/AP là behavior theo partition, operation và cấu hình, không phải nhãn cố định của sản phẩm.
+- Polyglot persistence chỉ đáng giá khi ownership, source of truth và synchronization rõ ràng.
+- Hãy mô hình hóa theo invariant và access pattern, rồi mới chọn công nghệ.
+
+#### Công thức ghi nhớ
+
+> **Database phù hợp = data model đúng + invariant/transaction đủ mạnh + access pattern hiệu quả + scale/failure behavior chấp nhận được + đội ngũ vận hành được.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -11373,3 +14756,121 @@ Các chủ đề tiếp theo gồm scaling strategy, load distribution, autoscal
 | **Cross-Origin Opener Policy** | Policy cô lập browsing context khỏi cross-origin opener. |
 | **Cross-Origin Embedder Policy** | Policy yêu cầu resource nhúng đáp ứng điều kiện cross-origin phù hợp. |
 | **Fetch Metadata** | Nhóm `Sec-Fetch-*` header mô tả context của request để server áp dụng policy. |
+| **Diagonal scaling** | Chiến lược phối hợp tăng kích thước node và tăng số node theo workload hoặc giai đoạn. |
+| **Scale down** | Giảm resource của một node theo hướng vertical scaling. |
+| **Scale in** | Giảm số node hoặc instance trong horizontal scaling. |
+| **Capacity planning** | Dự báo demand và xác định resource/headroom cần để giữ SLO. |
+| **Safety factor** | Hệ số dự phòng dùng khi tính capacity cho biến động và bất định. |
+| **Safe capacity** | Mức tải một resource xử lý được trong khi vẫn giữ SLO, không phải ngưỡng tối đa trước khi lỗi. |
+| **Time-to-scale** | Thời gian từ lúc phát hiện nhu cầu đến khi capacity mới thực sự nhận tải. |
+| **Diminishing returns** | Hiện tượng thêm resource nhưng lợi ích biên giảm do phần tuần tự, contention hoặc coordination. |
+| **Coordination overhead** | Chi phí giao tiếp và đồng bộ giữa các node khi hệ thống phân tán. |
+| **Marginal cost** | Chi phí phát sinh để có thêm một đơn vị capacity hoặc output. |
+| **Traffic spike** | Mức tải tăng đột ngột trong khoảng thời gian ngắn. |
+| **Noisy neighbor** | Workload/tenant dùng quá nhiều shared resource và làm workload khác suy giảm. |
+| **Round robin algorithm** | Phân phối connection/request luân phiên qua các backend khỏe. |
+| **Weighted round robin** | Round robin có trọng số để backend/pool nhận tỷ lệ traffic khác nhau. |
+| **Least connections** | Chọn backend có ít active connection hơn tại thời điểm quyết định. |
+| **Least outstanding requests** | Chọn backend có ít request/work chưa hoàn tất hơn. |
+| **Least response time** | Ưu tiên backend có observed latency thấp theo policy đo và làm mượt. |
+| **Power of Two Choices** | Lấy ngẫu nhiên hai backend rồi chọn backend có load thấp hơn. |
+| **IP hash** | Ánh xạ client IP qua hàm hash để chọn backend và tạo affinity tương đối. |
+| **Consistent hashing** | Hash scheme giảm số key bị remap khi backend membership thay đổi. |
+| **Rendezvous hashing** | Chọn node có score hash cao nhất cho key, hỗ trợ membership change với remapping hạn chế. |
+| **Adaptive load balancing** | Điều chỉnh lựa chọn backend dựa trên runtime signal như latency, error hoặc load. |
+| **Active health check** | Probe chủ động, định kỳ để đánh giá backend có sẵn sàng không. |
+| **Passive health check** | Suy ra backend health từ kết quả traffic thật như timeout, reset hoặc lỗi. |
+| **Outlier detection** | Nhận diện và tạm eject backend có hành vi lệch xấu đáng kể khỏi pool. |
+| **Health-check hysteresis** | Dùng threshold/window khác nhau để tránh backend flap liên tục giữa healthy và unhealthy. |
+| **Slow start** | Tăng traffic/weight dần cho backend mới hoặc vừa hồi phục trong thời gian warm-up. |
+| **Global load balancing** | Steering traffic giữa nhiều region/edge endpoint theo health, locality, capacity hoặc policy. |
+| **Internal load balancer** | Load balancer chỉ cung cấp private/internal endpoint trong network. |
+| **Direct Server Return** | Mô hình LB xử lý inbound selection nhưng backend trả response trực tiếp theo thiết kế mạng. |
+| **Proxy Protocol** | Protocol truyền metadata connection gốc như client address qua proxy tới backend. |
+| **Forwarded header** | HTTP header chuẩn hóa mang thông tin proxy như client, host và scheme gốc. |
+| **Reactive scaling** | Điều chỉnh capacity sau khi metric hiện tại vượt hoặc rời target. |
+| **Scheduled scaling** | Điều chỉnh capacity theo lịch demand đã biết trước. |
+| **Predictive scaling** | Dự báo demand từ dữ liệu lịch sử để provision capacity trước tải. |
+| **Event-driven scaling** | Scale worker/workload dựa trên nguồn work như queue, topic hoặc event stream. |
+| **Target tracking** | Policy điều chỉnh capacity để giữ một metric gần target mong muốn. |
+| **Step scaling** | Policy thay đổi capacity theo các mức tương ứng độ lệch của metric. |
+| **Scaling policy** | Tập signal, target, limit và rule quyết định khi nào/cách thay capacity. |
+| **Desired capacity** | Mức capacity controller đang cố gắng duy trì. |
+| **Minimum capacity** | Baseline capacity autoscaler không được giảm thấp hơn. |
+| **Maximum capacity** | Giới hạn capacity autoscaler không được vượt quá. |
+| **Cooldown** | Khoảng chờ sau scaling action nhằm hạn chế phản ứng liên tiếp quá sớm. |
+| **Warm-up period** | Thời gian instance mới cần trước khi cung cấp full usable capacity. |
+| **Stabilization window** | Cửa sổ dùng recommendation lịch sử để tránh scaling dao động quá nhanh. |
+| **Autoscaling oscillation** | Capacity liên tục tăng giảm do signal, policy hoặc reaction lag không ổn định. |
+| **Scale-to-zero** | Giảm workload về không instance khi idle rồi tạo lại khi có demand. |
+| **Cold start** | Độ trễ khởi tạo execution environment/application trước khi xử lý work đầu tiên. |
+| **Right-sizing** | Chọn resource size phù hợp workload, SLO và cost thay vì over/under-provision. |
+| **Spot capacity** | Cloud capacity giá thấp hơn nhưng có thể bị provider thu hồi với thông báo hạn chế. |
+| **Auto-healing** | Tự phát hiện và thay thế/restart resource không khỏe để giữ desired state. |
+| **Provisioning lag** | Thời gian từ quyết định scale tới lúc resource mới được tạo và sẵn sàng. |
+| **Queue age** | Thời gian một item đã chờ trong queue, phản ánh latency/backlog pressure. |
+| **Unit economics** | Chi phí trên một đơn vị business/output như request, order, user hoặc event. |
+| **Runaway scaling** | Autoscaler tăng capacity mất kiểm soát do signal/policy lỗi hoặc vòng khuếch đại. |
+| **Manual override** | Cơ chế operator tạm thay quyết định tự động khi sự cố hoặc bảo trì. |
+| **Linear scalability** | Trường hợp lý tưởng trong đó throughput tăng gần tỷ lệ với resource trong một phạm vi. |
+| **Scalability efficiency** | Tỷ lệ speedup thực tế so với speedup tuyến tính lý tưởng khi tăng resource. |
+| **Active-active** | Nhiều instance/tier cùng chủ động phục vụ traffic tại một thời điểm. |
+| **Active-passive** | Một instance/tier phục vụ, phần standby tiếp quản khi active lỗi. |
+| **Tiered caching** | Tổ chức nhiều lớp cache như client, edge, application và distributed cache. |
+| **FaaS** | Function as a Service, mô hình chạy function theo event/request dưới nền tảng managed. |
+| **Horizontal Pod Autoscaler** | Kubernetes controller điều chỉnh số pod theo resource, custom hoặc external metrics. |
+| **Cluster autoscaler** | Controller điều chỉnh số node của cluster khi workload cần thêm hoặc bớt scheduling capacity. |
+| **Pending pod** | Pod chưa được scheduler đặt lên node, thường do thiếu resource hoặc constraint không thỏa. |
+| **Committed capacity** | Capacity được cam kết trước để đổi lấy economics ổn định hơn, kèm ràng buộc sử dụng/thời hạn. |
+| **Structured data** | Dữ liệu có schema, type và field được tổ chức rõ ràng. |
+| **Semi-structured data** | Dữ liệu có key/tag/shape nhưng schema có thể linh hoạt giữa record. |
+| **Unstructured data** | Nội dung không thuận tiện truy vấn trực tiếp bằng schema field cố định như ảnh hoặc video. |
+| **Persistence** | Khả năng state tồn tại ngoài lifetime của process, session hoặc request. |
+| **Durability** | Guarantee rằng acknowledged data sống qua failure trong failure model đã cam kết. |
+| **Object storage** | Storage lưu object bytes và metadata theo key, thường truy cập qua API. |
+| **File storage** | Storage cung cấp hierarchy file/directory cùng filesystem semantics. |
+| **Block storage** | Storage trình bày raw blocks/volume để filesystem hoặc database quản lý layout. |
+| **Blob** | Binary Large Object, khối dữ liệu nhị phân như media hoặc document. |
+| **Access pattern** | Cách workload đọc, ghi, scan, cập nhật và phân bố truy cập dữ liệu. |
+| **IOPS** | Số I/O operation hoàn tất mỗi giây với workload/block-size cụ thể. |
+| **Recoverability** | Khả năng phục hồi đúng state và service sau failure hoặc lỗi logic. |
+| **Snapshot** | Ảnh chụp state tại một thời điểm theo semantics của storage. |
+| **Backup** | Bản sao phục vụ recovery, thường độc lập và giữ theo retention policy. |
+| **Point-in-time recovery** | Khả năng restore dữ liệu tới một thời điểm nhờ backup và change/transaction logs. |
+| **RPO** | Recovery Point Objective, lượng dữ liệu theo thời gian có thể chấp nhận mất. |
+| **RTO** | Recovery Time Objective, thời gian tối đa mong muốn để phục hồi dịch vụ. |
+| **Hot storage** | Tier cho dữ liệu truy cập thường xuyên với latency thấp. |
+| **Warm storage** | Tier trung gian cho dữ liệu ít truy cập hơn với cost/latency cân bằng. |
+| **Cold storage** | Tier rẻ cho dữ liệu hiếm truy cập, thường có retrieval delay hoặc fee. |
+| **Source of truth** | Nguồn state có thẩm quyền khi nhiều copy/view khác nhau tồn tại. |
+| **Derived data** | Dữ liệu như cache/index/projection được tạo từ source of truth và có thể rebuild. |
+| **CAP theorem** | Giới hạn giữa linearizable consistency và CAP availability khi distributed system bị partition. |
+| **Network partition** | Tình trạng các nhóm node không thể trao đổi message tin cậy trong time window liên quan. |
+| **CAP consistency** | Single-copy/linearizable behavior trong mô hình CAP. |
+| **CAP availability** | Mọi request tới non-failing node cuối cùng nhận non-error response trong mô hình CAP. |
+| **Partition tolerance** | Hệ thống có behavior được định nghĩa dù message giữa các nhóm node bị mất/trì hoãn. |
+| **CP behavior** | Khi partition, hy sinh availability của một số operation để giữ consistency. |
+| **AP behavior** | Khi partition, tiếp tục đáp ứng nhưng cho phép stale/divergent state cần hội tụ. |
+| **Linearizability** | Operation trông như xảy ra atomically theo một thứ tự real-time hợp lệ trên một bản sao logic. |
+| **PACELC** | Mô hình: khi partition chọn A/C; khi bình thường thường đánh đổi latency với consistency. |
+| **Conflict resolution** | Quy tắc phát hiện, merge hoặc chọn kết quả khi replica có thay đổi xung đột. |
+| **Data lifecycle** | Các giai đoạn tạo, dùng, tier, archive, retain và delete dữ liệu. |
+| **Relational model** | Mô hình dữ liệu tổ chức thông tin thành các relation và dùng key/constraint để biểu diễn liên hệ. |
+| **SQL** | Structured Query Language, ngôn ngữ khai báo để định nghĩa, truy vấn và thao tác dữ liệu; không đồng nhất hoàn toàn với relational model. |
+| **Primary key** | Thuộc tính hoặc nhóm thuộc tính định danh duy nhất một row. |
+| **Foreign key** | Constraint/tham chiếu liên kết giá trị ở một relation với key của relation khác. |
+| **Referential integrity** | Guarantee rằng reference giữa các relation tuân theo quy tắc tồn tại/cập nhật/xóa đã định. |
+| **Normalization** | Tổ chức relation theo dependency để giảm lặp dữ liệu và update anomaly. |
+| **Denormalization** | Lặp hoặc tính sẵn dữ liệu có chủ đích để tối ưu access pattern, đổi lại cần quản lý consistency. |
+| **Schema-on-write** | Kiểm tra/áp schema khi dữ liệu được ghi vào store. |
+| **Schema-on-read** | Diễn giải/áp schema khi dữ liệu được đọc hoặc xử lý. |
+| **ACID** | Atomicity, Consistency, Isolation, Durability — nhóm thuộc tính của transaction. |
+| **ACID consistency** | Transaction giữ các constraint/invariant đã định; khác CAP consistency. |
+| **Isolation level** | Mức guarantee quy định các transaction đồng thời có thể quan sát và ảnh hưởng lẫn nhau ra sao. |
+| **BASE** | Mnemonic: Basically Available, Soft State, Eventually Consistent; không phải đối cực loại trừ của ACID. |
+| **Document database** | Database lưu aggregate dưới dạng document có field và cấu trúc lồng nhau. |
+| **Key-value database** | Database truy cập value chủ yếu thông qua một key. |
+| **Wide-column database** | Database phân tán tổ chức dữ liệu quanh row/partition key và column family, thường model theo access pattern. |
+| **Columnar database** | Database phân tích lưu giá trị theo cột để tối ưu scan, compression và aggregation. |
+| **Graph database** | Database biểu diễn entity bằng node và quan hệ bằng edge để tối ưu traversal. |
+| **JSONB** | Kiểu lưu JSON dạng nhị phân có thể index/query trong PostgreSQL. |
