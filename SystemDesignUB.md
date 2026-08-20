@@ -14261,6 +14261,2575 @@ Relational thường bắt đầu từ entity, dependency, constraint và normal
 
 ---
 
+### Bài 41. Advanced Database Topics — Sharding, Replication & Polyglot Persistence
+
+#### 1. Ba kỹ thuật giải ba nhóm vấn đề khác nhau
+
+Khi database trở thành bottleneck, cần xác định đúng bottleneck trước khi chọn giải pháp:
+
+| Kỹ thuật | Vấn đề chính cần giải | Không tự động giải quyết |
+|---|---|---|
+| **Vertical scaling** | Một node thiếu CPU, RAM, I/O hoặc storage | Trần phần cứng, single-node failure, scale vô hạn |
+| **Replication/read replica** | Availability, failover và read throughput | Write throughput của một leader, tổng dataset quá lớn, backup |
+| **Sharding** | Storage capacity và read/write throughput vượt một node | Consistency, cross-shard transaction, hotspot, vận hành đơn giản |
+| **Polyglot persistence** | Một data model/query engine không phù hợp mọi workload | Đồng bộ dữ liệu, ownership, backup và operational complexity |
+
+Các kỹ thuật thường được kết hợp:
+
+```text
+                   Shard router / application routing
+                         /                    \
+                    Shard A                  Shard B
+                  leader A1                leader B1
+                  /       \                /       \
+            follower A2  A3          follower B2  B3
+```
+
+Trong ví dụ này:
+
+- **sharding** chia dataset và write load giữa A/B;
+- **replication** tạo nhiều bản sao bên trong từng shard;
+- **routing** đưa request tới đúng shard và đúng replica theo consistency requirement.
+
+> **Không có kiến trúc database phổ quát. Hãy tìm giới hạn đang gặp — compute, read, write, storage, availability, locality hay query model — rồi chọn kỹ thuật tương ứng.**
+
+---
+
+#### 2. Scaling SQL và NoSQL: tránh kết luận quá đơn giản
+
+Mô hình thường gặp trong lịch sử:
+
+- relational database bắt đầu bằng một primary mạnh, scale dọc và thêm read replica;
+- nhiều NoSQL database được thiết kế ngay từ đầu để partition/replicate trên nhiều node.
+
+Nhưng đây không phải ranh giới tuyệt đối:
+
+- SQL có partitioning, sharding và distributed SQL;
+- NoSQL vẫn có thể bị giới hạn bởi hot key, coordination, quorum, index hoặc partition quá lớn;
+- scale ngang không “gần như vô hạn”: throughput tăng đến khi chạm shared bottleneck, skew, network, coordination hoặc chi phí;
+- strong consistency và transaction không chỉ tồn tại trong SQL;
+- eventual consistency không phải đặc tính bắt buộc của NoSQL.
+
+Scale dọc có lợi thế đơn giản, latency nội bộ thấp và transaction dễ hơn. Scale ngang tăng tổng capacity và fault domains, nhưng thêm routing, replication, consistency, rebalancing và failure modes. Quyết định đúng phụ thuộc workload và economics, không chỉ tên loại database.
+
+---
+
+#### 3. Replication là gì?
+
+**Replication** duy trì nhiều bản sao của cùng logical data trên các node/failure domain khác nhau.
+
+Mục tiêu có thể gồm:
+
+- tăng availability và hỗ trợ failover;
+- mở rộng tải đọc;
+- đặt dữ liệu gần người dùng;
+- giảm blast radius của node/zone failure;
+- hỗ trợ bảo trì hoặc nâng cấp.
+
+Replication tạo thêm bản sao đang hoạt động, nhưng không tự động tạo một nguồn recovery độc lập.
+
+> **Replication không phải backup.** Lệnh xóa nhầm, update lỗi, corruption hoặc ransomware có thể nhanh chóng lan tới mọi replica. Vẫn cần backup/PITR, retention độc lập và restore test.
+
+##### 3.1 Replication log và thứ tự thay đổi
+
+Một node thường ghi thay đổi vào transaction/replication log rồi truyền tới replica. Tùy hệ thống, replica có thể nhận:
+
+- statement/command;
+- row-level logical changes;
+- physical log/page changes;
+- event/change stream.
+
+Thiết kế phải biết:
+
+- thứ tự change được bảo đảm trong scope nào;
+- replica apply đến vị trí nào;
+- retry có tạo duplicate không;
+- schema change tương thích thế nào;
+- snapshot/bootstrap replica mới ra sao.
+
+##### 3.2 Synchronous, asynchronous và semi-synchronous replication
+
+**Synchronous replication**
+
+- leader chỉ xác nhận write sau khi số replica yêu cầu đã nhận hoặc durable-commit;
+- giảm RPO khi leader hỏng;
+- tăng write latency và có thể giảm availability nếu replica/quorum không liên lạc được.
+
+**Asynchronous replication**
+
+- leader xác nhận trước khi follower bắt kịp;
+- write latency thấp hơn và leader ít phụ thuộc follower;
+- replica có lag; failover có thể mất acknowledged writes chưa replicate.
+
+**Semi-synchronous/quorum-based replication**
+
+- xác nhận sau một ngưỡng replica/quorum hoặc theo policy;
+- cân bằng durability, latency và availability;
+- cần hiểu chính xác “acknowledged” nghĩa là nhận vào memory, ghi log hay fsync.
+
+Không chỉ hỏi “sync hay async”; phải hỏi **acknowledgement point**, quorum, timeout và failure model.
+
+---
+
+#### 4. Leader–follower replication
+
+Trong mô hình leader–follower:
+
+1. client gửi write tới leader;
+2. leader xác định thứ tự và commit theo durability policy;
+3. change được truyền tới follower;
+4. follower replay/apply change;
+5. read có thể đi tới leader hoặc follower.
+
+Ưu điểm:
+
+- một write authority giúp conflict/order dễ quản lý hơn;
+- follower có thể scale read;
+- failover follower lên leader khi leader hỏng;
+- backup/analytics có thể giảm tải khỏi primary nếu được thiết kế đúng.
+
+Giới hạn:
+
+- leader vẫn là bottleneck của write path;
+- asynchronous follower có replication lag;
+- failover cần election, fencing và client rerouting;
+- long-running query trên follower có thể cạnh tranh I/O/apply;
+- follower càng nhiều, replication/network cost càng lớn.
+
+##### 4.1 Read replica
+
+Read replica là replica được dùng chủ yếu để phục vụ read. Nó phù hợp khi workload read-heavy như catalog, content, news hoặc reporting có thể chịu mức stale nhất định.
+
+Read replica **không**:
+
+- tăng trực tiếp write capacity của leader;
+- bảo đảm đọc thấy write vừa commit nếu replication async;
+- loại bỏ nhu cầu index/query optimization;
+- thay thế cache cho mọi use case;
+- thay thế backup.
+
+##### 4.2 Replica lag và stale read
+
+Có thể tách lag thành:
+
+- **transport lag**: change chưa tới replica;
+- **apply lag**: đã nhận nhưng chưa replay;
+- **visibility lag**: đã apply nhưng read path/cache chưa quan sát theo guarantee.
+
+Hậu quả:
+
+- user cập nhật profile rồi đọc lại thấy dữ liệu cũ;
+- vừa đặt đơn nhưng trang lịch sử chưa có đơn;
+- workflow quyết định dựa trên inventory/balance cũ;
+- pagination hoặc nhiều lần đọc quan sát thời gian “đi lùi”.
+
+Các kỹ thuật giảm vấn đề:
+
+- read critical data từ leader;
+- **read-your-writes** bằng sticky routing trong một khoảng thời gian;
+- truyền commit position/token và chỉ đọc replica đã bắt kịp;
+- dùng bounded-staleness SLA;
+- route theo replication lag/health;
+- tách read model eventual khỏi command/invariant path.
+
+##### 4.3 Failover không chỉ là “chọn replica khác”
+
+Một failover an toàn cần:
+
+1. phát hiện leader thực sự không còn hợp lệ;
+2. chọn follower đủ mới và promote;
+3. ngăn leader cũ tiếp tục nhận write bằng **fencing**;
+4. cập nhật routing/service discovery;
+5. xác định acknowledged write nào có thể mất;
+6. đưa node cũ trở lại mà không tạo split-brain;
+7. kiểm tra consistency và phục hồi capacity/replica count.
+
+Các metric cần theo dõi: replication lag theo bytes/time/log position, apply errors, replica health, quorum, failover duration, data loss window và read correctness.
+
+##### 4.4 Các topology khác
+
+- **Multi-leader**: nhiều leader nhận write, hữu ích cho multi-region/offline use case nhưng cần conflict detection/resolution.
+- **Leaderless/quorum**: client/coordinator ghi và đọc từ nhiều replica; cần quorum math, hinted handoff, read repair, anti-entropy và conflict semantics.
+
+Chúng không mặc định tốt hơn leader–follower; chỉ chuyển trade-off sang write conflict, convergence và application complexity.
+
+---
+
+#### 5. Partitioning và sharding
+
+**Partitioning** là chia logical dataset thành các phần. **Sharding** thường chỉ partition dữ liệu ngang qua nhiều database node/instance độc lập để phân tán storage và traffic.
+
+```text
+users 1..N
+   | shard key = user_id
+   +--> shard 0: một phần user
+   +--> shard 1: một phần user
+   +--> shard 2: một phần user
+```
+
+Mỗi shard sở hữu một subset dữ liệu và thường có replication riêng.
+
+##### 5.1 Horizontal và “vertical” sharding
+
+- **Horizontal sharding**: chia các row/entity cùng loại theo key/range/hash; mục tiêu chính là phân tán dataset và traffic.
+- **Vertical partitioning**: tách cột hoặc nhóm dữ liệu theo access pattern.
+- Việc tách profile, billing, analytics sang database/service khác thường được gọi không chính xác là **vertical sharding**; trong kiến trúc service, nó gần với functional decomposition/database-per-service hơn.
+
+Thuật ngữ có thể khác giữa tài liệu, vì vậy khi phỏng vấn nên mô tả cụ thể dữ liệu nào được chia và routing ra sao.
+
+##### 5.2 Khi nào cần sharding?
+
+Sharding đáng cân nhắc khi:
+
+- dataset/working set/index không còn phù hợp một node;
+- write throughput vượt khả năng primary;
+- maintenance/backup/recovery window của một database quá lớn;
+- cần locality/data residency theo tenant/region;
+- vertical scaling, indexing, caching, archival và read replica đã không đủ.
+
+Không nên shard quá sớm. Trước đó có thể tối ưu query/index, archive cold data, cache, read replica, partition trong một database hoặc chọn máy phù hợp. Sharding thêm một distributed system vào data layer và rất khó đảo ngược.
+
+---
+
+#### 6. Chọn shard key
+
+Shard key quyết định:
+
+- dữ liệu nằm ở đâu;
+- request có route tới một shard hay phải fan-out;
+- load/storage phân bố đều không;
+- transaction và uniqueness có local được không;
+- resharding khó tới mức nào.
+
+Một shard key tốt thường:
+
+- có cardinality đủ cao;
+- phân bố tương đối đều theo data size và request rate;
+- ổn định, hiếm đổi;
+- xuất hiện trong phần lớn query quan trọng;
+- giữ entity cần transaction cùng shard;
+- tránh monotonically increasing hotspot nếu write được dồn vào một range;
+- không tạo tenant khổng lồ chiếm trọn shard nếu chưa có split strategy.
+
+> **Phân bố row đều chưa chắc phân bố tải đều.** Một celebrity, tenant lớn hoặc hot product vẫn tạo hotspot dù số record mỗi shard bằng nhau.
+
+##### 6.1 Range-based sharding
+
+Ví dụ:
+
+```text
+A–F -> shard 1
+G–M -> shard 2
+N–Z -> shard 3
+```
+
+Ưu điểm:
+
+- range scan/local ordering hiệu quả;
+- routing và hiểu data locality tương đối đơn giản.
+
+Nhược điểm:
+
+- skew nếu phân bố hoặc tăng trưởng không đều;
+- timestamp/sequential ID có thể dồn write vào shard cuối;
+- split/merge range và migration phải được vận hành tốt.
+
+##### 6.2 Hash-based sharding
+
+```text
+shard = hash(shard_key) mod N
+```
+
+Ưu điểm:
+
+- phân bố key thường đều hơn;
+- giảm hotspot do key tăng tuần tự.
+
+Nhược điểm:
+
+- mất natural ordering/locality;
+- range query có thể scatter-gather;
+- modulo hashing làm nhiều key bị remap khi `N` thay đổi;
+- hot key vẫn nóng vì mọi request của key đó vẫn tới một shard.
+
+##### 6.3 Consistent hashing
+
+Consistent hashing ánh xạ key và node lên hash ring/token space. Khi membership đổi, chỉ một phần key range được chuyển thay vì remap gần như toàn bộ.
+
+Thực tế thường cần:
+
+- virtual nodes/tokens để cân bằng;
+- replication factor;
+- weighted capacity;
+- movement throttling;
+- health và ownership metadata;
+- xử lý node join/leave/failure.
+
+Consistent hashing **giảm** data movement, không loại bỏ rebalancing và không tự xử lý hot key.
+
+##### 6.4 Directory-based sharding
+
+Một lookup service/catalog lưu mapping:
+
+```text
+tenant_id -> shard_id
+```
+
+Ưu điểm:
+
+- placement linh hoạt;
+- dễ chuyển tenant cụ thể hoặc tách tenant lớn;
+- phù hợp khi capacity/tenant không đồng đều.
+
+Đổi lại, directory trở thành critical metadata plane: cần cache, replication, versioning, atomic update và tránh stale routing.
+
+##### 6.5 Geo-based sharding
+
+Chia theo country/region để:
+
+- giảm latency;
+- đáp ứng data residency/sovereignty;
+- cô lập failure domain;
+- vận hành theo market.
+
+Khó khăn xuất hiện khi user di chuyển, data cần truy cập xuyên region, global uniqueness/transaction hoặc regulation thay đổi. Geo placement không chỉ là bài toán performance mà còn là ownership và compliance.
+
+##### 6.6 Composite/hybrid strategy
+
+Hệ thống lớn thường kết hợp:
+
+```text
+region -> hash(tenant_id) -> time range
+```
+
+Ví dụ region tạo locality, hash tenant phân bố tải, còn time partition hỗ trợ lifecycle. Mỗi tầng tăng khả năng tối ưu nhưng cũng tăng routing, migration và debugging complexity.
+
+---
+
+#### 7. Những bài toán sharding làm khó hơn
+
+##### 7.1 Routing và metadata
+
+Application, proxy hoặc database coordinator phải biết shard ownership. Routing metadata cần có version và cơ chế invalidation để tránh request đi nhầm shard trong migration.
+
+##### 7.2 Scatter–gather query
+
+Nếu query không có shard key, coordinator có thể phải gửi tới mọi shard rồi merge/sort/aggregate kết quả:
+
+```text
+latency ~= shard chậm nhất + fan-out/merge overhead
+```
+
+Fan-out làm tăng tail latency, connection usage và blast radius. Giải pháp có thể là global index, search/analytics derived store, query restriction hoặc data model khác.
+
+##### 7.3 Cross-shard transaction
+
+Transaction trên nhiều shard cần distributed coordination như two-phase commit, consensus-backed transaction hoặc saga/compensation tùy invariant. Nó có latency, failure mode và operational cost cao hơn local transaction.
+
+Thiết kế tốt cố gắng chọn aggregate/shard key để invariant quan trọng nằm trong một shard, nhưng không hy sinh mọi query khác một cách mù quáng.
+
+##### 7.4 Global uniqueness và ID
+
+Auto-increment cục bộ có thể đụng ID giữa shard. Các hướng:
+
+- UUID/ULID hoặc ID generator phân tán;
+- prefix theo shard/region;
+- central allocation theo block;
+- unique registry/index nếu cần uniqueness toàn cục.
+
+Mỗi hướng đánh đổi locality, ordering, index locality và coordination.
+
+##### 7.5 Hot shard và hot key
+
+Giải pháp tùy nguyên nhân:
+
+- đổi/composite shard key;
+- split tenant/range lớn;
+- add salt/bucket cho write-heavy key;
+- cache/fan-out read;
+- rate limit/isolate noisy tenant;
+- adaptive partitioning;
+- tách workload/time window.
+
+Salting giúp phân tán write nhưng làm read/aggregation phải fan-out; cần nêu rõ trade-off.
+
+##### 7.6 Resharding và rebalancing
+
+Khi thêm shard, thay capacity hoặc skew tăng, dữ liệu phải di chuyển. Một online migration thường cần:
+
+1. tạo target shard/range;
+2. copy snapshot/backfill;
+3. capture change phát sinh trong lúc copy;
+4. bắt kịp và kiểm tra checksum/count/invariant;
+5. chuyển read/write routing bằng version/fencing;
+6. quan sát, rollback window;
+7. xóa source sau retention an toàn.
+
+Dual-write đơn giản dễ mất nhất quán khi một phía thành công, một phía thất bại. Nên dùng database-native migration, log/CDC, outbox hoặc protocol có idempotency và reconciliation rõ ràng.
+
+---
+
+#### 8. Kết hợp sharding với replication
+
+Production database thường không chọn một trong hai mà dùng cả hai:
+
+```text
+logical dataset
+  -> shard theo tenant/user/order
+  -> mỗi shard replicate qua node/zone
+```
+
+Khi một node lỗi, replica của shard đó failover. Khi tổng tải tăng, thêm shard và rebalance dataset. Điều này tạo hai control loops khác nhau:
+
+- **replica management** giữ đủ bản sao và leader/quorum khỏe;
+- **partition management** giữ ownership, size và load cân bằng.
+
+Các failure cần diễn tập:
+
+- leader của một shard chết;
+- cả zone chứa nhiều replica mất;
+- router/catalog stale;
+- resharding bị dừng giữa chừng;
+- một shard lag hoặc đầy disk;
+- network partition tạo competing leaders;
+- backup chỉ restore được một phần shard hoặc không đồng nhất theo thời điểm.
+
+Backup toàn cluster cần consistent snapshot hoặc recovery procedure biết log/time position của từng shard.
+
+---
+
+#### 9. Polyglot persistence ở quy mô lớn
+
+Polyglot persistence dùng nhiều data store vì các workload có data model và guarantee khác nhau:
+
+| Workload | Store thường cân nhắc |
+|---|---|
+| Transactional order/payment | Relational/distributed transactional DB |
+| Flexible product/profile aggregate | Document hoặc relational + JSON |
+| Cache/session/ephemeral state | In-memory key-value store |
+| Full-text search | Search engine/index |
+| Relationship traversal | Graph database |
+| High-volume event/time series | Wide-column, time-series hoặc log store |
+| Raw logs/media/backup | Object storage |
+| BI/large aggregation | Columnar warehouse/lakehouse engine |
+
+Nguyên tắc quan trọng:
+
+1. **Bắt đầu đơn giản:** một database đủ tốt thường tốt hơn năm database “tối ưu”.
+2. **Một source of truth:** cache, search index, warehouse và projection là derived data nếu có thể.
+3. **Ownership rõ:** service nào được quyền ghi dataset nào?
+4. **Propagation contract:** event/CDC gửi gì, ordering và delivery guarantee ra sao?
+5. **Idempotency/reconciliation:** duplicate, missing và out-of-order update xử lý thế nào?
+6. **Independent recovery:** backup/restore từng store và cách rebuild derived store?
+7. **Quan sát end-to-end:** lag, freshness, divergence, failed event và replay progress.
+8. **Justify complexity:** thêm store chỉ khi lợi ích đo được vượt chi phí vận hành.
+
+##### 9.1 Tránh dual-write inconsistency
+
+Tình huống nguy hiểm:
+
+```text
+1. Ghi order DB thành công
+2. Ghi search index thất bại
+3. API báo gì? Retry có tạo duplicate không?
+```
+
+Pattern thường dùng:
+
+- commit business state và outbox record trong cùng local transaction;
+- relay/CDC phát event at-least-once;
+- consumer cập nhật derived store idempotently;
+- theo dõi lag/failure và có replay/rebuild;
+- không giả vờ có transaction toàn cục nếu hệ thống không cung cấp.
+
+Eventual consistency ở đây phải có freshness SLO và repair path, không chỉ là lời hứa “rồi sẽ đồng bộ”.
+
+---
+
+#### 10. Các tình huống quyết định nhanh
+
+**Read tăng mạnh, write và data size vẫn vừa một primary**  
+Tối ưu query/index trước, sau đó cân nhắc cache và read replica. Định tuyến read cần xét freshness.
+
+**Write hoặc dataset vượt một node**  
+Chọn partition/shard key theo access pattern và invariant; thiết kế replication cho từng shard, resharding và cross-shard behavior.
+
+**Multi-region nhưng dữ liệu không được rời quốc gia**  
+Geo-shard theo residency boundary, sau đó replicate trong vùng hợp lệ; xử lý user migration/global query riêng.
+
+**Một tenant tạo phần lớn tải**  
+Hash tenant đơn thuần không đủ. Cần khả năng split tenant theo bucket/entity/time, isolate hoặc dedicated shard.
+
+**Cần search và analytics trên transactional data**  
+Giữ transactional DB làm source of truth, đồng bộ search/warehouse bằng outbox/CDC; thiết kế lag, replay và rebuild.
+
+**Cần đọc ngay dữ liệu vừa ghi từ replica**  
+Route tạm về leader, dùng commit token/replica position hoặc session consistency; không chỉ “chờ vài giây” không có contract.
+
+---
+
+#### 11. 18 câu hỏi ôn tập và phỏng vấn
+
+##### 11.1 Tám câu hỏi từ tài liệu PDF
+
+**Q1. Horizontal scaling và vertical scaling khác nhau thế nào? Khi nào chọn mỗi loại?**  
+Vertical scaling tăng CPU, RAM, I/O hoặc storage của một node; đơn giản hơn và phù hợp khi workload còn nằm trong giới hạn một máy. Horizontal scaling thêm node để phân tán tải/data; phù hợp khi capacity, availability hoặc locality vượt giới hạn một máy, nhưng thêm routing, consistency và vận hành phân tán. Đây không phải phân chia SQL–NoSQL tuyệt đối: cả hai nhóm đều có thể dùng hai hướng.
+
+**Q2. Leader–follower replication hoạt động ra sao và ảnh hưởng consistency/availability thế nào?**  
+Write đi qua leader rồi được truyền tới follower; read có thể đi từ follower để giảm tải. Với async replication, follower có thể stale và failover có nguy cơ mất write chưa replicate. Sync replication giảm data-loss window nhưng tăng write latency và có thể làm write unavailable khi không đủ replica. Việc truyền đồng bộ **không tự nó** bảo đảm mọi read đều strong consistent; còn phụ thuộc read routing, commit rule và protocol.
+
+**Q3. Read replica có ưu và nhược điểm gì?**  
+Ưu điểm là tăng read throughput, tách reporting/analytics workload và cho phép một số read tiếp tục khi primary gặp sự cố. Nhược điểm là replication lag, routing phức tạp và không tăng write capacity của leader. Replica chỉ trở thành failover target an toàn nếu có promotion, fencing và mức dữ liệu đủ mới; nó không thay backup.
+
+**Q4. So sánh range-based và hash-based sharding.**  
+Range sharding giữ ordering/locality nên range query hiệu quả, nhưng dễ skew hoặc hot range. Hash sharding thường phân bố key đều hơn, nhưng phá vỡ natural ordering và range query có thể phải fan-out. Hash chỉ giảm skew do phân bố key; một hot key hoặc hot tenant vẫn làm một shard quá tải.
+
+**Q5. Vì sao consistent hashing quan trọng?**  
+Với `hash(key) mod N`, thay đổi `N` có thể remap phần lớn key. Consistent hashing giúp chỉ một phần key range đổi owner khi node thêm/bớt, nhờ đó giảm data movement và hỗ trợ elasticity. Nó vẫn cần virtual node/token, replication, movement throttling và rebalancing; không tự bảo đảm availability hay loại hotspot.
+
+**Q6. CAP ảnh hưởng thiết kế distributed database thế nào? Cho ví dụ CP/AP.**  
+Khi network partition xảy ra, một operation không thể đồng thời bảo đảm linearizable consistency và CAP availability ở mọi phía. CP behavior sẽ reject/wait ở phía không thể xác nhận authoritative state; AP behavior tiếp tục đáp ứng nhưng chấp nhận stale/divergent state và cần conflict resolution. MongoDB, Cassandra hoặc DynamoDB không nên bị gắn nhãn cố định nếu chưa nêu topology, read/write setting và operation cụ thể.
+
+**Q7. Polyglot persistence là gì và vì sao dùng nhiều database?**  
+Đó là dùng data store chuyên biệt cho các workload khác nhau, chẳng hạn relational DB cho transaction, document DB cho aggregate linh hoạt, search index cho full-text search và key-value store cho cache/session. Lợi ích là data model và performance phù hợp hơn; chi phí là nhiều hệ cần quản lý, bảo mật, backup và đồng bộ. Phải có source of truth, ownership và repair path rõ ràng.
+
+**Q8. Netflix hoặc Uber dùng nhiều công nghệ database như thế nào?**  
+PDF nêu các ví dụ minh họa: Netflix kết hợp Cassandra, MySQL, Elasticsearch và DynamoDB; Uber kết hợp PostgreSQL/MySQL, Redis, BigQuery và Hadoop cho các workload khác nhau. Cách trả lời quan trọng hơn danh sách sản phẩm: transaction, high-write/geo-distributed data, cache/geospatial state, search và analytics có yêu cầu khác nhau nên có thể cần store khác nhau. Danh sách công nghệ của công ty lớn thay đổi theo thời gian và từng service, vì vậy không nên coi đây là inventory hiện hành hay architecture duy nhất của họ.
+
+##### 11.2 Mười câu hỏi đào sâu thêm
+
+**Q9. Replication và sharding khác nhau thế nào?**  
+Replication tạo nhiều bản sao của cùng data để availability/read scale; sharding chia các subset khác nhau để scale storage và read/write. Thực tế thường replicate từng shard.
+
+**Q10. Synchronous và asynchronous replication đánh đổi gì?**  
+Synchronous giảm data-loss window nhưng tăng latency/phụ thuộc replica; asynchronous giảm write latency nhưng có lag và nguy cơ mất acknowledged write khi failover.
+
+**Q11. Làm sao đạt read-your-writes với replica?**  
+Đọc từ leader, sticky session, dùng commit position/token để chọn replica đã bắt kịp hoặc cung cấp session/bounded-staleness guarantee.
+
+**Q12. Vì sao failover có thể gây split-brain?**  
+Leader cũ vẫn nhận write trong khi leader mới đã được promote. Cần quorum/lease/consensus và fencing để chỉ một writer hợp lệ.
+
+**Q13. Shard key tốt có đặc điểm gì?**  
+Cardinality cao, ổn định, phân bố cả data lẫn traffic, có trong query chính và co-locate transaction/invariant quan trọng.
+
+**Q14. Scatter–gather có vấn đề gì?**  
+Query chạm nhiều shard, latency phụ thuộc shard chậm nhất và fan-out khuếch đại tải/lỗi. Nên tránh trên hot path hoặc dùng derived global index.
+
+**Q15. Cross-shard transaction xử lý thế nào?**  
+Co-locate invariant nếu có thể; nếu bắt buộc, dùng database-supported distributed transaction hoặc workflow saga/compensation với semantics được nêu rõ.
+
+**Q16. Reshard online cần gì?**  
+Snapshot/backfill, capture change, validation, versioned routing/fencing, idempotency, monitoring, rollback window và cleanup an toàn.
+
+**Q17. Vì sao replication không phải backup?**  
+Replica thường sao chép cả lỗi logic/xóa/corruption. Backup có retention và recovery boundary độc lập, kèm PITR và restore test.
+
+**Q18. SQL có shard được không?**  
+Có. Application sharding, middleware và distributed SQL đều tồn tại; transaction, join, routing và rebalancing trở nên phức tạp hơn.
+
+---
+
+#### 12. Những lỗi tư duy thường gặp
+
+- Cho rằng SQL chỉ scale dọc và NoSQL luôn scale ngang.
+- Thêm replica để xử lý write bottleneck của một leader.
+- Đọc mọi request từ replica mà không phân loại freshness.
+- Chỉ đo replica lag trung bình, bỏ qua tail lag và apply error.
+- Promote leader mới mà không fencing leader cũ.
+- Xem replication là backup.
+- Shard trước khi tối ưu index/query, archive, cache hoặc scale đơn giản hơn.
+- Chọn shard key chỉ vì cardinality cao mà bỏ qua traffic skew/query locality.
+- Dùng timestamp range khiến mọi write dồn vào shard mới nhất.
+- Nghĩ hash sharding loại bỏ hot key.
+- Dùng modulo hashing rồi bất ngờ khi thêm node phải remap gần toàn bộ.
+- Không thiết kế query thiếu shard key và scatter–gather cost.
+- Giả định uniqueness, join và transaction xuyên shard vẫn rẻ như một node.
+- Reshard bằng dual-write không có idempotency/reconciliation.
+- Dùng nhiều store nhưng không xác định source of truth.
+- Thêm polyglot persistence theo xu hướng dù đội ngũ không vận hành nổi.
+- Không diễn tập failover, restore và migration khi tải thật.
+
+---
+
+#### 13. Advanced database checklist
+
+1. Bottleneck hiện tại là CPU, memory, I/O, read, write, storage hay locality?
+2. Có thể giải bằng index/query/cache/archive/read replica trước sharding không?
+3. Replication mode và acknowledgement point là gì?
+4. RPO khi failover và RTO/election/routing time?
+5. Read nào chịu stale; freshness/read-your-writes contract?
+6. Lag, apply error, quorum và failover được quan sát thế nào?
+7. Fencing và split-brain prevention?
+8. Shard key phân bố data và traffic ra sao ở hiện tại/tương lai?
+9. Hot tenant/key/range được split hoặc isolate thế nào?
+10. Query thiếu shard key, global index và scatter–gather behavior?
+11. Cross-shard transaction, uniqueness và ID generation?
+12. Online resharding, validation, rollback và throttling?
+13. Mỗi shard có replication/failure-domain placement phù hợp không?
+14. Cluster-wide backup/PITR có consistent recovery point không?
+15. Với polyglot persistence, source of truth và data owner là ai?
+16. Outbox/CDC propagation, idempotency, ordering, lag và replay?
+17. Security, residency, retention và deletion có đi qua mọi copy/store?
+18. Cost/complexity có được biện minh bằng SLO hoặc business requirement đo được?
+
+#### 14. Ý chính cần nhớ
+
+- Vertical scaling đơn giản nhưng có trần; horizontal scaling tăng capacity cùng distributed complexity.
+- SQL/NoSQL không quyết định một mình cách scale hay consistency model.
+- Replication phục vụ availability/read scale; sharding phục vụ phân tán data và write/read load.
+- Read replica có thể stale; critical read cần freshness strategy.
+- Replication mode là trade-off giữa acknowledgement latency, availability và data-loss window.
+- Failover cần election, fencing, routing và recovery — không chỉ promote một node.
+- Replication không thay backup.
+- Shard key là quyết định cốt lõi; phải cân bằng distribution, locality, transaction và future growth.
+- Range, hash, consistent hashing, directory và geo sharding có mục tiêu khác nhau.
+- Consistent hashing giảm remapping nhưng không loại hotspot hay rebalancing.
+- Cross-shard query/transaction/uniqueness và resharding là phần giá của sharding.
+- Polyglot persistence bắt đầu bằng một source of truth và synchronization contract rõ.
+- Start simple; chỉ thêm distributed complexity khi requirement biện minh được.
+
+#### Công thức ghi nhớ
+
+> **Database scale tốt = replication cho availability/read + sharding cho data/write + routing/consistency đúng + failover/resharding đã diễn tập + polyglot có ownership rõ.**
+
+---
+
+### Bài 42. Object Storage in Modern Systems
+
+#### 1. Object storage giải bài toán gì?
+
+Object storage được thiết kế để lưu lượng dữ liệu rất lớn dưới dạng các **object độc lập**, truy cập qua API bằng một key. Nó đặc biệt phù hợp với:
+
+- ảnh, video, audio và tài liệu;
+- user upload và static asset;
+- backup, archive và compliance record;
+- log, event file và data lake;
+- model, dataset và artifact của ML/AI;
+- package, build artifact và large binary.
+
+Mục tiêu chính là durability, throughput tổng, quy mô và chi phí trên dung lượng — không phải low-latency random mutation như block storage hoặc filesystem semantics đầy đủ.
+
+> **Object storage phù hợp khi application có thể coi dữ liệu là object hoàn chỉnh: tạo/đọc/thay thế/xóa theo key, thay vì sửa byte/block tùy ý tại chỗ.**
+
+---
+
+#### 2. Object, bucket, key và metadata
+
+Một object có thể hình dung như:
+
+```text
+object = bytes + object key + system metadata + custom metadata/tags
+```
+
+##### 2.1 Object
+
+Object chứa payload bytes và thông tin mô tả. Storage service không nhất thiết hiểu nội dung nghiệp vụ bên trong; application chịu trách nhiệm encoding, format, schema và validation.
+
+##### 2.2 Bucket/container
+
+Bucket là logical container và thường là boundary cho:
+
+- namespace;
+- access policy;
+- versioning;
+- lifecycle;
+- replication;
+- logging/audit;
+- region và một phần compliance configuration.
+
+Không nên tạo bucket tùy tiện cho từng user nếu provider quota/policy model không phù hợp. Multi-tenant system thường dùng một số bucket theo environment/data class rồi cô lập bằng key prefix, identity/policy và metadata database.
+
+##### 2.3 Object key và prefix
+
+Object được định danh bằng key, ví dụ:
+
+```text
+tenant-42/videos/01J.../source.mp4
+```
+
+Dấu `/` thường chỉ là ký tự trong key. Console có thể hiển thị giống folder, nhưng phần lớn object store dùng namespace logic phẳng và mô phỏng hierarchy bằng **prefix**.
+
+Thiết kế key cần xét:
+
+- uniqueness và idempotency;
+- tenant isolation;
+- lifecycle/query/list pattern;
+- khả năng đoán key;
+- rename/move cost;
+- tránh đưa PII/secret vào key hoặc URL/log;
+- tránh phụ thuộc filename do user cung cấp.
+
+“Đổi tên” object thường thực chất là copy sang key mới rồi xóa key cũ; không có atomic filesystem rename mặc định.
+
+##### 2.4 Metadata và tags
+
+Metadata có thể gồm:
+
+- content type, content length, timestamp;
+- checksum/validation information;
+- encryption/version/storage class;
+- owner, project, classification;
+- application-specific fields.
+
+Metadata hữu ích cho policy và xử lý, nhưng object store không phải lúc nào cũng hỗ trợ ad-hoc query metadata như database. Nhiều hệ thống giữ metadata có thể truy vấn trong relational/document/search store, còn object storage giữ bytes và một số metadata kỹ thuật.
+
+---
+
+#### 3. Object storage khác file và block storage
+
+| Khía cạnh | Object storage | File storage | Block storage |
+|---|---|---|---|
+| **Đơn vị** | Object hoàn chỉnh | File/directory | Block/volume |
+| **Addressing** | Bucket + key qua API | Path trong hierarchy | Block offset/device |
+| **Metadata** | Rich system/custom metadata | Filesystem metadata | Ít semantics; filesystem/DB tự quản lý |
+| **Mutation** | Thường replace object; multipart cho upload | Read/write/append theo file semantics | Random read/write block |
+| **Latency** | Network/API latency, tối ưu throughput/scale | Phù hợp shared file access | Thường thấp, phù hợp DB/VM |
+| **Sharing** | HTTP/API, dễ truy cập ở quy mô lớn | POSIX/NFS/SMB-like semantics | Thường attach vào host/cluster cụ thể |
+| **Use case** | Media, backup, lake, static asset | Shared workspace, home directory, legacy app | Database volume, VM disk, transactional I/O |
+
+Object storage không mặc định là “tốt hơn”; nó cung cấp semantics khác. Database thường không nên đặt active data files trực tiếp trên generic object APIs nếu database engine không được thiết kế cho điều đó.
+
+---
+
+#### 4. Nền tảng phổ biến
+
+- Amazon S3;
+- Azure Blob Storage;
+- Google Cloud Storage;
+- MinIO/S3-compatible deployments;
+- Ceph Object Gateway và các private/hybrid object stores.
+
+S3-compatible API không bảo đảm mọi implementation có cùng consistency, IAM, versioning, event, lifecycle, multipart, checksum hoặc failure semantics. Khi chọn nền tảng, cần so sánh:
+
+- ecosystem và API compatibility;
+- region/data residency;
+- durability/availability commitment;
+- consistency theo operation;
+- identity, encryption và audit;
+- lifecycle/archive/replication;
+- request, retrieval và egress pricing;
+- managed service so với self-operated complexity;
+- migration/portability và test thực tế.
+
+---
+
+#### 5. Request path điển hình
+
+```text
+Client
+  -> application/API xin quyền hoặc metadata
+  -> presigned upload/download URL
+  -> object storage
+  -> event/queue
+  -> scanner/transcoder/indexer
+  -> metadata DB cập nhật trạng thái
+  -> CDN phục vụ object/variant đã duyệt
+```
+
+Application không nhất thiết proxy toàn bộ bytes. Direct upload/download bằng quyền tạm thời giúp:
+
+- giảm bandwidth và memory/connection load của application server;
+- tăng throughput;
+- cho client dùng multipart/resume;
+- tách control plane khỏi data plane.
+
+Nhưng application vẫn phải kiểm soát object key, tenant, size, content type thực, checksum, thời hạn, trạng thái upload và bước xử lý sau upload.
+
+---
+
+#### 6. Consistency và object semantics
+
+Consistency của object store có thể khác theo:
+
+- tạo object mới;
+- overwrite cùng key;
+- delete;
+- list/prefix enumeration;
+- metadata/tag update;
+- cross-region replication;
+- event notification;
+- CDN/cache visibility.
+
+Không nên học một câu chung như “object storage là eventual consistency”. Nhiều managed service hiện cung cấp strong consistency cho một số hoặc phần lớn operation, nhưng guarantee phải được kiểm tra trong tài liệu provider và region/configuration đang dùng.
+
+Các pattern an toàn:
+
+- dùng immutable key/versioned key thay vì overwrite hot object;
+- ghi object trước rồi commit metadata/status trong database;
+- coi event notification là at-least-once nếu contract không nói khác;
+- consumer xử lý idempotently;
+- không suy ra upload hoàn tất chỉ từ việc nhận callback phía client;
+- không coi `LIST` là transaction/query database;
+- version hoặc cache-bust URL khi nội dung đổi;
+- thiết kế reconciliation nếu object và metadata DB lệch nhau.
+
+##### 6.1 Whole-object replacement
+
+Object store thường không hỗ trợ random in-place update như block device. Muốn đổi vài byte, application thường tạo object/version mới. Append-heavy log nên gom/buffer thành chunk/file hoặc dùng log/stream store trước khi compact sang object storage.
+
+##### 6.2 Range request
+
+Client có thể yêu cầu một byte range để đọc một phần object nếu service hỗ trợ. Điều này hữu ích cho media seeking, parallel download và format có index/footer, nhưng không biến object store thành low-latency block storage.
+
+##### 6.3 Multipart upload
+
+Object lớn được chia thành parts để upload song song và retry riêng:
+
+1. khởi tạo upload;
+2. upload từng part có số thứ tự/checksum;
+3. complete để tạo object;
+4. abort nếu thất bại.
+
+Cần lifecycle dọn incomplete multipart upload; nếu không, các part bỏ dở vẫn có thể phát sinh storage cost.
+
+---
+
+#### 7. Durability, availability và integrity
+
+- **Durability**: xác suất acknowledged object không bị mất trong failure model đã cam kết.
+- **Availability**: khả năng request được phục vụ tại thời điểm cần.
+- **Integrity**: bytes đọc ra đúng với bytes đã ghi.
+- **Recoverability**: có thể khôi phục đúng object/version sau lỗi vận hành hoặc logic.
+
+Object store có thể dùng replication, erasure coding, checksum/scrubbing và nhiều failure domain để đạt durability cao. Tuy nhiên:
+
+- durability cao không bảo đảm service luôn reachable;
+- availability cao không bảo đảm không xóa nhầm;
+- replication/versioning không tự thay backup độc lập;
+- cross-region replication có lag và có thể replicate thao tác xóa/lỗi theo policy;
+- client nên xác minh checksum cho đường truyền và, khi phù hợp, end-to-end integrity.
+
+`ETag` có thể hỗ trợ conditional request/cache validation, nhưng **không nên mặc định coi ETag là checksum nội dung**: semantics có thể thay đổi theo multipart upload, encryption hoặc provider.
+
+---
+
+#### 8. Performance và access pattern
+
+Object storage thường mạnh ở:
+
+- nhiều client song song;
+- large sequential transfer;
+- aggregate throughput lớn;
+- write-once/read-many;
+- distribution qua CDN và batch analytics.
+
+Nó thường yếu hơn ở:
+
+- rất nhiều object cực nhỏ;
+- frequent overwrite/append;
+- random small read/write;
+- filesystem locking/rename semantics;
+- low-latency transaction;
+- query theo field bên trong object.
+
+##### 8.1 Small-object problem
+
+Hàng tỷ object vài KB có thể khiến request cost, metadata/list overhead và processing latency lớn hơn chi phí bytes. Có thể gom record thành larger immutable files/chunks, dùng columnar formats cho analytics hoặc giữ hot small records trong database phù hợp.
+
+##### 8.2 Tối ưu thường dùng
+
+- multipart upload/download cho object lớn;
+- parallelism có giới hạn và retry với backoff/jitter;
+- byte-range request;
+- CDN/cache cho public hoặc distributed read;
+- compression phù hợp khả năng truy cập;
+- immutable/versioned asset names;
+- regional placement gần producer/consumer;
+- connection reuse và request batching nơi API hỗ trợ;
+- benchmark theo object-size distribution và concurrency thật.
+
+Không tối ưu chỉ theo bandwidth tối đa; cần đo p50/p95/p99 latency, error/throttle, time-to-first-byte, requests/second, transfer volume và cost.
+
+---
+
+#### 9. Security và chia sẻ object
+
+##### 9.1 Nguyên tắc nền tảng
+
+- private by default và chặn public access ngoài ý muốn;
+- least-privilege identity/role thay cho long-lived access key;
+- bucket/container policy rõ và tránh ACL rải rác nếu không cần;
+- TLS khi truyền; encryption at rest;
+- tách role upload, processing, read và administration;
+- audit data access/configuration change;
+- key rotation và quyền KMS phù hợp;
+- tenant isolation được kiểm tra ở cả API lẫn storage policy.
+
+##### 9.2 Presigned URL
+
+Presigned URL cấp quyền tạm thời cho một operation/object cụ thể mà client không cần cloud credential trực tiếp.
+
+Cần giới hạn:
+
+- method (`GET`, `PUT`...);
+- bucket/key chính xác;
+- thời hạn ngắn phù hợp;
+- content length/type/checksum nếu cơ chế ký hỗ trợ;
+- quyền tạo URL chỉ ở trusted backend;
+- không log/chia sẻ URL như dữ liệu công khai;
+- trạng thái object sau upload phải được backend xác nhận.
+
+Ai có URL còn hiệu lực thường có thể dùng quyền đó, nên presigned URL là bearer capability chứ không phải xác thực user liên tục.
+
+##### 9.3 Upload không tin cậy
+
+User upload nên đi vào quarantine prefix/bucket, sau đó:
+
+1. xác minh size/checksum;
+2. kiểm tra MIME bằng content, không chỉ extension/header;
+3. malware scan/content moderation;
+4. normalize/transcode nếu cần;
+5. ghi metadata và trạng thái;
+6. chỉ publish qua key/CDN path đã duyệt.
+
+Object key do backend sinh; sanitize filename và response headers để tránh path confusion, content sniffing hoặc stored content attack.
+
+##### 9.4 Encryption và KMS
+
+- provider-managed server-side encryption đơn giản hơn;
+- KMS/customer-managed key tăng control/audit nhưng thêm quota, latency, availability và key-lifecycle dependency;
+- client-side encryption bảo vệ trước khi upload nhưng làm search, range, key recovery và processing phức tạp hơn.
+
+Encryption không thay authorization, audit, backup hay data deletion policy.
+
+---
+
+#### 10. Storage class, lifecycle và cost
+
+Các tier thường trải từ hot/standard tới infrequent-access, archive và deep archive. Tên/đặc tính tùy provider.
+
+Tổng chi phí không chỉ là GB/tháng:
+
+```text
+total cost
+  = capacity
+  + PUT/GET/LIST requests
+  + data retrieval
+  + network egress/transfer
+  + replication
+  + encryption/key operations
+  + early deletion/minimum duration
+  + processing/observability
+```
+
+Lifecycle rule có thể tự động:
+
+- chuyển object/version sang tier rẻ hơn;
+- hết hạn current hoặc noncurrent versions;
+- xóa delete marker;
+- abort incomplete multipart upload;
+- giữ object theo retention/compliance rule.
+
+Trước khi chuyển archive cần biết:
+
+- restore mất bao lâu;
+- retrieval fee và request fee;
+- minimum storage duration;
+- object có cần restore tạm trước khi đọc không;
+- business RTO có đáp ứng không;
+- disaster recovery có cần restore song song ở quy mô lớn không.
+
+Tier rẻ nhất chưa chắc rẻ nhất nếu thường xuyên retrieve hoặc giữ object ngắn hơn minimum duration.
+
+---
+
+#### 11. Versioning, immutability và retention
+
+**Versioning** giữ nhiều version của cùng key, hỗ trợ phục hồi overwrite/delete nhầm. Cần quản lý:
+
+- noncurrent-version lifecycle;
+- delete marker;
+- storage growth;
+- quyền xóa version;
+- cách application chọn version hiện hành.
+
+**Object Lock/WORM** ngăn overwrite/delete trong retention period theo mode và policy; **legal hold** giữ object cho tới khi được gỡ bởi quyền phù hợp.
+
+Những cơ chế này hữu ích cho compliance và ransomware resistance, nhưng:
+
+- cấu hình sai có thể khóa dữ liệu lâu và tạo chi phí lớn;
+- retention không tự xác minh backup có thể restore;
+- versioning trong cùng account/failure boundary không phải backup độc lập;
+- quyền quản trị, key encryption và audit log vẫn cần bảo vệ.
+
+---
+
+#### 12. Các kiến trúc điển hình
+
+##### 12.1 Media hosting/video streaming
+
+```text
+Client
+  -> API tạo upload session + immutable object key
+  -> multipart upload trực tiếp vào quarantine bucket
+  -> object-created event / completion verification
+  -> queue
+  -> scan + transcode nhiều bitrate/resolution
+  -> HLS/DASH manifest và segments trong object storage
+  -> metadata DB chuyển trạng thái READY
+  -> CDN phân phối tới viewer
+```
+
+Các quyết định cần nêu:
+
+- upload resume, checksum và size limit;
+- idempotent processing khi event trùng;
+- original/derived object ownership;
+- metadata DB là nguồn trạng thái nghiệp vụ;
+- CDN authorization/signed URL/cookie cho nội dung private;
+- cache key/invalidation và immutable variant;
+- lifecycle cho source, rendition cũ và failed uploads;
+- moderation, deletion và copyright workflow.
+
+##### 12.2 Backup hàng petabyte
+
+- gom/compress log theo time/tenant và tạo manifest;
+- checksum từng object và manifest;
+- versioning/Object Lock khi requirement cần immutability;
+- lifecycle từ hot sang archive theo access/RTO;
+- replication hoặc account/region isolation theo threat model;
+- catalog/index để tìm recovery set;
+- kiểm thử restore có đo throughput, thời gian và chi phí;
+- lifecycle dọn expired versions/incomplete upload;
+- không chỉ đo backup success, phải đo recovery success.
+
+##### 12.3 Microservices chia sẻ file lớn
+
+- service sở hữu file phát presigned URL có scope/thời hạn;
+- consumer truyền object reference thay vì bytes qua message/API;
+- object reference gồm bucket/key/version/checksum/content type;
+- quyền storage gắn với workload identity;
+- event/outbox thông báo trạng thái, consumer idempotent;
+- audit, retention và deletion đi theo data ownership;
+- tránh một shared bucket trở thành nơi mọi service đọc/ghi tùy ý.
+
+##### 12.4 Data lake
+
+Object storage giữ raw/curated datasets; catalog/metastore giữ schema/partition metadata; compute engine đọc theo batch hoặc interactive query.
+
+Cần thiết kế file format, partitioning, compaction, schema evolution, small files, table format/transaction layer, access policy và data quality — không chỉ “ném file vào bucket”.
+
+##### 12.5 Static website và CDN origin
+
+Object storage có thể giữ HTML/CSS/JS/media; CDN cung cấp edge cache, TLS, custom domain và bảo vệ origin. Tránh public bucket nếu có thể dùng private origin access. Với SPA cần cấu hình routing/error fallback; deployment nên dùng immutable asset hash và atomic pointer/version strategy.
+
+---
+
+#### 13. Chín câu hỏi phỏng vấn từ tài liệu PDF
+
+##### Nhóm khái niệm
+
+**Q1. Object storage khác file và block storage thế nào?**  
+Object storage truy cập object bằng key/API và có rich metadata; file storage cung cấp hierarchy/filesystem semantics; block storage cung cấp raw blocks cho filesystem/DB. Chọn theo mutation, latency, sharing và access pattern, không chỉ loại dữ liệu.
+
+**Q2. Khi nào chọn object storage thay filesystem?**  
+Khi cần lưu lượng lớn media, backup, log, dataset hoặc static asset với durability, scale và HTTP/API access; không cần POSIX locking, atomic rename hoặc frequent in-place mutation.
+
+**Q3. Một object gồm gì và metadata có vai trò gì?**  
+Gồm payload bytes, key/identifier và system/custom metadata. Metadata hỗ trợ content handling, policy, lifecycle, classification và processing; ad-hoc business search thường vẫn cần metadata DB/index riêng.
+
+##### Nhóm tình huống system design
+
+**Q4. Dùng object storage để thiết kế nền tảng video thế nào?**  
+Client upload trực tiếp bằng presigned multipart URL vào khu vực quarantine; event kích hoạt scan/transcode; mỗi resolution/segment là object; metadata DB theo dõi trạng thái; CDN phân phối HLS/DASH. Bổ sung checksum, idempotency, authorization và lifecycle.
+
+**Q5. Thiết kế backup tiết kiệm chi phí cho hàng petabyte log?**  
+Gom/compress theo partition, tạo manifest/checksum, dùng lifecycle chuyển tier, versioning/Object Lock theo threat/compliance model và đo access pattern. Quan trọng nhất là catalog, retention, PITR/restore procedure và restore drill phù hợp RTO/RPO.
+
+**Q6. Microservices chia sẻ file lớn an toàn thế nào?**  
+Truyền object reference và phát presigned URL ngắn hạn; workload identity/IAM chỉ cấp quyền tối thiểu; TLS và encryption at rest; audit access; kiểm tra checksum/version. Không gửi long-lived credential hoặc payload lớn qua message bus.
+
+##### Nhóm thực tế và trade-off
+
+**Q7. Performance trade-off của object storage cho real-time access?**  
+Network/API latency cao hơn local block, small random I/O và frequent mutation kém phù hợp. Bù lại, object storage có aggregate throughput và scale lớn. Consistency không nên khẳng định chung là eventual; phải kiểm tra provider/operation và cả CDN/cache layer.
+
+**Q8. Storage tiers ảnh hưởng thiết kế thế nào?**  
+Hot tier có latency/availability tốt hơn nhưng storage cost cao; archive rẻ hơn nhưng retrieval chậm và có fee/minimum duration. Lifecycle phải xuất phát từ access frequency, legal retention, RTO và tổng chi phí, không chỉ giá GB.
+
+**Q9. Kiểm soát truy cập dữ liệu từng user thế nào?**  
+Backend xác thực user rồi ánh xạ sang tenant/object ownership; dùng role/policy least privilege và presigned URL đúng key/method/thời hạn; mã hóa, audit và public-access guardrail. Không tin object key do client gửi nếu chưa kiểm tra ownership.
+
+---
+
+#### 14. Những lỗi tư duy thường gặp
+
+- Nghĩ prefix là directory thật và kỳ vọng atomic rename/locking.
+- Dùng object storage như filesystem hoặc database volume dù workload không phù hợp.
+- Đưa mọi object qua application server, tạo bandwidth bottleneck.
+- Phát presigned URL quá lâu, quá rộng hoặc cho key do client tự chọn.
+- Tin extension/`Content-Type` của upload mà không kiểm tra nội dung.
+- Publish object trước khi scan/transcode/validation hoàn tất.
+- Nghĩ object-created event chỉ đến đúng một lần và đúng thứ tự.
+- Nói mọi object store đều eventual consistent hoặc mọi operation đều strong consistent.
+- Coi ETag luôn là checksum nội dung.
+- Dùng overwrite cùng key rồi quên CDN/browser cache cũ.
+- Tạo hàng tỷ object rất nhỏ mà không tính request/metadata cost.
+- Bật versioning nhưng không dọn noncurrent versions/delete markers.
+- Coi versioning/replication là backup.
+- Chuyển mọi dữ liệu sang archive rẻ nhất mà không xét retrieval/RTO.
+- Chỉ tính GB/tháng, bỏ qua request, retrieval, egress và KMS cost.
+- Bật Object Lock/retention mà không kiểm thử governance và chi phí.
+- Dùng một shared bucket với quyền rộng cho mọi service/tenant.
+- Không lưu checksum/version trong metadata DB hoặc manifest.
+- Có backup nhưng chưa thử restore ở quy mô thực.
+
+---
+
+#### 15. Object storage design checklist
+
+1. Object là gì, kích thước và số lượng/growth distribution?
+2. Key scheme có unique, immutable, tenant-safe và không chứa PII?
+3. Access pattern: PUT/GET/LIST/range/overwrite/delete?
+4. Latency, throughput, concurrency và availability SLO?
+5. Consistency guarantee theo create/overwrite/delete/list/replication?
+6. Multipart threshold, retry, checksum và incomplete-upload cleanup?
+7. Metadata nào ở object store, metadata nào ở database/index?
+8. Direct upload/download hay proxy qua application?
+9. Presigned URL scope, TTL, size/type/checksum constraints?
+10. Quarantine, malware scan, moderation và publish workflow?
+11. Private access, IAM/bucket policy, public guardrail và audit?
+12. TLS, at-rest encryption, KMS dependency và key recovery?
+13. Versioning, Object Lock, retention, legal hold và deletion?
+14. Replication/failure domains, backup và restore test?
+15. Storage class/lifecycle theo access, RTO và minimum duration?
+16. Request/retrieval/egress/replication/KMS cost model?
+17. CDN cache key, invalidation, authorization và origin protection?
+18. Event delivery, idempotency, lag và reconciliation?
+19. Data residency, compliance và secure deletion?
+20. Portability/API compatibility và migration/exit strategy?
+
+#### 16. Ý chính cần nhớ
+
+- Object storage lưu bytes cùng key và metadata, truy cập qua API.
+- Bucket/prefix là logical organization; prefix thường không phải folder thật.
+- Object storage khác file/block ở interface và mutation semantics.
+- Nó mạnh về durability, scale và aggregate throughput; yếu hơn ở low-latency random mutation.
+- Consistency phải kiểm tra theo provider, operation và cache/replication layer.
+- Immutable/versioned key thường an toàn hơn overwrite hot object.
+- Multipart upload, range request, checksum và CDN là building blocks quan trọng.
+- Durability khác availability, integrity và recoverability.
+- ETag không mặc định là content checksum.
+- Presigned URL là quyền tạm thời; phải giới hạn key, method, TTL và kiểm tra hậu upload.
+- Versioning/Object Lock hỗ trợ recovery/compliance nhưng không thay backup/restore test.
+- Tổng chi phí gồm request, retrieval, egress và operation khác ngoài storage bytes.
+- Lifecycle phải dựa trên access pattern, retention và RTO.
+- Metadata DB thường quản lý business state; object store giữ large bytes.
+- Thiết kế tốt bao gồm upload, processing, delivery, retention và deletion end-to-end.
+
+#### Công thức ghi nhớ
+
+> **Object storage tốt = immutable objects + key/metadata rõ + direct secure transfer + consistency/integrity có contract + lifecycle đúng RTO/cost + recovery đã kiểm thử.**
+
+---
+
+### Bài 43. File Systems and Distributed Storage
+
+#### 1. File system là lớp abstraction nào?
+
+Raw block device chỉ cung cấp các vùng byte/block. **File system** biến chúng thành abstraction quen thuộc:
+
+- file và directory;
+- path/name resolution;
+- metadata như size, owner, permission và timestamp;
+- mapping logical file offset tới physical blocks/extents;
+- create, read, write, append, rename và delete semantics;
+- allocation/free-space management;
+- caching, buffering và recovery sau crash.
+
+```text
+Application
+  -> system calls / file API
+  -> virtual file system + concrete filesystem
+  -> page cache / I/O scheduler
+  -> block device / volume
+```
+
+Application làm việc với path/file descriptor thay vì tự quản từng disk block.
+
+Ví dụ local filesystem: ext4, XFS, NTFS, APFS. Tên filesystem không đủ để quyết định; cần xét workload, mount options, storage device, kernel, durability mode và cách vận hành.
+
+> **File system là một hợp đồng về namespace và file semantics, không chỉ là cách đặt dữ liệu lên đĩa.**
+
+---
+
+#### 2. Thành phần và đặc tính của filesystem truyền thống
+
+##### 2.1 Namespace và path lookup
+
+Directory tạo hierarchy:
+
+```text
+/data/projects/p42/events.parquet
+```
+
+Filesystem phân giải từng thành phần của path, kiểm tra quyền rồi tìm metadata/data tương ứng. Directory cực lớn hoặc path lookup dày đặc có thể trở thành metadata workload đáng kể.
+
+##### 2.2 Inode/file metadata
+
+Nhiều Unix-like filesystem dùng cấu trúc tương tự **inode** để giữ metadata và pointer/extent tới data blocks. Filename thường nằm trong directory entry trỏ tới inode; vì vậy tên/path và nội dung không nhất thiết là cùng một record.
+
+##### 2.3 Allocation và fragmentation
+
+Filesystem phải cấp phát block/extent, thu hồi free space và hạn chế fragmentation. Large sequential files, hàng triệu small files và random overwrite tạo profile I/O khác nhau.
+
+##### 2.4 Cache, buffer và durability
+
+Write trả về thành công ở application chưa chắc bytes đã durable trên media. Cần hiểu:
+
+- page cache;
+- buffered/direct I/O;
+- flush/`fsync` semantics;
+- device/controller cache;
+- write ordering và barrier;
+- failure model của volume.
+
+##### 2.5 Journaling và crash recovery
+
+Journaling ghi trước metadata hoặc thay đổi theo transaction-like log để filesystem khôi phục structure nhất quán sau crash. Nó không tự bảo vệ khỏi xóa nhầm, corruption ở mọi lớp hoặc mất cả thiết bị; backup và integrity checks vẫn cần.
+
+##### 2.6 Local filesystem không nhất thiết là “một disk”
+
+Local filesystem có thể nằm trên partition, RAID, logical volume, SAN block device hoặc volume do cloud cung cấp. Điểm phân biệt quan trọng là filesystem semantics được một host/kernel quản lý trực tiếp hay được cung cấp như shared/distributed service — không chỉ số ổ đĩa bên dưới.
+
+---
+
+#### 3. Local, network và distributed filesystem
+
+| Mô hình | Cách nhìn từ client | Dữ liệu/metadata | Điểm mạnh | Giới hạn chính |
+|---|---|---|---|---|
+| **Local filesystem** | Mount/device của một host | Host/filesystem quản lý | Latency thấp, semantics rõ, đơn giản | Chia sẻ và scale-out cần lớp khác |
+| **Network filesystem** | Remote share được mount | Có thể tập trung ở server/appliance | Dễ chia sẻ file qua NFS/SMB | Server/network bottleneck và failure domain tùy kiến trúc |
+| **Distributed filesystem (DFS)** | Một logical namespace trên cluster | Metadata và file chunks/blocks phân tán/được phối hợp | Scale-out, throughput và fault tolerance | Consistency, metadata, repair và vận hành phức tạp |
+| **Object storage** | Bucket + key qua API | Object độc lập, không full filesystem semantics | Massive scale, durability, API/HTTP | Không mặc định POSIX, random in-place update hoặc atomic rename |
+
+Network filesystem và distributed filesystem có thể chồng lấn: một DFS có thể được expose qua NFS/SMB/POSIX-like mount. Khi thảo luận, nên mô tả implementation và guarantee thay vì chỉ dùng nhãn.
+
+---
+
+#### 4. Vì sao cần distributed filesystem?
+
+Khi một storage server không đáp ứng đủ:
+
+- tổng capacity;
+- aggregate throughput;
+- số client đồng thời;
+- availability;
+- recovery time;
+- failure-domain isolation;
+- compute/data locality;
+
+DFS chia file thành block/chunk và đặt chúng trên nhiều storage node, trong khi vẫn trình bày một logical namespace.
+
+Lợi ích:
+
+- thêm node để tăng capacity/throughput;
+- đọc/ghi nhiều block song song;
+- replica/parity chịu node/disk failure;
+- rebalance khi membership/capacity đổi;
+- scheduling compute gần data cho một số workload.
+
+Chi phí:
+
+- network hop và coordination;
+- metadata service phải scale và HA;
+- consistency/cache/locking phức tạp;
+- background repair/rebalance cạnh tranh I/O;
+- rolling upgrade, capacity skew và incident blast radius;
+- semantics có thể yếu/khác POSIX để đổi lấy throughput.
+
+> **DFS không làm latency của một operation tự động thấp hơn; nó chủ yếu tăng aggregate capacity, parallelism và resilience.**
+
+---
+
+#### 5. Kiến trúc DFS tổng quát
+
+```text
+                         Metadata service
+                      namespace + block map
+                         /      |      \
+Client -- metadata lookup      health   placement
+  |                              |         |
+  +-------- direct data I/O ---> Data node A
+  +-------- direct data I/O ---> Data node B
+  +-------- direct data I/O ---> Data node C
+```
+
+##### 5.1 Metadata plane
+
+Metadata service quản lý hoặc phối hợp:
+
+- directory tree và filename;
+- ownership/permission/ACL;
+- file -> block/chunk mapping;
+- replica placement;
+- lease/lock và open-file state tùy hệ thống;
+- node health/membership;
+- namespace mutation và recovery log.
+
+Metadata cần high availability. Các cách triển khai có thể dùng active/standby, replicated state machine, partitioned metadata hoặc distributed metadata servers. “Một metadata server” trong logical design không có nghĩa production chỉ có một process không dự phòng.
+
+##### 5.2 Data plane
+
+Storage/data node giữ bytes của block/chunk, phục vụ client I/O, báo health/inventory và tham gia replication/repair.
+
+Trong nhiều DFS, client hỏi metadata service để biết block ở đâu rồi truyền bytes **trực tiếp** với data nodes. Điều này tránh đưa mọi data qua metadata coordinator.
+
+##### 5.3 Control plane
+
+Control plane theo dõi desired state:
+
+- node heartbeat và block report;
+- under/over-replication;
+- disk usage và hot spots;
+- re-replication/recovery;
+- placement theo rack/zone;
+- decommission và rebalance;
+- corruption/checksum repair.
+
+---
+
+#### 6. HDFS như một ví dụ kiến trúc
+
+HDFS được tối ưu lịch sử cho large files, sequential streaming và batch analytics hơn là OLTP hoặc hàng triệu tiny random updates.
+
+##### 6.1 NameNode
+
+NameNode quản lý namespace và metadata như:
+
+- hierarchy/permission;
+- file-to-block mapping;
+- block location/replication state;
+- namespace operation;
+- lease và recovery coordination tùy operation.
+
+NameNode không phục vụ payload file trong normal data path. HA deployment cần standby/failover và cơ chế ngăn hai active cùng điều phối sai.
+
+##### 6.2 DataNode
+
+DataNode:
+
+- giữ actual blocks trên local volumes;
+- phục vụ client read/write;
+- gửi heartbeat và block report;
+- tạo/xóa/replicate block theo instruction;
+- xác minh checksum và báo lỗi.
+
+##### 6.3 Read path rút gọn
+
+1. Client hỏi NameNode metadata và block locations.
+2. NameNode trả danh sách replica, thường có ưu tiên locality/topology.
+3. Client đọc trực tiếp từ DataNode phù hợp.
+4. Nếu replica lỗi/corrupt, client thử replica khác và báo lỗi để hệ thống repair.
+
+##### 6.4 Write path rút gọn
+
+1. Client yêu cầu tạo file và nhận placement/pipeline.
+2. Data được chia thành packets/chunks và gửi vào pipeline DataNodes.
+3. Các DataNode forward/ghi theo replication protocol.
+4. Acknowledgement đi ngược pipeline.
+5. NameNode cập nhật namespace/block state theo protocol.
+6. Close/commit làm file visible theo semantics của hệ thống.
+
+Chi tiết acknowledgement và durability phải kiểm tra theo version/configuration; không suy ra chỉ từ replication factor.
+
+##### 6.5 Block size và replication factor
+
+Large block giúp:
+
+- giảm số metadata entries;
+- giảm seek/setup overhead;
+- tăng sequential throughput;
+- tạo đơn vị scheduling/parallelism đủ lớn.
+
+Nhưng block quá lớn giảm parallelism cho file nhỏ và tăng recovery granularity. Block size và replication factor là **cấu hình**, không nên học thuộc một con số như guarantee vĩnh viễn. Replication factor cao tăng resilience/read options nhưng tốn capacity/network và repair bandwidth.
+
+---
+
+#### 7. Fault tolerance và reliability
+
+##### 7.1 Failure là bình thường
+
+Trong cluster lớn, disk, process, server, rack, switch và network link đều có thể lỗi. DFS phải phát hiện, cô lập và repair liên tục.
+
+##### 7.2 Heartbeat và block report
+
+- **Heartbeat** cho biết DataNode còn sống/đáp ứng control protocol.
+- **Block report** cho biết node đang giữ những block nào.
+
+Không nhận heartbeat chỉ chứng minh node không liên lạc trong threshold, chưa chỉ ra nguyên nhân. Failure detector luôn có trade-off giữa phát hiện nhanh và false positive.
+
+##### 7.3 Replication placement
+
+Replica nên trải qua failure domains phù hợp, ví dụ nhiều disk/node/rack/zone. Ba copy trên cùng rack không bảo vệ khỏi mất rack.
+
+Placement cân bằng:
+
+- fault tolerance;
+- write/read locality;
+- cross-rack/zone bandwidth;
+- storage utilization;
+- compliance/residency.
+
+##### 7.4 Re-replication và repair
+
+Khi block under-replicated:
+
+1. metadata/control plane phát hiện;
+2. chọn healthy source và target;
+3. copy block, xác minh checksum;
+4. cập nhật ownership/location;
+5. throttle để tránh repair storm ảnh hưởng foreground traffic.
+
+Khi nhiều node cùng lỗi, repair bandwidth và time-to-repair quyết định exposure window. Chỉ biết replication factor là chưa đủ.
+
+##### 7.5 Erasure coding
+
+Erasure coding giảm storage overhead so với full replicas ở quy mô lớn, nhưng encode/reconstruct có CPU/network cost và thường phù hợp cold/large data hơn latency-sensitive small writes.
+
+##### 7.6 Metadata durability và HA
+
+Data blocks còn nguyên nhưng mất authoritative namespace/block mapping vẫn có thể khiến hệ thống khó sử dụng. Cần:
+
+- replicated metadata/log;
+- active/standby hoặc consensus;
+- checkpoint/snapshot theo design;
+- fencing khi failover;
+- backup và restore test metadata;
+- kiểm tra namespace/data consistency.
+
+##### 7.7 Replication không thay backup
+
+Lệnh xóa, corruption, bug hoặc ransomware có thể tác động nhiều replica. Vẫn cần snapshot/backup/versioning theo threat model, retention độc lập và recovery drill.
+
+---
+
+#### 8. Scalability và những bottleneck thực tế
+
+##### 8.1 Capacity và throughput
+
+Thêm node có thể tăng disk capacity và aggregate bandwidth, nhưng không tuyến tính mãi vì:
+
+- metadata coordination;
+- network/oversubscription;
+- skew/hot files;
+- background replication/rebalance;
+- client/scheduler limits;
+- shared rack/zone failure domains.
+
+##### 8.2 Metadata bottleneck
+
+Workload nhiều create/open/stat/list/rename hoặc hàng tỷ small files có thể giới hạn metadata plane trước khi hết data capacity.
+
+Giải pháp tùy hệ thống:
+
+- metadata sharding/federation;
+- cache có coherence đúng;
+- batch operation;
+- gom small files;
+- tránh deep/hot directory patterns;
+- tăng metadata node capacity;
+- dùng object/table store phù hợp hơn.
+
+##### 8.3 Small-file problem
+
+Nhiều file rất nhỏ tạo:
+
+- metadata entry và memory overhead lớn;
+- nhiều RPC/open/close;
+- poor sequential throughput;
+- nhiều tiny tasks trong analytics;
+- namespace scan/backup chậm.
+
+Có thể compact thành larger files/container, dùng Parquet/ORC cho analytics hoặc chọn key-value/object storage tùy access pattern.
+
+##### 8.4 Rebalancing
+
+Khi thêm/bớt node, hệ thống di chuyển block để cân bằng capacity/load và giữ placement policy. Rebalance phải:
+
+- có bandwidth/IO limit;
+- ưu tiên dữ liệu rủi ro cao;
+- tránh phá locality quá mức;
+- quan sát queue, ETA và impact;
+- hỗ trợ pause/resume/recovery;
+- phân biệt capacity balance với traffic balance.
+
+##### 8.5 Hot file, hot directory và skew
+
+Replica có thể scale một số read, nhưng một hot writer/metadata path vẫn nghẽn. Có thể partition workload, cache read-only data, tăng replica, tách namespace, rate limit hoặc thay data model. Cần đo request distribution, không chỉ dung lượng.
+
+---
+
+#### 9. Latency, throughput và data locality
+
+**Latency** là thời gian hoàn tất một operation; **throughput** là tổng bytes/operations theo thời gian. DFS cho analytics thường chọn:
+
+- large sequential I/O;
+- read-ahead/buffering;
+- parallel scan;
+- batching;
+- compression;
+- large files/blocks.
+
+Điều này tăng throughput nhưng không tối ưu small random read/write hoặc metadata-heavy OLTP.
+
+##### 9.1 Data locality
+
+Nếu compute chạy gần node/rack chứa data, có thể giảm network transfer và tăng throughput. Scheduler có thể ưu tiên node-local, rack-local rồi remote.
+
+Trong cloud/disaggregated architecture, compute và storage thường tách rời; locality có thể chuyển thành region/AZ/cache locality thay vì cùng physical host. Vì vậy data locality là cost/performance strategy, không phải quy tắc bất biến.
+
+##### 9.2 Đo hiệu năng đúng
+
+Cần đo:
+
+- p50/p95/p99 open/read/write/close latency;
+- aggregate và per-node throughput;
+- metadata ops/s;
+- network/disk utilization;
+- cache hit ratio;
+- under-replicated/corrupt blocks;
+- repair/rebalance backlog;
+- client retry/throttle/error;
+- file-size distribution và skew.
+
+---
+
+#### 10. Consistency, caching và concurrency
+
+POSIX-like expectations gồm read-after-write visibility, atomic rename, permissions, file locking và concurrent writer behavior. Distributed implementation phải coordination qua network nên mỗi guarantee có giá.
+
+Các model có thể gồm:
+
+- strong/linearizable metadata operation trong boundary nhất định;
+- close-to-open consistency;
+- session consistency;
+- write-once/read-many;
+- single-writer lease;
+- append với giới hạn cụ thể;
+- eventual propagation của cache/replica.
+
+Không nên nói “DFS hỗ trợ POSIX” rồi suy ra mọi corner case giống local ext4. Cần kiểm tra semantics của:
+
+- concurrent read/write;
+- rename/replace;
+- file lock/lease expiry;
+- append;
+- partial write/client crash;
+- cache invalidation;
+- failover và stale client;
+- permission/ACL update.
+
+##### 10.1 Client caching
+
+Cache data/metadata giảm latency và tải server nhưng tạo coherence problem. TTL đơn giản có thể trả stale; callback/lease/invalidation mạnh hơn nhưng thêm state và failure handling.
+
+##### 10.2 Lease, lock và fencing
+
+Lease cho writer quyền trong một khoảng thời gian. Khi lease hết hoặc failover, writer cũ có thể vẫn chạy. Fencing token/epoch giúp storage từ chối write của owner cũ, tránh split-brain và stale writer corruption.
+
+---
+
+#### 11. Chọn HDFS, CephFS, GlusterFS, network FS hay object storage
+
+| Nhu cầu | Hướng thường cân nhắc |
+|---|---|
+| Large sequential batch analytics, ecosystem Hadoop/Spark | HDFS hoặc storage connector tương thích workload |
+| Shared POSIX-like namespace cho nhiều client | CephFS hoặc distributed/network filesystem phù hợp |
+| Shared enterprise/legacy file access | Managed NFS/SMB/NAS hoặc scale-out file platform |
+| Media/archive/data lake qua API, không cần POSIX | Object storage |
+| Database/VM low-latency random I/O | Block storage/filesystem được database hỗ trợ |
+
+Ceph có thể cung cấp object, block và file interfaces qua các thành phần khác nhau; CephFS là file interface. GlusterFS là một scale-out filesystem khác. HDFS được thiết kế quanh analytics/data-local processing và semantics riêng.
+
+Không chọn dựa trên bảng tên sản phẩm. Cần proof-of-concept theo:
+
+- POSIX/API compatibility thật sự cần;
+- small/large file mix;
+- latency/throughput/concurrency;
+- metadata scale;
+- write/append/locking semantics;
+- rack/AZ/region placement;
+- failure/recovery/rebalance;
+- backup/snapshot;
+- đội ngũ và managed/self-hosted operation;
+- roadmap/support của sản phẩm tại thời điểm triển khai.
+
+---
+
+#### 12. Thiết kế storage cho high-throughput analytics
+
+Một pipeline điển hình:
+
+```text
+Sources -> ingest/broker -> distributed/object storage
+                              |
+                       partitioned datasets
+                              |
+                     compute scheduler/engine
+                              |
+                   curated tables / serving layer
+```
+
+Quyết định quan trọng:
+
+1. Partition theo time/tenant/domain để pruning nhưng tránh quá nhiều partition nhỏ.
+2. Dùng Parquet/ORC hoặc format phù hợp để column pruning/compression.
+3. Compact small files và kiểm soát target file size.
+4. Replicate/erasure-code theo durability và cost.
+5. Đặt compute gần data hoặc cache hot working set.
+6. Tách ingest, compaction, query và repair bandwidth.
+7. Thêm node dựa trên disk, network, metadata và recovery headroom — không chỉ dung lượng.
+8. Rebalance có throttling và capacity reserve.
+9. Catalog/schema/lineage và access control phải scale cùng bytes.
+10. Backup, DR, restore và corruption detection được kiểm thử.
+
+Autoscaling storage node không tức thời: provision, data movement và rebalance có thể mất lâu. Cần capacity planning và headroom thay vì đợi cluster gần đầy mới scale.
+
+---
+
+#### 13. Sáu câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. File system và distributed file system khác nhau thế nào?**  
+Filesystem quản lý namespace, metadata và block mapping của file. Local filesystem do một host quản lý; DFS phối hợp metadata/data qua nhiều node nhưng trình bày logical namespace chung. DFS tăng capacity, throughput và fault tolerance, đổi lại thêm network, consistency và operational complexity.
+
+**Q2. HDFS bảo đảm fault tolerance/reliability ra sao?**  
+File được chia thành block và đặt nhiều replica hoặc protection scheme trên các DataNode/failure domain; health được theo dõi bằng heartbeat/block report; block thiếu replica được repair. Block size và replication factor là cấu hình. Reliability còn cần metadata HA, checksum, rack awareness, fencing, backup và restore test — không chỉ “ba bản sao”.
+
+**Q3. NameNode và DataNode có vai trò gì?**  
+NameNode quản namespace, permission và file-to-block/location metadata; DataNode lưu actual blocks và phục vụ I/O. Client thường lấy block location từ NameNode rồi truyền dữ liệu trực tiếp với DataNode. Production cần HA/failover cho metadata plane.
+
+**Q4. Latency và throughput đánh đổi thế nào trong distributed storage?**  
+Network/coordination làm operation latency cao hơn; parallel sequential I/O, large block và batching tăng aggregate throughput. Tối ưu analytics scan không đồng nghĩa phù hợp small random transactional reads/writes. Chọn theo latency percentile và workload mix.
+
+**Q5. Khi nào cân nhắc CephFS/GlusterFS thay HDFS?**  
+Khi cần shared/general-purpose hoặc POSIX-like file access hơn là semantics batch analytics của HDFS. CephFS phù hợp trong Ceph ecosystem; GlusterFS là một lựa chọn scale-out khác. Tuy nhiên phải kiểm tra feature/support/operations hiện hành và benchmark — không nên mặc định một hệ “đơn giản hơn” trong mọi môi trường.
+
+**Q6. Scale storage cho high-throughput analytics thế nào?**  
+Dùng distributed/object storage phù hợp; partition data, large efficient formats như Parquet/ORC, compression và compaction; thêm storage node có headroom; tận dụng locality/cache; tách foreground traffic khỏi repair/rebalance; theo dõi metadata, network, skew và recovery time.
+
+---
+
+#### 14. Những lỗi tư duy thường gặp
+
+- Nói filesystem truyền thống luôn nằm trên đúng một physical disk.
+- Đồng nhất network filesystem với distributed filesystem mà không mô tả architecture.
+- Nghĩ DFS làm mọi read/write nhanh hơn local storage.
+- Đưa mọi payload qua metadata server/NameNode trong sơ đồ.
+- Coi NameNode production luôn là single point of failure mà không xét HA design.
+- Học thuộc block size/replication factor như hằng số của HDFS.
+- Nghĩ replication factor đủ để bảo đảm durability/recovery.
+- Đặt replica cùng failure domain.
+- Coi replication là backup.
+- Chỉ scale data nodes, bỏ qua metadata capacity.
+- Lưu hàng tỷ small files mà không tính metadata/RPC/task overhead.
+- Nghĩ capacity cân bằng đồng nghĩa traffic cân bằng.
+- Rebalance không throttling làm foreground workload suy giảm.
+- Không reserve capacity cho repair khi node/rack lỗi.
+- Khẳng định “POSIX-compatible” mà không kiểm tra rename, lock, append và cache semantics.
+- Dùng TTL cache nhưng không chấp nhận stale metadata/data.
+- Dùng lease mà không fencing stale writer.
+- Chỉ đo throughput trung bình, bỏ qua tail latency và repair backlog.
+- Bật autoscaling nhưng không tính thời gian provision/rebalance.
+- Chọn HDFS/CephFS/GlusterFS theo tên tuổi thay vì workload và khả năng vận hành.
+
+---
+
+#### 15. Distributed filesystem design checklist
+
+1. File-size/count distribution và growth rate?
+2. Read/write ratio; sequential, random, append hay overwrite?
+3. Namespace/stat/list/rename/lock workload?
+4. POSIX/NFS/SMB/API semantics nào thực sự bắt buộc?
+5. Latency percentile, throughput và concurrency SLO?
+6. Metadata architecture, capacity, HA và recovery?
+7. Data block/chunk size và placement policy?
+8. Replication factor hay erasure coding theo data class?
+9. Failure domains: disk, node, rack, AZ, region?
+10. Heartbeat/failure detection và false-positive policy?
+11. Re-replication priority, bandwidth và time-to-repair?
+12. Rebalance/decommission có throttling và rollback không?
+13. Hot file/directory/node và small-file mitigation?
+14. Cache consistency, lease, lock và fencing semantics?
+15. Checksums, scrubbing và corruption repair?
+16. Capacity headroom cho failure, repair và growth?
+17. Data locality/network topology và scheduler integration?
+18. Encryption, ACL, tenant isolation và audit?
+19. Snapshot/backup/DR, RPO/RTO và restore test?
+20. Upgrade, compatibility, observability và operational ownership?
+
+#### 16. Ý chính cần nhớ
+
+- Filesystem biến raw blocks thành file, directory, metadata và operation semantics.
+- Local filesystem có thể nằm trên nhiều lớp/device; “local” không đồng nghĩa một disk.
+- DFS trình bày logical namespace trên nhiều storage node.
+- Metadata plane và data plane nên được phân biệt rõ.
+- Client thường truyền payload trực tiếp với data nodes, không qua metadata coordinator.
+- HDFS tối ưu large sequential/batch workload, không phải mọi file workload.
+- Block size và replication factor là cấu hình, không phải con số bất biến.
+- Replication/erasure coding, placement, checksum và repair cùng tạo fault tolerance.
+- Metadata HA quan trọng ngang data replication.
+- Replication không thay backup.
+- DFS thường tăng aggregate throughput và scale, không tự giảm single-operation latency.
+- Small files và metadata-heavy workload có thể làm cluster nghẽn trước khi hết disk.
+- Data locality vẫn hữu ích nhưng hình thức thay đổi trong cloud/disaggregated systems.
+- POSIX, cache, lock, lease và failover semantics phải được kiểm tra cụ thể.
+- Rebalance/repair cần capacity reserve, throttling và observability.
+- Chọn storage theo workload, guarantee và operational capability.
+
+#### Công thức ghi nhớ
+
+> **Distributed filesystem tốt = namespace/metadata HA + data placement đúng failure domain + replication/repair có kiểm soát + semantics phù hợp workload + capacity/recovery đã diễn tập.**
+
+---
+
+### Bài 44. Big Data Fundamentals
+
+#### 1. Big Data là gì?
+
+Big Data không có một ngưỡng cố định như “từ 1 TB trở lên”. Một workload trở thành bài toán big data khi quy mô, tốc độ, độ đa dạng hoặc yêu cầu xử lý khiến cách làm thông thường không còn đáp ứng được SLO, chi phí hay khả năng vận hành.
+
+```text
+Big Data problem
+  = data vượt giới hạn của cách xử lý hiện tại
+  + cần storage/compute phân tán hoặc chuyên biệt
+  + vẫn phải tạo ra giá trị đáng tin cậy với chi phí hợp lý
+```
+
+Dữ liệu có thể đến từ:
+
+- click, page view và user behavior;
+- API/application/database logs;
+- transaction và change events;
+- IoT/sensor/vehicle telemetry;
+- hình ảnh, video và tài liệu;
+- security/audit signals;
+- dataset, feature và artifact của ML.
+
+Big data không phải một sản phẩm. Nó là tập các bài toán về ingest, storage, processing, quality, governance, serving và cost ở quy mô lớn.
+
+> **“Lưu được nhiều byte” chưa phải thành công. Dữ liệu chỉ có giá trị khi hệ thống biến nó thành quyết định hoặc sản phẩm đáng tin cậy, đúng thời điểm và với chi phí chấp nhận được.**
+
+---
+
+#### 2. 5V và 6V của Big Data
+
+Tài liệu PDF dùng **5V**; transcript dùng **6V** bằng cách thêm **Variability**. Đây là các biến thể của cùng framework, không phải hai định nghĩa mâu thuẫn.
+
+| V | Câu hỏi kiến trúc | Hệ quả thường gặp |
+|---|---|---|
+| **Volume** | Bao nhiêu byte/record, tăng nhanh đến đâu, giữ bao lâu? | Partition, distributed storage, compression, tiering và lifecycle |
+| **Velocity** | Tốc độ đến và mức burst? Insight cần sau bao lâu? | Broker, backpressure, stream processing, autoscaling và buffering |
+| **Variety** | Structured, semi-structured, binary và schema khác nhau thế nào? | Flexible ingestion, schema registry/evolution, nhiều format và engine |
+| **Veracity** | Dữ liệu có đúng, đủ, không trùng và truy xuất nguồn được không? | Validation, dedup, quality rule, lineage và reconciliation |
+| **Value** | Dữ liệu cải thiện quyết định/sản phẩm/KPI gì? | Ưu tiên use case, freshness/SLO, ROI và tránh giữ data vô mục đích |
+| **Variability** | Distribution, traffic, schema hoặc ý nghĩa thay đổi ra sao? | Adaptive capacity, drift detection, versioning và semantic governance |
+
+Một số tài liệu còn thêm các V khác. Không cần học thuộc số lượng; điều quan trọng là dùng framework để tìm requirement và bottleneck.
+
+##### 2.1 Volume không chỉ là tổng dung lượng
+
+Cần biết:
+
+- record/object/file count;
+- average và tail size;
+- raw, compressed và replicated size;
+- hot working set;
+- retention/growth;
+- bytes scanned mỗi query;
+- tốc độ restore/reprocess.
+
+##### 2.2 Velocity không đồng nghĩa mọi thứ phải real-time
+
+Ingest 1 triệu event/giây không có nghĩa mọi insight cần dưới 1 giây. Có thể buffer stream rồi xử lý micro-batch hoặc batch. Business latency quyết định processing model.
+
+##### 2.3 Variety không buộc phải bỏ schema
+
+Schema vẫn tồn tại trong event contract, table format, validation và consumer. Variety đòi hỏi schema evolution tốt, không phải schema chaos.
+
+##### 2.4 Veracity thường khó hơn analytics
+
+Duplicate, missing field, late event, clock skew, bot traffic, unit mismatch và semantic drift có thể khiến dashboard chính xác về phép tính nhưng sai về ý nghĩa.
+
+---
+
+#### 3. Vì sao cách xử lý truyền thống có thể gặp giới hạn?
+
+Các giới hạn thường xuất hiện ở:
+
+- một node không chứa/scan được dataset trong thời gian yêu cầu;
+- ingest/write vượt throughput của một primary;
+- nhiều query cạnh tranh CPU, memory, I/O;
+- backup/restore/reindex mất quá lâu;
+- schema và format đa dạng;
+- failure ở quy mô lớn xảy ra thường xuyên;
+- scale dọc có diminishing returns;
+- workload batch làm ảnh hưởng OLTP;
+- analytics cần lịch sử dài và full scan.
+
+Nhưng không nên kết luận:
+
+```text
+RDBMS = không dùng được cho Big Data
+NoSQL/Hadoop = luôn là đáp án
+```
+
+Modern relational/distributed SQL và warehouses có thể scale rất lớn. Ngược lại, một cluster phân tán thiết kế kém vẫn chậm và đắt. Thường cần tách:
+
+- **OLTP system of record** cho transaction/invariant;
+- **analytical platform** cho scan, aggregation, ML và lịch sử;
+- pipeline đồng bộ có freshness/reconciliation contract.
+
+Vấn đề là workload và SLO, không phải nhãn “truyền thống” hay “hiện đại”.
+
+---
+
+#### 4. Kiến trúc Big Data tổng quát
+
+```text
+Operational DBs / Apps / Devices / Files
+                    |
+             CDC / logs / events
+                    v
+          Ingestion & durable buffer
+                    |
+          +---------+----------+
+          |                    |
+     Stream processing     Raw landing zone
+          |                    |
+    real-time views       batch ETL/ELT
+          |                    |
+          +------ curated tables ------+
+                         |              |
+                 SQL/BI/ML engines   Serving stores
+                         |
+                  dashboards/models/APIs
+
+Cross-cutting: catalog, schema, lineage, quality, security,
+               orchestration, observability, cost and recovery
+```
+
+##### 4.1 Sources
+
+Nguồn dữ liệu phải có owner, schema/version, event time, unique ID và change semantics. Trích xuất từ database cần tránh polling/full dump liên tục nếu CDC phù hợp hơn.
+
+##### 4.2 Ingestion và durable buffer
+
+Broker/log hoặc managed stream giúp:
+
+- tách producer khỏi consumer;
+- hấp thụ burst;
+- replay;
+- partition để scale;
+- theo dõi lag;
+- cho nhiều processing pipelines đọc độc lập.
+
+Phải thiết kế retention, partition key, ordering scope, delivery guarantee, schema compatibility và backpressure.
+
+##### 4.3 Storage layers
+
+- raw/bronze: dữ liệu gần nguồn, immutable, phục vụ audit/replay;
+- cleaned/silver: chuẩn hóa, dedup, quality checks và conformed fields;
+- curated/gold: aggregate/table tối ưu cho business query hoặc ML.
+
+Tên layer không quan trọng bằng contract, ownership và khả năng rebuild.
+
+##### 4.4 Processing
+
+- stream cho low-latency transformation/alert/stateful computation;
+- batch cho backfill, historical aggregation, model training và large recomputation;
+- interactive SQL cho exploration và BI;
+- specialized compute cho graph, search hoặc ML.
+
+##### 4.5 Serving
+
+Không nên cho mọi user/API scan data lake. Derived serving layers có thể là warehouse, OLAP store, search index, feature store, time-series DB hoặc key-value cache tùy latency/query.
+
+---
+
+#### 5. Batch processing
+
+Batch xử lý một tập dữ liệu hữu hạn hoặc snapshot tại một thời điểm.
+
+Phù hợp với:
+
+- daily/hourly ETL;
+- billing/reconciliation;
+- historical reporting;
+- large joins/aggregations;
+- model training;
+- backfill/recompute;
+- compaction và data quality audit.
+
+Ưu điểm:
+
+- throughput và cost efficiency tốt cho dữ liệu lớn;
+- logic dễ reason/replay hơn stream trong nhiều trường hợp;
+- có thể retry partition/job;
+- tận dụng columnar scan và distributed parallelism.
+
+Nhược điểm:
+
+- kết quả có latency theo lịch/cycle;
+- job dài tạo large failure/retry scope;
+- shuffle/skew/straggler có thể chi phối runtime;
+- backfill cạnh tranh resource với job hiện tại.
+
+##### 5.1 MapReduce mental model
+
+```text
+Input splits
+   -> Map: transform/filter thành key-value
+   -> Shuffle: partition/sort/group theo key
+   -> Reduce: aggregate/join/output
+```
+
+MapReduce quan trọng về tư duy: đưa computation tới data, partition work và chịu failure bằng retry. Shuffle thường là phần đắt vì network, disk, sort và skew.
+
+##### 5.2 Spark mental model
+
+Spark xây execution plan/DAG từ transformations, chia thành stages/tasks quanh shuffle boundary rồi chạy phân tán. Nó có thể cache data nhưng không phải “mọi thứ luôn ở RAM”. Performance phụ thuộc partition count, shuffle, serialization, spill, file layout, skew và executor sizing.
+
+---
+
+#### 6. Stream processing
+
+Stream xử lý dữ liệu **không giới hạn** khi events tiếp tục đến. “Real-time” thường là một dải từ milliseconds tới minutes; cần nêu latency SLO thay vì chỉ dùng nhãn.
+
+Phù hợp với:
+
+- fraud/risk signals;
+- monitoring và alert;
+- IoT anomaly;
+- personalization/recommendation features;
+- live counters/dashboard;
+- CDC materialized views;
+- online enrichment/routing.
+
+##### 6.1 Event time và processing time
+
+- **event time**: thời điểm sự kiện xảy ra ở nguồn;
+- **processing time**: thời điểm operator xử lý sự kiện;
+- **ingestion time**: thời điểm platform nhận sự kiện.
+
+Network delay, retry và offline device làm event đến trễ hoặc sai thứ tự.
+
+##### 6.2 Window
+
+Unbounded stream phải được giới hạn khi aggregate:
+
+- tumbling window: các cửa sổ cố định không chồng;
+- sliding/hopping window: cửa sổ chồng theo bước;
+- session window: nhóm events theo khoảng hoạt động;
+- global/custom window: theo logic riêng.
+
+##### 6.3 Watermark và late data
+
+Watermark là ước lượng rằng event time đã tiến tới mốc nào. Nó giúp engine quyết định khi nào emit/close window nhưng không bảo đảm không còn event cũ.
+
+Cần quyết định:
+
+- allowed lateness;
+- update/retract kết quả cũ;
+- late-event side output/DLQ;
+- backfill/reconciliation;
+- dashboard có hiển thị preliminary hay final.
+
+##### 6.4 Stateful processing và recovery
+
+Stateful operator giữ window, aggregate, join hoặc dedup state. Cần checkpoint/snapshot, durable input offsets và restore coordination.
+
+“Exactly-once” luôn có scope. Source, processing state và sink phải phối hợp; external side effect thường vẫn cần idempotency, transaction hoặc dedup.
+
+##### 6.5 Backpressure
+
+Khi consumer xử lý chậm hơn ingest, backlog/lag tăng. Hệ thống cần buffer, autoscale, admission control, degrade/drop policy hoặc replay plan — không thể giả định stream processor luôn bắt kịp.
+
+---
+
+#### 7. Batch hay stream?
+
+| Tiêu chí | Batch | Stream |
+|---|---|---|
+| **Input** | Bounded dataset/snapshot | Unbounded event flow |
+| **Latency** | Phút, giờ hoặc theo lịch | Millisecond tới phút tùy SLO |
+| **Throughput** | Tối ưu large scan/aggregation | Tối ưu continuous incremental updates |
+| **State/time** | Snapshot/job semantics | Event time, window, watermark, late data |
+| **Failure recovery** | Retry job/partition | Replay + checkpoint/state recovery |
+| **Use case** | ETL, report, train, backfill | Alert, fraud, monitoring, live feature |
+| **Độ phức tạp** | Thường dễ hơn | Cao hơn vì ordering, time, state và continuous ops |
+
+Nhiều hệ thống dùng cả hai:
+
+- stream tạo quyết định/view nhanh;
+- batch tính lại authoritative result hoặc train model;
+- cùng đọc raw immutable data và dùng common business definitions.
+
+**Fraud detection** thường cần stream scoring để phản ứng nhanh, nhưng batch vẫn dùng để train model, tìm pattern lịch sử, backtest và reconciliation. Stream không thay toàn bộ batch.
+
+##### 7.1 Lambda và Kappa architecture
+
+- **Lambda**: batch layer và speed layer chạy song song rồi merge view; linh hoạt nhưng dễ duplicate logic.
+- **Kappa**: coi stream/replay log là nền tảng chính và reprocess bằng replay; đơn giản hóa số pipeline nhưng replay/state/cost vẫn khó.
+
+Đây là mental models, không phải pattern bắt buộc. Unified engines/table formats có thể cho batch và stream dùng chung nhiều logic.
+
+---
+
+#### 8. Storage: HDFS, object storage, warehouse và lakehouse
+
+##### 8.1 HDFS
+
+- distributed filesystem trong cluster;
+- data locality với compute trong mô hình truyền thống;
+- large sequential/high-throughput workload;
+- metadata/data node và cluster operations do đội ngũ quản lý;
+- semantics phù hợp hệ Hadoop hơn generic object API.
+
+##### 8.2 Object storage như S3-style systems
+
+- compute và storage tách rời;
+- managed elasticity/durability và nhiều storage tiers;
+- API/object semantics, không phải HDFS/POSIX;
+- nhiều engine có thể đọc cùng data lake;
+- request/list/egress/retrieval cost và small-file issue cần quản lý.
+
+##### 8.3 Data warehouse
+
+Warehouse cung cấp managed/optimized SQL analytics, schema/governance và performance features. Nó phù hợp BI và curated datasets nhưng cost/concurrency/load patterns phải được quản lý.
+
+##### 8.4 Data lake
+
+Lake lưu raw và processed files trên distributed/object storage. Nếu thiếu catalog, schema, quality, ownership và lifecycle, nó dễ thành “data swamp”.
+
+##### 8.5 Lakehouse và table format
+
+Lakehouse cố gắng giữ storage mở/giá hợp lý của lake đồng thời thêm table semantics như:
+
+- ACID commit/concurrent writer coordination;
+- schema enforcement/evolution;
+- snapshots/time travel;
+- partition metadata;
+- compaction và file management;
+- data skipping/pruning tùy implementation.
+
+**Delta Lake** là một table/storage layer dựa trên transaction log và data files trên storage như object store/HDFS. Nó không phải replacement ngang hàng với underlying storage. Apache Iceberg và Apache Hudi là các table-format/lakehouse approaches khác với trade-off riêng.
+
+---
+
+#### 9. File layout, partitioning và query performance
+
+##### 9.1 Row và columnar formats
+
+- JSON/CSV dễ trao đổi/debug nhưng type/schema/scan efficiency hạn chế;
+- Avro phù hợp row-oriented serialization/event/data exchange;
+- Parquet/ORC lưu theo cột, hỗ trợ compression, column pruning và analytics scan.
+
+##### 9.2 Partitioning
+
+Ví dụ:
+
+```text
+events/date=2026-08-20/region=ap-southeast-1/part-....parquet
+```
+
+Partition giúp query bỏ qua data không liên quan. Nhưng:
+
+- partition quá thô làm scan nhiều;
+- quá mịn tạo nhiều directory/file/metadata;
+- high-cardinality partition key gây explosion;
+- event-time partition gặp late data;
+- skew tạo partition rất lớn hoặc rất nhỏ.
+
+##### 9.3 Partition pruning và predicate pushdown
+
+- partition pruning bỏ hẳn partition không phù hợp filter;
+- predicate pushdown dùng file statistics/index để bỏ row groups/pages hoặc chỉ đọc cần thiết;
+- column pruning chỉ đọc cột truy vấn.
+
+Các tối ưu chỉ hiệu quả nếu query predicate, statistics và file layout phù hợp.
+
+##### 9.4 Compaction và small files
+
+Streaming/micro-batch dễ tạo nhiều small files. Compaction gộp thành file lớn hơn để giảm metadata/request overhead và tăng scan throughput.
+
+Compaction phải phối hợp transaction/snapshot để không làm reader thấy thiếu/trùng data; đồng thời tốn compute/I/O và cần lifecycle xóa file cũ an toàn.
+
+##### 9.5 Data skew
+
+Một key/partition nhận quá nhiều data làm một task chạy lâu và giữ cả job. Kỹ thuật gồm repartition, salting, skew-aware join, pre-aggregation, split hot key và adaptive execution; mỗi cách ảnh hưởng query/reconciliation.
+
+---
+
+#### 10. Data quality, governance và security
+
+##### 10.1 Schema contract
+
+Producer/consumer cần schema version và compatibility. Schema evolution phải quy định add/remove/rename/type change, default và semantic meaning.
+
+##### 10.2 Quality dimensions
+
+- completeness;
+- validity;
+- uniqueness;
+- consistency;
+- timeliness/freshness;
+- accuracy;
+- referential integrity trong scope phù hợp.
+
+Quality check cần có owner, threshold, alert và quarantine/repair path; không chỉ dashboard màu xanh.
+
+##### 10.3 Lineage và catalog
+
+- catalog cho biết dataset/table/schema/owner/location/classification;
+- lineage cho biết data đến từ đâu, qua transform nào, phục vụ output nào;
+- lineage hỗ trợ impact analysis, audit, debugging và deletion/compliance.
+
+##### 10.4 Security
+
+- workload/user identity và least privilege;
+- encryption in transit/at rest;
+- row/column/object-level control tùy system;
+- masking/tokenization cho PII;
+- audit query/data access;
+- tenant isolation;
+- retention, legal hold và deletion propagation;
+- secret/key management.
+
+##### 10.5 Semantic governance
+
+Hai dashboard có thể tính “active user” khác nhau dù cùng source. Metric definitions, timezone, late-data policy và dimension history phải được version/owned như code.
+
+---
+
+#### 11. Reliability và vận hành pipeline
+
+Một pipeline production cần:
+
+- idempotent ingestion/processing;
+- durable offsets/checkpoints;
+- retry có backoff và poison-data handling;
+- replay/backfill không phá current workload;
+- freshness/completeness SLO;
+- monitoring source-to-sink lag;
+- schema/data-quality alerts;
+- lineage và run metadata;
+- capacity/headroom cho burst/recovery;
+- DR cho metadata/catalog/state, không chỉ raw files;
+- cost guardrail và quota.
+
+##### 11.1 Observability nên đo gì?
+
+- ingest rate và rejected records;
+- broker lag/oldest event age;
+- watermark/event-time delay;
+- batch duration và schedule delay;
+- task failure/retry/straggler;
+- shuffle bytes/spill/skew;
+- file count/average size;
+- data freshness/completeness/duplicate rate;
+- query latency/bytes scanned;
+- checkpoint duration/failure;
+- compute/storage/egress cost theo pipeline/tenant.
+
+##### 11.2 Backfill
+
+Backfill cần versioned code/schema, bounded date range, idempotent output, isolated resource pool hoặc throttling, validation và atomic publish. Không chạy lại cả lịch sử trực tiếp vào production tables mà không có collision/overwrite plan.
+
+---
+
+#### 12. Thiết kế pipeline xử lý hàng terabyte log mỗi ngày
+
+```text
+Applications/agents
+   -> broker/managed stream
+   -> raw immutable object storage
+   -> stream processor -> alerts / live metrics / serving store
+   -> batch processor  -> cleaned Parquet/table format
+   -> SQL engine/warehouse -> dashboards, investigations
+```
+
+##### 12.1 Ingestion
+
+- log/event có timestamp, source, schema version và unique ID;
+- partition broker theo service/tenant/key phù hợp ordering;
+- compression/batching;
+- backpressure và local buffering có giới hạn;
+- không để logging làm application hết disk/memory.
+
+##### 12.2 Raw storage
+
+- immutable, partition theo event date/hour và coarse dimensions;
+- checksum, retention/lifecycle;
+- schema catalog;
+- tránh object quá nhỏ bằng batching;
+- raw data đủ để replay nhưng vẫn tuân thủ PII/security.
+
+##### 12.3 Stream path
+
+- parse/validate/redact;
+- alert/rule/anomaly;
+- window/watermark/late-event policy;
+- idempotent sink;
+- checkpoint và lag SLO.
+
+##### 12.4 Batch path
+
+- dedup, normalize và enrich;
+- Parquet/ORC + table format;
+- partition pruning và compaction;
+- aggregate theo service/customer/use case;
+- backfill/reconciliation.
+
+##### 12.5 Query và visualization
+
+- SQL query engine/warehouse cho investigation/BI;
+- pre-aggregated serving tables cho dashboards;
+- search system cho full-text/interactive log exploration nếu cần;
+- quota/workload isolation để một query không quét cả lake ngoài ý muốn.
+
+##### 12.6 Những câu hỏi quyết định
+
+- alert cần trong 1 giây, 1 phút hay 15 phút?
+- raw/curated giữ bao lâu?
+- search window bao lâu?
+- duplicate/lost log chấp nhận mức nào?
+- event đến trễ bao lâu?
+- tenant nào tạo skew?
+- PII cần redact ở source hay ingest?
+- replay một ngày mất bao lâu và chi phí bao nhiêu?
+- dashboard freshness/completeness SLO là gì?
+
+---
+
+#### 13. Tám câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. 5V của Big Data là gì và vì sao quan trọng?**  
+Volume, Velocity, Variety, Veracity và Value giúp xác định scale, latency, format, quality và business outcome. Transcript thêm Variability để nhấn mạnh drift/biến động. Framework dùng để hỏi requirement, không phải checklist công nghệ.
+
+**Q2. Vì sao database truyền thống gặp khó với Big Data?**  
+Một primary hoặc OLTP schema/query engine có thể bị giới hạn bởi capacity, ingest, large scan, concurrency và cost. Nhưng không nên nói RDBMS không scale được; giải pháp thường là tách OLTP khỏi analytics, dùng partition/distributed compute/storage hoặc warehouse thích hợp.
+
+**Q3. So sánh HDFS và S3-style object storage.**  
+HDFS là distributed filesystem gắn với cluster và có data-locality semantics; object storage là API service tách compute/storage, dễ dùng bởi nhiều engine và có cost model request/transfer. Chọn theo deployment, locality, semantics, managed operations, latency, cost và ecosystem — không chỉ “on-prem hay cloud”.
+
+**Q4. Workload nào là Big Data problem?**  
+Clickstream, logs, IoT, fraud signals, video, ad bidding và ML có thể là big data khi volume/velocity/variety hoặc processing SLO vượt cách hiện tại. Dataset nhỏ nhưng velocity/complexity cao vẫn có thể là bài toán lớn; petabyte không có value cũng chỉ là chi phí.
+
+**Q5. Batch và stream khác nhau thế nào? Dùng gì cho fraud detection?**  
+Batch xử lý bounded dataset với throughput cao và latency lớn hơn; stream xử lý continuous events với event-time/state/recovery complexity. Fraud thường dùng stream để score/alert nhanh và batch để train, backtest, recompute và reconciliation.
+
+**Q6. Delta Lake là gì và cải thiện data lake thế nào?**  
+Delta Lake dùng transaction log và data files để thêm ACID table commits, schema enforcement/evolution, snapshot/time travel và file management trên lake storage. Nó giúp concurrent operations đáng tin cậy hơn nhưng không tự giải quyết governance, data quality, access control hay mọi performance problem.
+
+**Q7. Thiết kế hệ thống xử lý hàng terabyte log mỗi ngày thế nào?**  
+Dùng durable ingest/broker, raw immutable object storage, stream processor cho alert, batch engine cho ETL/aggregation, columnar/table format cho curated data và query/serving layer theo use case. Bổ sung schema, dedup, late data, security, backfill, freshness SLO và cost controls.
+
+**Q8. Chọn storage và processing framework nào, vì sao?**  
+HDFS/object storage/warehouse/lakehouse table theo deployment và query semantics; Spark cho nhiều batch/ETL workloads; Flink/Kafka Streams cho stateful/low-latency stream tùy requirement; Trino/Presto-style engines cho distributed interactive SQL. Tên công cụ đứng sau latency, scale, state, correctness, team skill và operating model.
+
+---
+
+#### 14. Những lỗi tư duy thường gặp
+
+- Định nghĩa Big Data chỉ bằng số TB/PB.
+- Thu thập mọi dữ liệu mà không có value, owner hoặc retention.
+- Nghĩ velocity cao đồng nghĩa mọi thứ cần real-time.
+- Bỏ schema vì dữ liệu đa dạng.
+- Đồng nhất Big Data với Hadoop hoặc NoSQL.
+- Nói relational database không thể scale ngang.
+- Dùng stream cho workload batch đủ đáp ứng, tăng complexity vô ích.
+- Gọi micro-batch là “real-time” mà không nêu latency SLO.
+- Không phân biệt event time và processing time.
+- Bỏ qua late/out-of-order events và watermark policy.
+- Tuyên bố exactly-once end-to-end mà không nêu source/state/sink scope.
+- Không thiết kế backpressure, replay và checkpoint recovery.
+- Dùng cùng business logic riêng biệt ở batch/stream rồi để kết quả lệch nhau.
+- Coi data lake chỉ là bucket chứa file.
+- Xem Delta Lake là underlying storage ngang hàng với S3/HDFS.
+- Partition theo high-cardinality field và tạo hàng triệu partition nhỏ.
+- Tạo small files liên tục nhưng không có compaction.
+- Chỉ tăng executor mà bỏ qua shuffle/skew/file layout.
+- Dùng JSON/CSV cho large analytical scan mà không cân nhắc columnar format.
+- Chỉ theo dõi job success, không đo freshness/completeness.
+- Backfill không idempotent làm dữ liệu trùng hoặc overwrite sai.
+- Dùng dashboard kết quả nhưng không có lineage/metric definition.
+- Chỉ tính storage cost, bỏ qua compute, scan, shuffle và egress.
+
+---
+
+#### 15. Big Data design checklist
+
+1. Use case/value và người ra quyết định từ output?
+2. 5V/6V: volume, velocity, variety, veracity, value, variability?
+3. Ingest average/peak/burst và retention?
+4. Business latency/freshness/completeness SLO?
+5. Batch, stream hay hybrid; vì sao?
+6. Event ID, event time, ordering và duplicate semantics?
+7. Schema owner, registry/evolution và compatibility?
+8. Broker partition key, retention, replay và backpressure?
+9. Raw source of truth và rebuild strategy?
+10. Storage: HDFS, object, warehouse hoặc lakehouse table?
+11. File format, target size, partitioning và compaction?
+12. Query pattern, pruning, bytes scanned và concurrency?
+13. Stateful processing, window, watermark và late data?
+14. Checkpoint/recovery và exactly-once scope?
+15. Data-quality rules, quarantine và reconciliation?
+16. Catalog, lineage, ownership và semantic definitions?
+17. PII, access control, encryption, audit và deletion?
+18. Serving layer cho API/search/dashboard/ML?
+19. Backfill/replay isolation, idempotency và atomic publish?
+20. Observability từ source tới sink và cost attribution?
+21. Capacity/headroom cho burst, failure và recovery?
+22. RPO/RTO, metadata recovery và disaster drill?
+
+#### 16. Ý chính cần nhớ
+
+- Big Data là vấn đề tương đối theo workload, SLO, cost và công cụ hiện tại.
+- 5V là Volume, Velocity, Variety, Veracity, Value; Variability thường được thêm thành V thứ sáu.
+- Big data platform gồm ingest, storage, processing, serving, governance và operations.
+- Tách OLTP khỏi large-scale analytics thường quan trọng hơn tranh luận SQL/NoSQL.
+- Batch tối ưu bounded historical work; stream tối ưu continuous low-latency work.
+- Stream processing phải xử lý event time, window, watermark, late data, state và backpressure.
+- Exactly-once luôn cần nêu scope và sink side effects.
+- HDFS và object storage có semantics/operating model khác nhau.
+- Lake không tự có table semantics; table formats/lakehouse layers bổ sung transaction, schema và snapshots.
+- Delta Lake không thay underlying object/distributed storage.
+- Columnar formats, partition pruning và compaction quyết định nhiều tới analytics performance.
+- Small files, shuffle và skew là bottleneck phổ biến.
+- Data quality, lineage, catalog và semantic ownership quan trọng ngang compute.
+- Stream cho fraud alert vẫn cần batch train/recompute/reconciliation.
+- Raw immutable data và idempotent backfill giúp hệ thống sửa sai/rebuild.
+- Giá trị và correctness quan trọng hơn số lượng công nghệ.
+
+#### Công thức ghi nhớ
+
+> **Big Data platform tốt = value/SLO rõ + ingest chịu burst + storage có thể replay + batch/stream đúng latency + dữ liệu có quality/governance + serving hiệu quả + cost/recovery quan sát được.**
+
+---
+
+### Bài 45. Section Summary — Storage and Databases
+
+#### 1. Tư duy cốt lõi của phần Storage
+
+Phần này không nhằm tìm ra một công nghệ lưu trữ “tốt nhất”. Mục tiêu là học cách nhìn **data như một phần của toàn hệ thống** và chọn giải pháp dựa trên:
+
+- bản chất và cấu trúc dữ liệu;
+- access pattern đọc/ghi;
+- invariant và transaction boundary;
+- consistency, durability và availability;
+- latency, throughput và quy mô;
+- failure/recovery requirement;
+- lifecycle, compliance và chi phí;
+- khả năng vận hành của đội ngũ.
+
+```text
+Business requirement
+  -> data + invariant + access pattern
+  -> storage interface và data model
+  -> consistency/durability/availability contract
+  -> scale, replication và partitioning
+  -> backup/recovery/lifecycle
+  -> đo lường, kiểm thử và vận hành
+```
+
+> **Chọn storage là chọn một tập guarantee và trade-off, không chỉ chọn nơi chứa bytes.**
+
+---
+
+#### 2. Những mảnh ghép đã học
+
+##### 2.1 Storage foundations và CAP
+
+- Phân biệt structured, semi-structured và unstructured data.
+- Phân biệt database với object, file và block storage.
+- Xác định access pattern, source of truth và derived data.
+- Hiểu durability, availability, consistency, atomicity và recoverability là các guarantee khác nhau.
+- CAP chỉ ép lựa chọn giữa linearizable consistency và CAP availability khi network partition xảy ra.
+- CP/AP là behavior theo operation, topology và configuration — không phải nhãn cố định của sản phẩm.
+- Replication không thay backup; backup chỉ có ý nghĩa khi restore được.
+
+##### 2.2 SQL và NoSQL
+
+- Relational/SQL mạnh về relation, constraint, transaction, join và query ecosystem.
+- NoSQL là một họ gồm document, key-value, wide-column, graph và các model chuyên biệt.
+- NoSQL không mặc định schema-less, eventual consistent hoặc không transaction.
+- SQL không chỉ scale dọc; relational system vẫn có thể partition, shard và phân tán.
+- ACID và BASE không phải hai phía loại trừ nhau.
+- Consistency trong ACID khác consistency trong CAP.
+- Quyết định phải xuất phát từ invariant và access pattern, không từ xu hướng công nghệ.
+
+##### 2.3 Replication, sharding và polyglot persistence
+
+- Replication tạo nhiều copy của cùng data để tăng availability/read scale.
+- Sharding chia dataset để phân tán storage và read/write load.
+- Read replica có thể stale và không giải quyết write bottleneck của leader.
+- Failover cần election, fencing, routing và recovery procedure.
+- Shard key quyết định distribution, locality, hot spot và cross-shard complexity.
+- Resharding, scatter–gather và cross-shard transaction là phần chi phí của scale ngang.
+- Polyglot persistence chỉ hữu ích khi mỗi store có owner, source of truth và synchronization contract rõ.
+
+##### 2.4 Object storage
+
+- Lưu object bytes cùng key và metadata qua API.
+- Bucket/prefix là logical organization; prefix thường không phải directory thật.
+- Phù hợp media, backup, archive, data lake và large immutable artifacts.
+- Mạnh về durability, scale và aggregate throughput; không tối ưu random in-place mutation.
+- Multipart upload, byte range, checksum, CDN và presigned URL là các building blocks quan trọng.
+- Versioning/Object Lock hỗ trợ recovery/compliance nhưng không thay backup.
+- Lifecycle phải xét request, retrieval, egress và restore latency ngoài giá dung lượng.
+
+##### 2.5 File systems và distributed storage
+
+- Filesystem cung cấp file, directory, metadata và operation semantics trên raw storage.
+- DFS trình bày một logical namespace trên nhiều metadata/data nodes.
+- Metadata plane và data plane có trách nhiệm khác nhau.
+- HDFS tối ưu large sequential/batch workloads; không phải mọi file workload.
+- Replication/erasure coding, placement, checksum và repair tạo fault tolerance.
+- Metadata scale, small files, rebalancing và hot directories là bottleneck phổ biến.
+- POSIX, caching, lease, locking và failover semantics phải được kiểm tra cụ thể.
+
+##### 2.6 Big Data
+
+- Big Data được đánh giá qua Volume, Velocity, Variety, Veracity, Value và có thể thêm Variability.
+- Data platform gồm ingestion, storage, batch/stream processing, serving, governance và operations.
+- Batch xử lý bounded historical workloads; stream xử lý continuous low-latency events.
+- Stream cần event time, window, watermark, late-data, state, checkpoint và backpressure.
+- Data lake không tự có table semantics; table format/lakehouse layer bổ sung transaction, schema và snapshot.
+- File format, partitioning, compaction, skew và small files ảnh hưởng trực tiếp tới analytics performance.
+- Data quality, catalog, lineage và semantic ownership quan trọng ngang compute.
+
+---
+
+#### 3. Bản đồ lựa chọn storage rút gọn
+
+| Nhu cầu chính | Hướng thường cân nhắc | Câu hỏi cần hỏi thêm |
+|---|---|---|
+| Transaction và relationship phức tạp | Relational database | Isolation, constraints, scale và recovery? |
+| Aggregate/document linh hoạt | Document database hoặc relational + JSON | Query, transaction và shard key? |
+| Lookup theo key, cache/session | Key-value store | Durability, eviction và source of truth? |
+| Write lớn theo partition/access pattern | Wide-column store | Hot partition, consistency và query shape? |
+| Traversal quan hệ nhiều bước | Graph database | Graph size, partitioning và transaction? |
+| Low-latency DB/VM volume | Block storage | IOPS, latency, attachment và failure model? |
+| Shared hierarchy/file semantics | File/network/distributed filesystem | POSIX, locking, metadata scale và HA? |
+| Media, backup, archive, raw data lake | Object storage | Consistency, lifecycle, egress và retrieval? |
+| Large SQL analytics/BI | Warehouse/lakehouse/OLAP engine | Freshness, concurrency, scan cost và governance? |
+| Real-time event processing | Broker + stream processor + serving store | Ordering, window, state và replay? |
+
+Bảng này chỉ là điểm bắt đầu. Một hệ thống thực tế thường kết hợp nhiều lớp, nhưng mỗi lớp phải có vai trò và ownership rõ ràng.
+
+---
+
+#### 4. Quy trình ra quyết định
+
+##### Bước 1 — Bắt đầu từ business requirement
+
+- Dữ liệu phục vụ quyết định/chức năng nào?
+- Sai dữ liệu gây hậu quả gì?
+- Chậm hoặc unavailable trong bao lâu thì chấp nhận được?
+- Luật retention, residency và privacy là gì?
+
+##### Bước 2 — Mô tả dữ liệu
+
+- Entity, relationship, aggregate và lifecycle?
+- Record/object/file size và growth?
+- Structured, semi-structured hay binary?
+- Schema thay đổi ra sao?
+
+##### Bước 3 — Mô tả access pattern
+
+- Point lookup, range scan, join, traversal, full-text search hay aggregation?
+- Read/write ratio và peak throughput?
+- Hot key/tenant/time range?
+- Latency percentile và concurrency?
+
+##### Bước 4 — Xác định guarantee
+
+- Transaction/invariant boundary?
+- Strong, session, bounded-staleness hay eventual consistency?
+- Durability acknowledgement ở đâu?
+- Availability/degraded mode khi partition hoặc dependency lỗi?
+
+##### Bước 5 — Chọn model/interface đơn giản nhất đủ dùng
+
+Ưu tiên một store quen thuộc nếu nó đáp ứng requirement. Chỉ thêm cache, replica, shard, search index, event pipeline hoặc store mới khi bottleneck/use case đủ rõ để biện minh complexity.
+
+##### Bước 6 — Thiết kế failure và recovery
+
+- Replication/failover/fencing?
+- Backup/PITR/restore test?
+- RPO/RTO?
+- Corruption, xóa nhầm và regional failure?
+- Rebuild derived data?
+
+##### Bước 7 — Xác minh bằng workload thật
+
+- Benchmark theo data shape và access mix thực tế.
+- Thử skew, burst, lag, partition và node failure.
+- Đo migration, rebalance, backup và restore.
+- Kiểm tra cost theo request, storage, compute và network.
+
+---
+
+#### 5. Những nguyên tắc xuyên suốt
+
+1. **Access pattern trước công nghệ.** Một data model chỉ tốt khi phục vụ đúng các thao tác quan trọng.
+2. **Invariant quyết định consistency.** Không phải mọi field cần strong consistency như nhau.
+3. **Source of truth phải rõ.** Cache, search index, projection và warehouse thường là derived data.
+4. **Replication khác backup.** Một bản sao online thường sao chép cả lỗi logic.
+5. **Scale ngang có giá.** Routing, coordination, shard key, rebalance và failure modes đều tăng.
+6. **Schema linh hoạt vẫn là schema.** Contract chỉ được chuyển sang application/read path, không biến mất.
+7. **Không gắn nhãn sản phẩm tuyệt đối.** Guarantee phụ thuộc operation, deployment và configuration.
+8. **Durability khác availability.** Dữ liệu có thể còn nguyên nhưng service tạm không truy cập được, và ngược lại.
+9. **Cost là một thuộc tính kiến trúc.** Cần tính compute, I/O, request, retrieval, egress và vận hành.
+10. **Recovery phải được diễn tập.** Backup chưa restore-test chỉ là một giả định.
+11. **Derived data nên rebuild được.** Có event/log/source và procedure đủ rõ.
+12. **Start simple.** Chỉ thêm distributed complexity khi requirement hoặc measurement biện minh được.
+
+---
+
+#### 6. Checklist tổng kết Storage & Databases
+
+1. Dataset nào là source of truth và service nào sở hữu?
+2. Data model, schema và relationship?
+3. Access pattern và query quan trọng nhất?
+4. Transaction/invariant boundary?
+5. Consistency theo từng operation?
+6. Durability acknowledgement và failure model?
+7. Latency, throughput, availability SLO?
+8. Capacity, growth, retention và lifecycle?
+9. Index/partition/shard key và hot-spot strategy?
+10. Replica lag/read routing/failover/fencing?
+11. Backup, PITR, RPO/RTO và restore drill?
+12. Derived stores, propagation, idempotency và reconciliation?
+13. File/object size, format, compaction và small-file risk?
+14. Batch/stream latency, state, replay và late-data policy?
+15. Encryption, authorization, audit, residency và deletion?
+16. Schema evolution, migration, resharding và rollback?
+17. Observability cho latency, saturation, lag, skew và recovery?
+18. Cost attribution và guardrails?
+19. Đội ngũ có đủ khả năng vận hành công nghệ này không?
+20. Phương án đơn giản hơn có đáp ứng requirement không?
+
+#### 7. Ý chính cần nhớ
+
+- Storage architecture bắt đầu từ data, invariant và access pattern.
+- SQL và NoSQL là các lựa chọn trade-off, không phải đối thủ tuyệt đối.
+- Replication, sharding và polyglot persistence là phản ứng với requirement tăng trưởng, không phải mặc định ngày đầu.
+- Object storage phù hợp large unstructured/immutable data và API access.
+- Distributed filesystem phù hợp shared namespace hoặc high-throughput distributed file workloads.
+- Big Data cần distributed storage/processing khi scale, speed hoặc complexity vượt cách hiện tại.
+- Batch và stream thường bổ sung cho nhau.
+- Quality, governance, security, recovery và cost là một phần của thiết kế dữ liệu.
+- Kiến trúc tốt không phải kiến trúc nhiều công nghệ nhất, mà là kiến trúc đáp ứng đúng requirement với complexity có thể kiểm soát.
+
+#### Công thức ghi nhớ
+
+> **Storage architecture tốt = đúng data model + đúng access pattern + guarantee đủ mạnh + scale/recovery có kế hoạch + complexity và cost được kiểm soát.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -14874,3 +17443,100 @@ Relational thường bắt đầu từ entity, dependency, constraint và normal
 | **Columnar database** | Database phân tích lưu giá trị theo cột để tối ưu scan, compression và aggregation. |
 | **Graph database** | Database biểu diễn entity bằng node và quan hệ bằng edge để tối ưu traversal. |
 | **JSONB** | Kiểu lưu JSON dạng nhị phân có thể index/query trong PostgreSQL. |
+| **Replication** | Duy trì nhiều bản sao của cùng logical data trên các node/failure domain. |
+| **Leader–follower replication** | Một leader nhận/sắp thứ tự write rồi truyền thay đổi tới các follower. |
+| **Read replica** | Replica chủ yếu phục vụ read để giảm tải primary, có thể trả dữ liệu stale. |
+| **Replication lag** | Khoảng cách về thời gian/log position giữa source và replica đã nhận hoặc apply. |
+| **Synchronous replication** | Chỉ acknowledge write sau khi số replica yêu cầu đạt mốc nhận/durable đã định. |
+| **Asynchronous replication** | Acknowledge write trước khi replica bắt kịp, đổi latency thấp hơn lấy lag/data-loss window. |
+| **Fencing** | Cơ chế ngăn leader/worker cũ tiếp tục ghi sau khi authority đã chuyển sang bên mới. |
+| **Split-brain** | Nhiều node cùng tin mình có quyền leader/writer và tạo các lịch sử dữ liệu xung đột. |
+| **Sharding** | Chia dataset ngang qua nhiều database node/instance để phân tán storage và traffic. |
+| **Shard key** | Thuộc tính dùng để xác định shard sở hữu một record/entity. |
+| **Range-based sharding** | Chia key space thành các khoảng liên tiếp, giữ locality nhưng có thể tạo skew/hot range. |
+| **Hash-based sharding** | Dùng hash của key để phân bố dữ liệu, thường đều hơn nhưng làm range query khó hơn. |
+| **Directory-based sharding** | Dùng catalog tra mapping entity/tenant tới shard để placement linh hoạt. |
+| **Geo-sharding** | Đặt/chia dữ liệu theo vùng địa lý nhằm phục vụ latency, residency hoặc fault isolation. |
+| **Scatter–gather query** | Fan-out query tới nhiều shard rồi thu và hợp nhất kết quả. |
+| **Resharding** | Thay partition ownership/boundary và di chuyển dữ liệu khi topology hoặc tải thay đổi. |
+| **Rebalancing** | Phân phối lại data/load giữa node hoặc shard để khôi phục cân bằng. |
+| **Multi-leader replication** | Nhiều leader nhận write và sau đó đồng bộ, đòi hỏi conflict semantics rõ. |
+| **Leaderless replication** | Read/write qua nhiều replica theo quorum/coordination thay vì một leader duy nhất. |
+| **Data residency** | Yêu cầu dữ liệu phải được lưu hoặc xử lý trong location/jurisdiction nhất định. |
+| **Bucket** | Logical container/namespace chứa object và thường là policy/configuration boundary. |
+| **Object key** | Identifier dùng để định vị object trong bucket; có thể chứa dấu `/` nhưng không nhất thiết tạo directory thật. |
+| **Object prefix** | Phần đầu chung của key dùng để group/list/policy object theo logic. |
+| **Object metadata** | System hoặc application attributes mô tả object, tách khỏi payload bytes. |
+| **Storage class** | Tier có profile khác nhau về availability, access latency, retrieval và cost. |
+| **Lifecycle rule** | Policy tự động transition hoặc expire object/version theo tuổi, tag hoặc điều kiện. |
+| **Presigned URL** | URL được ký để cấp quyền tạm thời cho operation cụ thể trên object. |
+| **Multipart upload** | Upload object lớn thành nhiều part có thể truyền/retry song song rồi complete. |
+| **Byte-range request** | Request chỉ đọc một khoảng byte của object/resource. |
+| **Object versioning** | Giữ nhiều version của cùng object key để hỗ trợ recovery và history. |
+| **Delete marker** | Marker biểu thị logical delete trong versioned bucket mà chưa nhất thiết xóa version cũ. |
+| **Object Lock** | Cơ chế retention/immutability ngăn object version bị xóa hoặc ghi đè theo policy. |
+| **WORM** | Write Once Read Many, dữ liệu sau khi ghi không được sửa/xóa trong thời hạn quy định. |
+| **Legal hold** | Giữ object khỏi bị xóa cho tới khi hold được gỡ bởi quyền thích hợp, độc lập với thời hạn thông thường. |
+| **Server-side encryption** | Storage service mã hóa object at rest sau khi nhận dữ liệu. |
+| **KMS** | Key Management Service, hệ thống quản lý key và operation mật mã cùng policy/audit. |
+| **Network egress** | Dữ liệu truyền ra khỏi provider/region/boundary và thường phát sinh phí. |
+| **Retrieval fee** | Phí đọc/khôi phục dữ liệu từ một số storage class, đặc biệt tier lạnh. |
+| **Data lake** | Kho lưu raw/curated datasets quy mô lớn để nhiều engine xử lý và phân tích. |
+| **Erasure coding** | Mã hóa dữ liệu thành data/parity fragments để chịu mất một số fragment với overhead thấp hơn full replication. |
+| **Small-object problem** | Overhead request/metadata/list và cost tăng cao khi lưu số lượng rất lớn object quá nhỏ. |
+| **File system** | Lớp tổ chức raw storage thành file, directory, metadata và operation semantics. |
+| **Distributed file system** | Filesystem cung cấp logical namespace trên nhiều node và phối hợp metadata/data phân tán. |
+| **Network file system** | Filesystem/share được client truy cập qua mạng, ví dụ thông qua NFS hoặc SMB. |
+| **POSIX semantics** | Tập hành vi file/process API theo chuẩn POSIX; mức hỗ trợ thực tế cần kiểm tra theo filesystem. |
+| **Inode** | Cấu trúc metadata của file trong nhiều Unix-like filesystem, tách khỏi filename/directory entry. |
+| **Journaling** | Ghi log thay đổi filesystem để hỗ trợ khôi phục cấu trúc nhất quán sau crash. |
+| **Metadata server** | Thành phần quản lý namespace, attribute và mapping từ file tới data location. |
+| **NameNode** | Metadata coordinator của HDFS, quản namespace và block mapping/location. |
+| **DataNode** | Storage worker của HDFS, lưu block và phục vụ client data I/O. |
+| **Block report** | Báo cáo định kỳ từ DataNode về tập block nó đang lưu. |
+| **Replication factor** | Số bản sao mong muốn của một block/chunk trong replication policy. |
+| **Rack awareness** | Placement/scheduling có hiểu network và failure domain theo rack. |
+| **Data locality** | Đặt/chạy compute gần nơi dữ liệu nằm để giảm network transfer và tăng throughput. |
+| **Small-file problem** | Metadata/RPC/task overhead cao khi filesystem hoặc analytics engine xử lý quá nhiều file nhỏ. |
+| **Write pipeline** | Chuỗi node/step mà data và acknowledgement đi qua khi ghi/replicate. |
+| **Lease** | Quyền có thời hạn cho client/writer; cần expiry/recovery và thường kết hợp fencing. |
+| **Re-replication** | Tạo thêm replica để khôi phục replication level sau failure hoặc placement change. |
+| **CephFS** | Distributed filesystem interface trong hệ sinh thái Ceph. |
+| **HDFS** | Hadoop Distributed File System, tối ưu lịch sử cho large sequential data và batch analytics. |
+| **GlusterFS** | Scale-out distributed filesystem cung cấp shared file namespace. |
+| **Parquet** | Columnar file format phổ biến cho analytics, hỗ trợ compression và column pruning. |
+| **ORC** | Optimized Row Columnar, columnar file format cho analytics/big-data workloads. |
+| **Big Data** | Bài toán dữ liệu có scale, speed hoặc complexity vượt cách xử lý hiện tại theo SLO/cost. |
+| **Volume** | Khối lượng và tốc độ tăng của dữ liệu cần lưu/xử lý. |
+| **Velocity** | Tốc độ dữ liệu được tạo, đến và cần được xử lý. |
+| **Variety** | Độ đa dạng về nguồn, format, schema và kiểu dữ liệu. |
+| **Veracity** | Mức độ đúng, đủ, nhất quán và đáng tin cậy của dữ liệu. |
+| **Value** | Giá trị business/sản phẩm/insight thu được từ dữ liệu. |
+| **Variability** | Mức biến động của traffic, distribution, schema hoặc ý nghĩa dữ liệu theo thời gian/context. |
+| **Batch processing** | Xử lý bounded dataset hoặc snapshot theo job/lịch, thường tối ưu throughput. |
+| **Stream processing** | Xử lý continuous unbounded events với latency thấp và state/time semantics. |
+| **Processing time** | Thời điểm processing engine xử lý event. |
+| **Ingestion time** | Thời điểm event được platform/broker tiếp nhận. |
+| **Window** | Cách chia unbounded stream thành phạm vi hữu hạn để aggregate/join. |
+| **Watermark** | Ước lượng tiến độ event time dùng để quyết định emit/close window và xử lý late data. |
+| **Late event** | Event đến processor sau watermark/cửa sổ kỳ vọng của event time. |
+| **Backpressure** | Cơ chế/tình trạng downstream chậm khiến upstream phải giảm tốc, buffer hoặc áp dụng policy. |
+| **MapReduce** | Processing model gồm map, shuffle/group và reduce trên dữ liệu phân tán. |
+| **Shuffle** | Trao đổi/repartition dữ liệu giữa workers theo key hoặc partition boundary. |
+| **Straggler** | Task/partition chậm bất thường làm kéo dài completion time của stage/job. |
+| **Apache Spark** | Distributed processing engine dùng DAG/stages/tasks cho batch, SQL, streaming và workload khác. |
+| **Apache Flink** | Distributed engine tập trung vào stateful stream processing và cũng hỗ trợ bounded data. |
+| **Kafka Streams** | Client library xử lý stream dựa trên Kafka topics, partition và local state. |
+| **Data warehouse** | Hệ thống quản lý/compute dữ liệu đã tổ chức để phục vụ SQL analytics và BI. |
+| **Lakehouse** | Kiến trúc kết hợp data-lake storage với table/transaction/governance semantics gần warehouse. |
+| **Table format** | Metadata/protocol tổ chức data files thành table có snapshot, schema và commit semantics. |
+| **Delta Lake** | Table/storage layer dùng transaction log và data files để thêm ACID table semantics trên data lake. |
+| **Time travel** | Đọc table/dataset tại snapshot hoặc version lịch sử còn được retention. |
+| **Schema enforcement** | Chặn/kiểm soát write không tuân schema/constraint đã khai báo. |
+| **ETL** | Extract, Transform, Load: biến đổi trước khi nạp vào target chính. |
+| **ELT** | Extract, Load, Transform: nạp raw trước rồi biến đổi trong analytical platform. |
+| **Data catalog** | Inventory metadata về dataset, schema, owner, location và classification. |
+| **Data lineage** | Quan hệ nguồn–biến đổi–đích cho biết dữ liệu được tạo và sử dụng thế nào. |
+| **Partition pruning** | Bỏ qua toàn bộ partition không thỏa filter khi query. |
+| **Predicate pushdown** | Đẩy filter xuống storage/scan layer để bỏ dữ liệu sớm. |
+| **Compaction** | Gộp/rewrite nhiều file/segment nhỏ thành layout hiệu quả hơn theo transaction/snapshot semantics. |
