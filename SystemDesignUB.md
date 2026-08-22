@@ -16830,6 +16830,7217 @@ Bảng này chỉ là điểm bắt đầu. Một hệ thống thực tế thư�
 
 ---
 
+## Phần 8 — Performance: Concepts, Tools & Techniques
+
+### Bài 46. Introduction to System Performance
+
+#### 1. Performance trong System Design là gì?
+
+Performance không chỉ là “response nhanh”. Một hệ thống có thể rất nhanh với 10 user nhưng sụp đổ ở traffic production. Kiến trúc sư cần nhìn performance qua nhiều chiều:
+
+| Chiều | Câu hỏi |
+|---|---|
+| **Speed/latency** | Một operation mất bao lâu từ góc nhìn user/client? |
+| **Capacity/throughput** | Hệ thống hoàn tất bao nhiêu work trong một đơn vị thời gian? |
+| **Concurrency** | Có bao nhiêu operation/user đang hoạt động đồng thời? |
+| **Efficiency** | Mỗi request/transaction tiêu thụ bao nhiêu CPU, memory, I/O, network và chi phí? |
+| **Scalability** | Khi tăng load/resource, performance thay đổi ra sao? |
+| **Predictability** | Tail latency và variance có ổn định không? |
+| **Reliability under load** | Khi gần/vượt capacity, hệ thống degrade và phục hồi thế nào? |
+
+```text
+Performance tốt
+  != benchmark nhanh nhất
+
+Performance tốt
+  = đáp ứng SLO cho workload thật
+  + còn headroom cho burst/failure
+  + dùng tài nguyên và chi phí hợp lý
+  + hành vi có thể dự đoán khi tải tăng
+```
+
+> **Mục tiêu không phải làm mọi thứ nhanh nhất, mà là giữ trải nghiệm đủ nhanh và đáng tin cậy trong phạm vi tải đã cam kết.**
+
+---
+
+#### 2. Agenda của phần Performance
+
+Phần này sẽ phát triển dần theo chu trình:
+
+1. định nghĩa metric và performance requirement;
+2. đo latency, throughput, percentiles và resource pressure;
+3. thiết kế caching và giảm work trên critical path;
+4. kiểm tra performance dưới các workload khác nhau;
+5. tìm bottleneck bằng metrics, traces, logs và profiling;
+6. theo dõi production bằng SLI/SLO và alert;
+7. tối ưu database, network, application và architecture;
+8. cân bằng responsiveness, reliability và cost.
+
+Performance engineering là một vòng lặp liên tục:
+
+```text
+Measure -> Explain -> Change -> Validate -> Monitor -> Repeat
+```
+
+Không tối ưu theo trực giác hoặc một benchmark không đại diện.
+
+---
+
+#### 3. Latency và response time
+
+**Latency** thường được dùng để chỉ thời gian một operation/request mất để hoàn tất. Khi cần chính xác hơn, có thể tách:
+
+```text
+response time
+  = client/network time
+  + queueing time
+  + service/processing time
+  + downstream waits
+  + serialization/transfer time
+```
+
+Các mốc đo khác nhau trả lời câu hỏi khác nhau:
+
+- browser/user-perceived latency;
+- edge/gateway latency;
+- server handler latency;
+- database/query latency;
+- queue wait và job completion time;
+- time to first byte so với full response/download time.
+
+Vì vậy câu “API latency 200 ms” chưa đủ. Cần nêu:
+
+- đo từ đâu tới đâu;
+- route/operation nào;
+- request thành công hay gồm cả lỗi/timeout;
+- payload/data size;
+- time window và region;
+- cache hit/miss;
+- percentile nào.
+
+##### 3.1 Service time và queueing time
+
+- **Service time**: thời gian resource thực sự xử lý work.
+- **Queueing time**: thời gian chờ vì resource/concurrency slot đang bận.
+
+Khi utilization tiến gần capacity, queueing có thể tăng rất nhanh dù service time của mỗi item gần như không đổi. Vì thế latency tăng không luôn có nghĩa code xử lý chậm hơn; có thể hệ thống chỉ đang chờ lâu hơn.
+
+---
+
+#### 4. Throughput, goodput và concurrency
+
+**Throughput** là lượng work được xử lý theo thời gian:
+
+- requests/second;
+- transactions/second;
+- messages/second;
+- jobs/hour;
+- MB/s hoặc records/s.
+
+**Goodput** chỉ tính work hữu ích hoàn tất đúng contract, loại retry, lỗi, timeout hoặc duplicate không tạo business value.
+
+```text
+goodput <= throughput
+```
+
+Throughput cao không đáng mừng nếu error rate, retry hoặc queue age tăng.
+
+##### 4.1 Concurrency không phải throughput
+
+Concurrency là số work đang in-flight. Với steady state, Little’s Law cho mental model:
+
+```text
+L = λ × W
+
+L: average in-flight/concurrency
+λ: average completion/arrival rate
+W: average time trong hệ thống
+```
+
+Ví dụ: 1.000 request/s với average response time 0,2 s tương ứng khoảng 200 request in-flight trong steady state.
+
+Little’s Law không thay percentile analysis và chỉ dùng đúng khi boundary/unit/steady-state assumptions phù hợp.
+
+##### 4.2 Latency và throughput không tự động cùng tốt lên
+
+- batching tăng throughput nhưng có thể tăng waiting latency;
+- concurrency tăng throughput tới điểm saturation, sau đó contention/queueing làm latency tăng;
+- compression giảm network bytes nhưng dùng thêm CPU;
+- cache giảm latency/backend load nhưng thêm invalidation/staleness;
+- async processing giảm response path nhưng chuyển latency sang background completion.
+
+---
+
+#### 5. Utilization, saturation và bottleneck
+
+**Utilization** cho biết resource bận bao nhiêu phần trăm thời gian/capacity. **Saturation** cho biết work đang phải chờ hoặc resource không còn headroom, ví dụ:
+
+- CPU run queue/throttling;
+- thread/connection pool wait;
+- disk queue depth/I/O wait;
+- memory pressure, swap hoặc GC pause;
+- network queue/retransmission;
+- database lock wait/connections;
+- queue backlog/oldest item age.
+
+CPU 100% có thể bình thường cho batch worker nếu latency SLO vẫn đạt; CPU 40% vẫn có thể chậm vì một core nóng, lock contention, downstream I/O hoặc quota throttling.
+
+**Bottleneck** là resource/component giới hạn end-to-end capacity trong workload hiện tại. Tối ưu bottleneck có thể chỉ làm bottleneck tiếp theo lộ ra.
+
+##### 5.1 Các loại bottleneck phổ biến
+
+- CPU-bound: compute, serialization, compression, encryption;
+- memory-bound: allocation, cache pressure, GC, memory bandwidth;
+- storage-bound: IOPS, bandwidth, fsync, lock, query/index;
+- network-bound: bandwidth, RTT, packet loss, connection setup;
+- contention-bound: locks, mutex, hot key/partition;
+- dependency-bound: downstream latency/capacity;
+- queue/concurrency-bound: thread, connection hoặc worker pool;
+- algorithm/data-model-bound: quá nhiều work cho mỗi request;
+- limit/quota-bound: provider/API/runtime throttling.
+
+---
+
+#### 6. Scalability và responsiveness
+
+**Scalability** hỏi hệ thống có thể duy trì mục tiêu khi demand tăng không. **Responsiveness** hỏi user phải chờ bao lâu. Một hệ thống xử lý được hàng triệu request/ngày vẫn có thể rất chậm ở từng request.
+
+Các kỹ thuật giữ responsiveness khi scale:
+
+- cache/CDN và precomputation;
+- index/query/data-model optimization;
+- horizontal scaling của stateless hoặc partitionable components;
+- load balancing và locality-aware routing;
+- asynchronous processing cho work không cần nằm trên response path;
+- queue để hấp thụ burst;
+- batching cho downstream throughput;
+- timeouts, retry budgets và circuit breakers;
+- rate limiting, admission control và load shedding;
+- degradation/fallback cho optional features;
+- autoscaling với warm-up/headroom phù hợp.
+
+Autoscaling không phải “lá chắn tức thời”: detection, provisioning, startup, readiness và load redistribution đều có delay. Với spike nhanh, cần baseline headroom, cache, queue hoặc pre-scaling.
+
+---
+
+#### 7. SLA, SLO và SLI
+
+##### 7.1 SLI — Service Level Indicator
+
+SLI là measurement đại diện trải nghiệm/độ tin cậy của service. Ví dụ latency SLI:
+
+```text
+SLI = số request hợp lệ hoàn tất dưới 300 ms
+      --------------------------------------
+      tổng số request hợp lệ
+```
+
+Cần định nghĩa rõ:
+
+- event nào được tính vào denominator;
+- success/error/timeout classification;
+- internal health check có loại không;
+- endpoint, tenant, region và traffic class;
+- time window và data source;
+- client-side hay server-side observation.
+
+##### 7.2 SLO — Service Level Objective
+
+SLO là target cho SLI trong một window, ví dụ:
+
+> Trong 28 ngày, 99% request checkout hợp lệ hoàn tất thành công dưới 500 ms.
+
+SLO tốt phải phản ánh user journey/business criticality, không chỉ metric dễ thu thập.
+
+##### 7.3 SLA — Service Level Agreement
+
+SLA là cam kết với customer/partner, có thể kèm service credit hoặc hậu quả hợp đồng. SLA thường không giống hoàn toàn internal SLO; đội ngũ có thể đặt SLO chặt hơn để có safety margin.
+
+##### 7.4 Error budget
+
+Error budget là phần unreliability được phép trong SLO window. Nó giúp quyết định rollout, reliability work và risk. Burn rate cho biết budget đang bị tiêu nhanh thế nào; alert theo burn rate thường hữu ích hơn cảnh báo từng spike ngắn.
+
+##### 7.5 Cách nhớ
+
+```text
+SLA = lời hứa/thoả thuận
+SLO = mục tiêu
+SLI = phép đo
+```
+
+---
+
+#### 8. Average, percentile và tail latency
+
+Average có thể che giấu distribution lệch. Ví dụ:
+
+```text
+99 request × 10 ms + 1 request × 10.000 ms
+average ≈ 110 ms
+```
+
+Average 110 ms không cho biết có một user chờ 10 giây.
+
+##### 8.1 Cách đọc percentile
+
+- **P50**: 50% observation nhỏ hơn hoặc bằng giá trị này — trải nghiệm điển hình.
+- **P95**: 95% nhỏ hơn hoặc bằng; 5% chậm hơn.
+- **P99**: 99% nhỏ hơn hoặc bằng; 1% chậm hơn.
+- **P99.9**: xem phần đuôi sâu hơn cho workload rất lớn/critical.
+
+Percentile phải kèm population và window. P99 của toàn service có thể che giấu một endpoint/region/tenant rất chậm.
+
+##### 8.2 Tail latency đến từ đâu?
+
+- queueing và saturation;
+- GC pause/scheduling;
+- disk/network variance;
+- cache miss;
+- lock contention/hot partition;
+- retry/timeout;
+- slow dependency;
+- cold start;
+- payload/data-dependent work;
+- noisy neighbor;
+- background maintenance.
+
+##### 8.3 Tail amplification trong fan-out
+
+Nếu một request gọi nhiều downstream song song, nó thường chờ nhánh chậm nhất. Giả sử mỗi call có 99% khả năng nằm trong threshold và có 20 call độc lập:
+
+```text
+P(tất cả 20 call đạt threshold) ≈ 0,99^20 ≈ 81,8%
+```
+
+Khoảng 18,2% aggregate request có ít nhất một call vượt threshold. Thực tế correlation và dependency topology làm mô hình phức tạp hơn, nhưng nguyên lý cho thấy fan-out khuếch đại tail.
+
+##### 8.4 Lỗi đo percentile thường gặp
+
+- lấy average của P99 từ nhiều instance;
+- tính percentile của percentiles;
+- histogram buckets quá thô;
+- bỏ timeout/cancel/error khỏi population;
+- trộn endpoint/workload khác bản chất;
+- chỉ đo server latency, bỏ client/network/render;
+- nhìn một window dài che incident ngắn;
+- load generator bị coordinated omission.
+
+Muốn tổng hợp đúng nên merge distribution/histogram có thiết kế phù hợp, không average các percentile cục bộ.
+
+---
+
+#### 9. Performance testing
+
+Performance test không chỉ “bắn thật nhiều request”. Nó là experiment có workload model, hypothesis, metric và pass/fail criteria.
+
+| Loại test | Câu hỏi |
+|---|---|
+| **Baseline/benchmark** | Trạng thái hiện tại và chi phí mỗi operation là gì? |
+| **Load test** | Expected load có đạt SLO không? |
+| **Stress test** | Breaking point ở đâu và hệ thống fail/degrade thế nào? |
+| **Spike test** | Burst nhanh ảnh hưởng queue, autoscale và recovery ra sao? |
+| **Endurance/soak test** | Sau nhiều giờ/ngày có leak, fragmentation, drift hay degradation không? |
+| **Capacity test** | Safe capacity có headroom là bao nhiêu? |
+| **Scalability test** | Thêm resource làm throughput/latency/cost thay đổi thế nào? |
+| **Failover under load** | Node/zone/dependency lỗi khi tải cao thì chuyện gì xảy ra? |
+
+##### 9.1 Workload model phải đại diện
+
+Cần mô tả:
+
+- arrival rate và burst distribution;
+- endpoint/operation mix;
+- read/write ratio;
+- payload/data cardinality;
+- cache hit/miss và warm/cold state;
+- authenticated user/session behavior;
+- think time;
+- geographic/network conditions;
+- retry/timeout;
+- test duration và ramp pattern.
+
+##### 9.2 Open và closed workload model
+
+- **Open model**: request đến theo arrival process độc lập với response time; gần traffic external nhiều trường hợp.
+- **Closed model**: fixed virtual users gửi request tiếp theo sau khi response/think time; khi system chậm, arrival rate tự giảm.
+
+Closed model có thể che overload vì client chờ lâu nên gửi ít hơn.
+
+##### 9.3 Coordinated omission
+
+Nếu load generator đợi response trước khi gửi request kế tiếp, khoảng thời gian service “đứng hình” có thể không tạo các observation đáng lẽ đã đến. Kết quả latency đẹp giả tạo. Tool/test design cần giữ intended arrival schedule hoặc hiệu chỉnh phù hợp.
+
+##### 9.4 Test an toàn và đáng tin
+
+- production-like data/topology/configuration;
+- generator không phải bottleneck;
+- warm-up được tách khỏi steady state;
+- clocks/metrics có độ phân giải đúng;
+- quan sát cả client, app, dependency và resource;
+- test có abort thresholds;
+- không gây tác động ngoài ý muốn tới external system/customer;
+- lặp lại để xác nhận variance;
+- version code/config/data của từng run.
+
+---
+
+#### 10. Performance monitoring và observability
+
+Testing giúp hiểu trước deployment; monitoring/observability giúp hiểu production liên tục.
+
+##### 10.1 Golden Signals
+
+- latency;
+- traffic;
+- errors;
+- saturation.
+
+##### 10.2 RED method cho request-driven services
+
+- **Rate**: request/work rate;
+- **Errors**: failure rate/count;
+- **Duration**: latency distribution.
+
+##### 10.3 USE method cho resources
+
+- **Utilization**;
+- **Saturation**;
+- **Errors**.
+
+Các framework bổ sung nhau: RED nhìn từ service/request; USE nhìn từ resource.
+
+##### 10.4 Metrics, logs, traces và profiles
+
+| Tín hiệu | Trả lời tốt câu hỏi nào? |
+|---|---|
+| **Metrics** | Có vấn đề không, xu hướng/SLI/resource nào thay đổi? |
+| **Logs** | Event/error cụ thể nói gì? |
+| **Distributed traces** | Request chậm ở service/span/dependency nào? |
+| **Profiles** | CPU/time/allocation nằm ở code path nào? |
+
+APM thường kết hợp telemetry để theo request path. Tool cụ thể như Prometheus/Grafana, Datadog, New Relic, CloudWatch hoặc hệ khác chỉ hữu ích khi instrumentation, labels, sampling, retention và alert design đúng.
+
+##### 10.5 Synthetic monitoring và RUM
+
+- **Synthetic monitoring** chạy scripted probes từ location định trước, tốt cho availability/journey kiểm soát.
+- **Real User Monitoring (RUM)** đo trải nghiệm client thật, phản ánh device/network/browser diversity.
+
+Synthetic ổn định nhưng không đại diện mọi user; RUM thực tế hơn nhưng noisy, chịu privacy/sampling và khó kiểm soát population. Nên dùng bổ sung nhau.
+
+##### 10.6 Alert đúng vào điều user quan tâm
+
+Ưu tiên alert theo SLO burn, error, tail latency, queue age và saturation có khả năng hành động. CPU spike ngắn không nhất thiết là incident; ngược lại dependency chậm có thể vi phạm SLO khi CPU vẫn thấp.
+
+---
+
+#### 11. Phương pháp tìm bottleneck
+
+Một quy trình có cấu trúc:
+
+1. **Xác định symptom/SLO:** endpoint nào, percentile nào, workload nào?
+2. **Kiểm tra measurement:** boundary, clock, sampling, timeout và labels có đúng không?
+3. **Tái hiện/thu hẹp:** production trace hoặc controlled load test.
+4. **Vẽ critical path:** client → gateway → service → cache/DB/dependency.
+5. **Tách time:** queue, service, network và downstream wait.
+6. **Tìm saturation/error:** CPU, GC, pool, I/O, lock, connection, quota, backlog.
+7. **Dùng trace/profile/query plan:** tìm span/code/query tốn thời gian/work.
+8. **Đặt hypothesis:** nguyên nhân có thể kiểm chứng.
+9. **Thay một biến:** index, cache, pool, algorithm, capacity...
+10. **Đo lại cùng workload:** kiểm tra SLO, cost và side effects.
+11. **Load tới bottleneck mới:** xác định safe capacity/headroom.
+12. **Thêm guardrail/monitor:** ngăn regression.
+
+Không tối ưu component chỉ vì metric local xấu nếu nó không nằm trên critical path hoặc không giới hạn system goal.
+
+##### 11.1 Các câu hỏi chẩn đoán nhanh
+
+- Arrival rate có đổi hay service time đổi?
+- Queueing bắt đầu ở đâu?
+- Error/retry có khuếch đại load không?
+- Cache hit ratio thay đổi?
+- DB query plan/index/data distribution thay đổi?
+- Pool/connection/thread có chờ dù CPU thấp?
+- Một tenant/key/endpoint tạo skew?
+- Dependency hay network region nào chậm?
+- GC/cold start/deployment có tương quan?
+- Background job, compaction, backup hay failover đang cạnh tranh resource?
+
+---
+
+#### 12. Thiết kế để chịu traffic spike
+
+Một spike-safe system cần nhiều lớp:
+
+```text
+Client
+  -> CDN/cache
+  -> rate limit/admission control
+  -> load balancer + warm capacity
+  -> stateless services
+  -> queue for deferrable work
+  -> protected dependencies
+       timeouts + concurrency limits + circuit breakers
+  -> load shedding/degraded response khi quá tải
+```
+
+Các điểm cần nhớ:
+
+- CDN chỉ giúp cacheable traffic;
+- queue làm phẳng burst nhưng tăng completion latency và cần backlog capacity;
+- autoscaling cần time-to-scale và downstream cũng phải scale;
+- stateless app vẫn có stateful DB/cache/broker bottleneck;
+- retry không giới hạn biến spike thành retry storm;
+- circuit breaker không tạo thêm capacity;
+- load shedding phải ưu tiên critical work và trả response rõ;
+- pre-scaling/scheduled scaling phù hợp event biết trước;
+- recovery sau spike quan trọng ngang việc sống sót trong spike.
+
+---
+
+#### 13. Performance và cost
+
+Performance tốt hơn thường cần thêm resource, nhưng brute-force scale không luôn hiệu quả.
+
+```text
+cost per useful request
+  = total infrastructure + platform + transfer + operations cost
+    ------------------------------------------------------------
+                     successful useful requests
+```
+
+Các trade-off:
+
+- larger instance/provisioned IOPS giảm latency nhưng tăng idle cost;
+- autoscaling giảm idle capacity nhưng có lag/cold start;
+- reserved/committed capacity rẻ hơn cho baseline nhưng giảm flexibility;
+- spot/preemptible phù hợp retryable work nhưng có interruption risk;
+- cache giảm origin work nhưng thêm memory, consistency và miss path;
+- batching/compression giảm request/network nhưng thêm delay/CPU;
+- multi-region giảm user RTT nhưng tăng replication/egress/operations;
+- observability chi tiết giúp debug nhưng tăng telemetry cost/cardinality.
+
+Tối ưu nên nhìn **marginal cost để đạt SLO**, không chỉ giảm hóa đơn hay đạt benchmark tối đa.
+
+---
+
+#### 14. Tám câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Latency và throughput khác nhau thế nào?**  
+Latency là thời gian một operation hoàn tất trong boundary đã định; throughput là lượng work hoàn tất theo thời gian. Cần thêm goodput, error rate và concurrency để tránh hiểu sai. Batching/concurrency có thể tăng throughput nhưng làm latency tăng.
+
+**Q2. SLA, SLO và SLI khác nhau thế nào?**  
+SLA là thỏa thuận/cam kết bên ngoài; SLO là mục tiêu cho một SLI trong window; SLI là phép đo định nghĩa rõ numerator/denominator. Ví dụ: 99% checkout request hợp lệ thành công dưới 500 ms trong 28 ngày. Internal SLO thường chặt hơn SLA.
+
+**Q3. Vì sao P95/P99 quan trọng?**  
+Average che khuất outlier; percentile mô tả distribution và tail experience. P99 nghĩa 99% observation không vượt ngưỡng, không phải “average của 1% chậm nhất”. Phải segment theo endpoint/region và không average percentile giữa instance.
+
+**Q4. Tìm performance bottleneck thế nào?**  
+Định nghĩa SLO/workload, kiểm tra measurement, phân rã critical path bằng trace, xem RED/USE và queue/saturation, profile code/query, kiểm chứng hypothesis bằng load test rồi đo lại. Tool không thay phương pháp.
+
+**Q5. Giữ responsiveness trong hệ thống scale lớn thế nào?**  
+Giảm work bằng cache/index, tách async work, scale-out component phù hợp, bảo vệ dependency bằng timeout/concurrency limit/circuit breaker, dùng queue/rate limit/load shedding, và theo dõi tail latency. Mỗi kỹ thuật có failure/cost trade-off.
+
+**Q6. Công cụ/kỹ thuật performance testing và monitoring?**  
+JMeter, k6 hoặc Locust là ví dụ load generators; Prometheus/Grafana, Datadog, New Relic, CloudWatch là ví dụ telemetry/APM platforms. Ngoài tên tool cần nói workload model, distributed tracing, profiling, synthetic, RUM, SLO alert và cách tránh generator bottleneck/coordinated omission.
+
+**Q7. Thiết kế cho sudden traffic spike?**  
+CDN/cache, warm headroom/pre-scaling, stateless scale-out, queue cho work trì hoãn được, autoscaling, rate/admission control, timeouts/circuit breakers, retry budgets và load shedding. Kiểm tra stateful dependencies và time-to-scale; autoscaling đơn độc không đủ.
+
+**Q8. Performance và cost trong cloud đánh đổi thế nào?**  
+Resource/IOPS/region redundancy cao hơn thường tăng cost; autoscaling/serverless giảm idle nhưng có cold start và unit-cost trade-off; reserved/committed phù hợp baseline; cache/batching/compression giảm work nhưng thêm complexity. Quyết định phải bám SLO và cost per useful request.
+
+---
+
+#### 15. Những lỗi tư duy thường gặp
+
+- Dùng “nhanh” mà không định nghĩa boundary, workload và percentile.
+- Chỉ nhìn average latency.
+- Average P95/P99 từ nhiều instance hoặc time windows.
+- Loại timeout/error khỏi latency population để dashboard đẹp hơn.
+- Trộn endpoint/cache hit-miss/region khác nhau vào một percentile.
+- Đồng nhất throughput với useful throughput.
+- Tăng concurrency vô hạn để tăng throughput.
+- Chỉ nhìn CPU utilization, bỏ queue/saturation/lock/I/O.
+- Tối ưu component không nằm trên critical path.
+- Benchmark với payload, data cardinality hoặc cache state không thực tế.
+- Dùng closed load model che overload/coordinated omission.
+- Load generator trở thành bottleneck nhưng tưởng server đạt giới hạn.
+- Không warm-up hoặc không tách cold-start measurement.
+- Load test chỉ happy path, không test failure/retry/failover.
+- Chỉ test peak vài phút, bỏ memory leak/soak degradation.
+- Nghĩ autoscaling xử lý spike ngay lập tức.
+- Dùng queue nhưng không theo dõi age/backlog và capacity.
+- Retry/circuit breaker không có timeout/budget/concurrency protection.
+- Alert resource spike không liên quan user impact.
+- Thu telemetry nhiều nhưng không có owner/action/runbook.
+- Tối ưu latency bằng quá nhiều resource mà không đo cost.
+- Tuning sau cùng thay vì thiết kế performance requirement từ đầu.
+
+---
+
+#### 16. Performance checklist mở đầu
+
+1. User journey/operation nào quan trọng?
+2. Latency đo từ đâu tới đâu; percentile và window nào?
+3. Throughput/goodput/concurrency expected và peak?
+4. Payload, data size/cardinality và operation mix?
+5. Availability/error/correctness SLO đi cùng performance?
+6. Safe capacity và headroom cho burst/failure?
+7. Resource nào có thể saturate: CPU, memory, disk, network, pools, DB?
+8. Queueing/backpressure/load-shedding strategy?
+9. Critical path và fan-out/dependency budgets?
+10. Timeout, retry budget, circuit breaker và concurrency limits?
+11. Cache warm/cold, hit/miss và invalidation behavior?
+12. Autoscaling signal, warm-up và time-to-scale?
+13. Load/stress/spike/soak/failover test plan?
+14. Open/closed workload model và coordinated omission?
+15. Client, service, DB, dependency và resource telemetry?
+16. RED/USE/Golden Signals và SLO burn alerts?
+17. Trace sampling, profiling và high-cardinality controls?
+18. Performance regression gate/baseline?
+19. Cost per request/transaction và marginal cost đạt SLO?
+20. Rollback, degradation và recovery behavior khi quá tải?
+
+#### 17. Ý chính cần nhớ
+
+- Performance gồm latency, throughput, concurrency, efficiency, scalability và predictability.
+- Response time gồm cả queueing, service, network và downstream waits.
+- Goodput quan trọng hơn raw throughput khi có retry/error/duplicate.
+- Khi gần saturation, queueing/tail latency có thể tăng rất nhanh.
+- Scalability không tự bảo đảm responsiveness.
+- SLA là cam kết, SLO là mục tiêu, SLI là phép đo.
+- Percentile phải có population/window và không được average tùy tiện.
+- Fan-out khuếch đại tail latency.
+- Performance testing cần workload model và pass/fail criteria, không chỉ traffic volume.
+- Load, stress, spike và soak test trả lời các câu hỏi khác nhau.
+- Open/closed workload và coordinated omission có thể làm sai kết quả.
+- Metrics, logs, traces và profiles bổ sung nhau.
+- RED nhìn service; USE nhìn resource; Golden Signals nối user impact với saturation.
+- Bottleneck phải được tìm bằng measurement và experiment.
+- Autoscaling có delay; spike cần cache, queue, headroom và load protection.
+- Performance, reliability và cost phải được tối ưu cùng nhau.
+- Performance là requirement từ thiết kế, được kiểm chứng bằng test và duy trì bằng monitoring.
+
+#### Công thức ghi nhớ
+
+> **Performance engineering tốt = SLO rõ + workload thật + percentile đúng + bottleneck có bằng chứng + test tái lập + production observability + tối ưu theo reliability và cost.**
+
+---
+
+### Bài 47. Caching for Speed Optimization
+
+#### 1. Vì sao caching có tác động lớn?
+
+Caching lưu tạm dữ liệu hoặc kết quả tính toán ở một lớp **nhanh hơn/gần consumer hơn** để tránh lặp lại expensive work.
+
+Lợi ích:
+
+- giảm latency và tail latency;
+- giảm database/API/computation load;
+- tăng goodput và safe capacity;
+- hấp thụ read burst;
+- giảm network/egress và cost trong một số trường hợp;
+- cho phép degraded read khi source tạm lỗi nếu dữ liệu stale được chấp nhận.
+
+```text
+Request
+  -> cache hit  -> trả kết quả nhanh
+  -> cache miss -> gọi source of truth
+                   -> tính/đọc dữ liệu
+                   -> populate cache
+                   -> trả kết quả
+```
+
+Nhưng cache tạo thêm một bản sao của dữ liệu. Ngay khi có nhiều copy, ta phải giải quyết:
+
+- key và namespace;
+- freshness/staleness;
+- invalidation;
+- eviction;
+- race condition;
+- failure và recovery;
+- memory/cost;
+- security/tenant isolation;
+- observability.
+
+> **Caching đổi repeated work lấy memory và consistency complexity. Chỉ cache khi lợi ích đo được lớn hơn chi phí đó.**
+
+---
+
+#### 2. Đo lợi ích của cache
+
+##### 2.1 Hit rate và miss penalty
+
+Một mental model đơn giản:
+
+```text
+expected latency
+  ≈ hit_ratio  × cache_hit_latency
+  + miss_ratio × (cache_lookup_latency + origin_latency + populate_cost)
+```
+
+Ví dụ:
+
+- cache hit: 2 ms;
+- origin path: 100 ms;
+- hit ratio: 90%.
+
+```text
+E[L] ≈ 0,9 × 2 + 0,1 × 102 = 12 ms
+```
+
+Đây chỉ là average model; production vẫn phải đo P95/P99 riêng cho hit và miss.
+
+##### 2.2 Origin offload
+
+Nếu 10.000 read/s và 90% hit, origin lý tưởng chỉ nhận khoảng 1.000 miss/s cho access pattern đó. Nhưng còn:
+
+- refresh/revalidation;
+- write/invalidation;
+- retry;
+- cache node failure/cold start;
+- bypass và uncacheable requests.
+
+##### 2.3 Hit ratio không phải mục tiêu duy nhất
+
+Cache 99% các lookup vốn chỉ mất 1 ms có thể ít giá trị hơn cache 40% query mất 2 giây. Cần đo:
+
+- latency saved;
+- origin CPU/I/O/QPS saved;
+- byte hit ratio;
+- cost saved;
+- staleness/error introduced;
+- miss amplification;
+- memory efficiency theo key/value size.
+
+---
+
+#### 3. Các lớp caching
+
+```text
+User
+  -> browser/client cache
+  -> CDN/edge cache
+  -> gateway/reverse-proxy cache
+  -> application local cache
+  -> distributed cache
+  -> database buffer/result/materialized view
+  -> source of truth
+```
+
+Mỗi hit ở lớp ngoài ngăn request đi sâu hơn vào lớp chậm/đắt hơn.
+
+##### 3.1 Client/browser cache
+
+- HTTP cache cho image, CSS, JS và response phù hợp;
+- service worker cho offline/application strategies;
+- local application cache cho dữ liệu không nhạy cảm theo threat model.
+
+Cần cache headers, validation, versioned assets và security. `localStorage` không phải cache có eviction/freshness/security semantics như HTTP cache và JavaScript có thể truy cập nó.
+
+##### 3.2 CDN/edge cache
+
+Giảm RTT và origin load cho static hoặc cacheable dynamic content. Cache key phải xét host, path, query, headers, encoding, authorization và tenant. Không cache nhầm private response thành shared object.
+
+##### 3.3 Reverse proxy/API cache
+
+Cache response ở gateway/proxy cho nhiều application instances. Hữu ích với public/read-heavy APIs nhưng cần vary/auth/invalidation semantics rõ.
+
+##### 3.4 Local in-process cache
+
+Ưu điểm:
+
+- latency rất thấp;
+- không có network call;
+- giảm tải distributed cache.
+
+Nhược điểm:
+
+- mỗi instance có copy khác nhau;
+- invalidation/freshness khó;
+- memory tăng theo số instance;
+- cold cache khi deploy/scale;
+- hit ratio bị phân mảnh.
+
+##### 3.5 Distributed cache
+
+Redis/Memcached-like systems cho nhiều application instances dùng chung cache. Dễ chia sẻ/invalidate hơn local cache nhưng thêm network hop, cluster topology, sharding, replication và failure modes.
+
+##### 3.6 Database-side caching
+
+- buffer/page cache;
+- query/result cache tùy engine;
+- prepared plan cache;
+- materialized view;
+- precomputed aggregate.
+
+Materialized view là derived persisted result với refresh semantics, không hoàn toàn giống volatile key-value cache.
+
+---
+
+#### 4. Nên cache dữ liệu nào?
+
+Candidate tốt thường có:
+
+- read nhiều hơn write;
+- expensive read/computation;
+- reuse cao;
+- bounded value size;
+- chấp nhận stale trong một khoảng;
+- key ổn định và query dễ xác định;
+- source có thể chịu miss/cold-start load;
+- dữ liệu có thể rebuild.
+
+Ví dụ:
+
+- product/catalog/profile public fields;
+- search suggestions/popular query results;
+- feature/config/reference data;
+- expensive aggregates;
+- authorization decisions trong TTL rất ngắn nếu semantics cho phép;
+- session state nếu cache/store được thiết kế durability/availability phù hợp;
+- static/media assets qua CDN.
+
+Không nên cache mù quáng:
+
+- số dư, tồn kho reservation hoặc quyền nhạy cảm nếu stale gây vi phạm invariant;
+- dữ liệu thay đổi liên tục nhưng reuse thấp;
+- value rất lớn làm giảm memory efficiency;
+- high-cardinality one-time queries;
+- data có invalidation dependency không quản lý được;
+- secret/PII nếu isolation/encryption/access không đủ.
+
+---
+
+#### 5. Caching patterns
+
+##### 5.1 Cache-aside / lazy loading
+
+```text
+read(key):
+  value = cache.get(key)
+  if hit: return value
+
+  value = database.get(key)
+  cache.set(key, value, ttl)
+  return value
+```
+
+Ưu điểm:
+
+- chỉ cache dữ liệu được truy cập;
+- application kiểm soát;
+- cache failure có thể fallback source;
+- phù hợp read-heavy workloads.
+
+Nhược điểm:
+
+- first request/cold miss chậm;
+- stampede khi nhiều miss cùng key;
+- application phải invalidation;
+- race có thể repopulate dữ liệu cũ sau update;
+- nhiều service có thể triển khai semantics khác nhau.
+
+##### 5.2 Read-through cache
+
+Application gọi cache; cache/provider loader tự đọc source khi miss. Nó chuẩn hóa read path nhưng loader/source coupling, timeout và failure semantics vẫn phải thiết kế.
+
+##### 5.3 Write-through
+
+Write đi qua cache layer và được ghi tới source trước khi acknowledge theo contract.
+
+Lợi ích:
+
+- cache được cập nhật cùng write path;
+- read sau đó ít miss/stale hơn;
+- logic tập trung hơn.
+
+Chi phí:
+
+- write latency tăng;
+- cache chứa cả dữ liệu có thể không được đọc;
+- cache/source partial failure và ordering vẫn tồn tại.
+
+> **Write-through không tự tạo strong consistency.** Nếu cache và DB là hai hệ độc lập, cần transaction/protocol/versioning để tránh một phía thành công, một phía thất bại hoặc concurrent writers ghi đảo thứ tự.
+
+##### 5.4 Write-back / write-behind
+
+Write được acknowledge sau khi vào cache/buffer; source được cập nhật bất đồng bộ.
+
+Ưu điểm:
+
+- write latency thấp;
+- batching/coalescing tăng throughput;
+- giảm write amplification tới source.
+
+Rủi ro:
+
+- mất dữ liệu nếu cache/buffer lỗi trước persistence;
+- ordering, duplicate và replay;
+- cache trở thành source có durability requirement;
+- backlog và recovery phức tạp;
+- read từ source có thể stale.
+
+Chỉ dùng khi durability, acknowledgement và recovery semantics được nêu rõ; “Redis có persistence” chưa đủ để mặc định an toàn.
+
+##### 5.5 Write-around
+
+Write trực tiếp source rồi invalidate/bypass cache. Tránh pollute cache bởi write-only data nhưng read ngay sau write có thể miss hoặc gặp race/stale nếu invalidation không đúng.
+
+##### 5.6 Refresh-ahead / stale-while-revalidate
+
+Refresh data trước hoặc khi gần hết TTL, hoặc trả stale value trong lúc một worker refresh. Giảm user-facing miss latency nhưng dùng thêm background work và cần giới hạn stale/error behavior.
+
+---
+
+#### 6. Cache invalidation và consistency
+
+Ba nhóm phổ biến:
+
+##### 6.1 Expiration bằng TTL
+
+Đơn giản và tạo upper bound tương đối cho cache lifetime, nhưng:
+
+- dữ liệu có thể stale tới gần TTL;
+- expiry đồng loạt tạo avalanche/stampede;
+- TTL quá ngắn làm miss nhiều;
+- TTL quá dài tăng stale;
+- TTL không tự xử lý delete/security revoke khẩn cấp.
+
+Chọn TTL theo **staleness budget**, update rate, miss cost và incident/failure behavior — không theo con số quen tay.
+
+##### 6.2 Explicit invalidation/update
+
+Sau write source, delete hoặc update cache key. Delete thường đơn giản hơn update vì source vẫn authoritative, nhưng race giữa read miss và write có thể tạo stale repopulation.
+
+Ví dụ race:
+
+```text
+T1: reader miss, đọc DB version 1
+T2: writer ghi DB version 2, delete cache
+T1: reader set cache = version 1  <- stale quay lại
+```
+
+Mitigation:
+
+- versioned cache value/key;
+- compare-and-set theo version;
+- request coalescing/lease;
+- ordered CDC/event invalidation;
+- double-delete có delay trong một số design nhưng không phải guarantee tổng quát;
+- read source/version lại trước publish;
+- short TTL như safety net.
+
+##### 6.3 Event/CDC-driven invalidation
+
+Database change hoặc domain event cập nhật/invalidate nhiều cache consumers. Cần:
+
+- event ordering/version;
+- at-least-once idempotency;
+- lag/failure/replay;
+- delete/tombstone;
+- mapping entity → keys/queries bị ảnh hưởng;
+- reconciliation khi event bị bỏ lỡ.
+
+Event-driven update thường eventual consistent; không nên hứa immediate consistency nếu pipeline không bảo đảm.
+
+##### 6.4 Versioned cache keys
+
+Đưa version/content hash vào key:
+
+```text
+product:123:v42
+asset/app.8f3c.js
+```
+
+Consumer chuyển sang version mới thay vì mutate cùng key. Giúp invalidation an toàn nhưng cần lifecycle dọn version cũ và cách tìm current version.
+
+##### 6.5 Negative caching
+
+Cache “not found” trong TTL ngắn để ngăn request lặp vào source. Phải phân biệt absent thật với transient error, và invalidation khi entity vừa được tạo.
+
+---
+
+#### 7. Eviction và memory management
+
+**Expiration** (TTL) loại item theo thời gian/freshness. **Eviction** loại item do memory/capacity pressure. Hai khái niệm có thể phối hợp nhưng không giống nhau.
+
+| Policy | Ý tưởng | Phù hợp/điểm yếu |
+|---|---|---|
+| **LRU** | Loại item ít được dùng gần đây | Tốt khi temporal locality cao; scan lớn có thể pollute |
+| **LFU** | Loại item có tần suất thấp | Giữ hot set dài hạn; cần aging để trend cũ không chi phối mãi |
+| **FIFO** | Loại item vào sớm nhất | Rẻ/đơn giản; bỏ qua popularity/recency |
+| **Random** | Loại ngẫu nhiên | Overhead thấp; hiệu quả tùy workload |
+| **TTL-based** | Loại item hết hạn | Kiểm soát lifetime; không tự quản pressure trước expiry |
+| **Size/cost-aware** | Xét size hoặc cost-to-recompute | Memory/value hiệu quả hơn nhưng cần metadata/policy phức tạp |
+
+Ngoài eviction cần quan sát:
+
+- memory fragmentation/allocator overhead;
+- serialized value size;
+- max item size;
+- admission policy — item nào được phép vào cache;
+- key cardinality;
+- eviction churn;
+- headroom cho failover/rebalance.
+
+LRU không phải “mặc định tốt nhất” cho mọi workload; policy phải được benchmark theo trace/access distribution.
+
+---
+
+#### 8. Cache stampede, penetration, avalanche và hot key
+
+##### 8.1 Cache stampede / thundering herd
+
+Một hot key hết hạn/miss, nhiều request cùng gọi origin và populate.
+
+Mitigation:
+
+- single-flight/request coalescing;
+- distributed lock/lease có timeout và fencing nếu cần;
+- stale-while-revalidate;
+- refresh-ahead;
+- probabilistic early refresh;
+- TTL jitter;
+- rate/concurrency limit origin;
+- stale-if-error/degraded response;
+- pre-warm hot keys.
+
+Lock không được giữ vô hạn và phải xử lý owner crash. Đừng khóa toàn cache cho một key.
+
+##### 8.2 Cache penetration
+
+Request cho key không tồn tại luôn miss và đánh origin. Giải pháp:
+
+- validate input/authorization;
+- negative caching;
+- Bloom filter khi false-positive trade-off phù hợp;
+- rate limit/abuse protection;
+- cache error chỉ khi hiểu transient/permanent semantics.
+
+##### 8.3 Cache avalanche
+
+Nhiều key hết hạn hoặc cache cluster mất cùng lúc, origin nhận burst cực lớn.
+
+Mitigation:
+
+- TTL jitter;
+- staggered refresh/pre-warm;
+- multi-level cache;
+- capacity/headroom và load shedding ở origin;
+- cache HA/failover;
+- cold-start/recovery drill;
+- prioritize critical keys.
+
+##### 8.4 Hot key
+
+Một key nhận tỷ lệ traffic lớn làm một shard/node/network link nóng dù tổng capacity còn nhiều.
+
+Mitigation:
+
+- local L1 replicas;
+- replicate/read fan-out hot value;
+- key splitting chỉ khi semantics cho phép;
+- request coalescing;
+- edge/CDN caching;
+- detect/route/isolate hot key;
+- cache tiny hot object tại application.
+
+Consistent hashing phân bố nhiều keys nhưng không chia một hot key tự động.
+
+---
+
+#### 9. Distributed cache design
+
+##### 9.1 Client-side sharding hay proxy/coordinator?
+
+- Client-side sharding giảm hop nhưng mọi client cần topology/version/routing logic.
+- Proxy/coordinator đơn giản hóa client nhưng thêm hop và thành component cần scale/HA.
+
+##### 9.2 Partitioning
+
+Hash/consistent hashing hoặc server-native slot/routing phân bố keys. Cần xét:
+
+- rebalance/data movement;
+- multi-key operations có cùng partition không;
+- tenant skew và hot keys;
+- node heterogeneity;
+- client topology refresh;
+- cache miss burst khi ownership đổi.
+
+##### 9.3 Replication và failover
+
+Replication tăng availability/read capacity nhưng:
+
+- replica có lag;
+- promotion có data loss window;
+- client có thể đọc stale;
+- failover làm hit ratio giảm;
+- capacity cần đủ khi một node mất;
+- split-brain/fencing tùy system.
+
+Vì cache thường là derived data, có thể chấp nhận mất entry — nhưng origin phải chịu được recovery/cold start. Nếu cache giữ session/job/state độc nhất, nó không còn là “chỉ cache” và durability/recovery requirement thay đổi.
+
+##### 9.4 Multi-level cache
+
+```text
+L1 local cache -> L2 distributed cache -> source of truth
+```
+
+L1 giảm network latency/L2 load; L2 chia sẻ giữa instances. Đổi lại invalidation, stale window, memory duplication và instrumentation phức tạp hơn.
+
+##### 9.5 Cache outage strategy
+
+- fail open tới origin có thể làm origin overload;
+- fail closed làm request lỗi dù source khỏe;
+- bypass có concurrency/rate limit;
+- stale fallback theo data class;
+- load shed optional traffic;
+- recover/warm theo tốc độ kiểm soát;
+- circuit breaker cache và origin độc lập;
+- capacity plan cho degraded mode.
+
+---
+
+#### 10. Redis — hiểu đúng vai trò
+
+Redis là in-memory data platform phổ biến với:
+
+- strings, hashes, lists, sets, sorted sets và data structures khác;
+- TTL/expiration;
+- atomic commands và server-side scripting/transactions trong scope hỗ trợ;
+- replication/cluster/high-availability options tùy deployment;
+- persistence options với durability trade-off;
+- Pub/Sub và stream/queue-like capabilities khác nhau về retention/delivery semantics.
+
+Use cases:
+
+- application cache;
+- session store;
+- rate limiting;
+- counters/leaderboards;
+- idempotency/dedup state;
+- coordination/locks khi protocol đúng;
+- ephemeral or fast serving state.
+
+Cần tránh:
+
+- coi Redis luôn chỉ mất dữ liệu không sao;
+- coi persistence tương đương database durability contract;
+- dùng Pub/Sub như durable queue;
+- chạy unbounded command/value gây latency spike;
+- dùng keys/list scan nguy hiểm trên hot path;
+- bỏ memory/eviction/replication lag/failover monitoring;
+- distributed lock không có lease/fencing;
+- không phân biệt managed Redis-compatible service với Redis product semantics cụ thể.
+
+> **Nếu application không thể rebuild data và mất nó gây sai nghiệp vụ, hãy thiết kế Redis như một stateful data system với durability, backup và recovery — không gọi nó là cache để né yêu cầu.**
+
+---
+
+#### 11. Thiết kế cache cho trang chi tiết sản phẩm
+
+```text
+Browser
+  -> CDN: image/CSS/JS + public cacheable fragments
+  -> API/Gateway
+       -> L1 optional local cache
+       -> L2 distributed cache: product/catalog
+       -> catalog DB (source of truth)
+       -> pricing/inventory services theo freshness requirement
+```
+
+##### 11.1 Phân loại dữ liệu
+
+- ảnh/asset: immutable URL + CDN TTL dài;
+- tên/mô tả/thuộc tính: cache-aside TTL vừa + event invalidation;
+- giá: TTL ngắn hoặc version/event tùy business rule;
+- inventory: không dùng stale cached count để xác nhận reservation; command path phải kiểm tra authoritative invariant;
+- review aggregate: cache/precompute eventual được nếu UI chấp nhận;
+- recommendation: personalized key/serving store, tránh cache leak giữa user.
+
+##### 11.2 Key design
+
+```text
+product:v3:{product_id}:{locale}:{currency}
+```
+
+Key phải chứa mọi dimension làm response khác nhau. Tránh cache fragmentation không cần thiết và không đưa PII/token thô vào key/log.
+
+##### 11.3 Read path
+
+1. L1 lookup nếu dùng.
+2. L2 lookup.
+3. Miss: single-flight theo key.
+4. Đọc DB/source với timeout/concurrency limit.
+5. Populate kèm version + TTL jitter.
+6. Trả response; đo hit/miss latency riêng.
+
+##### 11.4 Update path
+
+1. Ghi source of truth.
+2. Commit event/outbox hoặc CDC.
+3. Invalidate/update cache theo entity version.
+4. Purge/revalidate CDN nếu content cùng URL thay đổi, hoặc dùng versioned URL.
+5. Theo dõi invalidation lag và reconciliation.
+
+##### 11.5 Failure behavior
+
+- cache lỗi: bypass có giới hạn, không flood DB;
+- DB lỗi: stale-if-error cho catalog nếu policy cho phép;
+- event lag: TTL là safety net;
+- hot product: local/edge caching và request coalescing;
+- cold deploy: warm theo popularity, có throttling.
+
+---
+
+#### 12. Session, authentication và cache
+
+Session store cần low latency nhưng session có thể là authoritative security state. Nếu eviction làm user logout thì có thể chấp nhận; nếu làm bypass revocation hoặc sai quyền thì không.
+
+Cần:
+
+- opaque unpredictable session ID;
+- TTL/idle/absolute expiry;
+- rotation/revocation;
+- tenant/user key scope;
+- secure transport/access control;
+- HA/durability theo UX/security SLO;
+- tránh cache authorization lâu hơn staleness budget;
+- invalidate role/permission/session change;
+- không cache sensitive response thành shared public entry.
+
+“Session cache” thường thực chất là session database/store; hãy gọi đúng vai trò để thiết kế failure semantics đúng.
+
+---
+
+#### 13. Observability và đánh giá cache
+
+Metric cần theo dõi:
+
+- hit/miss ratio theo layer, keyspace, route và tenant;
+- byte hit ratio/origin offload;
+- P50/P95/P99 hit và miss latency;
+- source latency/QPS khi miss;
+- eviction/expiration/admission/rejection rate;
+- memory used, fragmentation và item-size distribution;
+- key cardinality và growth;
+- hot keys/traffic skew;
+- connections/pool wait/timeouts/errors;
+- replication lag/failover/rebalance;
+- invalidation/event lag;
+- stale served/refresh success;
+- stampede/coalesced waiters;
+- cost và latency saved.
+
+##### 13.1 Đọc hit ratio đúng
+
+- hit ratio cao nhưng cached values rất nhỏ/rẻ có thể ít tác động;
+- global ratio che tenant/route/keyspace xấu;
+- L1 hit làm L2 ratio có vẻ thấp nhưng tổng hệ thống vẫn tốt;
+- outage/cold start cần xem miss penalty và origin survival;
+- negative-cache hit cần phân biệt legitimate traffic với abuse;
+- byte hit ratio quan trọng cho CDN/media hơn request hit ratio.
+
+##### 13.2 Capacity planning
+
+Ước lượng sơ bộ:
+
+```text
+memory
+  ≈ số live entries
+  × (average serialized value + key + metadata/allocator overhead)
+  × replication factor
+  + headroom
+```
+
+Đo serialized size và real allocator/fragmentation thay vì chỉ kích thước object trong application.
+
+---
+
+#### 14. Mười một câu hỏi phỏng vấn từ tài liệu PDF
+
+##### Nhóm khái niệm
+
+**Q1. Caching là gì và vì sao quan trọng?**  
+Lưu tạm data/result ở lớp nhanh hoặc gần hơn để giảm repeated work, latency và origin load. Nó tăng capacity/cost efficiency nhưng thêm copy, staleness, invalidation và failure complexity.
+
+**Q2. Có những lớp cache nào?**  
+Client/browser, CDN/edge, reverse proxy/API, in-process L1, distributed L2 và database-side caches/materialized views. Chọn theo sharing scope, latency, consistency, security và invalidation.
+
+**Q3. Write-through và write-back khác nhau thế nào?**  
+Write-through cập nhật source trên synchronous write path nên chậm hơn và cache fresh hơn, nhưng không tự giải quyết dual-write/strong consistency. Write-back acknowledge ở cache/buffer rồi persist sau, tăng throughput nhưng yêu cầu durability, ordering, replay và backlog recovery.
+
+**Q4. Cache-aside/lazy loading là gì?**  
+Application lookup cache; miss thì đọc source, populate và trả. Phù hợp read-heavy/working set nhỏ hơn dataset. Cần chống stampede, xử lý stale repopulation race và invalidation.
+
+##### Nhóm tình huống
+
+**Q5. Tối ưu product details page bằng cache thế nào?**  
+CDN cho images/assets; distributed cache cho catalog; TTL/event invalidation; key gồm locale/currency/variant; giá và tồn kho có freshness/invariant khác. Single-flight miss, TTL jitter, stale fallback và metrics theo hit/miss.
+
+**Q6. Chọn eviction nào khi memory hạn chế?**  
+LRU nếu recency dự đoán reuse; LFU nếu popularity ổn định; FIFO/random khi overhead/simplicity quan trọng; size/cost-aware khi values khác lớn. Kết hợp TTL và admission; benchmark theo access trace thật.
+
+**Q7. Giữ cache và DB đồng bộ thế nào?**  
+Source-of-truth write + invalidate/update, versioned keys/values, outbox/CDC event, TTL safety net và reconciliation. Nêu staleness budget, ordering, duplicate, lost event và concurrent-write races; “write-through” một mình chưa đủ.
+
+**Q8. Rủi ro của aggressive caching?**  
+Stale/security error, memory/cost, stampede/avalanche/hot key, invalidation complexity, cache outage làm origin overload, data loss nếu dùng write-back và hidden dependency. Cache cũng có thể che query/data-model vấn đề.
+
+##### Nhóm triển khai
+
+**Q9. Triển khai Redis cache trong web app thế nào?**  
+Thiết kế key/version/TTL/serialization; cache-aside; timeout ngắn và bounded connection pool; single-flight miss; source fallback có limit; explicit/event invalidation; metrics hit/miss/eviction/hot key. Library cụ thể không thay những quyết định này.
+
+**Q10. Chống cache stampede/thundering herd thế nào?**  
+Request coalescing/single-flight, lock/lease theo key, stale-while-revalidate, refresh-ahead, probabilistic early refresh, randomized TTL, origin concurrency limit và pre-warm. Phải xử lý lock-owner crash và cache outage.
+
+**Q11. Công cụ nào dùng cho distributed caching?**  
+Redis Cluster/compatible managed systems, Memcached, Hazelcast, Apache Ignite hoặc platform khác. Chọn theo data structures, consistency, sharding, HA, persistence, eviction, client ecosystem và operational capability; consistent hashing/replication không tự giải quyết hot key.
+
+---
+
+#### 15. Những lỗi tư duy thường gặp
+
+- Cache mọi thứ vì “RAM nhanh”.
+- Dùng hit ratio làm mục tiêu duy nhất.
+- Không đo miss path và origin capacity khi cache chết.
+- Cache key thiếu tenant/user/locale/currency/auth dimensions.
+- Cache private response ở shared layer.
+- TTL được chọn tùy ý, không theo staleness budget.
+- Nghĩ TTL tự giải quyết mọi invalidation.
+- Nghĩ write-through tự bảo đảm strong consistency.
+- Dùng write-back nhưng không có durable log/replay.
+- Invalidate sau update nhưng bỏ qua stale repopulation race.
+- Event invalidation không version/order/reconciliation.
+- Expiry đồng loạt không có jitter.
+- Dùng global mutex thay vì lock/coalescing theo key.
+- Lock không timeout/fencing, owner crash làm treo refresh.
+- Consistent hashing được kỳ vọng tự giải hot key.
+- Không negative-cache invalid key, để attacker làm cache penetration.
+- Negative-cache transient error quá lâu.
+- LRU được coi là tốt nhất mà không benchmark.
+- Bỏ qua key/value/allocator/serialization memory overhead.
+- Local caches khác nhau nhưng không có invalidation strategy.
+- Cache outage fail-open trực tiếp làm DB sập.
+- Coi Redis persistence là durability guarantee đủ cho mọi business state.
+- Dùng Pub/Sub như durable queue.
+- Session/security state bị eviction hoặc stale mà không xét hậu quả.
+- Warm toàn dataset, làm cache thành database thứ hai.
+
+---
+
+#### 16. Caching design checklist
+
+1. Expensive/repeated operation nào cần cache?
+2. Source of truth và rebuild path?
+3. Target latency, origin offload và cost benefit?
+4. Cache layer: browser/CDN/proxy/local/distributed/DB?
+5. Key gồm đủ tenant/auth/locale/version/query dimensions?
+6. Value size, serialization/compression và cardinality?
+7. Cache-aside/read-through/write-through/write-back/write-around?
+8. Staleness budget và TTL?
+9. Explicit/event/CDC invalidation và ordering/version?
+10. Delete/tombstone và newly-created entity với negative cache?
+11. Stampede protection: single-flight, jitter, refresh-ahead, stale?
+12. Eviction/admission policy theo access distribution?
+13. Hot key/tenant và partition/rebalance strategy?
+14. Local + distributed multi-level coherence?
+15. Cache outage/cold start/failover behavior và origin protection?
+16. Replication/durability nếu cache giữ state không rebuild được?
+17. Security, PII, public/private và tenant isolation?
+18. Metrics hit/miss/byte/offload/eviction/stale/hot key?
+19. Load test warm, cold, churn, failover và stampede?
+20. Capacity/headroom/cost và recovery/warming procedure?
+
+#### 17. Ý chính cần nhớ
+
+- Cache giảm repeated work bằng cách thêm một copy nhanh/gần hơn.
+- Hit ratio chỉ có ý nghĩa cùng miss penalty, bytes và origin offload.
+- Cache layers khác nhau về scope, latency, sharing và invalidation.
+- Cache-aside đơn giản nhưng có cold miss, stampede và race.
+- Write-through không tự bảo đảm strong consistency giữa hai hệ.
+- Write-back cần durability, ordering và replay như một data pipeline.
+- TTL là freshness safety net, không thay explicit invalidation cho mọi use case.
+- Expiration khác eviction.
+- LRU/LFU/FIFO phải khớp access pattern và memory economics.
+- Stampede, penetration, avalanche và hot key là failure modes khác nhau.
+- Single-flight, TTL jitter, SWR và origin protection thường cần kết hợp.
+- Distributed cache thêm sharding, replication, failover và cold-start complexity.
+- Cache là derived data nếu có thể rebuild; nếu không, nó là stateful store.
+- Redis có nhiều data structures/persistence options nhưng không phải mặc định source of truth.
+- Product catalog, price và inventory có freshness/invariant khác nhau.
+- Cache outage behavior phải được test, không chỉ cache hit path.
+- Caching hiệu quả là bài toán consistency, reliability và observability, không chỉ memory speed.
+
+#### Công thức ghi nhớ
+
+> **Cache tốt = đúng repeated work + đúng layer/key + staleness budget rõ + invalidation/version an toàn + chống stampede/hot key + origin sống khi cache lỗi + lợi ích được đo.**
+
+---
+
+### Bài 48. Messaging & Queues for Decoupling
+
+#### 1. Vì sao dùng asynchronous messaging?
+
+Synchronous call buộc producer chờ consumer/dependency hoàn tất:
+
+```text
+Client -> Service A -> Service B -> Service C -> response
+```
+
+Nếu work không cần hoàn tất trước response, có thể tách bằng broker:
+
+```text
+Client -> Producer -> durable broker/queue -> Consumer(s)
+              |                              |
+          acknowledge nhanh             xử lý độc lập
+```
+
+Lợi ích:
+
+- producer và consumer scale độc lập;
+- hấp thụ burst và làm phẳng tốc độ tới downstream;
+- consumer tạm unavailable không nhất thiết làm mất work;
+- retry/replay theo policy;
+- giảm latency của request path cho background work;
+- thêm consumer mới mà không sửa producer trong nhiều use case;
+- cô lập failure và rate limits tốt hơn direct-call chains.
+
+Nhưng asynchronous messaging không làm work nhanh hơn một cách kỳ diệu:
+
+```text
+user response latency giảm
+!= business completion latency giảm
+```
+
+Work vẫn phải được xử lý; queue chỉ chuyển thời gian chờ khỏi request path và tạo backlog nếu arrival rate vượt processing rate.
+
+> **Queue là buffer và coordination boundary, không phải capacity vô hạn hay guarantee hoàn thành ngay.**
+
+---
+
+#### 2. Thành phần của messaging system
+
+##### 2.1 Message
+
+Message thường gồm envelope và payload:
+
+```json
+{
+  "messageId": "msg-...",
+  "type": "ProductPriceChanged",
+  "schemaVersion": 3,
+  "occurredAt": "...",
+  "producer": "catalog-service",
+  "correlationId": "...",
+  "causationId": "...",
+  "partitionKey": "product-123",
+  "payload": {}
+}
+```
+
+Metadata hỗ trợ dedup, tracing, ordering, schema evolution và debugging. Không dùng broker header/payload như nơi phát tán secret/PII ngoài policy.
+
+##### 2.2 Producer
+
+Producer tạo/publish message. Nó phải biết khi nào business transaction đã commit, publish failure xử lý ra sao và acknowledgement từ broker nghĩa là gì.
+
+##### 2.3 Broker
+
+Broker nhận, lưu/route và deliver message qua queue, topic hoặc partitioned log. Guarantee phụ thuộc persistence, replication, acknowledgement, retention, topology và cấu hình.
+
+##### 2.4 Consumer
+
+Consumer nhận/poll message, xử lý side effect rồi acknowledge/commit progress. Thời điểm ack quyết định trade-off mất message với duplicate.
+
+##### 2.5 Channel/subscription/consumer group
+
+- queue thường phân phối một work item tới một consumer trong nhóm cạnh tranh;
+- pub/sub tạo logical copy cho mỗi subscription;
+- partitioned log cho consumer group tự theo dõi offset và replay theo retention.
+
+---
+
+#### 3. Command, event và document message
+
+##### 3.1 Command
+
+Yêu cầu một capability thực hiện action:
+
+```text
+ReserveInventory(orderId, items)
+```
+
+- mang ý định;
+- thường có một logical owner/handler;
+- có thể thành công/thất bại;
+- nên có idempotency key.
+
+##### 3.2 Event
+
+Thông báo fact đã xảy ra:
+
+```text
+InventoryReserved(orderId, reservationId)
+```
+
+- tên ở quá khứ;
+- producer không ra lệnh subscriber cụ thể;
+- có thể có nhiều subscriber;
+- event đã công bố nên immutable về fact; sửa bằng event mới.
+
+##### 3.3 Document/data message
+
+Mang state/snapshot để đồng bộ hoặc truyền dữ liệu, ví dụ `ProductSnapshotV3`. Nó giảm lookup nhưng tăng payload, duplication và schema/version concerns.
+
+Phân biệt ba loại giúp tránh event giả command như `SendEmailEvent` hoặc command giả event làm coupling khó thấy.
+
+---
+
+#### 4. Queue, Pub/Sub và partitioned log
+
+| Mô hình | Delivery/consumption | Retention/replay | Phù hợp |
+|---|---|---|---|
+| **Work queue** | Competing consumers chia work | Thường xóa/ẩn sau ack theo policy | Background jobs, task distribution |
+| **Pub/Sub** | Mỗi subscription nhận logical copy | Phụ thuộc broker/subscription | Notifications, integration events |
+| **Partitioned log/stream** | Append log; group đọc offset theo partition | Giữ theo time/size, có thể replay | Event streaming, CDC, analytics, state rebuild |
+
+Nhãn không hoàn toàn loại trừ nhau; một sản phẩm có thể cung cấp nhiều mode. Khi thiết kế, hỏi semantics cụ thể:
+
+- ai nhận một message?
+- message tồn tại bao lâu?
+- có replay được không?
+- ordering ở scope nào?
+- ack/offset commit khi nào?
+- một consumer chậm ảnh hưởng consumer khác thế nào?
+
+---
+
+#### 5. Decoupling — hiểu đúng phạm vi
+
+Messaging có thể giảm:
+
+- **temporal coupling**: consumer không nhất thiết online cùng lúc;
+- **spatial coupling**: producer không cần biết instance/address cụ thể;
+- **rate coupling**: producer và consumer có thể chạy ở tốc độ khác trong giới hạn buffer.
+
+Nhưng messaging không loại bỏ:
+
+- **semantic coupling**: consumer vẫn phụ thuộc meaning/schema;
+- business workflow coupling;
+- shared identifiers và invariants;
+- operational dependency vào broker;
+- eventual consistency và completion tracking.
+
+Loose coupling không có nghĩa không có contract. Event schema, ownership, compatibility và deprecation vẫn cần governance.
+
+---
+
+#### 6. Khi nào nên và không nên dùng queue?
+
+##### Phù hợp khi
+
+- work có thể hoàn tất sau response;
+- traffic burst cần buffer;
+- consumer cần retry/replay;
+- producer/consumer scale hoặc deploy độc lập;
+- fan-out tới analytics, audit, notifications;
+- bảo vệ API/rate-limited/expensive resource;
+- image/video/report/export processing;
+- email/SMS/push;
+- CDC/data pipeline/event streaming.
+
+##### Không phù hợp hoặc cần cân nhắc kỹ khi
+
+- user cần kết quả ngay để tiếp tục;
+- invariant cần transaction đồng bộ trong một boundary;
+- queue delay không nằm trong business SLO;
+- ordering toàn cục bắt buộc ở throughput lớn;
+- operation không thể retry/idempotent/compensate;
+- team chưa có observability/recovery cho async workflows;
+- thêm broker chỉ để né thiết kế API đơn giản.
+
+Hybrid thường hợp lý: command quan trọng được chấp nhận/commit đồng bộ, còn side effects không critical chạy async.
+
+---
+
+#### 7. Queueing, throughput và completion latency
+
+Giả sử:
+
+- producer arrival rate `λp` messages/s;
+- consumer completion rate `λc` messages/s.
+
+```text
+nếu λp > λc kéo dài:
+backlog growth rate ≈ λp - λc
+```
+
+Ví dụ producer 5.000 msg/s, consumer 4.000 msg/s thì backlog tăng khoảng 1.000 msg/s. Queue không sửa capacity deficit dài hạn.
+
+Little’s Law cho steady-state mental model:
+
+```text
+average backlog/in-flight ≈ throughput × average time in system
+```
+
+Metric quan trọng:
+
+- publish/ingest rate;
+- delivery/processing/success rate;
+- queue depth;
+- oldest message age/end-to-end event age;
+- consumer lag/offset distance;
+- processing latency và queueing delay;
+- retries/redeliveries;
+- DLQ count/age;
+- partition skew;
+- consumer utilization/saturation;
+- broker storage/network/replication health.
+
+Queue depth 1 triệu có thể bình thường nếu xử lý trong 2 phút, hoặc nghiêm trọng nếu oldest age là 6 giờ. Age thường gần user/business impact hơn depth đơn thuần.
+
+##### 7.1 Autoscaling consumers
+
+Scale theo:
+
+- backlog per worker;
+- queue age/lag;
+- processing time;
+- arrival trend;
+- downstream safe capacity.
+
+Không scale consumers vượt database/external API capacity. Với partitioned log, số partition có thể giới hạn parallelism hiệu quả của một consumer group.
+
+---
+
+#### 8. Acknowledgement và redelivery
+
+##### 8.1 Ack trước xử lý
+
+```text
+receive -> ack -> process
+```
+
+Nếu consumer crash sau ack, message có thể mất trong processing scope: gần at-most-once.
+
+##### 8.2 Ack sau xử lý
+
+```text
+receive -> process/commit side effect -> ack
+```
+
+Nếu side effect commit nhưng ack thất bại hoặc consumer crash, broker redeliver: at-least-once và có duplicate.
+
+##### 8.3 Visibility timeout/ack deadline
+
+Một số queue ẩn message trong thời gian consumer xử lý. Nếu chưa delete/ack trước deadline, message hiện lại. Timeout phải dài hơn normal processing hoặc được gia hạn bằng heartbeat; quá dài làm recovery chậm, quá ngắn tạo concurrent duplicates.
+
+##### 8.4 Offset commit
+
+Log consumer thường commit offset/progress. Commit trước side effect có thể mất work; commit sau side effect có thể replay duplicate. Cần phối hợp state/sink transaction hoặc idempotency.
+
+##### 8.5 Prefetch/batch receive
+
+Prefetch tăng throughput và giảm broker round trips, nhưng:
+
+- một worker giữ quá nhiều unacked messages;
+- load distribution kém;
+- recovery/redelivery lớn khi worker chết;
+- memory/processing time tăng;
+- ordering behavior phức tạp.
+
+Điều chỉnh theo processing time, worker capacity và fairness.
+
+---
+
+#### 9. Delivery guarantees
+
+##### 9.1 At-most-once
+
+- không chủ động redeliver trong scope;
+- duplicate ít hơn;
+- có thể mất work khi failure;
+- phù hợp telemetry không critical hoặc sampling khi business cho phép.
+
+##### 9.2 At-least-once
+
+- retry/redelivery để giảm mất message;
+- duplicate là bình thường;
+- consumer cần idempotency/dedup;
+- là lựa chọn thực dụng phổ biến.
+
+##### 9.3 Exactly-once — luôn hỏi “trong boundary nào?”
+
+Exactly-once có thể áp dụng trong một protocol/transaction scope, ví dụ broker read-process-write trong cùng ecosystem. Nó không tự bảo đảm external email, payment API hoặc database side effect chỉ xảy ra một lần.
+
+Với bank transfer/billing, correctness không đến từ việc nói “dùng exactly-once queue”. Cần:
+
+- business idempotency key;
+- unique constraint/ledger invariant;
+- atomic local transaction;
+- reconciliation;
+- audit;
+- xử lý uncertain outcome với external provider.
+
+##### 9.4 Effectively-once
+
+At-least-once transport + idempotent business operation + dedup/unique constraints + reconciliation tạo hiệu ứng nghiệp vụ như một lần trong boundary đã định.
+
+---
+
+#### 10. Idempotent consumer
+
+##### 10.1 Inbox/dedup trong cùng transaction
+
+```text
+BEGIN
+  INSERT inbox(message_id) ON CONFLICT -> already processed
+  apply business state transition with invariant/version check
+COMMIT
+ACK message
+```
+
+Ưu điểm: dedup marker và business side effect cùng commit. Nếu lưu “processed” ở Redis riêng rồi ghi DB, partial failure vẫn tồn tại.
+
+##### 10.2 Business idempotency
+
+Tốt hơn chỉ dedup message ID:
+
+- `order_id + operation_type` unique;
+- payment provider idempotency key;
+- state transition `PENDING -> RESERVED` chỉ một lần;
+- append ledger entry với unique transaction ID;
+- compare version/sequence.
+
+Message có thể được republish với message ID mới nhưng đại diện cùng business command; business key vẫn ngăn duplicate effect.
+
+##### 10.3 Dedup retention
+
+Dedup record phải sống ít nhất qua khoảng redelivery/replay có thể xảy ra. Xóa sớm làm duplicate cũ có hiệu lực; giữ vô hạn tạo growth. Policy phải dựa retention, replay và audit requirements.
+
+##### 10.4 External side effects
+
+Email/SMS có thể gửi trùng sau uncertain failure. Dùng provider idempotency nếu có, request ledger/outbox, deterministic key và business tolerance. Không phải side effect nào cũng hoàn tác hoàn hảo.
+
+---
+
+#### 11. Producer reliability và Transactional Outbox
+
+Dual-write nguy hiểm:
+
+```text
+1. Commit order DB
+2. Publish OrderCreated
+```
+
+Nếu bước 1 thành công, bước 2 thất bại, order tồn tại nhưng event mất.
+
+Transactional Outbox:
+
+```text
+BEGIN
+  write business state
+  write outbox event
+COMMIT
+
+relay/CDC -> publish outbox event at-least-once
+```
+
+Consumer vẫn idempotent vì relay có thể publish trùng. Cần:
+
+- outbox polling/CDC lag;
+- ordering per aggregate;
+- relay retry;
+- event schema/version;
+- cleanup/retention;
+- monitoring unpublished age;
+- atomic mark/publish semantics hoặc safe duplicate behavior.
+
+Alternative như broker transaction/distributed transaction có scope/cost khác; không mặc định tốt hơn.
+
+---
+
+#### 12. Retry, poison message và DLQ
+
+##### 12.1 Phân loại lỗi
+
+- transient: timeout, rate limit, dependency tạm unavailable;
+- permanent/business: invalid data, forbidden transition, missing required entity;
+- bug/schema incompatibility;
+- overload/resource exhaustion.
+
+Retry chỉ hữu ích cho lỗi có khả năng tự hết.
+
+##### 12.2 Retry policy
+
+- exponential backoff + jitter;
+- maximum attempts hoặc maximum elapsed time;
+- timeout/concurrency limit mỗi attempt;
+- retry topic/delay queue để không block hot partition;
+- preserve attempt count và last error;
+- circuit breaker cho dependency lỗi;
+- idempotency cho mọi attempt.
+
+Immediate retry loop khuếch đại outage.
+
+##### 12.3 Poison message
+
+Message luôn thất bại do data/schema/code. Nó có thể block queue/partition nếu retry vô hạn. Sau policy, chuyển vào DLQ/quarantine.
+
+##### 12.4 DLQ không phải nghĩa địa
+
+DLQ cần:
+
+- owner và alert;
+- reason/context/traces;
+- PII/security policy;
+- retention;
+- inspection/fix procedure;
+- safe redrive có rate limit;
+- dedup/idempotency khi replay;
+- metric age/count/redrive outcome.
+
+Sửa consumer rồi redrive hàng triệu messages không throttle có thể gây outage lần hai.
+
+---
+
+#### 13. Ordering
+
+“FIFO” phải có scope:
+
+- toàn queue?
+- partition/shard?
+- per key/aggregate?
+- chỉ khi một consumer?
+- ordering theo publish, broker append hay event time?
+
+Parallelism và ordering thường đánh đổi:
+
+- một partition/key giữ order nhưng giới hạn throughput của key đó;
+- nhiều partitions tăng parallelism nhưng không có global order;
+- retry một message có thể block các message sau hoặc làm chúng vượt lên;
+- multi-producer clocks không tạo total order;
+- redelivery làm processing completion order khác delivery order.
+
+Pattern thường dùng:
+
+- partition theo aggregate/order/customer ID;
+- sequence number/version trong message;
+- consumer bỏ/đợi out-of-order theo policy;
+- state transition kiểm tra version;
+- không yêu cầu global ordering nếu business chỉ cần per-entity order.
+
+---
+
+#### 14. RabbitMQ và Kafka — so sánh theo semantics
+
+| Khía cạnh | RabbitMQ-style broker | Kafka-style partitioned log |
+|---|---|---|
+| **Mental model** | Exchange/routing → queues → consumers | Append-only topics/partitions → consumer groups/offsets |
+| **Consumption** | Broker delivery/push-oriented hoặc client flow control | Consumer pull theo offset |
+| **Retention** | Thường lifecycle theo ack/queue policy; các mode khác có thể tồn tại | Retention độc lập với một consumer đã đọc, hỗ trợ replay |
+| **Routing** | Exchange/binding/routing keys linh hoạt | Topic/partition key là trục chính |
+| **Ordering** | Phụ thuộc queue, concurrency, redelivery và config | Theo partition, không global |
+| **Use case** | Work queues, task routing, request/reply, per-message workflows | Event streaming, CDC, replayable pipelines, analytics/log |
+| **Scale unit** | Queue/consumer/broker topology | Partition/broker/consumer group |
+
+Không nên học thành:
+
+```text
+RabbitMQ = luôn push, FIFO, xóa ngay
+Kafka = luôn exactly-once
+```
+
+Sản phẩm/version/plugin/configuration có semantics chi tiết khác nhau. Chọn dựa trên:
+
+- work queue hay replayable event log;
+- routing complexity;
+- retention/replay;
+- throughput/latency;
+- ordering/partitioning;
+- consumer fan-out;
+- delivery/transaction scope;
+- managed operations/ecosystem;
+- message size và backlog behavior.
+
+Azure Service Bus, SQS và các managed brokers cũng có contract riêng về duplicate, ordering, visibility, DLQ và retention; không suy diễn từ tên “queue”.
+
+---
+
+#### 15. Thiết kế order processing đúng boundary
+
+Một thiết kế an toàn hơn “frontend đưa order vào queue rồi hy vọng”:
+
+```text
+Client -> Order API
+           |
+           +-- local transaction:
+           |     create Order(PENDING)
+           |     write outbox OrderCreated
+           |
+           +-- return order_id + status
+
+Outbox relay -> event broker
+                  |
+                  +-> Inventory service: reserve idempotently
+                  +-> Payment workflow: authorize idempotently
+                  +-> Notification: send after state/event
+                  +-> Analytics/Audit
+```
+
+Workflow có thể là saga orchestration/choreography. Cần định nghĩa:
+
+- khi nào order được coi là accepted/confirmed/completed;
+- inventory và payment thứ tự nào;
+- compensation khi payment thành công nhưng inventory fail;
+- timeout/deadline và stuck workflow recovery;
+- idempotency key từ client tới payment/inventory;
+- per-order ordering/version;
+- audit/reconciliation;
+- user polling/webhook/WebSocket cho trạng thái;
+- DLQ/redrive không gây double charge;
+- privacy/retention của messages.
+
+Email/analytics không nên làm checkout request chậm. Nhưng payment/inventory invariant không thể “đẩy async” mà không thiết kế business state machine.
+
+---
+
+#### 16. Security, schema và observability
+
+##### 16.1 Security
+
+- TLS/mTLS theo boundary;
+- producer/consumer identity;
+- least-privilege topic/queue ACL;
+- encryption at rest và key management;
+- secret/PII minimization;
+- tenant isolation;
+- audit publish/consume/admin changes;
+- quota/rate limits để ngăn noisy tenant;
+- schema validation và payload size limit.
+
+##### 16.2 Schema evolution
+
+- schema ID/version trong envelope;
+- backward/forward compatibility policy;
+- add field với default/optional semantics;
+- không đổi meaning âm thầm;
+- upcaster/adapter cho history;
+- deprecation window theo retention/replay;
+- consumer contract tests.
+
+##### 16.3 Observability
+
+Theo dõi end-to-end, không chỉ broker health:
+
+- publish success/latency và outbox lag;
+- broker ingress/egress/storage/replication;
+- queue depth/age và partition lag;
+- consumer processing/error/retry/ack latency;
+- DLQ count/oldest age;
+- duplicate/dedup rate;
+- business completion latency;
+- stuck workflows;
+- trace/correlation từ API qua events;
+- schema compatibility failures;
+- cost per useful message/work item.
+
+Sampling trace cần giữ error/slow/stuck cases và propagate correlation/causation IDs.
+
+---
+
+#### 17. Bảy câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Vì sao dùng asynchronous messaging?**  
+Để tách request path khỏi work có thể trì hoãn, buffer burst, cho producer/consumer scale độc lập và giữ work khi consumer tạm lỗi. Đổi lại có completion latency, eventual consistency, duplicate, ordering và vận hành broker/workflow.
+
+**Q2. RabbitMQ và Kafka khác nhau thế nào?**  
+RabbitMQ-style phù hợp routing/work queues/per-message workflows; Kafka-style là partitioned retained log phù hợp replay/event streaming/CDC. Không gắn nhãn tuyệt đối về push/FIFO/exactly-once; so contract theo retention, routing, ordering, scale và processing scope.
+
+**Q3. At-most-once, at-least-once và exactly-once là gì?**  
+At-most-once có thể mất; at-least-once retry nên có duplicate; exactly-once chỉ đúng trong boundary cụ thể. Financial correctness cần idempotency keys, unique constraints/ledger và reconciliation, không chỉ chọn broker “exactly once”.
+
+**Q4. Queue cải thiện scalability/fault tolerance thế nào?**  
+Nó decouple arrival rate khỏi processing rate trong giới hạn backlog, cho consumer scale/failover độc lập. Nó không thêm downstream capacity và không bảo vệ nếu broker không durable/HA hoặc backlog vượt retention/capacity.
+
+**Q5. Vấn đề dưới heavy load và cách giảm?**  
+Backlog/age, broker storage exhaustion, redelivery storm, duplicate, partition skew, hot key và downstream saturation. Tối ưu/scale consumer tới safe dependency capacity; backpressure/admission control; retry delay; DLQ; partitioning; load shedding và capacity/retention planning.
+
+**Q6. Thiết kế order processing bằng queue thế nào?**  
+Order API commit order + outbox, publish `OrderCreated`, inventory/payment xử lý idempotently trong saga/state machine, events cập nhật status, email/analytics tách riêng. Có compensation, timeout, ordering, DLQ và reconciliation; không để queue message là bản ghi order duy nhất.
+
+**Q7. Bảo đảm consumer idempotency thế nào?**  
+Dùng message/business ID, inbox marker + business update trong cùng DB transaction, unique constraints/versioned state transition và provider idempotency keys. Broker dedup hoặc Redis flag riêng chỉ hỗ trợ, không thay atomic business correctness.
+
+---
+
+#### 18. Những lỗi tư duy thường gặp
+
+- Dùng queue cho mọi communication dù cần response đồng bộ.
+- Nói queue làm work nhanh hơn thay vì chuyển completion latency.
+- Xem queue như capacity vô hạn.
+- Chỉ theo dõi depth, không theo dõi oldest age/end-to-end completion.
+- Scale consumers vượt safe capacity của DB/external API.
+- Acknowledge trước khi side effect durable nhưng kỳ vọng không mất work.
+- Acknowledge sau xử lý nhưng không thiết kế duplicate.
+- Visibility timeout ngắn hơn processing time, tạo concurrent redelivery.
+- Prefetch quá lớn làm unfairness và recovery burst.
+- Nói exactly-once mà không nêu scope.
+- Chọn exactly-once broker cho payment nhưng không có business idempotency/ledger.
+- Dùng Redis processed-message flag tách khỏi DB transaction rồi tưởng atomic.
+- Dedup TTL ngắn hơn replay/redelivery window.
+- Dual-write DB + broker không có outbox/protocol.
+- Retry mọi lỗi, kể cả validation/business permanent error.
+- Immediate retry không backoff/jitter làm outage nặng hơn.
+- Có DLQ nhưng không owner, alert, retention hoặc redrive procedure.
+- Redrive toàn bộ DLQ không throttle.
+- Yêu cầu global FIFO khi chỉ cần per-entity order.
+- Thêm partitions nhưng partition key tạo hot spot/skew.
+- Nghĩ async messaging loại mọi coupling; schema/semantics vẫn coupling.
+- Event payload chứa PII/secret rồi tồn tại lâu trong retention/backups.
+- Dùng Pub/Sub non-durable cho critical work mà không đọc contract.
+- Chọn RabbitMQ/Kafka theo slogan thay vì semantics/workload.
+- Chỉ đo broker uptime, không đo business completion/stuck workflows.
+
+---
+
+#### 19. Messaging design checklist
+
+1. Work có thật sự không cần response ngay không?
+2. Command, event hay document message?
+3. Queue, pub/sub hay retained partitioned log?
+4. Source of truth và business state nằm ở đâu?
+5. Producer commit và publish atomic bằng cách nào?
+6. Broker acknowledgement/durability/replication contract?
+7. At-most/at-least/exactly-once scope nào?
+8. Consumer idempotency/inbox/unique business key?
+9. Ack/offset commit trước hay sau side effect?
+10. Ordering scope và partition key?
+11. Visibility timeout/ack deadline/prefetch/batch settings?
+12. Retry classification, backoff/jitter/max attempts?
+13. Poison messages, DLQ owner và safe redrive?
+14. Queue capacity, retention và overflow behavior?
+15. Arrival/processing rates, safe backlog và age SLO?
+16. Consumer autoscaling và downstream capacity limits?
+17. Backpressure, admission control và load shedding?
+18. Schema version/compatibility/deprecation?
+19. Security, tenant isolation, PII và payload limit?
+20. Correlation/causation IDs và end-to-end tracing?
+21. Replay/backfill/reconciliation và dedup retention?
+22. Broker/consumer/business completion SLI/SLO?
+23. Disaster recovery, failover và partition behavior?
+24. Cost, operations, upgrade và ownership?
+
+#### 20. Ý chính cần nhớ
+
+- Messaging decouple request path, rate và availability trong phạm vi broker contract.
+- Queue giảm user response latency nhưng business completion có thể lâu hơn.
+- Queue, pub/sub và partitioned log có consumption/retention semantics khác nhau.
+- Command, event và document message thể hiện ý định khác nhau.
+- Async giảm temporal/spatial coupling nhưng không loại semantic coupling.
+- Backlog tăng nếu arrival rate vượt completion rate kéo dài.
+- Queue age thường quan trọng hơn depth đơn thuần.
+- Ack timing quyết định trade-off loss với redelivery duplicate.
+- At-least-once + idempotency là lựa chọn thực dụng phổ biến.
+- Exactly-once phải nêu rõ boundary; external side effects vẫn cần business correctness.
+- Inbox + business update nên cùng local transaction.
+- Transactional Outbox giải khoảng trống giữa DB commit và publish, nhưng có thể publish trùng.
+- Retry chỉ cho lỗi có khả năng phục hồi; poison messages cần DLQ có vận hành.
+- Ordering thường theo partition/key, không global.
+- RabbitMQ/Kafka phải so theo semantics, không theo slogan.
+- Consumer scale bị giới hạn bởi partitions và downstream safe capacity.
+- Order processing async cần state machine/saga, compensation và reconciliation.
+- Security, schema governance và end-to-end observability là phần cốt lõi.
+
+#### Công thức ghi nhớ
+
+> **Messaging tốt = đúng async boundary + durable handoff + at-least-once có idempotency + ordering theo business key + retry/DLQ có kiểm soát + backlog/age được bảo vệ + workflow quan sát và reconciliation được.**
+
+---
+
+### Bài 49. Concurrency & Parallelism
+
+#### 1. Concurrency và parallelism khác nhau thế nào?
+
+Hai khái niệm liên quan nhưng giải quyết hai vấn đề khác nhau:
+
+| Khái niệm | Bản chất | Mục tiêu chính | Ví dụ |
+|---|---|---|---|
+| **Concurrency** | Nhiều task cùng ở trạng thái tiến triển; có thể xen kẽ trên một core | Responsiveness và sử dụng thời gian chờ hiệu quả | Web server xử lý request khác khi một request đang chờ database |
+| **Parallelism** | Nhiều task thực sự chạy đồng thời trên nhiều execution units/CPU cores | Rút ngắn CPU work và tăng throughput | Chia video thành nhiều phần để encode trên nhiều core |
+
+```text
+Concurrency: quản lý nhiều việc cùng lúc
+Parallelism: thực thi nhiều việc đúng cùng thời điểm
+```
+
+Một hệ thống có thể:
+
+- concurrent nhưng không parallel: một core xen kẽ nhiều task;
+- parallel nhưng bài toán ít concurrency ở tầng ứng dụng: một job được chia thành nhiều phần chạy đồng thời;
+- dùng cả hai: async I/O phục vụ nhiều request, đồng thời worker pool xử lý CPU-heavy work trên nhiều core.
+
+`async`, concurrency và parallelism không phải từ đồng nghĩa. Một `async` operation có thể chỉ đang chờ I/O và không sử dụng CPU nào.
+
+---
+
+#### 2. Phân loại workload trước khi chọn mô hình
+
+##### 2.1 I/O-bound
+
+Phần lớn thời gian chờ network, database, disk hoặc external API:
+
+- ưu tiên asynchronous, non-blocking I/O;
+- connection pool và downstream limits thường là nút thắt;
+- thêm CPU threads không làm database hay network phản hồi nhanh hơn;
+- cần timeout, cancellation và backpressure.
+
+##### 2.2 CPU-bound
+
+Phần lớn thời gian dùng CPU như encode, compression, rendering, ML inference hoặc tính toán ma trận:
+
+- có thể chia work và chạy song song trên nhiều core;
+- pool size thường liên hệ với số core và đặc điểm contention;
+- quá nhiều runnable threads làm tăng context switching và giảm hiệu năng;
+- nếu task không thể chia nhỏ, thêm worker không tạo speedup tương ứng.
+
+##### 2.3 Mixed workload
+
+Tách I/O path và CPU path để chúng không tranh nhau cùng pool. Ví dụ, request handler dùng async I/O rồi chuyển image processing sang bounded worker pool hoặc job queue riêng.
+
+> **Quy tắc:** I/O-bound cần giảm blocking; CPU-bound cần parallelism có giới hạn.
+
+---
+
+#### 3. Process và thread
+
+| Thuộc tính | Process | Thread |
+|---|---|---|
+| Memory | Address space riêng | Chia sẻ heap/address space trong process; mỗi thread có stack riêng |
+| Isolation | Mạnh hơn | Yếu hơn; lỗi memory/process-level có thể ảnh hưởng mọi thread |
+| Giao tiếp | IPC, socket, shared memory có kiểm soát | Shared memory trực tiếp, nhanh nhưng dễ race |
+| Tạo và chuyển ngữ cảnh | Thường nặng hơn | Thường nhẹ hơn process |
+| Fault/security boundary | Tốt hơn | Không phải boundary mạnh |
+
+Process phù hợp khi cần isolation, privilege boundary và independent lifecycle. Thread phù hợp khi cần chia sẻ dữ liệu nhanh và concurrency trong cùng ứng dụng.
+
+Đây không phải lựa chọn loại trừ nhau: production system thường có nhiều process/container; mỗi process lại có runtime threads, event loop hoặc thread pools.
+
+---
+
+#### 4. Thread pool và worker model
+
+Tạo một thread mới cho mỗi task gây:
+
+- chi phí tạo/hủy và stack memory;
+- quá nhiều runnable threads;
+- context switching lớn;
+- nguy cơ cạn tài nguyên khi traffic tăng đột biến.
+
+Thread pool tái sử dụng số thread có kiểm soát:
+
+```text
+tasks -> bounded queue -> worker 1
+                       -> worker 2
+                       -> worker N
+```
+
+Worker model tách việc nhận work khỏi thực thi. Idle worker lấy task từ queue, xử lý rồi quay lại nhận task tiếp theo. Nó hỗ trợ load distribution và scale workers.
+
+Nhưng thread pool không tự động an toàn:
+
+- pool quá nhỏ tạo queueing latency;
+- pool quá lớn tạo contention/context switching;
+- unbounded queue che giấu overload cho tới khi memory hoặc latency vỡ;
+- blocking task có thể gây **thread-pool starvation**;
+- một pool chung cho task dài và task ngắn có thể gây head-of-line blocking.
+
+Nên dùng bounded queue, overload policy rõ ràng và tách pool theo workload/resource khi cần.
+
+---
+
+#### 5. Asynchronous processing thực sự làm gì?
+
+Với blocking I/O:
+
+```text
+thread -> gửi I/O -> ngồi chờ -> nhận kết quả -> tiếp tục
+```
+
+Với non-blocking async I/O:
+
+```text
+task -> đăng ký I/O -> nhường thread
+                    ... I/O hoàn tất ...
+completion -> task được schedule tiếp
+```
+
+`async/await`, promises và futures giúp biểu diễn một computation hoàn tất trong tương lai. Lợi ích chính là giải phóng execution resource trong lúc chờ, nhờ đó tăng concurrency và throughput.
+
+Điều async **không bảo đảm**:
+
+- operation riêng lẻ sẽ hoàn thành nhanh hơn;
+- code tự động thread-safe;
+- mọi API gắn nhãn async đều non-blocking end-to-end;
+- CPU-bound loop sẽ tự chạy song song;
+- bỏ được timeout, cancellation hoặc error handling.
+
+Với work dài, cần durable handoff hoặc chịu burst, dùng message queue và background workers thay vì chỉ fire-and-forget trong memory.
+
+---
+
+#### 6. Event loop và mô hình web server hiện đại
+
+Mô hình request-per-thread/process dễ hiểu nhưng khó mở rộng khi có nhiều connection phần lớn đang chờ I/O. Web server hiện đại thường dùng event-driven/non-blocking I/O để một số lượng thread nhỏ điều phối nhiều connection.
+
+Ví dụ:
+
+- **Node.js:** JavaScript callback thường chạy trên một event-loop thread; runtime/OS và libuv xử lý nhiều I/O, một số operation dùng libuv thread pool. CPU-heavy callback vẫn có thể chặn event loop; khi đó cần Worker Threads/process/service riêng.
+- **ASP.NET Core:** async request pipeline kết hợp Task-based model và .NET thread pool.
+- **Nginx:** event-driven workers xử lý nhiều connection hiệu quả.
+
+Một request handler không nên block event-loop/thread-pool thread bằng synchronous I/O hoặc CPU work kéo dài. “Single-threaded event loop” cũng không có nghĩa toàn bộ runtime chỉ có đúng một OS thread.
+
+---
+
+#### 7. Race condition, atomicity và visibility
+
+Race condition xảy ra khi kết quả phụ thuộc vào interleaving/timing giữa các execution flows. Ví dụ `counter++` thường là chuỗi read-modify-write, không mặc nhiên atomic:
+
+```text
+T1 đọc 10          T2 đọc 10
+T1 ghi 11          T2 ghi 11
+Kỳ vọng 12, thực tế 11
+```
+
+Ba câu hỏi cần tách:
+
+- **Atomicity:** operation có xuất hiện như một bước không thể bị xen giữa không?
+- **Visibility:** write của thread này có được thread khác nhìn thấy đúng lúc không?
+- **Ordering:** compiler/CPU/runtime được phép reorder những operation nào?
+
+Thread-safe không chỉ là “không crash”. Nó cần invariant được giữ dưới mọi interleaving hợp lệ.
+
+Cách xử lý:
+
+- tránh shared mutable state;
+- immutable data hoặc copy-on-write;
+- atomic primitives cho operation phù hợp;
+- mutex/lock để bảo vệ một invariant nhiều bước;
+- thread-safe collection, nhưng vẫn khóa/transaction nếu workflow gồm nhiều operation phải atomic;
+- partition ownership, actor/message passing hoặc single writer;
+- database constraint/transaction khi invariant nằm ở database.
+
+`volatile` hoặc concurrent collection không tự biến một chuỗi read-check-write thành atomic transaction.
+
+---
+
+#### 8. Locks và phạm vi critical section
+
+Lock bảo đảm chỉ execution flow được phép đi vào critical section theo contract tại một thời điểm. Thiết kế lock tốt cần:
+
+- bảo vệ **invariant**, không chỉ một biến riêng lẻ;
+- critical section ngắn;
+- không làm blocking network/database I/O khi giữ lock nếu có thể tránh;
+- lock ownership rõ ràng;
+- không public/expose lock object cho code ngoài;
+- đo contention và wait time;
+- ưu tiên primitive cấp cao phù hợp thay vì tự chế synchronization.
+
+Reader-writer lock chỉ có lợi trong workload thực sự read-heavy, critical section đủ lớn và implementation phù hợp. Overhead, writer starvation hoặc upgrade complexity có thể khiến mutex đơn giản tốt hơn.
+
+Lock-free không có nghĩa wait-free, dễ triển khai hay luôn nhanh hơn; nó có thể có retry contention, ABA problem và memory-reclamation complexity.
+
+---
+
+#### 9. Deadlock và các lỗi liveness khác
+
+Deadlock có thể xảy ra khi đồng thời có bốn điều kiện Coffman:
+
+1. mutual exclusion;
+2. hold and wait;
+3. no preemption;
+4. circular wait.
+
+Ví dụ:
+
+```text
+T1 giữ lock A, chờ B
+T2 giữ lock B, chờ A
+```
+
+Phòng tránh/giảm rủi ro:
+
+- đặt global lock ordering và luôn acquire theo cùng thứ tự;
+- giảm số lock phải giữ đồng thời;
+- giữ lock ngắn, không gọi code không kiểm soát trong lock;
+- dùng timeout/try-lock khi semantics cho phép;
+- thiết kế ownership để loại shared locking;
+- thu thread dump/stack và lock graph khi điều tra.
+
+Timeout giúp phát hiện/thoát chờ nhưng không chứng minh state vẫn nhất quán; cần cleanup, rollback hoặc retry policy.
+
+Phân biệt thêm:
+
+- **starvation:** một task không được cấp CPU/lock/resource đủ lâu;
+- **livelock:** các task vẫn đổi trạng thái nhưng liên tục nhường/phản ứng nên không tiến triển;
+- **priority inversion:** task ưu tiên cao chờ lock do task ưu tiên thấp giữ;
+- **thread-pool starvation:** work cần thread để tiếp tục nhưng pool bị blocking work chiếm hết.
+
+---
+
+#### 10. Backpressure và bounded concurrency
+
+Concurrency vô hạn thường chỉ chuyển bottleneck xuống database/API và làm latency tệ hơn. Cần giới hạn:
+
+- số request đang xử lý;
+- số connection tới downstream;
+- số task chạy song song;
+- queue depth và thời gian chờ;
+- số retry đồng thời.
+
+Khi đạt giới hạn, hệ thống phải có policy: chờ có timeout, trả `429/503`, shed low-priority work, spill sang durable queue hoặc degrade feature.
+
+Little's Law giúp kiểm tra capacity ở steady state:
+
+```text
+L = lambda x W
+```
+
+- `L`: số request/work item trung bình đang trong hệ thống;
+- `lambda`: completion/arrival rate trung bình khi ổn định;
+- `W`: thời gian trung bình trong hệ thống.
+
+Ví dụ, 2.000 request/giây với average latency 0,2 giây tương ứng khoảng 400 request in-flight trung bình. Tail latency và burst vẫn cần headroom riêng.
+
+---
+
+#### 11. Parallel speedup và Amdahl's Law
+
+Không phải toàn bộ workload đều song song hóa được. Nếu tỷ lệ tuần tự là `S` và dùng `N` execution units:
+
+```text
+Speedup <= 1 / (S + (1 - S) / N)
+```
+
+Nếu 20% công việc bắt buộc tuần tự, dù tăng core vô hạn, speedup lý thuyết cũng không vượt quá `5x`. Thực tế còn thấp hơn do coordination, serialization, cache coherence, data movement và load imbalance.
+
+Do đó cần benchmark toàn workflow; đừng suy ra “gấp đôi core = gấp đôi throughput”.
+
+---
+
+#### 12. Thiết kế web server xử lý hàng nghìn request
+
+Một thiết kế có thể gồm:
+
+```text
+Clients
+   -> load balancer/reverse proxy
+   -> stateless app instances
+        -> async I/O + bounded in-flight work
+        -> connection pools
+        -> cache
+        -> durable queue cho background work
+   -> bounded worker pool cho CPU-heavy jobs
+```
+
+Các điểm bắt buộc:
+
+1. async/non-blocking cho I/O path;
+2. timeout, cancellation và request deadline propagation;
+3. bounded concurrency theo downstream;
+4. connection pooling nhưng pool size không vượt safe DB capacity;
+5. cache cho hot/read-heavy data;
+6. queue cho work không cần hoàn tất trước response;
+7. scale ngang app/worker nhưng bảo vệ dependency;
+8. đo p50/p95/p99 latency, throughput, errors, saturation, queue wait và pool starvation.
+
+---
+
+#### 13. Background job processing ở quy mô lớn
+
+```text
+API -> durable queue -> competing workers -> dependency
+                        | retry/DLQ
+```
+
+Thiết kế cần:
+
+- durable publish, thường dùng Transactional Outbox nếu đi cùng DB update;
+- idempotent consumer do message có thể redeliver;
+- retry có exponential backoff + jitter, không retry lỗi permanent;
+- DLQ có owner, alert, inspection và safe redrive;
+- scale workers theo queue age/backlog nhưng giới hạn theo downstream;
+- visibility timeout/ack deadline lớn hơn normal processing time hoặc được gia hạn;
+- graceful shutdown: ngừng nhận work mới, hoàn tất/nhả work đang giữ;
+- metrics về arrival, completion, failure, age, attempts và saturation.
+
+Đây là nơi kiến thức Bài 48 kết nối trực tiếp với concurrency: queue phân phối work, còn bounded workers kiểm soát số task thực thi đồng thời.
+
+---
+
+#### 14. Debug race condition và deadlock
+
+Race thường biến mất khi thêm log/debugger vì timing đổi. Quy trình thực tế:
+
+1. bảo toàn evidence: timestamps, correlation ID, request/message ID, state transition;
+2. thu thread dump/core dump/profile tại thời điểm treo;
+3. lập wait-for graph: thread nào giữ/chờ lock nào;
+4. kiểm tra lock acquisition order và blocking call trong critical section;
+5. tái hiện bằng stress/load test, fault injection và scheduler variation;
+6. dùng race detector/thread sanitizer nếu hệ sinh thái hỗ trợ;
+7. sửa invariant/ownership, không chỉ tăng timeout;
+8. thêm regression test lặp nhiều lần và metric contention/liveness.
+
+Với distributed system, “race” còn có thể xảy ra giữa requests, workers hoặc services; local process lock không bảo vệ nhiều instances. Khi đó cân nhắc DB transaction/constraint, optimistic concurrency, compare-and-set, fencing token, partition ownership hoặc idempotency.
+
+---
+
+#### 15. Những ngộ nhận thường gặp
+
+- **“Async luôn nhanh hơn”** — async chủ yếu tăng resource efficiency cho waiting-heavy workloads.
+- **“Một request một thread sẽ đơn giản và scale mãi”** — thread/memory/context-switching có giới hạn.
+- **“Càng nhiều threads càng nhiều throughput”** — sau saturation, contention và switching làm throughput giảm.
+- **“Concurrent collection làm toàn workflow thread-safe”** — từng method an toàn không làm chuỗi operation atomic.
+- **“Event loop không có race condition”** — interleaving async, worker threads, external state và nhiều process vẫn tạo races.
+- **“Lock-free luôn nhanh”** — phụ thuộc contention, workload và implementation.
+- **“Timeout giải quyết deadlock”** — chỉ phá chờ; state recovery vẫn là bài toán correctness.
+- **“Scale workers theo queue depth không giới hạn”** — có thể làm sập downstream.
+- **“Process luôn an toàn hơn thread”** — isolation tốt hơn nhưng distributed coordination và IPC vẫn có failure modes.
+- **“CPU utilization thấp nghĩa là còn capacity”** — hệ thống có thể đang nghẽn connection pool, lock, I/O hoặc external quota.
+
+---
+
+#### 16. Mười câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Concurrency khác parallelism thế nào?**
+
+Concurrency là tổ chức để nhiều task cùng tiến triển, kể cả xen kẽ trên một core. Parallelism là thực thi thực sự đồng thời, thường trên nhiều core. Concurrency thường nhắm responsiveness và utilization; parallelism nhắm speed/throughput của compute work.
+
+**Q2. Thread khác process thế nào?**
+
+Process có address space và fault boundary riêng; thread cùng process chia sẻ memory nhưng có stack/execution state riêng. Thread nhẹ và chia sẻ dữ liệu nhanh hơn, đổi lại cần synchronization và không cung cấp isolation mạnh như process.
+
+**Q3. Thread pool là gì và vì sao ưu tiên hơn tạo thread mới?**
+
+Thread pool tái sử dụng tập worker threads, giảm chi phí tạo/hủy, giới hạn resource usage và giảm nguy cơ thread explosion. Cần nói thêm rằng pool/queue phải bounded và được tune theo CPU-bound, I/O-bound, blocking behavior và latency SLO.
+
+**Q4. Thiết kế web server xử lý hàng nghìn concurrent requests ra sao?**
+
+Dùng non-blocking I/O, bounded in-flight concurrency, connection pooling, cache, timeout/cancellation và load balancing. Đẩy background work sang durable queue, tách CPU-heavy pool, scale ngang và theo dõi tail latency/saturation thay vì chỉ CPU average.
+
+**Q5. Thiết kế background job processing có khả năng scale?**
+
+Producer ghi work vào durable queue; competing workers xử lý và scale ngang. Bổ sung idempotency, retry/backoff/jitter, DLQ, visibility/ack đúng thời điểm, observability, graceful shutdown, outbox khi cần và downstream-aware autoscaling.
+
+**Q6. Debug và xử lý deadlock thế nào?**
+
+Thu thread dumps/stacks, xác định thread giữ/chờ lock và dựng circular wait. Sửa bằng consistent lock ordering, critical section nhỏ, tránh blocking call trong lock, giảm nested locks hoặc đổi ownership model. Timeout có thể hỗ trợ recovery nhưng không thay thế sửa nguyên nhân.
+
+**Q7. Race condition là gì và ngăn ngừa ra sao?**
+
+Là lỗi mà outcome phụ thuộc timing/interleaving của concurrent operations trên state liên quan. Ngăn bằng loại shared mutable state, immutable/single-owner design, lock, atomic operations, thread-safe primitives và transaction/constraint đúng boundary.
+
+**Q8. Làm sao bảo đảm thread-safe trong shared-memory environment?**
+
+Xác định invariant và synchronization policy; dùng mutex/monitor, atomic primitive, concurrent collection hoặc reader-writer lock khi phù hợp. Ưu tiên immutability/ownership. Kiểm tra atomicity của toàn compound operation, không chỉ từng API call.
+
+**Q9. Event loop trong Node.js hoạt động thế nào?**
+
+Event loop chạy JavaScript callbacks/tasks theo các phase và nhận completion của async operations. OS/runtime/libuv xử lý I/O; một số operation dùng libuv thread pool. Callback CPU-heavy chặn event loop, nên chuyển sang Worker Threads/process/service khi cần parallel compute.
+
+**Q10. Parallel threads khác async I/O thế nào?**
+
+Parallel threads/executors dùng nhiều cores cho CPU-bound work. Async I/O không giữ thread ngồi chờ I/O và phù hợp nhiều concurrent network/file/database operations. Hệ thống thực tế thường kết hợp async I/O cho request path và bounded parallel workers cho compute-heavy work.
+
+---
+
+#### 17. Checklist thiết kế concurrency
+
+1. Workload là I/O-bound, CPU-bound hay mixed?
+2. Concurrency nhằm giảm waiting hay parallelism nhằm tăng compute throughput?
+3. Shared mutable state và invariant nằm ở đâu?
+4. Correctness cần atomicity/visibility/ordering nào?
+5. Concurrency limit và queue capacity là bao nhiêu?
+6. Pool có task blocking, long-running hoặc ưu tiên khác nhau không?
+7. Khi overload: wait, reject, shed, degrade hay queue?
+8. Timeout/cancellation có truyền xuyên request chain không?
+9. Lock ordering, scope và ownership đã rõ chưa?
+10. Có nguy cơ deadlock, starvation, livelock hoặc priority inversion không?
+11. Worker scale có vượt connection/quota/capacity downstream không?
+12. Retry có tạo retry storm và duplicate side effects không?
+13. Graceful shutdown xử lý in-flight work thế nào?
+14. Đo queue wait, active workers, pool saturation, lock contention và p99 chưa?
+15. Load/stress/soak tests có kiểm tra correctness ngoài throughput không?
+
+#### 18. Ý chính cần nhớ
+
+- Concurrency quản lý nhiều task cùng tiến triển; parallelism thực thi nhiều task đồng thời.
+- Async không đồng nghĩa parallel và không mặc nhiên làm một operation nhanh hơn.
+- I/O-bound ưu tiên non-blocking I/O; CPU-bound dùng bounded parallelism.
+- Process tối ưu isolation; thread tối ưu chia sẻ và resource efficiency.
+- Thread pool giảm lifecycle overhead nhưng cần giới hạn queue/pool và tránh starvation.
+- Event-loop callback không được làm CPU/blocking work kéo dài.
+- Shared mutable state làm phát sinh atomicity, visibility và ordering concerns.
+- Bảo vệ invariant của compound operation; thread-safe method riêng lẻ chưa đủ.
+- Giảm shared state/đặt single owner thường đơn giản hơn thêm nhiều locks.
+- Deadlock cần phá circular dependency hoặc một điều kiện Coffman, không chỉ tăng timeout.
+- Backpressure bảo vệ cả ứng dụng lẫn downstream khỏi concurrency không giới hạn.
+- Amdahl's Law giải thích vì sao thêm core không tạo linear speedup.
+- Queue + bounded worker model là nền tảng của background processing có kiểm soát.
+- Đo tail latency, queue wait, saturation, contention và correctness dưới load.
+
+#### Công thức ghi nhớ
+
+> **Concurrency tốt = phân loại đúng workload + non-blocking I/O cho waiting + bounded parallelism cho compute + shared-state discipline + backpressure + liveness/correctness observability.**
+
+---
+
+### Bài 50. Database Performance Optimization Techniques
+
+#### 1. Tư duy tối ưu database
+
+Database performance không bắt đầu bằng việc thêm index hoặc nâng cấp máy. Quy trình đúng là:
+
+```text
+Xác định SLO và workload
+        -> đo bottleneck
+        -> đọc execution plan/wait events
+        -> thay đổi nhỏ nhất có căn cứ
+        -> benchmark và kiểm tra correctness
+        -> theo dõi regression
+```
+
+Cần biết rõ:
+
+- workload là OLTP, analytical hay mixed;
+- tỷ lệ read/write, query shapes và hot paths;
+- data size, growth rate, working set và access locality;
+- p50/p95/p99 latency, throughput và concurrency;
+- CPU, memory, disk IOPS/latency, network, locks và connection saturation;
+- freshness, consistency, durability và availability requirements.
+
+Một query nhanh trong development với ít dữ liệu chưa chứng minh nó sẽ nhanh ở production. Tối ưu phải dựa trên representative data, parameter distribution và concurrency thực tế.
+
+---
+
+#### 2. Chẩn đoán trước khi tối ưu
+
+##### 2.1 Bắt đầu từ triệu chứng
+
+- request chậm do database hay do queue/network/application?
+- tất cả query chậm hay chỉ một query shape?
+- latency tăng theo data size, concurrency hay thời điểm deploy?
+- chậm ở execution hay chờ connection/lock/I/O?
+- average bình thường nhưng p99 xấu hay không?
+
+##### 2.2 Thu evidence
+
+- slow-query log hoặc query statistics;
+- normalized query/fingerprint và call count;
+- total time, mean và tail latency;
+- rows returned so với rows scanned;
+- execution plan thực tế nếu engine hỗ trợ;
+- buffer/cache hit, disk reads, temp spill và sort;
+- lock waits/deadlocks;
+- active/idle connections và pool wait time;
+- replication lag và replica errors.
+
+##### 2.3 Ưu tiên theo tổng chi phí
+
+Một query 20 ms chạy một triệu lần có thể đáng tối ưu hơn query 5 giây chạy mỗi tuần:
+
+```text
+Total database cost ~= frequency x cost per execution
+```
+
+Luôn lưu baseline và so sánh trước/sau; một tối ưu cho read có thể làm write, storage hoặc freshness tệ hơn.
+
+---
+
+#### 3. Replication và hiệu năng
+
+Replication duy trì bản sao dữ liệu để hỗ trợ:
+
+- high availability và failover;
+- disaster recovery;
+- phân phối read-heavy workloads;
+- reporting/backup tách khỏi primary trong một số kiến trúc.
+
+Mô hình primary-replica thường route writes về primary và cho phép một số reads tới replicas:
+
+```text
+write -> primary -> replication stream -> replica(s)
+read  -------------------------------> replica
+```
+
+Trade-offs:
+
+- replication không scale write capacity nếu mọi write vẫn vào một primary;
+- asynchronous replication có **replica lag**, stale read và read-after-write anomaly;
+- synchronous replication giảm nguy cơ mất committed data nhưng tăng write latency/giảm availability khi replica không phản hồi;
+- failover có thể gây downtime, lost acknowledged writes tùy guarantee hoặc split-brain nếu coordination sai;
+- nhiều replicas làm tăng fan-out/retention/network/operational cost;
+- read routing phải xét consistency: vừa ghi xong có thể cần đọc primary hoặc dùng session/LSN-based consistency.
+
+Multi-primary cho phép nhiều nơi nhận write nhưng cần conflict detection/resolution, topology, clock/order semantics và invariant strategy. Nó không phải “primary-replica nhưng nhanh hơn”.
+
+---
+
+#### 4. Partitioning và sharding
+
+**Partitioning** là chia logical dataset thành các phần. **Sharding** thường chỉ horizontal partitioning phân bố qua nhiều database nodes/servers. Vì vậy, “partitioning luôn trong một instance” chỉ là cách giải thích đơn giản, không phải định nghĩa phổ quát.
+
+| Chiến lược | Lợi ích | Rủi ro |
+|---|---|---|
+| Range theo thời gian/ID | Partition pruning, archive/drop theo range | Hot latest partition, skew |
+| Hash theo key | Phân bố đều hơn | Range query và resharding khó hơn |
+| List/geographic/tenant | Locality, compliance, ownership rõ | Tenant/region lớn tạo hotspot |
+
+Hiệu quả query chỉ tăng khi predicate cho phép **partition pruning**. Nếu query phải fan-out mọi shard/partition, tổng work, network và merge cost có thể tăng.
+
+Khi chọn shard key, xem xét:
+
+- cardinality và phân bố;
+- query locality;
+- write hotspot;
+- cross-shard joins/transactions;
+- unique constraints và ID generation;
+- resharding/rebalancing;
+- noisy tenant và capacity headroom.
+
+Sharding là biện pháp scale mạnh nhưng tăng đáng kể complexity. Chỉ dùng sau khi đã tối ưu schema/query/index, partition hợp lý và xác định giới hạn của một node.
+
+---
+
+#### 5. CAP và quyết định hiệu năng
+
+CAP nói về hành vi của distributed data system **khi network partition xảy ra**:
+
+- **Consistency (C):** mỗi operation quan sát một single, up-to-date logical history theo model CAP;
+- **Availability (A):** mọi request tới non-failing node đều nhận non-error response, không bảo đảm response chứa dữ liệu mới nhất;
+- **Partition tolerance (P):** hệ thống tiếp tục theo policy dù messages giữa các nhóm node bị mất/chậm.
+
+Khi partition xảy ra, hệ thống phải chọn theo từng operation/path:
+
+- từ chối/trì hoãn một số operation để giữ consistency (**CP behavior**);
+- tiếp tục phản hồi và chấp nhận divergence/stale data để giữ availability (**AP behavior**).
+
+Không nên học CAP thành “luôn chọn hai trong ba”. Trong một distributed system thực tế, partition là failure phải thiết kế; trade-off C/A chỉ trở nên bắt buộc trong partition. Latency/consistency khi mạng bình thường còn được mô tả tốt hơn bởi các model và trade-off khác như PACELC.
+
+Business invariant quyết định lựa chọn: product recommendations có thể chấp nhận stale; double-spend hoặc inventory oversell có thể cần coordination/stronger consistency tại write boundary.
+
+---
+
+#### 6. Index — tăng tốc có điều kiện
+
+Index là cấu trúc phụ giúp engine tìm row mà không quét toàn bộ dữ liệu. Index type và capability phụ thuộc database engine:
+
+| Loại | Phù hợp | Lưu ý |
+|---|---|---|
+| **B-tree/B+tree** | Equality, range, ordered scan, prefix của composite key | Loại phổ biến trong relational DB |
+| **Hash** | Equality lookup | Thường không hỗ trợ range/order; behavior tùy engine |
+| **Full-text/inverted** | Token/keyword/text search | Khác semantics `LIKE`; cần analyzer/language config |
+| **Bitmap** | Low-cardinality analytical predicates | Có thể không phù hợp high-write OLTP; tùy engine |
+| **Spatial** | Geo/geometry queries | Operator và index type chuyên biệt |
+
+##### 6.1 Composite index
+
+Thứ tự cột quan trọng. Với index `(tenant_id, status, created_at)`, hiệu quả phụ thuộc predicate, sort và quy tắc leftmost-prefix của engine. Không thể suy ra từ danh sách cột đơn thuần.
+
+##### 6.2 Covering index
+
+Nếu index chứa đủ columns query cần, engine có thể tránh lookup về table/heap trong điều kiện phù hợp. Đổi lại index lớn hơn và write amplification cao hơn.
+
+##### 6.3 Selectivity và statistics
+
+Optimizer ước lượng số row dựa trên statistics/cardinality. Statistics stale hoặc correlated columns có thể dẫn tới plan sai dù index tồn tại.
+
+##### 6.4 Chi phí của index
+
+- tăng storage và cache footprint;
+- thêm I/O/CPU cho insert, update, delete;
+- page split/fragmentation hoặc maintenance tùy engine;
+- làm optimizer có thêm plan candidates;
+- duplicate/redundant indexes gây write amplification.
+
+Không “index mọi cột trong `WHERE/JOIN/ORDER BY`”. Thiết kế từ query patterns, kiểm tra plan và đo write cost.
+
+---
+
+#### 7. Tối ưu slow query bằng execution plan
+
+Quy trình thực tế:
+
+1. lấy exact query shape và representative parameters;
+2. xác nhận latency nằm ở database execution hay pool/lock/network;
+3. đọc estimated plan và, khi an toàn, actual execution statistics;
+4. so estimated rows với actual rows;
+5. tìm full scan không mong muốn, bad join order/algorithm, sort/hash spill, repeated lookup, temp work, lock wait;
+6. giảm rows/columns càng sớm càng tốt;
+7. thêm/chỉnh index hoặc rewrite query có căn cứ;
+8. benchmark cold/warm cache và concurrent workload;
+9. kiểm tra regression cho writes và query khác.
+
+Các kỹ thuật phổ biến:
+
+- chỉ `SELECT` columns cần dùng thay vì `SELECT *`;
+- viết predicate **sargable**, tránh bọc indexed column trong function/cast khiến engine khó seek;
+- index đúng filter/join/order pattern;
+- batch/eager load để xử lý N+1;
+- loại redundant joins/subqueries;
+- lọc và aggregate ở tầng phù hợp;
+- dùng prepared/parameterized statements để an toàn và hỗ trợ plan reuse theo engine;
+- cập nhật statistics và bảo trì index theo evidence;
+- tránh transfer result set lớn không cần thiết.
+
+Không có quy tắc “`INNER JOIN` luôn nhanh hơn `OUTER JOIN`”. Semantics phải đúng trước; optimizer, cardinality và access path mới quyết định cost.
+
+---
+
+#### 8. N+1 query problem
+
+Ứng dụng lấy danh sách cha rồi query con cho từng row:
+
+```text
+1 query lấy 100 orders
++ 100 query lấy customer/items
+= 101 round trips
+```
+
+Cách xử lý:
+
+- join/eager loading nếu row multiplication có thể kiểm soát;
+- batch lookup bằng tập keys;
+- DataLoader/request-scoped batching;
+- projection/read model phù hợp;
+- prefetch có giới hạn.
+
+Một join khổng lồ không mặc nhiên tốt hơn N+1: nó có thể tạo Cartesian multiplication và payload lớn. Mục tiêu là giảm round trips và total work trong khi giữ result size hợp lý.
+
+---
+
+#### 9. Normalization và denormalization
+
+| Normalization | Denormalization |
+|---|---|
+| Giảm duplication và update anomalies | Cố ý lặp/precompute data cho read path |
+| Dễ duy trì single source of truth | Giảm joins/online computation |
+| Phù hợp transactional core | Phù hợp read-heavy/reporting/search/read model |
+| Có thể cần nhiều joins | Tăng storage, sync và consistency complexity |
+
+Kiến trúc thực tế thường hybrid:
+
+```text
+normalized write model
+        -> CDC/events/refresh
+        -> denormalized read model/materialized view/search index
+```
+
+Denormalization cần xác định:
+
+- source of truth;
+- update propagation và failure handling;
+- acceptable staleness;
+- backfill/rebuild;
+- reconciliation;
+- schema evolution.
+
+Không denormalize trước khi đo bottleneck; duplication biến performance problem thành data-correctness problem nếu thiếu ownership.
+
+---
+
+#### 10. Connection pooling
+
+Mở connection có thể tốn network handshake, TLS, authentication và database session resources. Pool tái sử dụng connections:
+
+```text
+requests -> app pool -> giới hạn database connections -> database
+```
+
+Pool quá nhỏ tạo wait/timeout; quá lớn có thể làm database quá tải, tăng memory, scheduler contention và lock concurrency. Với nhiều application instances:
+
+```text
+total potential connections
+= instance count x pool max per instance
+```
+
+Con số này phải nằm trong database safe capacity và chừa headroom cho admin, migration, replicas/failover. Autoscaling app không được vô tình tạo connection storm.
+
+Best practices:
+
+- acquisition timeout và query/statement timeout riêng;
+- trả connection sớm; không giữ trong lúc gọi external service;
+- đóng/dispose đúng để trả về pool;
+- validate/recycle stale connections theo driver;
+- transaction ngắn;
+- đo pool waiters, acquisition latency, active/idle và timeouts;
+- cân nhắc connection proxy/pooler cho serverless hoặc nhiều short-lived instances.
+
+---
+
+#### 11. Materialized view và precomputation
+
+Regular view thường lưu query definition; materialized view lưu kết quả đã tính trước. Nó chuyển chi phí từ request time sang refresh time:
+
+```text
+expensive joins/aggregations -> refresh -> stored result -> fast reads
+```
+
+Phù hợp dashboard, reporting, warehouse và query lặp lại. Trade-offs:
+
+- dữ liệu stale giữa các lần refresh;
+- full refresh có thể đắt; incremental refresh phức tạp;
+- cần index/storage/maintenance riêng;
+- refresh có thể tranh tài nguyên với production traffic;
+- phải theo dõi refresh duration, lag và failure.
+
+Freshness SLA quyết định refresh on-demand, scheduled, incremental hay event/CDC-driven. Khi correctness cần dữ liệu tức thời, query source hoặc read-your-write path có thể vẫn cần thiết.
+
+---
+
+#### 12. Batching
+
+Batching amortize network/statement/transaction overhead:
+
+```text
+10.000 operations riêng -> nhiều round trips/commits
+100 batches x 100 rows  -> ít round trips hơn
+```
+
+Nhưng batch càng lớn không phải càng tốt:
+
+- transaction dài giữ locks/version/WAL resources lâu hơn;
+- memory và payload tăng;
+- rollback/retry đắt hơn;
+- có thể vượt statement/packet/parameter limits;
+- một bad row có thể làm cả batch thất bại tùy semantics.
+
+Chọn batch size bằng benchmark và giới hạn latency/lock footprint. Cần idempotency/checkpoint khi batch job có thể retry.
+
+---
+
+#### 13. Pagination
+
+##### 13.1 Offset pagination
+
+```sql
+SELECT id, created_at, title
+FROM posts
+ORDER BY created_at DESC, id DESC
+LIMIT 50 OFFSET 100000;
+```
+
+Dễ dùng và nhảy tới page bất kỳ, nhưng offset sâu có thể phải scan/skip nhiều rows. Concurrent inserts/deletes còn gây duplicate hoặc missing item giữa pages.
+
+##### 13.2 Keyset/cursor pagination
+
+```sql
+SELECT id, created_at, title
+FROM posts
+WHERE (created_at, id) < (:last_created_at, :last_id)
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+Ổn định và hiệu quả hơn cho feed/scroll sâu nếu có index khớp `(created_at, id)`. Cần total deterministic order với tie-breaker; cursor nên opaque/versioned nếu public API.
+
+Pagination chỉ giảm result mỗi request; nó không sửa một predicate/index kém. Count tổng chính xác trên dataset lớn cũng có thể đắt và cần estimate/precompute.
+
+---
+
+#### 14. Xử lý dataset lớn — chọn theo bottleneck
+
+- **query trả quá nhiều rows:** filter, projection, keyset pagination, streaming có backpressure;
+- **hot reads:** cache với invalidation/TTL và stampede protection;
+- **repeated aggregation:** materialized view/read model/precomputation;
+- **một node hết storage/throughput:** partition rồi cân nhắc sharding;
+- **read-heavy:** read replicas nếu chấp nhận/routing được consistency;
+- **write-heavy:** batch, schema/index review, partition/shard key, log-structured engine tùy workload;
+- **analytical scan ảnh hưởng OLTP:** replica/warehouse/lakehouse riêng qua CDC/ETL;
+- **archive/history:** time partitioning, retention/tiering/object storage;
+- **search:** full-text/search engine thay vì ép transactional DB làm mọi loại query.
+
+Caching, replica và denormalized read models đều tạo thêm consistency/freshness boundary. Mỗi lớp phải có invalidation, ownership, monitoring và recovery plan.
+
+---
+
+#### 15. Mười câu hỏi phỏng vấn từ tài liệu PDF
+
+> PDF đánh số một đoạn giải thích CAP thành câu 4; dưới đây gom lại thành 10 câu hỏi hoàn chỉnh theo nội dung thực tế.
+
+**Q1. Database replication là gì và giúp hiệu năng ra sao?**
+
+Replication tạo bản sao dữ liệu trên nodes khác, hỗ trợ availability/failover và offload một số read workload. Nó không mặc nhiên scale writes; cần nêu replica lag, stale/read-after-write behavior, synchronous write latency và failover guarantees.
+
+**Q2. Sharding khác partitioning thế nào?**
+
+Partitioning là khái niệm chia dataset thành các phần; sharding thường là horizontal partitioning qua nhiều database nodes. Local partitioning có thể giúp pruning/maintenance; sharding scale storage/traffic vượt một node nhưng thêm routing, cross-shard query/transaction và resharding complexity.
+
+**Q3. CAP ảnh hưởng quyết định database performance thế nào?**
+
+Khi network partition xảy ra, distributed system không thể đồng thời bảo đảm cả CAP consistency và availability cho mọi operation. CP path có thể reject/wait để bảo vệ correctness; AP path tiếp tục phục vụ nhưng chấp nhận divergence/staleness. Quyết định dựa trên business invariant, không chọn một nhãn cho toàn hệ thống.
+
+**Q4. Các loại index phổ biến và khi nào dùng?**
+
+B-tree/B+tree cho equality/range/order; hash cho equality tùy engine; full-text/inverted cho text search; bitmap thường cho analytical low-cardinality predicates; spatial cho geo. Luôn kiểm tra engine, query pattern, composite column order, selectivity và write/storage cost.
+
+**Q5. Normalization và denormalization ảnh hưởng hiệu năng ra sao?**
+
+Normalization giảm duplication/update anomalies nhưng read có thể cần joins. Denormalization giảm online joins/computation nhưng tăng storage, propagation, staleness và reconciliation complexity. Thường giữ normalized source of truth và tạo read models/materialized views có freshness contract.
+
+**Q6. Connection pooling cải thiện hiệu năng thế nào?**
+
+Nó tái sử dụng connections, giảm handshake/auth/session setup và giới hạn database concurrency. Pool phải được tính trên tổng số application instances; pool quá lớn làm database overload, quá nhỏ làm application chờ.
+
+**Q7. Tối ưu một slow query như thế nào?**
+
+Thu query fingerprint/parameters, đọc actual execution plan và waits; so estimated/actual rows; tìm scan, bad join, spill, lookup và locks. Sau đó giảm rows/columns, sửa predicate, index/rewrite/batch hợp lý, cập nhật statistics nếu cần rồi benchmark representative concurrent load.
+
+**Q8. Materialized view là gì và tăng tốc ra sao?**
+
+Nó lưu physical result của query/precomputation để tránh lặp joins/aggregations lúc đọc. Đổi lại có refresh cost và staleness; cần freshness SLA, refresh strategy, failure monitoring và rebuild path.
+
+**Q9. Xử lý dataset lớn ra sao?**
+
+Không có một đáp án chung: dùng pagination/projection cho result lớn, cache cho hot reads, batching cho nhiều writes, partition/sharding cho capacity, replica cho read scale, precomputation cho aggregations và analytical store riêng cho scans. Chọn sau khi xác định bottleneck.
+
+**Q10. Consistency và performance trong distributed database đánh đổi thế nào?**
+
+Coordination để có consistency mạnh thường thêm network round trips, quorum wait và giảm availability trong một số failure modes. Eventual/weak consistency có thể giảm coordination và tăng availability/latency performance nhưng chuyển complexity sang conflict, stale reads, invariant và reconciliation. Không đồng nhất “relational = strong” hay “NoSQL = eventual”; guarantee phụ thuộc sản phẩm và configuration.
+
+---
+
+#### 16. Sai lầm thường gặp
+
+- Tối ưu trước khi đo hoặc chỉ nhìn average latency.
+- Thêm index cho mọi column mà không xem plan/write amplification.
+- Tin rằng index tồn tại thì optimizer chắc chắn dùng.
+- Dùng `SELECT *` và trả result set lớn không cần thiết.
+- Sửa N+1 bằng một join tạo Cartesian explosion.
+- Tăng connection pool cùng số app instances mà không tính database capacity.
+- Route mọi read sang replica nhưng bỏ qua read-after-write và lag.
+- Shard quá sớm hoặc chọn shard key theo storage mà bỏ qua query locality.
+- Offset pagination sâu cho feed lớn.
+- Batch/transaction quá lớn gây lock, WAL và retry cost.
+- Denormalize nhưng không chỉ định source of truth/reconciliation.
+- Cache chậm query mà không sửa query/index gốc.
+- Đánh đồng CAP với “chọn hai trong ba ở mọi thời điểm”.
+- Scale phần cứng trước khi kiểm tra execution plan và workload.
+
+---
+
+#### 17. Checklist tối ưu database
+
+1. SLO latency/throughput/freshness/correctness là gì?
+2. Query fingerprints nào chiếm nhiều total time nhất?
+3. Rows scanned/returned và estimated/actual cardinality ra sao?
+4. Bottleneck là CPU, I/O, lock, memory spill, network hay connection wait?
+5. Index có khớp predicate/join/order và composite order không?
+6. Có redundant/unused index làm tăng write cost không?
+7. Query có N+1, `SELECT *`, non-sargable predicate hoặc deep offset không?
+8. Statistics có mới và representative không?
+9. Pool max nhân với số instances có vượt database safe connections không?
+10. Transaction có giữ lock/connection quá lâu không?
+11. Replica lag/failover/read consistency được xử lý thế nào?
+12. Partition pruning và shard locality có hoạt động không?
+13. Cache/materialized view/read model có freshness và invalidation contract không?
+14. Batch size/pagination cursor có giới hạn và deterministic order không?
+15. Benchmark có representative data, parameters, concurrency và warm/cold cache không?
+16. Sau thay đổi đã kiểm tra write regression, correctness và rollback plan chưa?
+
+#### 18. Ý chính cần nhớ
+
+- Database optimization là vòng lặp đo lường, giải thích plan, thay đổi và kiểm chứng.
+- Ưu tiên query theo frequency nhân cost, không chỉ query chậm nhất.
+- Replication scale reads/availability nhưng thêm lag, consistency và failover trade-offs.
+- Sharding là distributed partitioning; cả hai chỉ có lợi khi key và query locality phù hợp.
+- CAP trade-off C/A trở nên bắt buộc khi network partition xảy ra.
+- Index phải khớp workload; read gain đổi lấy write, storage và maintenance cost.
+- Execution plan và actual cardinality quan trọng hơn phỏng đoán.
+- Thread-safe/concurrent application không cứu được database khỏi unbounded connections.
+- Normalized write model và denormalized read model thường phối hợp tốt.
+- Materialized view đổi freshness/refresh cost lấy read speed.
+- Batching giảm round trips nhưng batch quá lớn tăng lock và retry cost.
+- Keyset pagination thường tốt hơn deep offset cho feed lớn.
+- Cache, replica và denormalization đều tạo consistency boundary cần quản trị.
+- Scale hardware/shard chỉ sau khi hiểu bottleneck và tối ưu work không cần thiết.
+
+#### Công thức ghi nhớ
+
+> **Database nhanh bền vững = workload/SLO rõ + đo đúng bottleneck + query plan tốt + index vừa đủ + bounded connections + data layout phù hợp + freshness/consistency được chủ động thiết kế.**
+
+---
+
+### Bài 51. Tổng kết — Performance trong System Design
+
+#### 1. Performance là kết quả của cả kiến trúc
+
+Hiệu năng không đến từ một kỹ thuật đơn lẻ. Nó là kết quả tổng hợp của nhiều quyết định trên toàn request path:
+
+```text
+Client
+  -> network/CDN/cache
+  -> load balancer/application
+  -> concurrency limits/queues
+  -> cache/database/downstream services
+```
+
+Chỉ tối ưu một thành phần có thể chuyển bottleneck sang nơi khác. Ví dụ:
+
+- tăng application workers có thể làm database quá tải;
+- cache giảm read load nhưng tạo invalidation và consistency complexity;
+- queue giảm user-facing latency nhưng làm tăng business completion time nếu backlog lớn;
+- thêm database indexes tăng tốc reads nhưng làm writes và storage đắt hơn;
+- parallelism tăng CPU throughput nhưng contention/coordination có thể xóa lợi ích.
+
+Do đó, performance engineering phải đo và tối ưu **end-to-end**, không nhìn từng hộp kiến trúc riêng lẻ.
+
+---
+
+#### 2. Năm mảng kiến thức đã học
+
+##### 2.1 Performance fundamentals
+
+- **Latency:** thời gian hoàn tất một operation.
+- **Throughput:** lượng work hoàn tất trong một đơn vị thời gian.
+- **Concurrency:** số operation đang active/in-flight.
+- **Scalability:** khả năng giữ SLO khi workload tăng bằng cách bổ sung hoặc tổ chức lại tài nguyên.
+- **Responsiveness:** cảm nhận phản hồi của người dùng, không nhất thiết đồng nghĩa toàn bộ business work đã hoàn tất.
+
+Không chỉ đo average. Tail latency như p95/p99 thường phản ánh trải nghiệm khi hệ thống chịu contention, queueing hoặc dependency chậm.
+
+##### 2.2 Caching
+
+Caching đưa dữ liệu/kết quả thường dùng gần nơi tiêu thụ hơn để:
+
+- giảm read latency;
+- giảm repeated computation;
+- giảm traffic tới database/downstream;
+- tăng khả năng hấp thụ read traffic.
+
+Đổi lại phải xử lý cache key, TTL, invalidation, eviction, stale data, cache stampede, hot key và cold start. Cache là bản sao có freshness contract, không phải source of truth mặc định.
+
+##### 2.3 Messaging và queues
+
+Messaging tách producer khỏi thời điểm và tốc độ xử lý của consumer:
+
+- decouple services;
+- hấp thụ traffic burst;
+- đưa work dài ra khỏi request path;
+- hỗ trợ competing consumers và horizontal worker scaling;
+- cô lập một số failure/downstream slowdown.
+
+Nhưng cần quản lý backlog/queue age, idempotency, acknowledgement, retry/backoff, DLQ, ordering và eventual consistency. Queue không tạo thêm processing capacity; nó chỉ buffer chênh lệch tốc độ trong giới hạn.
+
+##### 2.4 Concurrency và parallelism
+
+- concurrency giúp nhiều task cùng tiến triển và tận dụng thời gian chờ;
+- non-blocking async I/O phù hợp I/O-bound workloads;
+- parallelism dùng nhiều execution units cho CPU-bound workloads;
+- thread/worker pools tái sử dụng tài nguyên nhưng phải bounded;
+- backpressure bảo vệ downstream khi tốc độ đến vượt khả năng xử lý.
+
+Tốc độ không được đánh đổi correctness. Shared mutable state có thể gây race condition; locking sai có thể gây contention, starvation hoặc deadlock.
+
+##### 2.5 Database performance
+
+Các kỹ thuật chính gồm:
+
+- query measurement và execution-plan analysis;
+- indexes phù hợp query patterns;
+- query rewrite, batching và pagination;
+- connection pooling có giới hạn;
+- replication cho availability/read scale;
+- partitioning và sharding cho data/throughput scale;
+- normalization, denormalized read models và materialized views;
+- cache/analytical store để tách workload phù hợp.
+
+Tối ưu database bắt đầu bằng việc xác định bottleneck, không mặc định bằng index, replica hay sharding.
+
+---
+
+#### 3. Các mối liên hệ quan trọng
+
+| Quyết định | Lợi ích mong muốn | Chi phí/rủi ro cần kiểm soát |
+|---|---|---|
+| Cache | Giảm latency và database load | Staleness, invalidation, stampede |
+| Queue | Giảm request-path work, hấp thụ burst | Backlog, completion latency, duplicates |
+| Tăng concurrency | Tận dụng I/O/resources | Contention, downstream overload, queueing |
+| Parallelize | Tăng CPU throughput | Coordination, memory pressure, Amdahl limit |
+| Thêm index | Giảm query scan | Write amplification, storage, maintenance |
+| Read replica | Phân phối reads | Replica lag, routing, read-after-write |
+| Sharding | Scale vượt một node | Cross-shard operations, hotspots, resharding |
+| Denormalization | Read nhanh hơn | Duplication, propagation, reconciliation |
+
+Một kiến trúc tốt không tối đa hóa một metric. Nó đạt các SLO cần thiết trong giới hạn correctness, reliability, operability và cost.
+
+---
+
+#### 4. Quy trình performance engineering thống nhất
+
+1. Xác định user journey và business-critical operations.
+2. Đặt SLO cho latency, throughput, freshness và error rate.
+3. Ước lượng workload: traffic, read/write ratio, payload, data growth và bursts.
+4. Đo end-to-end và phân rã latency theo từng thành phần.
+5. Tìm bottleneck thật qua saturation, waits, queueing và profiles.
+6. Giảm work không cần thiết trước khi thêm capacity.
+7. Chọn kỹ thuật phù hợp: cache, async queue, bounded concurrency, query/index hoặc data distribution.
+8. Load test với representative data và concurrency.
+9. Kiểm tra correctness, reliability và cost regression.
+10. Theo dõi production, đặt alert và lặp lại khi workload thay đổi.
+
+```text
+Measure -> Explain -> Change -> Validate -> Observe -> Repeat
+```
+
+---
+
+#### 5. Dấu hiệu của một câu trả lời System Design tốt
+
+Khi thảo luận hiệu năng trong phỏng vấn hoặc thiết kế thực tế:
+
+- nêu workload và SLO trước giải pháp;
+- xác định read path, write path và asynchronous completion path;
+- chỉ ra bottleneck giả định và cách xác minh;
+- giải thích vì sao chọn cache/queue/index/replica/shard;
+- luôn nêu trade-off về freshness, consistency, reliability và cost;
+- đặt limits/backpressure thay vì cho concurrency và queue tăng vô hạn;
+- đề cập metrics, load testing, capacity planning và rollback;
+- phân biệt tối ưu hiện tại với bước chỉ cần khi hệ thống thật sự lớn lên.
+
+Kiến trúc tốt không phải kiến trúc dùng nhiều công nghệ nhất, mà là kiến trúc đạt yêu cầu với độ phức tạp hợp lý và có đường mở rộng rõ ràng.
+
+---
+
+#### 6. Ý chính cần nhớ
+
+- Performance là thuộc tính end-to-end của hệ thống.
+- Latency, throughput, concurrency và scalability liên quan nhưng không đồng nghĩa.
+- Average che giấu tail latency; p95/p99 thường quan trọng với production.
+- Cache đổi freshness/complexity lấy tốc độ và giảm downstream load.
+- Queue đổi synchronous waiting lấy asynchronous completion và backlog management.
+- Async I/O phù hợp waiting-heavy work; parallelism phù hợp CPU-heavy work.
+- Bounded concurrency và backpressure ngăn tối ưu cục bộ làm sập downstream.
+- Database performance cần đo query plan, indexes, connections và data layout cùng nhau.
+- Mỗi optimization đều có trade-off về correctness, reliability, operability hoặc cost.
+- Tối ưu chỉ có giá trị khi được đo trước/sau dưới workload đại diện.
+- Hệ thống nhanh nhưng làm mất dữ liệu, trả kết quả sai hoặc không phục hồi được vẫn là hệ thống thất bại.
+
+#### Công thức ghi nhớ
+
+> **High-performance system = SLO rõ + đo end-to-end + giảm work + đưa dữ liệu gần nơi dùng + tách work không đồng bộ + giới hạn concurrency + tối ưu data path + kiểm chứng dưới tải thật.**
+
+---
+
+#### 7. Chuyển sang Reliability
+
+Performance trả lời câu hỏi:
+
+> Hệ thống có phục vụ nhanh và hiệu quả dưới tải không?
+
+Phần tiếp theo về reliability sẽ trả lời:
+
+> Hệ thống có tiếp tục hoạt động đúng khi component lỗi, dependency chậm, instance chết hoặc cả vùng gặp sự cố không?
+
+Các chủ đề tiếp theo sẽ nối trực tiếp với performance: availability, redundancy, failover, fault tolerance, recovery và graceful degradation. Một hệ thống có giá trị không chỉ cần nhanh khi mọi thứ bình thường, mà còn phải dự đoán được và phục hồi được khi sự cố xảy ra.
+
+---
+
+## Phần 9 — Reliability, Availability & Disaster Recovery
+
+### Bài 52. Introduction to System Reliability
+
+#### 1. Vì sao reliability quan trọng?
+
+Người dùng không nhìn thấy replication topology, health checks hay circuit breakers. Họ chỉ kỳ vọng hệ thống:
+
+- truy cập được khi cần;
+- phản hồi trong thời gian chấp nhận được;
+- trả kết quả đúng;
+- không làm mất hoặc hỏng dữ liệu đã cam kết;
+- phục hồi nhanh và có hành vi dự đoán được khi sự cố xảy ra.
+
+Downtime hoặc xử lý sai trong ngân hàng, thương mại điện tử, y tế hay messaging có thể gây thiệt hại tài chính, vi phạm pháp lý và mất niềm tin. Reliability vì vậy là business requirement được chuyển thành mục tiêu kỹ thuật, không phải phần trang trí thêm sau khi viết xong tính năng.
+
+> **Không thiết kế với giả định “không có gì hỏng”; hãy thiết kế để failure được dự kiến, phát hiện, cô lập và phục hồi với tác động chấp nhận được.**
+
+---
+
+#### 2. System reliability là gì?
+
+Reliability là khả năng hệ thống thực hiện đúng chức năng đã định trong một khoảng thời gian và dưới các điều kiện xác định.
+
+Một hệ thống đáng tin cậy cần phối hợp nhiều thuộc tính:
+
+- **correctness:** kết quả và state transitions đúng;
+- **availability:** dịch vụ sẵn sàng phục vụ khi cần;
+- **durability:** dữ liệu đã được xác nhận không bị mất ngoài guarantee;
+- **fault containment:** lỗi cục bộ không lan thành outage toàn hệ thống;
+- **recoverability:** phát hiện và khôi phục service/data trong mục tiêu thời gian;
+- **predictability:** behavior trong overload/failure phù hợp contract;
+- **operability:** con người có thể quan sát, chẩn đoán và can thiệp an toàn.
+
+Hệ thống trả response 100% nhưng dữ liệu sai không reliable. Hệ thống lưu dữ liệu hoàn hảo nhưng thường xuyên không truy cập được cũng không đạt trải nghiệm reliable.
+
+---
+
+#### 3. Phân biệt các khái niệm cốt lõi
+
+| Khái niệm | Câu hỏi nó trả lời | Ví dụ |
+|---|---|---|
+| **Reliability** | Hệ thống có thực hiện đúng và ổn định theo thời gian không? | Checkout xử lý đúng, không mất đơn và đáp ứng SLO |
+| **Availability** | Người dùng có nhận được service hợp lệ ngay lúc này không? | API phục vụ request thay vì timeout/error |
+| **Durability** | Dữ liệu đã acknowledge có còn tồn tại sau failure không? | Order đã commit không mất khi một node chết |
+| **Resilience** | Hệ thống hấp thụ, thích nghi và phục hồi từ disruption ra sao? | Dependency lỗi nhưng core flow vẫn hoạt động ở degraded mode |
+| **Fault tolerance** | Hệ thống có tiếp tục đáp ứng yêu cầu dù một số component lỗi không? | Một instance chết nhưng traffic tự chuyển sang instance khác |
+| **Disaster recovery** | Sau sự cố lớn, service/data được khôi phục ở đâu và trong bao lâu? | Khôi phục region từ replica/backup theo RTO/RPO |
+
+Availability không bảo đảm correctness hay durability. Durability cũng không bảo đảm dữ liệu luôn đọc được ngay. Fault tolerance thường nhằm giữ service tiếp tục chạy; disaster recovery chấp nhận có thể có gián đoạn nhưng đặt mục tiêu phục hồi.
+
+---
+
+#### 4. Bắt đầu từ failure model
+
+Không thể nói “reliable” nếu chưa nêu hệ thống phải chịu được loại failure nào:
+
+- process/container crash;
+- host/VM failure;
+- disk hoặc storage corruption;
+- availability-zone/region outage;
+- packet loss, latency spike, network partition;
+- dependency timeout/throttling;
+- traffic spike và resource exhaustion;
+- software bug, bad deploy hoặc configuration error;
+- expired certificate/credential/quota;
+- operator error;
+- data corruption, accidental deletion hoặc ransomware;
+- correlated/common-mode failure ảnh hưởng nhiều replicas cùng lúc.
+
+Redundancy chỉ có giá trị nếu các bản sao không cùng chung failure domain. Hai instances trên cùng host, cùng AZ hoặc cùng cấu hình lỗi có thể không bảo vệ khỏi sự cố cần chịu.
+
+```text
+Reliability claim = workload + time window + success criteria + failure assumptions
+```
+
+---
+
+#### 5. Đo reliability: MTBF, MTTR và MTTD
+
+##### 5.1 MTBF — Mean Time Between Failures
+
+Thời gian trung bình giữa các failure của một repairable system. MTBF cao thường cho thấy failure ít xảy ra hơn, nhưng average có thể che giấu failure distribution và correlated incidents.
+
+##### 5.2 MTTR — Mean Time to Recovery/Restore
+
+Thời gian trung bình để phục hồi service sau failure. Tài liệu khác đôi khi dùng chữ `R` cho Repair, Restore, Recover hoặc Resolution; khi dùng metric phải định nghĩa chính xác điểm bắt đầu/kết thúc.
+
+##### 5.3 MTTD — Mean Time to Detect
+
+Thời gian trung bình từ khi failure bắt đầu đến khi được phát hiện. Recovery nhanh không thể bắt đầu nếu detection chậm hoặc alert không phản ánh user impact.
+
+Với mô hình repairable system đơn giản, steady-state availability có thể được xấp xỉ:
+
+```text
+Availability ~= MTBF / (MTBF + MTTR)
+```
+
+Ví dụ: MTBF 720 giờ và MTTR 1 giờ cho availability xấp xỉ `99,86%`.
+
+Giới hạn của công thức:
+
+- giả định chu kỳ up/down và cách tính failure/repair phù hợp;
+- không thể hiện partial outage, request volume hay mức độ nghiêm trọng;
+- averages có thể che giấu incident dài;
+- không thay thế trực tiếp SLI đo trên requests/minutes thực tế;
+- với non-repairable component có thể dùng MTTF thay cho MTBF.
+
+Mục tiêu không chỉ là “ít hỏng” mà là phát hiện sớm, giảm blast radius và phục hồi nhanh.
+
+---
+
+#### 6. Availability và downtime budget
+
+Nếu đo liên tục trong một năm 365 ngày, downtime lý thuyết xấp xỉ:
+
+| Availability | Downtime/năm | Tên thường gọi |
+|---:|---:|---|
+| 99% | 3 ngày 15 giờ 36 phút | two nines |
+| 99,9% | 8 giờ 45 phút 36 giây | three nines |
+| 99,99% | 52 phút 34 giây | four nines |
+| 99,999% | 5 phút 15 giây | five nines |
+
+Nhưng con số chỉ có ý nghĩa khi measurement contract rõ:
+
+- measured service/endpoint/user journey nào?
+- success là status code, correctness hay latency threshold?
+- cửa sổ theo tháng, quý hay năm?
+- planned maintenance có tính không?
+- đo theo thời gian hay tỷ lệ good requests?
+- regional hay global?
+- dependency/customer-side failures xử lý thế nào?
+
+99,99% cho một health endpoint không chứng minh checkout 99,99% nếu database write path đang lỗi.
+
+---
+
+#### 7. SLI, SLO, SLA và error budget
+
+- **SLI (Service Level Indicator):** phép đo thực tế, ví dụ tỷ lệ checkout requests đúng và dưới 800 ms.
+- **SLO (Service Level Objective):** mục tiêu nội bộ cho SLI trong một cửa sổ, ví dụ 99,95% trong 30 ngày.
+- **SLA (Service Level Agreement):** cam kết/contract với khách hàng, có phạm vi, exclusions và remedies/penalties.
+- **Error budget:** phần không hoàn hảo được phép theo SLO.
+
+```text
+Error budget = 1 - SLO target
+```
+
+SLO nên chặt hơn SLA để có safety margin. Reliability target ảnh hưởng trực tiếp tới redundancy, on-call, testing, monitoring, deployment, backup, failover và chi phí.
+
+Đặt mọi service ở five nines là không thực tế. Hãy bắt đầu từ user journey và business impact; critical write path có thể cần mục tiêu khác search suggestion hoặc analytics dashboard.
+
+---
+
+#### 8. Các building blocks của reliability
+
+##### 8.1 Redundancy
+
+Nhiều instances/nodes/copies loại một số single points of failure. Cần placement qua failure domains, capacity đủ khi mất một phần hệ thống và cơ chế giữ replicas nhất quán theo yêu cầu.
+
+##### 8.2 Health checks và failover
+
+Health signal phải phản ánh khả năng phục vụ thật. Failover chuyển traffic/leadership/work sang healthy capacity. Sai threshold có thể gây flapping hoặc loại nhầm instance; failover phải được kiểm thử chứ không chỉ tồn tại trên sơ đồ.
+
+##### 8.3 Timeouts
+
+Mọi remote call cần deadline/timeout. Nếu không, resource có thể bị giữ vô hạn và tạo cascading failure. Timeout phải nằm trong end-to-end deadline budget.
+
+##### 8.4 Retries
+
+Retry chỉ phù hợp transient failure và operation idempotent hoặc có idempotency key. Dùng exponential backoff, jitter, retry budget và giới hạn attempt. Retry không kiểm soát làm tăng tải đúng lúc dependency yếu nhất.
+
+##### 8.5 Circuit breaker
+
+Ngừng gọi dependency đang failure/saturated trong một khoảng, fail fast và thử phục hồi có kiểm soát. Nó giảm wasted work/cascade nhưng không sửa dependency hay thay thế timeout.
+
+##### 8.6 Bulkhead và isolation
+
+Tách pools, queues, quotas hoặc failure domains để một tenant/dependency/workload không chiếm hết tài nguyên chung.
+
+##### 8.7 Graceful degradation
+
+Giữ chức năng cốt lõi khi chức năng phụ lỗi: checkout vẫn hoạt động dù recommendation unavailable; trả cached/stale-if-safe data; tắt feature tốn tài nguyên.
+
+##### 8.8 Load shedding và rate limiting
+
+Từ chối có chủ đích một phần tải để bảo vệ core service và recovery, thay vì nhận mọi request rồi cùng timeout.
+
+##### 8.9 Backup, restore và replication
+
+Replication hỗ trợ availability nhưng không thay backup: bug hoặc delete có thể replicate sang mọi bản sao. Backup chỉ đáng tin khi restore được kiểm thử và đáp ứng RPO/RTO.
+
+---
+
+#### 9. Tránh cascading failure
+
+Một dependency chậm có thể tạo chuỗi:
+
+```text
+dependency chậm
+ -> request giữ thread/connection lâu
+ -> queue và pool đầy
+ -> timeout/retry tăng
+ -> tải dependency cao hơn
+ -> nhiều services cùng suy sụp
+```
+
+Các lớp bảo vệ:
+
+- end-to-end deadlines và per-hop timeout;
+- bounded concurrency/queues;
+- retry budget + exponential backoff + jitter;
+- circuit breaker;
+- bulkhead/isolation;
+- load shedding và admission control;
+- cached/fallback/degraded response khi business cho phép;
+- request priority;
+- capacity reserve cho recovery/control plane.
+
+Không retry `N` lần ở mọi tầng. Retry amplification qua chuỗi services có thể tăng số attempts theo cấp số nhân.
+
+---
+
+#### 10. Reliability trong distributed systems
+
+Distributed systems phải xử lý partial failure: một node không biết dependency đã chết hay chỉ chậm/network partition. Timeout chỉ tạo uncertainty; nó không chứng minh remote operation chưa xảy ra.
+
+Do đó cần:
+
+- idempotency/deduplication cho retry;
+- replication qua independent failure domains;
+- quorum/consistency policy phù hợp business invariant;
+- leader election và fencing để tránh stale leader gây side effect;
+- durable logs/checkpoints;
+- reconciliation cho eventual consistency;
+- observability và correlation xuyên services;
+- capacity/failover plan khi mất node/AZ/region.
+
+Consensus protocols như Raft/Paxos giúp các nodes thống nhất thứ tự/state trong failure model nhất định. Chúng không làm hệ thống “không bao giờ hỏng”, không thay backup, không loại network latency và có thể từ chối tiến triển khi mất quorum để bảo vệ safety.
+
+---
+
+#### 11. Reliability trong cloud-native systems
+
+VM có thể biến mất, container restart, pod bị reschedule và mạng có transient errors. Ứng dụng cloud-native nên:
+
+- stateless khi có thể; state lưu ở durable systems có contract rõ;
+- nhiều replicas qua zones và anti-affinity phù hợp;
+- readiness khác liveness: chưa sẵn sàng thì không nhận traffic, deadlocked thì mới cần restart;
+- graceful shutdown/draining cho in-flight work;
+- autoscaling có headroom và không làm downstream quá tải;
+- immutable/repeatable deployments, canary hoặc progressive rollout;
+- rollback nhanh và config/secret/certificate management;
+- infrastructure as code và tested recovery procedures;
+- observability dựa trên user impact;
+- chaos/fault-injection có hypothesis, safety guardrails và phạm vi kiểm soát.
+
+Self-healing chỉ thay instance lỗi. Nó không tự sửa bad deploy, data corruption, dependency outage hoặc thiết kế có common-mode failure.
+
+---
+
+#### 12. Thiết kế cho 99,99% availability
+
+Four nines không đạt được chỉ bằng “triển khai multi-AZ”. Cần thiết kế từ user journey:
+
+1. định nghĩa SLI/SLO và cửa sổ đo;
+2. lập dependency graph và availability budget;
+3. loại SPOF trên compute, routing, data và control path;
+4. active capacity qua nhiều failure domains;
+5. load balancer + health/readiness checks + automatic failover;
+6. data replication với consistency/failover guarantee rõ;
+7. bounded timeouts, retries, circuit breakers và bulkheads;
+8. graceful degradation/load shedding;
+9. zero/minimal-downtime deploy và safe rollback;
+10. monitoring, alerting, on-call và runbooks;
+11. backup/restore cùng tested RPO/RTO;
+12. capacity đủ khi mất một zone và khi traffic spike;
+13. game days/chaos tests để đo failover thực tế;
+14. postmortems và error-budget governance.
+
+Availability end-to-end bị giới hạn bởi dependency chain. Nếu hai dependencies độc lập đều bắt buộc và mỗi cái 99,9%, availability nối tiếp xấp xỉ:
+
+```text
+0,999 x 0,999 = 0,998001 ~= 99,80%
+```
+
+Vì vậy cần giảm dependencies đồng bộ bắt buộc, tăng reliability của critical path hoặc cung cấp fallback/degradation.
+
+---
+
+#### 13. Điều tra microservice thường xuyên bị down
+
+1. Xác nhận user impact và timeline, không chỉ nhìn “process restart”.
+2. Kiểm tra SLI: errors, latency, traffic, saturation và dependency health.
+3. Correlate với deploy/config/infrastructure/traffic changes.
+4. Phân tích logs, traces, metrics, profiles, crash/OOM/thread dumps.
+5. Kiểm tra memory leak, CPU throttling, GC, disk, connection/thread-pool starvation, lock contention và quota.
+6. Xác định downstream timeout, retry storm hoặc poison message.
+7. Mitigate trước: rollback, reduce traffic, disable feature, scale hoặc isolate.
+8. Tìm root và contributing causes thay vì dừng ở “pod crashed”.
+9. Sửa bằng test/guardrail/observability cụ thể.
+10. Viết blameless postmortem, owner và deadline cho action items.
+
+Circuit breaker/retry/bulkhead chỉ là resilience controls; không nên thêm chúng thay cho root-cause analysis.
+
+---
+
+#### 14. Reliability dưới traffic và data volume lớn
+
+- stateless service + horizontal scale ở compute path;
+- caching để giảm repeated work nhưng có stampede/invalidation protection;
+- message queues để absorb burst, với backlog age, idempotency và DLQ;
+- rate limiting, admission control và load shedding;
+- database indexes/query tuning trước sharding;
+- replicas cho reads nếu xử lý được lag;
+- partition/shard khi đã xác định data/throughput bottleneck;
+- quotas/bulkheads để tenant hoặc workload lớn không ảnh hưởng toàn hệ thống;
+- autoscaling theo saturation/queue signals nhưng giữ downstream limits;
+- capacity planning, load/soak tests và degradation drills.
+
+Scale cải thiện capacity, không tự bảo đảm reliability. Nhiều components hơn cũng tạo nhiều failure modes hơn nếu thiếu automation và observability.
+
+---
+
+#### 15. Performance và reliability — trade-off hay cùng hướng?
+
+Hai thuộc tính đôi khi đánh đổi, đôi khi hỗ trợ nhau:
+
+- cache giảm latency và database load, có thể tăng reliability nhưng giảm freshness;
+- synchronous replication tăng durability/consistency nhưng làm write latency nhạy với replica/network;
+- timeout ngắn giải phóng tài nguyên và giảm cascade nhưng có thể tăng false failures;
+- retry tăng success với transient fault nhưng làm tail latency/load cao hơn;
+- headroom tăng reliability nhưng tăng cost;
+- batching tăng throughput nhưng transaction lớn làm recovery/lock impact nặng hơn.
+
+Trong ví dụ PDF, dashboard dùng cache trễ 15 giây không thật sự “hy sinh performance”; nó **cải thiện performance/stability nhưng hy sinh freshness**. Một câu trả lời phỏng vấn tốt phải gọi đúng thuộc tính bị đánh đổi và nêu metric trước/sau.
+
+---
+
+#### 16. Mười câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. System reliability là gì và vì sao quan trọng?**
+
+Là khả năng hệ thống thực hiện đúng chức năng trong thời gian và điều kiện xác định. Nó bảo vệ user experience, dữ liệu/giao dịch, doanh thu và niềm tin; đặc biệt quan trọng vì distributed systems có partial failures và cascade risk.
+
+**Q2. Availability khác durability thế nào?**
+
+Availability hỏi service có phục vụ được bây giờ không; durability hỏi dữ liệu đã acknowledge có còn an toàn sau failure không. ATM có thể unavailable trong khi số dư vẫn durable; một API có thể available nhưng mất write nếu durability contract kém.
+
+**Q3. MTBF và MTTR là gì, liên hệ ra sao?**
+
+MTBF đo thời gian trung bình giữa failures; MTTR đo thời gian trung bình để phục hồi theo định nghĩa cụ thể. Trong mô hình repairable đơn giản, availability xấp xỉ `MTBF / (MTBF + MTTR)`. Tăng MTBF và giảm MTTR đều có lợi, nhưng vẫn phải đo request-based SLI và tail incidents.
+
+**Q4. SLA giúp xác định reliability expectations ra sao?**
+
+SLA là cam kết với khách hàng về phạm vi/mức service và remedies. Engineering chuyển nó thành SLI/SLO nội bộ, error budget, monitoring, redundancy, on-call và recovery targets. Phải nêu measurement window, exclusions và success criteria.
+
+**Q5. Thiết kế hệ thống đạt 99,99% availability như thế nào?**
+
+Bắt đầu từ SLI/SLO của critical journey; loại SPOF, deploy qua failure domains, failover tự động, replicated data, bounded resilience controls, graceful degradation, safe deployments, observability/on-call và tested recovery. Chứng minh bằng end-to-end availability budget và failure tests.
+
+**Q6. Một microservice thường xuyên down: tìm và sửa thế nào?**
+
+Xác định timeline/user impact, correlate deploy/traffic/dependency, đọc metrics/logs/traces/dumps, mitigate bằng rollback/isolation rồi tìm root/contributing causes. Sau đó thêm test, resource limits, timeouts/bulkheads hoặc fix code phù hợp và theo dõi recurrence qua postmortem actions.
+
+**Q7. Cải thiện reliability khi traffic và data volume cao?**
+
+Giảm repeated load bằng cache; buffer async work bằng durable queue; bounded concurrency/rate limiting; horizontal stateless scale; database query/index optimization rồi partition/shard khi cần; tenant isolation, load tests và downstream-aware autoscaling.
+
+**Q8. Áp dụng redundancy và failover trong cloud-native system ra sao?**
+
+Phân bố healthy capacity qua zones/regions theo threat model; load balancer sử dụng readiness/health signals; replicated state và automatic failover có fencing; capacity đủ khi mất domain; backup/restore cho corruption. Kiểm thử RTO, data loss và traffic behavior trong game day.
+
+**Q9. Kể về lúc phải chọn giữa performance và reliability.**
+
+Dùng cấu trúc: bối cảnh và SLO → bottleneck/risk có số liệu → các lựa chọn → trade-off → quyết định → kết quả và bài học. Gọi đúng trade-off, chẳng hạn freshness đổi lấy cache latency/load reduction, hoặc write latency đổi lấy synchronous durability.
+
+**Q10. Làm sao reliable mà không over-engineer?**
+
+Đặt SLO theo business impact, xử lý failure modes có xác suất/tác động cao, giữ kiến trúc đơn giản, tận dụng managed service sau khi hiểu guarantee, tự động hóa detection/recovery, đo error budget và cải tiến dần. Không mua multi-region complexity khi RTO/RPO/SLO chưa yêu cầu.
+
+---
+
+#### 17. Sai lầm thường gặp
+
+- Đồng nhất reliability với uptime.
+- Đặt “nhiều số 9” mà không có SLI và measurement contract.
+- Có nhiều replicas nhưng cùng failure domain/common configuration.
+- Tin health endpoint xanh dù critical user journey đang lỗi.
+- Retry mọi lỗi, nhiều tầng và không jitter/idempotency.
+- Dùng timeout nhưng không có end-to-end deadline/cancellation.
+- Failover chưa từng thử; đến sự cố mới phát hiện DNS, credential hoặc capacity sai.
+- Coi replication là backup.
+- Autoscaling application nhưng làm database/dependency quá tải.
+- Restart loop che memory leak hoặc bad deploy thay vì sửa nguyên nhân.
+- Alert theo mọi metric thay vì user impact và actionable symptoms.
+- Chaos engineering không hypothesis, guardrail hoặc rollback.
+- Xây multi-region quá sớm, tăng complexity và common-mode risk.
+
+---
+
+#### 18. Checklist reliability ban đầu
+
+1. Critical user journeys và business impact là gì?
+2. SLI/SLO/SLA/error budget được định nghĩa thế nào?
+3. Correctness, availability, durability, RTO và RPO requirements?
+4. Failure model gồm process, node, AZ, region, dependency, deploy và data corruption nào?
+5. SPOFs và correlated failure domains ở đâu?
+6. End-to-end dependency graph/availability budget?
+7. Timeout, retry, idempotency và retry budget?
+8. Circuit breaker, bulkhead, bounded queue/concurrency?
+9. Graceful degradation/load shedding behavior?
+10. Health/readiness signals có phản ánh khả năng phục vụ thật không?
+11. Failover tự động hay thủ công, detection và fencing ra sao?
+12. Replication consistency/lag/data-loss guarantee?
+13. Backup restore đã thử và đạt RPO/RTO chưa?
+14. Capacity còn đủ khi mất một failure domain không?
+15. Deploy/rollback/config/certificate changes có an toàn không?
+16. Monitoring, tracing, alerts, runbooks và on-call ownership?
+17. Game days/chaos/load tests kiểm tra failure assumptions chưa?
+18. Postmortem actions có owner, deadline và verification không?
+
+#### 19. Ý chính cần nhớ
+
+- Failure là điều kiện thiết kế, không phải ngoại lệ hiếm gặp.
+- Reliability bao gồm correctness, availability, durability, containment và recovery.
+- Mọi reliability claim cần workload, time window, success criteria và failure model.
+- MTBF cao giảm tần suất failure; MTTR/MTTD thấp giảm thời gian user bị ảnh hưởng.
+- Availability formula từ MTBF/MTTR có giả định và không thay request-based SLI.
+- SLI đo thực tế, SLO đặt mục tiêu, SLA là cam kết, error budget cho biết mức lỗi được phép.
+- Redundancy phải qua independent failure domains và có capacity/failover đã kiểm thử.
+- Timeout, bounded retry, jitter, circuit breaker và bulkhead ngăn cascade.
+- Retry cần idempotency; timeout không cho biết remote operation có xảy ra hay chưa.
+- Replication không thay backup; backup không có giá trị nếu restore chưa được thử.
+- Consensus bảo vệ agreement/safety trong failure model nhưng có thể mất progress khi thiếu quorum.
+- Cloud self-healing không sửa được bad deploy, data corruption hay common-mode failure.
+- 99,99% là thuộc tính end-to-end của user journey, không phải checkbox multi-AZ.
+- Reliability tốt nhất đạt business SLO với complexity và cost hợp lý.
+
+#### Công thức ghi nhớ
+
+> **Reliable system = failure model rõ + SLO đo được + không có SPOF quan trọng + lỗi được cô lập + retry có giới hạn/idempotency + failover/restore đã thử + detection và recovery nhanh.**
+
+---
+
+### Bài 53. High Availability, Fault Tolerance & Failover
+
+#### 1. Ba khái niệm liên quan nhưng không đồng nghĩa
+
+| Khái niệm | Mục tiêu | Khi component lỗi |
+|---|---|---|
+| **High Availability (HA)** | Tối đa hóa tỷ lệ service sẵn sàng, giảm downtime | Có thể có gián đoạn ngắn trong lúc phát hiện và khôi phục/failover |
+| **Fault Tolerance (FT)** | Tiếp tục cung cấp đúng capability trong failure model xác định | Failure được che hoặc hấp thụ mà không làm mất capability/SLO đã cam kết |
+| **Failover** | Chuyển traffic, role, leadership hoặc workload sang thành phần thay thế | Là một cơ chế có thể dùng để đạt HA/FT, không phải mục tiêu cuối cùng |
+
+Fault tolerance không có nghĩa chịu được **mọi** failure và tuyệt đối không có tác động. Phải nêu scope: chịu mất một instance, một disk, một AZ hay một region; có giữ đầy đủ chức năng/latency không; có mất dữ liệu không.
+
+```text
+Redundancy tạo lựa chọn thay thế
+Failure detection quyết định khi nào chuyển
+Failover thực hiện chuyển đổi
+Fault isolation ngăn lỗi lan rộng
+Recovery đưa hệ thống về trạng thái ổn định
+```
+
+---
+
+#### 2. Redundancy — cần đúng failure domain
+
+Redundancy là có thêm thành phần hoặc đường đi để một failure không làm mất capability quan trọng:
+
+- **compute:** nhiều service instances;
+- **data:** replicas, erasure coding, replicated logs;
+- **network:** nhiều links, routers, load balancers, DNS/control paths;
+- **power/hardware:** redundant power supplies, disks, hosts;
+- **zone/region:** placement qua independent failure domains;
+- **operations:** nhiều người/quy trình, break-glass access và runbooks.
+
+Chỉ nhân đôi số lượng chưa đủ. Bản sao phải:
+
+- nằm ngoài failure domain cần chịu;
+- có software/config/credential/network hoạt động;
+- đủ capacity khi thành phần khác mất;
+- có state đủ mới theo RPO/consistency requirement;
+- được giám sát, vá và kiểm thử như primary;
+- không phụ thuộc cùng một hidden SPOF/control plane.
+
+Redundancy còn có **common-mode risk**: cùng bad deploy, schema migration, certificate hết hạn hoặc operator command có thể làm mọi bản sao lỗi đồng thời.
+
+---
+
+#### 3. N+1, N+2 và capacity khi failure
+
+Nếu `N` instances là capacity tối thiểu để đáp ứng peak/SLO, mô hình **N+1** provision thêm một instance dự phòng:
+
+```text
+required capacity = N
+deployed capacity = N + 1
+```
+
+N+1 chịu được một instance failure nếu:
+
+- các instances tương đương;
+- traffic phân bố lại kịp;
+- `N` instances còn lại thực sự chịu peak;
+- downstream cũng có capacity;
+- không mất toàn failure domain chứa nhiều instances.
+
+Nếu một AZ chứa nhiều instances, mất cả AZ có thể vượt `+1`. Khi threat model yêu cầu chịu hai failures hoặc maintenance đồng thời failure, cân nhắc N+2 hoặc capacity theo zone:
+
+```text
+remaining capacity after largest failure domain loss >= required peak capacity
+```
+
+Spare capacity không nhất thiết idle; trong active-active nó có thể là headroom phân bố trên các nodes. Autoscaling không thay hoàn toàn spare capacity vì provisioning/warm-up có độ trễ và có thể không hoạt động khi control plane/quota gặp sự cố.
+
+---
+
+#### 4. Active-active và active-passive
+
+##### 4.1 Active-active
+
+```text
+                 -> Active A
+Client -> LB ----> Active B
+                 -> Active C
+```
+
+Nhiều nodes/regions cùng phục vụ traffic.
+
+**Ưu điểm:**
+
+- sử dụng capacity thường xuyên;
+- failover traffic có thể nhanh;
+- load distribution và horizontal scaling;
+- có thể giảm latency theo vị trí.
+
+**Thách thức:**
+
+- state/session/data synchronization;
+- concurrent writes và conflict resolution;
+- routing khi một site degraded nhưng chưa chết;
+- bảo đảm phần còn lại đủ capacity;
+- correlated deploy/config failures;
+- active-active ở compute không đồng nghĩa data layer cũng active-active.
+
+##### 4.2 Active-passive
+
+```text
+Client -> Active
+          Passive/standby chờ promotion
+```
+
+**Ưu điểm:** ownership/write path đơn giản hơn, ít conflict, dễ reasoning hơn.
+
+**Thách thức:** standby capacity ít được sử dụng, promotion/routing có delay, standby có thể stale hoặc hỏng âm thầm.
+
+Standby có thể là:
+
+- **hot:** đang chạy, synchronized và gần như sẵn sàng nhận traffic;
+- **warm:** đã provision một phần, cần scale/start/promote;
+- **cold:** cần restore/provision/deploy, RTO dài hơn nhưng rẻ hơn.
+
+Lựa chọn dựa trên SLO, RTO/RPO, state semantics, traffic, cost và khả năng vận hành—không chỉ dựa vào nhãn “mission critical”.
+
+---
+
+#### 5. Graceful degradation
+
+Graceful degradation giữ core value khi dependency/resource không đủ, thay vì làm toàn hệ thống lỗi.
+
+Ví dụ e-commerce:
+
+| Tier | Chức năng | Khi sự cố |
+|---|---|---|
+| Critical | Cart, checkout, payment correctness | Bảo vệ capacity; fail closed nếu correctness không bảo đảm |
+| Important | Product search/detail | Có thể dùng cached/stale-safe data |
+| Optional | Recommendations, reviews, personalization | Ẩn/tắt hoặc trả default |
+
+Ví dụ streaming: giảm bitrate/resolution để duy trì playback. Tuy nhiên degradation phải an toàn:
+
+- không dùng stale price/inventory nếu gây sai giao dịch;
+- không biến security/auth failure thành “bypass”; 
+- hiển thị trạng thái rõ khi action chưa hoàn tất;
+- đo degraded requests riêng, không tính mọi response 200 là healthy;
+- có điều kiện thoát degraded mode và tránh flapping.
+
+Thiết kế từ đầu cần feature tiers, fallback contract, data freshness limit và capacity reservation cho critical path.
+
+---
+
+#### 6. Load balancer trong high availability
+
+Load balancer:
+
+- phân phối traffic qua healthy instances;
+- loại endpoint unhealthy khỏi rotation;
+- hỗ trợ connection draining khi deploy/failure;
+- hạn chế overload cục bộ bằng thuật toán/capacity signal;
+- có thể route theo zone/region và failover policy.
+
+Nhưng load balancer không tự bảo đảm HA:
+
+- LB/DNS/control plane phải được redundant;
+- health check có thể xanh trong khi critical dependency lỗi;
+- cached DNS/connection có thể giữ client ở endpoint cũ;
+- sticky session làm failover mất session nếu state local;
+- remaining instances có thể không đủ capacity;
+- existing long-lived connections có thể bị ngắt dù request mới được route tốt.
+
+Prefer stateless application instances hoặc externalized/replicated session state. Nếu dùng stickiness, cần mô tả recovery semantics.
+
+---
+
+#### 7. Health monitoring và failure detection
+
+Failure detector luôn đối mặt với uncertainty: node im lặng có thể đã chết, đang chậm hoặc bị network partition.
+
+Các lớp signal:
+
+- **liveness:** process có bị kẹt đến mức cần restart không?
+- **readiness:** instance có nên nhận traffic mới không?
+- **startup:** application đã hoàn tất initialization chưa?
+- **dependency/synthetic check:** critical user flow có hoạt động không?
+- **SLI telemetry:** errors, latency, saturation và correctness symptoms.
+
+Trade-offs:
+
+- threshold quá nhạy → false positive, flapping, mass eviction/restart;
+- threshold quá chậm → MTTR tăng và user tiếp tục gặp lỗi;
+- deep health check gọi mọi dependency → health check tự tạo load/cascade;
+- chỉ kiểm tra process → false healthy.
+
+Dùng nhiều consecutive failures/successes, grace period và hysteresis để ổn định chuyển trạng thái. Phân biệt alert cho con người với signal tự động loại traffic; không phải metric anomaly nào cũng nên trigger failover.
+
+---
+
+#### 8. Failover là một state machine
+
+Một failover đáng tin cậy thường có các bước:
+
+```text
+Healthy
+ -> Suspect
+ -> Confirm failure / lose quorum
+ -> Fence old primary
+ -> Promote standby
+ -> Route traffic
+ -> Validate service and data
+ -> Rebuild redundancy
+ -> Controlled failback (nếu cần)
+```
+
+Cần định nghĩa:
+
+- trigger và authority nào quyết định failover;
+- detection timeout và quorum;
+- standby eligibility/freshness;
+- fencing old primary;
+- promotion/routing propagation time;
+- connection retry/client behavior;
+- RTO và possible RPO/data loss;
+- rollback/failback policy;
+- audit trail và operator override.
+
+Failover không nhất thiết hoàn toàn tự động. Với một số disaster hoặc nguy cơ data corruption, human approval có thể an toàn hơn. Mục tiêu là automation đúng mức theo failure mode và business impact.
+
+---
+
+#### 9. Split-brain và fencing
+
+Trong active-passive hoặc leader-based system, network partition có thể khiến cả hai phía nghĩ mình là active:
+
+```text
+Primary A  X  Primary B
+    \           /
+     cùng nhận writes
+```
+
+Hậu quả: conflict, duplicate side effects, invariant violation hoặc data corruption.
+
+Biện pháp:
+
+- quorum/consensus để chỉ majority side tiến triển;
+- leases có semantics/clock assumptions rõ;
+- **fencing token** tăng đơn điệu để storage/downstream từ chối stale leader;
+- STONITH/power fencing trong cluster phù hợp;
+- single-writer ownership;
+- idempotency và reconciliation cho side effects.
+
+Chỉ “promote B” chưa đủ; phải bảo đảm A không còn quyền ghi. DNS hoặc load-balancer routing không fence direct connections/background workers.
+
+---
+
+#### 10. Data replication và failover
+
+##### Synchronous replication
+
+Commit đợi replica/quorum theo policy:
+
+- RPO có thể thấp hơn;
+- write latency tăng;
+- mất replica/quorum có thể giảm availability.
+
+##### Asynchronous replication
+
+Primary acknowledge trước khi replica bắt kịp:
+
+- write latency/availability thường tốt hơn;
+- failover có thể mất acknowledged writes;
+- replica lag và read-after-write anomalies.
+
+Trước promotion cần biết:
+
+- replica đã replay tới LSN/offset nào;
+- có divergent history không;
+- transactions nào acknowledged nhưng chưa replicate;
+- clients có retry tạo duplicate không;
+- schema/config/credentials có đồng bộ không.
+
+Sau failover phải rebuild redundancy sớm; chạy một primary mới không replica biến hệ thống thành SPOF. Replication vẫn không thay backup cho corruption/deletion.
+
+---
+
+#### 11. Geographical redundancy
+
+Multi-region giúp chịu region-scale outage và có thể giảm latency, nhưng thêm:
+
+- cross-region latency và bandwidth cost;
+- data sovereignty/compliance;
+- replication lag/conflict;
+- global traffic routing/DNS propagation;
+- regional dependency và control-plane coupling;
+- khó testing và vận hành;
+- capacity requirement khi một region nhận toàn traffic failover.
+
+Các mô hình:
+
+| Mô hình | Đặc điểm |
+|---|---|
+| Active-active regions | Cả hai phục vụ; nhanh failover nhưng state/conflict/routing phức tạp |
+| Active-passive hot/warm | Primary phục vụ; secondary được đồng bộ và sẵn sàng theo mức |
+| Pilot light/cold DR | Chỉ giữ data/core setup; restore/scale khi disaster, RTO dài hơn |
+
+Multi-AZ thường phục vụ HA cho localized infrastructure failures; multi-region thường gắn với disaster recovery. Boundary phụ thuộc cloud/provider architecture và threat model.
+
+---
+
+#### 12. Self-healing — hữu ích nhưng có giới hạn
+
+Các action tự động phổ biến:
+
+- restart crashed/deadlocked process;
+- replace unhealthy VM/pod;
+- reschedule workload;
+- remove endpoint khỏi LB;
+- scale capacity;
+- promote standby;
+- rollback canary theo SLI.
+
+Self-healing có thể làm sự cố tệ hơn nếu trigger sai:
+
+- restart loop xóa evidence và tăng load;
+- autoscaling khuếch đại connection storm;
+- mass failover do monitoring lỗi;
+- thay nodes liên tục trong khi nguyên nhân là dependency/config chung;
+- promote stale replica gây data loss.
+
+Cần rate limit remediation, cooldown, max attempts, circuit breaker cho automation, audit log, rollback và escalation tới người trực. Tự động hóa phải có observable outcome và safe stop condition.
+
+---
+
+#### 13. Kiểm thử failover
+
+Một sơ đồ redundant chưa chứng minh hệ thống failover được. Cần game days/fault injection kiểm tra:
+
+1. mất một instance;
+2. mất largest failure domain/AZ;
+3. dependency chậm thay vì chết hẳn;
+4. packet loss/network partition;
+5. primary data node failure;
+6. standby lag/stale/misconfigured;
+7. load balancer/DNS/control-plane issue;
+8. failover dưới peak traffic;
+9. deploy đồng thời instance failure;
+10. failback và rebuild redundancy;
+11. client retries/long-lived connections;
+12. RTO, RPO và data correctness/reconciliation.
+
+Trước test cần hypothesis, blast-radius limit, abort condition, owners và rollback. Sau test ghi actual detection, decision, promotion, routing và recovery times thay vì chỉ kết luận “thành công”.
+
+---
+
+#### 14. Bảy câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. High Availability là gì và vì sao quan trọng?**
+
+HA là khả năng giữ service accessible và functional với downtime trong SLO. Nó giảm revenue/user impact của component failures. Câu trả lời tốt cần nêu SLI, measurement window, failure model và các cơ chế như redundancy, detection, failover, capacity và safe deployment.
+
+**Q2. Active-active khác active-passive và chọn khi nào?**
+
+Active-active có nhiều nodes cùng phục vụ, tận dụng capacity và thường chuyển traffic nhanh nhưng state/conflict/routing phức tạp. Active-passive có một active và standby hot/warm/cold, ownership đơn giản hơn nhưng có promotion delay và unused capacity. Chọn theo RTO/RPO, write semantics, SLO, cost và operational maturity.
+
+**Q3. Fault tolerance khác high availability thế nào?**
+
+HA tập trung giảm downtime tổng thể; FT yêu cầu hệ thống tiếp tục đáp ứng capability trong failure model cụ thể khi lỗi đang xảy ra. HA có thể phục hồi qua một gián đoạn ngắn; FT thường cần lỗi được che/absorb. Cả hai đều phải nêu scope và SLO, không hứa “zero impact cho mọi failure”.
+
+**Q4. Graceful degradation là gì và cải thiện UX ra sao?**
+
+Hệ thống giữ core journey bằng cách giảm/tắt chức năng phụ hoặc chất lượng trong giới hạn an toàn. Ví dụ tắt recommendation nhưng giữ checkout; giảm video bitrate. Cần phân loại feature criticality, fallback/freshness contract và đo degraded mode riêng.
+
+**Q5. Load balancer đóng góp gì cho HA?**
+
+LB phân phối traffic, loại unhealthy endpoints và drain connections khi cần. Nhưng LB/control plane phải redundant, health check phải đúng, remaining capacity đủ và state/session không bị giữ cục bộ ngoài recovery contract.
+
+**Q6. Failover là gì và giúp duy trì availability thế nào?**
+
+Failover chuyển traffic/role/workload sang healthy replacement sau khi phát hiện failure. Một câu trả lời đầy đủ gồm detection, fencing, standby freshness, promotion, routing propagation, validation, RTO/RPO và rebuild redundancy—not chỉ “chuyển sang server phụ”.
+
+**Q7. Health monitoring và self-healing cải thiện reliability ra sao?**
+
+Monitoring rút ngắn detection và cung cấp signal cho alert/automation; self-healing thực hiện action như remove, restart, replace, scale hoặc rollback. Signal sai có thể gây flapping/mass remediation, nên cần readiness/liveness đúng, hysteresis, rate limit, audit và human escalation.
+
+---
+
+#### 15. Sai lầm thường gặp
+
+- Có hai instances nhưng cùng host/AZ/control dependency.
+- Gọi active-active dù data writes vẫn có một unprotected primary.
+- N+1 theo số instance nhưng không tính largest failure-domain loss.
+- Standby chưa từng nhận traffic, credential/schema đã stale.
+- Health check chỉ trả 200 từ process, không phản ánh critical capability.
+- Dùng liveness check cho transient dependency và tạo restart storm.
+- Auto-failover không fencing old primary, gây split-brain.
+- Tin DNS update tức thời dù resolver/client cache và connection còn tồn tại.
+- Failover thành công nhưng phần còn lại không đủ capacity.
+- Không tính acknowledged data loss với async replica.
+- Failback ngay sau sự cố, tạo outage thứ hai.
+- Self-healing xóa evidence hoặc lặp remediation vô hạn.
+- Multi-region nhưng cùng identity/config/deploy pipeline là common-mode SPOF.
+- Không đo degraded service, chỉ nhìn uptime.
+
+---
+
+#### 16. Checklist thiết kế HA/failover
+
+1. SLI/SLO và critical capability là gì?
+2. Failure model: instance, host, AZ, region, network, data, deploy?
+3. Required capacity sau largest failure-domain loss?
+4. Active-active, hot/warm/cold standby hay N+K, vì sao?
+5. State/session placement và data consistency/RPO?
+6. Health signal, detection threshold và false positive policy?
+7. Ai có authority quyết định failover?
+8. Old primary được fencing thế nào?
+9. Standby eligibility và freshness được xác minh ra sao?
+10. Routing/DNS/connection propagation mất bao lâu?
+11. Client retry/idempotency behavior trong chuyển đổi?
+12. Graceful degradation và load shedding path?
+13. Failover hoàn tất thì rebuild redundancy thế nào?
+14. Failback tự động hay thủ công, sau điều kiện nào?
+15. LB/control plane/credentials có SPOF không?
+16. Observability phân tách detection, promotion, routing, recovery times?
+17. Game day đã kiểm tra under load, data correctness, RTO/RPO chưa?
+18. Cost và complexity có tương xứng business SLO không?
+
+#### 17. Ý chính cần nhớ
+
+- HA giảm downtime; FT tiếp tục capability trong failure model; failover là cơ chế chuyển đổi.
+- Redundancy chỉ hữu ích khi placement, health, synchronization và capacity đúng.
+- N+1 phải tính failure domain, không chỉ đếm instances.
+- Active-active tận dụng capacity nhưng tăng state/conflict/routing complexity.
+- Active-passive đơn giản hơn nhưng standby freshness và promotion delay là rủi ro.
+- Graceful degradation bảo vệ core journey, nhưng không được bỏ correctness/security.
+- Load balancer, health checks và control plane cũng phải HA.
+- Failure detection là bài toán uncertainty; cần threshold và hysteresis phù hợp.
+- Failover là state machine có detection, fencing, promotion, routing, validation và rebuild.
+- Không fencing old primary có thể gây split-brain và data corruption.
+- Async replication có thể gây acknowledged data loss khi failover.
+- Self-healing cần guardrails vì automation sai có thể khuếch đại outage.
+- Failover/failback phải được thử dưới tải và đo RTO/RPO/correctness thực tế.
+
+#### Công thức ghi nhớ
+
+> **HA thực tế = redundancy qua failure domains + capacity sau failure + health signal đúng + failover có fencing + state/data đủ mới + degradation an toàn + game day chứng minh RTO/RPO.**
+
+---
+
+### Bài 54. Backup & Recovery Strategies
+
+#### 1. Backup và recovery là gì?
+
+- **Backup:** bản sao dữ liệu ở một recovery point, được quản lý độc lập đủ để bảo vệ trước các failure trong threat model.
+- **Restore:** đưa dữ liệu/cấu hình từ backup trở lại storage/system.
+- **Recovery:** toàn bộ quá trình khôi phục capability kinh doanh—gồm hạ tầng, ứng dụng, dữ liệu, secrets, routing, validation và mở traffic.
+
+```text
+Backup tạo khả năng khôi phục
+Restore đưa dữ liệu trở lại
+Recovery đưa business service trở lại trạng thái đúng
+```
+
+Một file backup restore được chưa chắc đã làm hệ thống recovery được. Có thể vẫn thiếu encryption key, schema version, configuration, identity, DNS, dependencies hoặc runbook.
+
+> **Backup chỉ có giá trị khi có thể restore đúng dữ liệu và khôi phục service trong RTO/RPO đã cam kết.**
+
+---
+
+#### 2. Backup không phải replication
+
+| Replication | Backup |
+|---|---|
+| Thường cập nhật gần real time | Giữ recovery points theo thời gian/retention |
+| Tối ưu availability/read scale/failover | Tối ưu khôi phục từ loss/corruption/deletion |
+| Bad write/delete/ransomware có thể lan tới replicas | Có thể quay về point trước sự cố nếu bản sao còn nguyên |
+| Thường cùng logical system/control plane | Nên độc lập về access/failure domain và có immutable/offline copy |
+
+Replication giúp dịch vụ tiếp tục khi node hỏng; backup giúp quay lại trạng thái lành khi state hiện tại đã sai. Một hệ thống resilient thường cần cả hai.
+
+Lấy backup từ replica có thể giảm tải primary, nhưng cần xác minh replica consistent và đủ mới. Replica dùng làm nguồn backup không khiến replica tự trở thành backup độc lập; corruption/delete vẫn có thể đã replicate sang đó.
+
+---
+
+#### 3. Backup bảo vệ trước những gì?
+
+Threat model thường gồm:
+
+- accidental delete/update;
+- software bug hoặc bad migration gây corruption;
+- hardware/storage failure;
+- operator hoặc automation error;
+- ransomware/credential compromise;
+- region/account/control-plane loss;
+- retention/compliance/legal discovery;
+- silent corruption chỉ phát hiện sau nhiều ngày;
+- dependency/vendor outage hoặc account lockout.
+
+Mỗi threat dẫn tới yêu cầu khác. Cross-region copy không bảo vệ khi compromised credential có quyền xóa cả hai vùng. Immutable backup không giải quyết việc đã sao lưu dữ liệu lỗi trong nhiều ngày nếu retention quá ngắn.
+
+---
+
+#### 4. Xác định backup scope
+
+Không chỉ sao lưu database. Recovery của một service có thể cần:
+
+- relational/NoSQL databases;
+- object/file storage và metadata;
+- message/event logs cần replay;
+- search index nếu không rebuild kịp RTO;
+- schemas/migrations và application artifacts;
+- infrastructure as code và deployment manifests;
+- configuration, feature flags và routing rules;
+- identity/IAM mappings;
+- encryption keys/certificates với quy trình khôi phục riêng;
+- external dependency state/identifiers;
+- backup catalog, inventory và recovery runbooks.
+
+Không nên đặt duy nhất encryption key để giải mã backup trong chính hệ thống có thể mất. Nhưng bản sao key cũng phải được bảo vệ nghiêm ngặt, audit và rotation/revocation đúng quy trình.
+
+---
+
+#### 5. Full, incremental và differential backup
+
+| Loại | Sao lưu gì? | Restore cần gì? | Trade-off |
+|---|---|---|---|
+| **Full** | Toàn bộ data theo scope | Một full backup set | Backup window/storage lớn; restore đơn giản hơn |
+| **Incremental** | Changes từ backup gần nhất, full hoặc incremental | Full nền + toàn bộ incrementals đúng thứ tự | Backup nhanh/nhỏ; chain dài làm restore và failure risk phức tạp |
+| **Differential** | Mọi changes từ full gần nhất | Full nền + differential mới nhất | Restore đơn giản hơn incremental; differential lớn dần |
+
+Ví dụ:
+
+```text
+Chủ nhật: Full F0
+Thứ hai: Incremental I1 (sau F0)
+Thứ ba: Incremental I2 (sau I1)
+Restore thứ ba = F0 + I1 + I2
+
+Thứ hai: Differential D1 (từ F0)
+Thứ ba: Differential D2 (từ F0)
+Restore thứ ba = F0 + D2
+```
+
+Nếu một incremental trong chain hỏng, recovery point sau nó có thể không dùng được. Vì vậy phải kiểm tra chain integrity và thực hiện synthetic full/new full định kỳ theo sản phẩm/workload.
+
+---
+
+#### 6. Physical, logical, snapshot và log-based backup
+
+##### 6.1 Physical backup
+
+Sao chép storage pages/files/blocks theo format của engine. Thường restore nhanh cho dataset lớn nhưng phụ thuộc engine/version/topology và cần consistency protocol.
+
+##### 6.2 Logical backup
+
+Export records/schema/commands ở logical level. Portable và hữu ích khi chọn lọc objects, nhưng export/restore rất lớn có thể chậm và không giữ mọi physical metadata.
+
+##### 6.3 Storage/database snapshot
+
+Snapshot là point-in-time view/copy, có thể copy-on-write và nhanh lúc tạo. Nhưng crash-consistent volume snapshot chưa chắc **application-consistent** cho database nhiều volumes hoặc distributed services. Cần engine-aware snapshot, quiesce/checkpoint hoặc coordinated mechanism.
+
+Snapshot cùng account/volume/control plane có thể bị xóa cùng production. Cần copy/export độc lập theo threat model.
+
+##### 6.4 Log-based backup và PITR
+
+Kết hợp base backup với transaction logs như WAL/binlog để replay tới thời điểm cụ thể:
+
+```text
+base backup -> replay logs -> dừng ngay trước bad operation
+```
+
+PITR hữu ích cho accidental delete/corruption. RPO thực tế phụ thuộc log shipping/archive interval và chain completeness. Cần biết timezone, transaction boundary, target timestamp/LSN và cách tìm “thời điểm trước sự cố”.
+
+---
+
+#### 7. RTO và RPO
+
+##### RTO — Recovery Time Objective
+
+Thời gian gián đoạn tối đa business chấp nhận trước khi capability phải được phục hồi.
+
+##### RPO — Recovery Point Objective
+
+Khoảng mất dữ liệu tối đa business chấp nhận, đo theo thời gian giữa recovered state và thời điểm incident.
+
+```text
+Incident time                   Service restored
+      |<-- possible data loss -->|<-- recovery time -->|
+              RPO                         RTO
+```
+
+Ví dụ:
+
+- `RPO = 15 phút`: recovered data không được cũ hơn 15 phút theo target;
+- `RTO = 1 giờ`: service phải trở lại trong một giờ theo recovery definition.
+
+Backup chạy mỗi 15 phút không tự chứng minh RPO 15 phút: job có thể thất bại, upload chưa hoàn tất hoặc bản sao hỏng. Restore duration không chỉ phụ thuộc download—còn provision, decrypt, replay logs, validate, reconnect dependencies và route traffic.
+
+RTO/RPO phải được đặt theo business impact cho từng capability/data class. Mục tiêu gần zero thường đòi replication/log shipping/hot capacity và chi phí cao, nhưng backup lịch sử vẫn cần để phục hồi corruption/ransomware.
+
+---
+
+#### 8. Cold, warm và hot recovery
+
+| Chiến lược | Trạng thái recovery environment | RTO/chi phí tương đối |
+|---|---|---|
+| **Cold** | Backup có sẵn; hạ tầng/app phải provision và restore | RTO dài nhất, chi phí thường thấp nhất |
+| **Warm** | Một phần hạ tầng/data/config đã chuẩn bị; cần scale/restore/start | Trung gian |
+| **Hot** | Secondary environment đang chạy và gần/đủ synchronized để takeover | RTO ngắn nhất, chi phí/complexity cao nhất |
+
+“Hot backup” đôi khi còn dùng để chỉ backup lấy khi database đang online; không nên nhầm với **hot recovery site/standby**. Khi giao tiếp cần định nghĩa thuật ngữ rõ.
+
+Recovery tier là business decision dựa trên RTO/RPO, criticality, incident likelihood, cost và team maturity. Có thể dùng nhiều tier trong cùng hệ thống: payment ledger hot/warm, analytics cold.
+
+---
+
+#### 9. Quy tắc 3-2-1 và phiên bản mở rộng
+
+**3-2-1:**
+
+- ít nhất **3** copies gồm production và backups;
+- trên **2** loại media/system độc lập phù hợp;
+- ít nhất **1** copy off-site.
+
+Với ransomware và cloud control-plane risk, thường mở rộng thành **3-2-1-1-0**:
+
+- thêm **1** copy offline, air-gapped hoặc immutable;
+- **0** lỗi chưa được phát hiện qua verification/restore tests.
+
+Đây là guideline, không phải chứng nhận tự động. Hai buckets khác nhau nhưng cùng account/admin credential có thể chưa đủ independence. Cần phân tách account/project, credentials, delete authority, region/provider theo threat model.
+
+---
+
+#### 10. Immutability và chống ransomware
+
+Backup phải chống việc attacker/automation xóa hoặc mã hóa mọi recovery point:
+
+- object lock/WORM retention;
+- immutable vault theo thời hạn;
+- offline/air-gapped copy;
+- separate account/tenant và credentials;
+- MFA/quorum approval cho destructive actions;
+- least privilege: backup writer không có quyền delete/shorten retention;
+- audit logs gửi sang nơi độc lập;
+- anomaly alerts khi volume delete/encryption tăng;
+- key protection và break-glass procedure.
+
+Immutability có trade-off storage/compliance: dữ liệu bị legal hold hoặc retention lock có thể không xóa được trước hạn. Thiết kế phải phối hợp security, privacy và regulatory requirements.
+
+---
+
+#### 11. Retention và lifecycle
+
+Retention không chỉ là “giữ 30 ngày”. Cần xét:
+
+- phát hiện corruption chậm đến mức nào;
+- daily/weekly/monthly/yearly recovery points;
+- compliance và legal hold;
+- data deletion/privacy obligations;
+- storage tier retrieval delay;
+- encryption-key lifetime;
+- application/schema version còn restore được không;
+- cost của storage, API, egress và restore.
+
+Ví dụ grandfather-father-son:
+
+```text
+daily:  30 ngày
+weekly: 12 tuần
+monthly: 12 tháng
+yearly: 7 năm (nếu business/compliance yêu cầu)
+```
+
+Lifecycle tiering giảm storage cost nhưng archival retrieval có thể phá RTO nếu restore cần nhiều giờ mới bắt đầu. Phải benchmark end-to-end recovery từ đúng storage tier.
+
+---
+
+#### 12. Backup cho microservices và distributed data
+
+Mỗi service sở hữu datastore riêng làm backup scope phân tán. Snapshot từng database cùng timestamp không tạo **global transactionally consistent snapshot**.
+
+Cần xác định recovery semantics:
+
+- khôi phục từng service độc lập hay toàn business workflow;
+- shared identifiers và version compatibility;
+- event log có còn đủ để replay không;
+- outbox/inbox offsets và consumer progress;
+- derived data nào rebuild được;
+- cross-service invariants được reconcile thế nào;
+- recovery order của identity, config, database, broker, services và routing.
+
+Một chiến lược thực dụng:
+
+1. inventory data owners và criticality;
+2. đặt RTO/RPO/retention theo service/data class;
+3. dùng engine-native consistent backups/PITR;
+4. giữ event/audit history để replay/reconcile trong giới hạn;
+5. backup config/IaC/secrets recovery metadata;
+6. catalog dependencies và restore order;
+7. tự động hóa environment rebuild;
+8. diễn tập scenario khôi phục business transaction end-to-end.
+
+Không nên sao lưu cache và derived search index nếu rebuild chắc chắn nằm trong RTO; nhưng phải đo rebuild time và source availability.
+
+---
+
+#### 13. Database hàng terabyte với downtime tối thiểu
+
+Thiết kế thường kết hợp:
+
+- online engine-aware physical/base backup hoặc consistent snapshot;
+- incremental/block-level/log-based backups;
+- continuous WAL/binlog archiving cho PITR;
+- backup từ replica để giảm primary I/O nếu consistency được xác minh;
+- rate limiting/QoS để backup không phá production SLO;
+- compression trước encryption theo tool design, dedup nếu phù hợp;
+- encryption và checksum/manifests;
+- parallel upload/restore có giới hạn;
+- tiered retention và independent immutable copy;
+- restore gần compute/data destination để tránh network bottleneck;
+- periodic full-scale restore benchmark.
+
+Backup window nhỏ không bảo đảm restore nhanh. Với TB-scale data, thường chính download, decompression, data load, log replay và index/cache warm-up quyết định RTO.
+
+---
+
+#### 14. Restore testing — tiêu chuẩn thật của backup
+
+Các mức kiểm thử:
+
+1. **Job success:** backup tool báo hoàn tất.
+2. **Integrity verification:** checksum, manifest và chain đầy đủ.
+3. **Technical restore:** restore vào isolated environment.
+4. **Application validation:** schema, queries, constraints, sampled records, auth và dependencies hoạt động.
+5. **Business reconciliation:** counts/totals/invariants và critical transactions đúng.
+6. **Full DR exercise:** rebuild environment, restore, replay, switch traffic và đo RTO/RPO.
+
+Một restore drill phải ghi:
+
+- recovery point được chọn;
+- restore bắt đầu/kết thúc khi nào;
+- actual data loss/freshness;
+- throughput và bottlenecks;
+- manual steps/credentials/approvals;
+- validation criteria;
+- deviations so với runbook;
+- owner và deadline khắc phục.
+
+Test trên isolated account/network để tránh ghi nhầm production, gửi email/payment thật hoặc làm lộ sensitive backup data. Dữ liệu restore test vẫn phải tuân thủ bảo mật và deletion policy.
+
+---
+
+#### 15. Cloud storage — đơn giản và phức tạp hơn ở đâu?
+
+**Đơn giản hóa:**
+
+- elastic/durable object storage;
+- managed snapshots/backups/PITR;
+- lifecycle/tiering;
+- cross-region copy;
+- encryption/KMS, object lock và policy automation;
+- backup inventory/reporting.
+
+**Tạo thêm concerns:**
+
+- account/IAM/KMS là hidden dependency;
+- vendor format/API lock-in;
+- snapshot scope/consistency semantics;
+- region/service/control-plane outage;
+- storage + API + egress + retrieval cost;
+- data residency/compliance;
+- retention lock và key deletion;
+- default settings không đồng nghĩa business RTO/RPO.
+
+Managed service giảm undifferentiated operations nhưng responsibility về policy, access, restore test, retention và compliance vẫn thuộc tổ chức sử dụng.
+
+---
+
+#### 16. Tám câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Full, incremental và differential backup khác nhau thế nào?**
+
+Full sao lưu toàn scope và restore từ một set; incremental lấy changes từ backup gần nhất nên nhỏ/nhanh nhưng cần cả chain; differential lấy changes từ full gần nhất nên lớn dần nhưng restore chỉ cần full + differential mới nhất. Chọn theo backup window, storage, chain risk và RTO thực tế.
+
+**Q2. Định nghĩa và cân bằng RTO/RPO trong distributed system?**
+
+RTO là thời gian tối đa để phục hồi capability; RPO là mức mất dữ liệu tối đa theo thời gian. Phân tier theo business journey/data class, rồi thiết kế backup frequency/log shipping, restore automation và standby tương ứng. Xác minh bằng drills, không suy luận chỉ từ cấu hình.
+
+**Q3. Cold, warm và hot recovery là gì?**
+
+Cold cần provision/rebuild/restore khi sự cố; warm có một phần hạ tầng/data sẵn; hot có secondary gần hoặc hoàn toàn sẵn sàng takeover. RTO giảm khi đi từ cold tới hot, còn cost/complexity thường tăng. Nêu rõ hot recovery khác online/hot backup.
+
+**Q4. Thiết kế backup cho cloud microservices thế nào?**
+
+Inventory data owners/dependencies, phân tier RTO/RPO/retention, dùng engine-native consistent backups/PITR, sao lưu IaC/config/key-recovery metadata, copy sang account/region độc lập và immutable, mã hóa/monitor, tự động restore environment, rồi test business workflow/reconciliation end-to-end.
+
+**Q5. Trade-offs của backup/recovery cho HA service?**
+
+Cost với recovery speed; backup overhead với RPO; full simplicity với incremental efficiency; storage với retention; immutability với deletion/compliance; portability với managed convenience; automation speed với safety controls. HA replication không loại nhu cầu historical backup.
+
+**Q6. Cloud storage đơn giản hoặc làm phức tạp backup ra sao?**
+
+Nó cung cấp durable storage, snapshots, lifecycle, geo-copy và automation; đổi lại tạo IAM/KMS/control-plane dependency, cost/egress, data residency, vendor-format và restore-throughput concerns. Guarantee phải được ánh xạ sang RTO/RPO của business.
+
+**Q7. Best practices cho automation và testing?**
+
+Policy as code, scheduled/monitored jobs, checksums/catalog, encryption, least privilege, 3-2-1 cùng immutable/offline copy, alerts về freshness/failure/capacity, restore vào isolated environment và DR drills đo actual RTO/RPO/correctness.
+
+**Q8. Backup database hàng TB với downtime tối thiểu?**
+
+Dùng online engine-consistent base backup/snapshot, continuous logs/PITR, incremental backup, có thể offload từ verified replica, throttle production impact, parallelize có giới hạn, encrypt/checksum và đặt copies ở independent tiers. Benchmark full restore/replay/warm-up; đừng chỉ đo thời gian tạo snapshot.
+
+---
+
+#### 17. Sai lầm thường gặp
+
+- Coi replica hoặc snapshot cùng production account là đủ backup.
+- Chỉ nhìn “backup job succeeded”, chưa restore/validate.
+- Backup database nhưng quên keys, config, IAM, schema và dependency order.
+- Chạy snapshot nhiều volumes mà không có consistency coordination.
+- Đặt RPO bằng schedule mà không đo failed/missing backups.
+- Đặt RTO bằng download time, bỏ qua provision/decrypt/replay/validation/routing.
+- Full backup quá hiếm làm incremental chain dài và dễ hỏng.
+- Retention ngắn hơn thời gian phát hiện silent corruption.
+- Backup writable/deletable bởi cùng compromised production credential.
+- Mã hóa backup nhưng không có key-recovery plan hoặc xóa key quá sớm.
+- Không tính archival retrieval/egress/API cost và delay.
+- Restore drill dùng production integrations và gây side effect thật.
+- Khôi phục từng microservice nhưng không reconcile workflow/invariants.
+- Không test schema/app version compatibility với backup cũ.
+
+---
+
+#### 18. Checklist backup và recovery
+
+1. Threat model gồm delete, corruption, ransomware, account/region loss nào?
+2. Data/services/config/keys nào nằm trong recovery scope?
+3. RTO/RPO/retention theo từng business tier?
+4. Backup là full/incremental/differential, physical/logical/snapshot/log-based?
+5. Backup có application/database consistency không?
+6. PITR logs có liên tục, cataloged và kiểm tra chain không?
+7. Copies có independent account/region/media/failure domain không?
+8. Có immutable/offline/air-gapped copy chống ransomware không?
+9. Encryption at rest/in transit và key recovery/rotation?
+10. Least privilege, separation of duties và destructive-action approval?
+11. Backup freshness/failure/capacity/integrity alerts?
+12. Lifecycle tier có retrieval time phù hợp RTO không?
+13. Restore order và dependency graph được ghi trong runbook chưa?
+14. Infrastructure/application artifacts có thể rebuild tương thích không?
+15. Restore test gần nhất đo actual RTO/RPO bao nhiêu?
+16. Validation có technical, application và business reconciliation không?
+17. Drill environment có isolated khỏi production side effects không?
+18. Recovery action items có owner và được retest không?
+
+#### 19. Ý chính cần nhớ
+
+- Backup tạo recovery point; restore đưa data lại; recovery khôi phục business capability.
+- Replication phục vụ availability nhưng không thay historical/independent backup.
+- Backup scope phải gồm data, config, schemas, artifacts, IAM và key-recovery metadata cần thiết.
+- Full đơn giản khi restore; incremental tiết kiệm nhưng phụ thuộc chain; differential nằm giữa.
+- Snapshot phải có consistency semantics rõ và được copy ra khỏi shared failure/control domain.
+- PITR cần base backup + continuous complete log chain.
+- RTO đo thời gian phục hồi capability; RPO đo mức mất dữ liệu chấp nhận được.
+- Backup schedule không tự chứng minh RPO; restore speed không chỉ là download speed.
+- Cold/warm/hot recovery đánh đổi cost và operational complexity lấy RTO.
+- 3-2-1 nên bổ sung immutable/offline copy và verification trong ransomware threat model.
+- Retention phải dài hơn detection horizon và phù hợp compliance/deletion requirements.
+- Distributed recovery cần restore order, replay và business reconciliation.
+- Backup chỉ được coi là usable sau khi restore và validation thành công.
+- DR drill phải đo actual RTO, actual recovery point và data correctness.
+
+#### Công thức ghi nhớ
+
+> **Backup đáng tin = recovery scope đầy đủ + recovery points độc lập/immutable + consistency được bảo đảm + retention đúng threat model + keys/runbook sẵn sàng + restore drill chứng minh RTO/RPO và correctness.**
+
+---
+
+### Bài 55. Disaster Recovery in Practice
+
+#### 1. Disaster Recovery là phục hồi business capability
+
+Backup trả lời:
+
+> Có thể lấy lại dữ liệu từ một recovery point không?
+
+Disaster Recovery (DR) trả lời rộng hơn:
+
+> Sau một disruption lớn, có thể khôi phục đúng capability kinh doanh, trong RTO/RPO, với con người và quy trình hiện có không?
+
+DR bao gồm:
+
+- tuyên bố/đánh giá disaster;
+- điều phối incident và communication;
+- provision/activate recovery environment;
+- phục hồi identity, network, compute, data và dependencies;
+- failover/cutover traffic;
+- kiểm tra correctness và security;
+- vận hành ở degraded/recovery site;
+- rebuild redundancy;
+- failback có kiểm soát;
+- post-incident reconciliation.
+
+Một backup thành công không bảo đảm ứng dụng chạy lại nhanh. Một failover nhanh cũng không bảo vệ trước data corruption/ransomware. DR trưởng thành phối hợp **backup + failover + recovery operations + business continuity**.
+
+---
+
+#### 2. Disaster khác sự cố component thông thường
+
+High Availability thường xử lý localized failures bằng redundancy tự động. DR nhắm tới các sự kiện lớn hoặc kéo dài:
+
+- mất toàn region/data center/account;
+- ransomware hoặc credential compromise;
+- corruption lan qua replicas;
+- major cloud/provider/control-plane outage;
+- natural disaster, power/network disruption;
+- bad deploy/schema/config toàn fleet;
+- key/certificate/identity outage;
+- mất nhân sự/site vận hành;
+- supplier/third-party outage kéo dài;
+- regulatory/security event buộc cô lập production.
+
+```text
+Localized failure -> HA/failover thường xử lý
+Large-scale/correlated failure -> kích hoạt DR plan
+```
+
+Ranh giới phụ thuộc business và architecture. “Mất một AZ” có thể là routine failover với hệ thống multi-AZ nhưng là disaster với hệ thống single-AZ.
+
+---
+
+#### 3. Business Impact Analysis (BIA)
+
+Không bắt đầu DR bằng việc chọn multi-region. Bắt đầu bằng BIA:
+
+1. xác định business processes và critical user journeys;
+2. định lượng tác động theo thời gian: doanh thu, an toàn, pháp lý, dữ liệu, uy tín;
+3. xác định maximum tolerable disruption/downtime;
+4. đặt RTO, RPO và minimum service level;
+5. lập dependency map: người, application, data, identity, network, vendor;
+6. phân tier phục hồi;
+7. xác định owner và recovery sequence;
+8. so sánh cost của controls với loss avoided/risk appetite.
+
+Ví dụ tier:
+
+| Tier | Ví dụ | Recovery expectation |
+|---|---|---|
+| Tier 0 | Identity, DNS/control, encryption-key recovery | Khôi phục trước hoặc đồng thời mọi service phụ thuộc |
+| Tier 1 | Payment/checkout/core ledger | RTO/RPO rất thấp, minimum critical features |
+| Tier 2 | Catalog/search/customer support | RTO trung bình, có cached/degraded mode |
+| Tier 3 | Analytics/reports/internal batch | RTO dài hơn, có thể rebuild từ source |
+
+Nếu tất cả services đều Tier 1, thực tế chưa có prioritization và plan khó thực thi khi resource hạn chế.
+
+---
+
+#### 4. RTO/RPO phải là end-to-end objectives
+
+- **RTO:** từ disruption/activation point theo định nghĩa đến khi business capability đạt acceptance criteria.
+- **RPO:** recovered state được phép lùi tối đa bao xa so với disaster time.
+
+RTO cần bao gồm:
+
+```text
+detection + decision + mobilization + provision
++ restore/replicate + replay + validate
++ route traffic + warm up + business sign-off
+```
+
+RPO cần xét từng datastore và transaction workflow. Database có `RPO = 0` nhưng object store/event/identity state cũ 30 phút vẫn có thể làm business workflow không nhất quán.
+
+Thấp hơn không phải lúc nào tốt hơn: RTO/RPO ngắn làm tăng infrastructure cost, replication coordination, operational complexity và testing burden. Hãy đặt theo BIA/SLA/compliance, không theo khả năng hấp dẫn của công nghệ.
+
+---
+
+#### 5. Các recovery architecture patterns
+
+| Pattern | Recovery environment | RTO/RPO/cost tương đối |
+|---|---|---|
+| **Backup & restore** | Chưa có runtime; dựng lại từ IaC và backup | RTO dài, chi phí thấp |
+| **Pilot light** | Core data/services tối thiểu luôn tồn tại | RTO ngắn hơn cold; cần scale/activate phần còn lại |
+| **Warm standby** | Bản thu nhỏ đang chạy, replicated data | RTO trung bình-thấp; cần scale và cutover |
+| **Hot standby** | Gần full capacity, sẵn sàng takeover | RTO thấp; cost/complexity cao |
+| **Multi-site active-active** | Nhiều sites cùng phục vụ | Potentially rất thấp, nhưng state/conflict/routing khó nhất |
+
+Architecture label không chứng minh target. Pilot light thiếu image/config mới hoặc warm standby không đủ quota vẫn trượt RTO. Mỗi pattern phải được kiểm thử với actual data volume và peak capacity.
+
+---
+
+#### 6. Reference DR design cho high-traffic web application
+
+```text
+Users
+  -> global traffic management / DNS
+       -> Region A (primary/active)
+       |    -> app capacity
+       |    -> data primary/replicas
+       |
+       -> Region B (warm/hot/active)
+            -> tested app capacity
+            -> replicated/recoverable data
+
+Independent backup vault/account/region
+Observability + incident command + automation
+```
+
+Thiết kế theo từng layer:
+
+- global routing không phụ thuộc duy nhất region lỗi;
+- application artifacts/config/secrets/IAM có ở recovery region;
+- quotas, certificates, domains và third-party allowlists đã sẵn sàng;
+- data replication mode phù hợp RPO;
+- immutable backups xử lý corruption/ransomware;
+- queues/events/offsets và background jobs có recovery semantics;
+- capacity đủ sau region loss và traffic surge;
+- feature flags để chạy minimum viable service;
+- observability hoạt động độc lập với primary;
+- DR runbook và activation authority rõ.
+
+---
+
+#### 7. Failover và backup giải hai failure class khác nhau
+
+| Scenario | Failover | Backup/restore |
+|---|---|---|
+| Compute/AZ failure, data còn lành | Phù hợp, nhanh | Thường không phải bước đầu |
+| Region outage | Cross-region failover nếu có | Dùng nếu secondary không sẵn/không đủ |
+| Accidental delete | Có thể chuyển sang replica đã bị delete theo | PITR/backup trước delete |
+| Logical corruption | Có thể lan sang standby | Historical clean recovery point |
+| Ransomware/account compromise | Active site khác có thể cũng bị ảnh hưởng | Immutable/offline, separate authority |
+
+Mature DR plan có decision tree: khi nào failover, khi nào restore, khi nào cô lập cả hai và dựng clean environment. Failover sang corrupted replica chỉ làm outage nhanh hơn, không recovery.
+
+---
+
+#### 8. Recovery orchestration và thứ tự phụ thuộc
+
+Một sequence mẫu:
+
+1. xác minh scope, security và tuyên bố disaster;
+2. freeze risky automation/deploys/writes nếu cần;
+3. bảo toàn evidence và chọn clean recovery point;
+4. kích hoạt incident command/communication;
+5. tạo hoặc xác minh recovery network/account/identity/KMS;
+6. restore/promote data services theo dependency order;
+7. fence old writers và thiết lập single source of truth;
+8. restore brokers, object stores, caches/read models cần thiết;
+9. deploy application/config/schema tương thích;
+10. replay logs/events và reconcile business invariants;
+11. chạy technical/security/business validation;
+12. mở traffic theo canary/percentage;
+13. theo dõi capacity, errors, lag và correctness;
+14. công bố recovered mode, duy trì change freeze phù hợp;
+15. rebuild redundancy và chuẩn bị failback.
+
+Automation nên orchestration các bước deterministic; các quyết định như chọn recovery point sau corruption hoặc xác nhận data correctness thường cần con người có thẩm quyền.
+
+---
+
+#### 9. Traffic failover không tức thời
+
+Các cách phổ biến:
+
+- global anycast/load balancer;
+- DNS health-based/weighted routing;
+- CDN/edge origin failover;
+- service discovery/control plane;
+- client-side endpoint list.
+
+Điểm cần tính:
+
+- DNS TTL không bảo đảm mọi resolver tuân thủ đúng thời điểm;
+- clients có cached IP và connection pools;
+- long-lived TCP/WebSocket connections cần reconnect;
+- TLS certificates, WAF/rules và firewall allowlists ở DR region;
+- health signal có thể false-positive/negative;
+- routing plane cũng có thể nằm trong region lỗi;
+- global route đổi trước khi data ready gây lỗi lớn hơn;
+- traffic shift cần rate limit/canary để tránh cold-cache overload.
+
+RTO phải đo đến khi users thật được route và critical journey hoạt động, không dừng lúc “DNS record đã update”.
+
+---
+
+#### 10. Geo-replication, consistency và data loss
+
+##### Synchronous cross-region
+
+- có thể giảm RPO;
+- tăng write latency và phụ thuộc network/quorum;
+- partition có thể làm write unavailable để giữ safety.
+
+##### Asynchronous cross-region
+
+- latency/availability thường tốt hơn;
+- replica lag tạo RPO và acknowledged-write loss khi promote;
+- cần conflict/idempotency/reconciliation nếu nhiều writers.
+
+Khi failover, ghi lại cutover boundary bằng LSN/offset/epoch và đối chiếu:
+
+- transaction nào confirmed ở old region;
+- transaction nào có ở new region;
+- client retries có tạo duplicate không;
+- downstream side effects đã xảy ra chưa;
+- event log/read model có cần replay/rebuild không.
+
+“Replication real time” là từ mơ hồ; cần số liệu p95/p99 lag, behavior khi partition và acknowledgement guarantee.
+
+---
+
+#### 11. Quorum-based design — đúng phạm vi và giới hạn
+
+Với 5 voting nodes, majority quorum thường là 3. Điều này giúp hai nhóm partition không cùng có majority và cùng commit conflicting leader histories.
+
+```text
+5 voters -> quorum 3
+partition 3/2 -> phía 3 có thể tiến triển; phía 2 không
+```
+
+Nhưng quorum không tự bảo đảm availability cho mọi region failure:
+
+- nếu mất region chứa 3/5 voters, còn 2/5 nên không có quorum;
+- hai region với voter placement không hợp lý gây khó đảm bảo vừa region survival vừa latency;
+- witness/third failure domain có thể giúp election topology nhưng không thay data capacity;
+- quorum service phụ thuộc network latency và failure detection;
+- reconfiguration trong incident cần protocol an toàn.
+
+Quorum/consensus bảo vệ safety trong failure model; khi thiếu quorum, dừng tiến triển có thể là hành vi đúng. DR topology phải chọn voter placement theo region-loss scenario và kiểm thử thật.
+
+---
+
+#### 12. Geo-distributed DR challenges
+
+- **Consistency:** cross-region state không đồng bộ tức thời.
+- **Latency:** replication/quorum/routing xa làm operation chậm.
+- **Split-brain:** nhiều regions nhận vai trò writer nếu fencing/consensus sai.
+- **Data residency:** không được sao chép dữ liệu sang khu vực không hợp lệ.
+- **Capacity:** recovery site nhỏ không chịu được full production load.
+- **Dependencies:** payment/email/identity vendors có thể chưa allowlist region mới.
+- **Control plane:** IAM, DNS, KMS, CI/CD hoặc observability cùng hỏng.
+- **Configuration drift:** standby lâu không chạy nên version/config khác primary.
+- **Cost:** idle capacity, egress, replica, drills và people/on-call.
+- **Operations:** nhiều systems phải cut over theo đúng sequence.
+
+Geo-redundancy có thể giảm một loại SPOF nhưng tạo coordination complexity. Chỉ dùng khi risk/SLO biện minh và đội ngũ có khả năng vận hành.
+
+---
+
+#### 13. DR cho ransomware và security disaster
+
+Không thể đơn giản auto-failover nếu attacker còn quyền truy cập:
+
+1. cô lập compromised identities/accounts/networks;
+2. bảo toàn forensic evidence;
+3. xác định blast radius và earliest clean point;
+4. rotate/rebuild trust: credentials, keys, certificates, images;
+5. dựng clean room/recovery environment;
+6. restore immutable verified data;
+7. scan/validate trước kết nối lại;
+8. reconcile business data và mở traffic dần;
+9. theo dõi reinfection/unauthorized access.
+
+DR plan cần separation of duties, break-glass access, offline contact/runbook và phương thức communication không phụ thuộc corporate identity đang bị compromise.
+
+---
+
+#### 14. Con người, quyền quyết định và communication
+
+Một plan kỹ thuật tốt vẫn thất bại nếu không rõ:
+
+- ai có quyền tuyên bố disaster;
+- incident commander và technical leads là ai;
+- ai chọn recovery point/chấp nhận data loss;
+- business/legal/security/compliance tham gia khi nào;
+- status cập nhật ở kênh nào khi primary tools không dùng được;
+- ai giao tiếp với khách hàng, regulator và vendor;
+- escalation/contact tree có offline copy không;
+- quyết định và timestamps được ghi lại ra sao.
+
+DR communication nên định kỳ, fact-based và phân biệt: known impact, mitigation, risks, next update. Không hứa thời điểm recovery chỉ dựa trên optimistic automation status.
+
+---
+
+#### 15. DR testing maturity
+
+| Mức | Bài kiểm tra | Giá trị |
+|---|---|---|
+| 1 | Document/runbook review | Tìm bước thiếu, owner/contact cũ |
+| 2 | Tabletop exercise | Luyện quyết định và communication theo scenario |
+| 3 | Component restore/failover | Chứng minh từng phần kỹ thuật |
+| 4 | Recovery environment drill | Dựng/restore stack isolated end-to-end |
+| 5 | Controlled traffic cutover | Chứng minh routing, capacity và client behavior |
+| 6 | Full-scale game day + failback | Đo capability thực tế trong failure conditions |
+
+Drill cần hypothesis, success criteria, blast-radius guardrails và abort conditions. Đo:
+
+- MTTD và activation/decision time;
+- actual recovery point/data loss;
+- provision, restore, replay, validate và routing times;
+- time đạt minimum service rồi full service;
+- capacity/error/latency trong recovery site;
+- manual steps, access failures và communication gaps;
+- failback/rebuild time;
+- action items được retest.
+
+> **DR plan chỉ đáng tin bằng lần diễn tập thành công gần nhất dưới giả định còn phù hợp.**
+
+---
+
+#### 16. Failback — thường khó như failover
+
+Sau khi primary region phục hồi, không nên chuyển về ngay. Cần:
+
+1. xác định recovery site đang là source of truth;
+2. rebuild old site từ clean current state;
+3. đồng bộ và xác minh lag/checksum/invariants;
+4. chuẩn bị reverse replication;
+5. chọn cutover window và write coordination;
+6. canary traffic về primary;
+7. theo dõi rồi tăng tỷ lệ;
+8. giữ rollback path;
+9. rebuild standby/redundancy cuối cùng.
+
+Failback vội có thể tạo outage thứ hai, divergent writes hoặc data loss. Một số tổ chức tiếp tục chạy ở recovery region cho tới khi thay đổi có kế hoạch được phê duyệt.
+
+---
+
+#### 17. Năm câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Failover khác backup thế nào?**
+
+Failover chuyển service/role/traffic sang healthy environment để duy trì availability. Backup giữ historical recovery points để restore data sau loss/corruption. Failover không cứu corrupted replicated state; backup không tự phục vụ traffic. DR trưởng thành dùng cả hai theo failure scenario.
+
+**Q2. Thiết kế DR cho high-traffic web app ra sao?**
+
+Bắt đầu bằng BIA và tiered RTO/RPO; chọn warm/hot/active-active region; chuẩn bị global routing, app/config/secrets/quota, replicated data và immutable backups; fencing + orchestrated cutover; minimum viable/degraded mode; independent observability; drills dưới peak load đo data correctness và failback.
+
+**Q3. RTO/RPO là gì và tối ưu thế nào?**
+
+RTO là thời gian tối đa để critical capability recovery; RPO là mức mất data theo thời gian được chấp nhận. Giảm RTO bằng pre-provisioned capacity, automation, dependency readiness và parallel recovery; giảm RPO bằng continuous logs/replication. Cả hai phải đo end-to-end và cân bằng với cost/complexity.
+
+**Q4. Những thách thức của geo-distributed DR?**
+
+Cross-region latency, replication lag, consistency/conflicts, split-brain, voter placement, routing propagation, data residency, capacity, control-plane/common dependencies, configuration drift, cost và coordinated recovery order. Nêu cách kiểm soát từng rủi ro thay vì chỉ nói “deploy multi-region”.
+
+**Q5. Quorum-based design trong distributed recovery là gì?**
+
+Operation/election cần đủ votes, thường majority, để các partition không cùng tiến triển conflicting state. Ví dụ 5 voters cần 3. Nó bảo vệ safety nhưng nếu mất majority thì service có thể dừng write; DR phải phân bố voters/failure domains và có fencing/reconfiguration protocol đúng.
+
+---
+
+#### 18. Sai lầm thường gặp
+
+- Có backup nhưng gọi đó là complete DR plan.
+- Có multi-region nhưng recovery region thiếu IAM/KMS/certificate/quota/vendor allowlist.
+- Đặt RTO từ thời gian promote DB, bỏ qua quyết định, validation và routing.
+- Mỗi datastore đạt RPO nhưng workflow tổng thể không nhất quán.
+- Auto-failover sang corrupted/compromised environment.
+- Không fence old writers, gây split-brain.
+- Giả định DNS TTL bằng actual client cutover time.
+- Warm standby không test full production capacity.
+- Quorum voters tập trung trong region có thể mất.
+- Backup/observability/CI/CD cùng account và cùng failure domain với production.
+- DR runbook chỉ online trong hệ thống có thể unavailable.
+- Drill chỉ tabletop, chưa từng restore/cutover traffic.
+- Test failover nhưng không test failback/rebuild redundancy.
+- Tất cả services đều gắn nhãn critical, không có recovery sequence.
+
+---
+
+#### 19. Checklist DR thực tế
+
+1. Disaster scenarios/threat model nào nằm trong scope?
+2. BIA, business tiers, minimum service và maximum tolerable disruption?
+3. RTO/RPO theo critical journey và data dependencies?
+4. Recovery pattern: restore, pilot light, warm/hot, active-active?
+5. Recovery account/region có độc lập đúng failure model không?
+6. IAM, DNS, KMS, secrets, certificates, quotas và vendor access đã sẵn?
+7. Data replication mode, lag, acknowledged-loss semantics?
+8. Immutable clean backup và recovery-point selection?
+9. Quorum/voter placement chịu được region-loss scenario nào?
+10. Fencing và single source of truth trong cutover?
+11. Restore/deploy/replay/reconciliation sequence?
+12. Minimum viable service và graceful degradation?
+13. Recovery site capacity sau traffic shift/cold cache?
+14. Activation authority, incident command và offline communications?
+15. Technical/security/business acceptance criteria?
+16. Actual client routing/connection behavior được đo chưa?
+17. Failback và rebuild redundancy plan?
+18. Drill gần nhất đạt actual RTO/RPO/correctness khi nào?
+19. Action items có owner, deadline và retest không?
+20. Cost/complexity có tương xứng business risk và SLO không?
+
+#### 20. Ý chính cần nhớ
+
+- DR phục hồi business capability, không chỉ data hoặc một server.
+- Backup bảo vệ historical data; failover bảo vệ service continuity; cần cả hai.
+- BIA quyết định service tiers, recovery order và RTO/RPO.
+- RTO/RPO phải đo end-to-end qua mọi dependency và validation.
+- Backup/restore, pilot light, warm/hot standby và active-active có cost/complexity khác nhau.
+- Global routing, IAM, KMS, certificates, quotas và observability đều là DR dependencies.
+- Failover sang corrupted/compromised replica không phải recovery.
+- Geo-replication phải nêu lag, acknowledgement và reconciliation semantics.
+- Quorum bảo vệ safety nhưng không bảo đảm availability khi mất majority.
+- Fencing old primary là bắt buộc để tránh split-brain.
+- DR orchestration cần đúng thứ tự và có business correctness checks.
+- Ransomware recovery cần clean environment và rebuild trust, không chỉ switch region.
+- Con người, authority và communication là một phần của architecture recovery.
+- Failback/rebuild redundancy phải được thiết kế và kiểm thử.
+- DR plan chỉ đáng tin sau full restore/cutover drill với actual metrics.
+
+#### Công thức ghi nhớ
+
+> **DR thực tế = BIA/tiering + RTO/RPO end-to-end + recovery site độc lập + backup sạch/immutable + failover có fencing + dependency-aware orchestration + communication rõ + drill và failback đã chứng minh.**
+
+---
+
+### Bài 56. Tổng kết — Building Reliable Distributed Systems
+
+#### 1. Bức tranh tổng thể
+
+Một distributed system đáng tin cậy không phải hệ thống “không bao giờ hỏng”. Đó là hệ thống:
+
+- biết failure nào có thể xảy ra;
+- phát hiện failure dựa trên user impact;
+- ngăn lỗi cục bộ lan rộng;
+- duy trì core capability khi có thể;
+- phục hồi service và dữ liệu trong mục tiêu đã định;
+- kiểm chứng correctness sau recovery;
+- học từ incident để giảm rủi ro tái diễn.
+
+```text
+Prevent where economical
+    -> Detect early
+    -> Contain blast radius
+    -> Degrade or fail over safely
+    -> Restore/reconcile correctly
+    -> Rebuild redundancy
+    -> Learn and improve
+```
+
+Reliability là thuộc tính end-to-end của business journey. Một component có uptime cao không cứu được checkout nếu identity, payment, database hoặc routing path vẫn là SPOF.
+
+---
+
+#### 2. Bốn lớp kiến thức của phần này
+
+##### 2.1 Reliability fundamentals
+
+Ta đã phân biệt:
+
+- **reliability:** hoạt động đúng và ổn định theo thời gian;
+- **availability:** service truy cập được khi cần;
+- **durability:** committed data không bị mất ngoài guarantee;
+- **resilience:** hấp thụ, thích nghi và phục hồi sau disruption;
+- **fault tolerance:** tiếp tục capability trong failure model xác định.
+
+Các metric như MTBF, MTTD và MTTR mô tả failure/recovery; SLI, SLO, SLA và error budget chuyển kỳ vọng kinh doanh thành mục tiêu vận hành đo được.
+
+##### 2.2 High Availability, Fault Tolerance và Failover
+
+HA/FT được xây bằng:
+
+- redundancy qua independent failure domains;
+- capacity còn đủ sau failure;
+- health/readiness signals đúng;
+- load balancing và traffic management;
+- failover có fencing chống split-brain;
+- timeouts, bounded retries, circuit breakers và bulkheads;
+- load shedding và graceful degradation;
+- self-healing có guardrails;
+- game days chứng minh behavior thực tế.
+
+##### 2.3 Backup và Recovery
+
+Backup giữ historical recovery points để xử lý delete, corruption, ransomware và catastrophic loss. Một chiến lược hoàn chỉnh gồm:
+
+- full/incremental/differential hoặc physical/logical/log-based backup;
+- snapshot/PITR có consistency guarantee;
+- retention, encryption, access separation;
+- off-site và immutable/offline copies;
+- backup catalog, monitoring và integrity checks;
+- restore tests chứng minh RTO/RPO và business correctness.
+
+Replication không thay backup; backup cũng không tự giữ service online.
+
+##### 2.4 Disaster Recovery trong thực tế
+
+DR mở rộng recovery từ dữ liệu sang toàn business capability:
+
+- Business Impact Analysis và service tiers;
+- recovery architecture: cold, pilot light, warm/hot standby hoặc active-active;
+- global routing, data replication và recovery-site capacity;
+- dependency-aware recovery sequence;
+- incident command, activation authority và communication;
+- ransomware clean-room recovery;
+- cutover, validation, failback và rebuild redundancy;
+- full DR drills dưới failure scenario đại diện.
+
+---
+
+#### 3. Trước, trong và sau failure
+
+| Giai đoạn | Mục tiêu | Kỹ thuật chính |
+|---|---|---|
+| **Trước failure** | Giảm xác suất/tác động và chuẩn bị recovery | Failure model, redundancy, SLO, capacity, backups, runbooks, drills |
+| **Khi failure bắt đầu** | Phát hiện đúng và giới hạn blast radius | SLI alerts, health checks, timeouts, bulkheads, circuit breakers |
+| **Trong failure** | Giữ core service hoặc chuyển sang trạng thái an toàn | Failover, fencing, degradation, load shedding, incident command |
+| **Recovery** | Khôi phục service/data đúng RTO/RPO | Restore/PITR, promotion, replay, reconciliation, traffic cutover |
+| **Sau recovery** | Tránh outage thứ hai và tái diễn | Rebuild redundancy, controlled failback, postmortem, action verification |
+
+Nếu chỉ thiết kế “trước failure” mà không luyện recovery, hệ thống vẫn phụ thuộc vào phản ứng thủ công trong lúc áp lực cao nhất.
+
+---
+
+#### 4. Các mục tiêu không thể dùng thay nhau
+
+| Metric/thuộc tính | Trả lời câu hỏi |
+|---|---|
+| Availability SLO | Bao nhiêu requests/time windows phải phục vụ thành công? |
+| Latency SLO | Success phải nhanh tới mức nào? |
+| Durability guarantee | Acknowledged data có thể mất trong failure nào? |
+| RTO | Business capability phải phục hồi trong bao lâu? |
+| RPO | Recovered data được phép cũ/mất bao nhiêu? |
+| MTTR | Thực tế recovery trung bình mất bao lâu theo định nghĩa metric? |
+| Error budget | Mức không hoàn hảo được phép trong SLO window? |
+
+Một dịch vụ có availability tốt nhưng RPO kém; hoặc RTO ngắn nhưng data correctness sai. Thiết kế cần đồng thời thỏa những mục tiêu phù hợp với critical journey.
+
+---
+
+#### 5. Failure containment quan trọng hơn nhân bản vô hạn
+
+Thêm replicas làm tăng khả năng chịu một số failure nhưng cũng thêm coordination và common-mode risk. Reliability thực tế đòi hỏi:
+
+- tách failure domains;
+- giới hạn shared pools/queues/connections;
+- tenant/workload isolation;
+- retry budgets;
+- bounded blast radius của deploy/config;
+- canary/progressive rollout và rollback;
+- quyền xóa/ghi backup tách khỏi production;
+- observability/control plane độc lập phù hợp;
+- minimum viable service khi dependency lỗi.
+
+```text
+Redundancy without isolation
+= nhiều bản sao có thể cùng thất bại
+```
+
+Hai nodes dùng chung database, certificate, KMS key, region hoặc bad configuration vẫn có thể cùng unavailable.
+
+---
+
+#### 6. Chuỗi bảo vệ một remote call
+
+Một call đáng tin cậy thường cần phối hợp:
+
+```text
+end-to-end deadline
+  -> per-hop timeout
+  -> bounded concurrency
+  -> idempotency
+  -> retry có backoff + jitter + budget
+  -> circuit breaker
+  -> fallback/degradation nếu an toàn
+  -> metrics/tracing
+```
+
+Không phải call nào cũng cần retry hay fallback. Security decision, payment hoặc non-idempotent side effect cần semantics rõ. Retry nhiều tầng có thể khuếch đại tải; fallback stale có thể vi phạm correctness.
+
+---
+
+#### 7. Chuỗi bảo vệ dữ liệu
+
+```text
+durable commit/replication
+  -> backups theo recovery points
+  -> independent immutable/offline copy
+  -> retention đúng detection horizon
+  -> key/catalog/runbook sẵn sàng
+  -> restore + replay + reconciliation
+  -> tested RPO/RTO/correctness
+```
+
+Mỗi lớp xử lý failure khác nhau:
+
+- replication: node/AZ failure và availability;
+- PITR: bad write/delete tới một thời điểm;
+- immutable/offline backup: ransomware/control-plane compromise;
+- reconciliation: cross-service/side-effect inconsistencies;
+- DR environment: region/account-scale outage.
+
+---
+
+#### 8. Reliability trong geo-distributed systems
+
+Geo-redundancy giúp chịu region failure nhưng không miễn phí:
+
+- cross-region latency;
+- replica lag và acknowledged-data-loss semantics;
+- consistency/availability trade-offs khi partition;
+- split-brain và stale leaders;
+- voter/quorum placement;
+- data residency/compliance;
+- global routing và client caching;
+- failover capacity và cold-cache storm;
+- control-plane/common dependency risk;
+- failback/reconciliation complexity.
+
+Quorum/consensus bảo vệ safety trong failure model. Nếu mất majority, dừng tiến triển có thể là hành vi đúng; không nên mô tả quorum như cách luôn giữ write availability.
+
+---
+
+#### 9. Automation và con người phải bổ trợ nhau
+
+Automation phù hợp với action lặp lại, deterministic và có guardrails:
+
+- restart/replace unhealthy instance;
+- remove endpoint;
+- provision environment;
+- restore từ recovery point đã chọn;
+- scale capacity;
+- run validation checks;
+- shift traffic theo canary;
+- collect evidence/metrics.
+
+Con người vẫn cần cho quyết định có judgment/risk cao:
+
+- đây có phải disaster hay security compromise không;
+- recovery point nào sạch;
+- chấp nhận data loss nào;
+- có mở write traffic chưa;
+- communication với khách hàng/regulator;
+- khi nào failback.
+
+Automation không có stop condition có thể tạo restart storm, mass failover hoặc data loss. Manual-only recovery lại thường quá chậm và dễ sai. Mục tiêu là **automated mechanics + explicit human authority**.
+
+---
+
+#### 10. Kiểm thử là bằng chứng cuối cùng
+
+Mức độ tin cậy tăng dần:
+
+1. diagram/document tồn tại;
+2. configuration/policy được kiểm tra;
+3. component failover/restore thành công;
+4. application/business validation thành công;
+5. recovery site chịu traffic đại diện;
+6. full cutover đạt actual RTO/RPO;
+7. failback và rebuild redundancy thành công;
+8. action items được sửa và retest.
+
+Test phải bao gồm slow/partial failures, không chỉ “kill một server”. Network partition, dependency latency, replica lag, bad deploy, credential loss và corruption thường khó hơn crash rõ ràng.
+
+---
+
+#### 11. Framework trả lời bài toán reliability trong System Design
+
+1. **Critical journey:** chức năng nào phải đúng và sẵn sàng?
+2. **Requirements:** SLI/SLO, durability, RTO, RPO, compliance và cost.
+3. **Failure model:** instance, AZ, region, network, dependency, deploy, corruption, ransomware.
+4. **SPOF/dependency map:** compute, state, control plane, people và vendors.
+5. **Steady-state design:** redundancy, capacity, isolation, replication.
+6. **Failure behavior:** timeout, retry, circuit breaker, degradation, failover/fencing.
+7. **Data protection:** backups, PITR, immutable copies, retention và restore.
+8. **DR orchestration:** activation, order, routing, validation, reconciliation và failback.
+9. **Observability/operations:** alerts, runbooks, on-call, communications và postmortems.
+10. **Proof:** load tests, chaos/game days, restore drills và actual metrics.
+
+Một câu trả lời mạnh nêu rõ trade-offs, không chỉ liệt kê công nghệ.
+
+---
+
+#### 12. Những ngộ nhận cần loại bỏ
+
+- **“Reliable nghĩa là không downtime.”** Reliability còn bao gồm correctness, durability và recovery.
+- **“Multi-AZ/multi-region tự động HA.”** Placement, state, capacity, routing và common dependencies mới quyết định.
+- **“Auto-scaling là fault tolerance.”** Nó tăng capacity sau một độ trễ và có thể làm downstream quá tải.
+- **“Retry tăng reliability.”** Chỉ đúng với transient failure, idempotency và giới hạn hợp lý.
+- **“Replication là backup.”** Corruption/delete có thể replicate.
+- **“Backup success nghĩa là recovery được.”** Phải restore và validate.
+- **“RTO là thời gian database promotion.”** RTO kết thúc khi business capability đạt acceptance criteria.
+- **“RPO bằng backup schedule.”** Phải tính failed jobs, upload/log gaps và recovered state thực tế.
+- **“Quorum luôn tăng availability.”** Mất majority có thể dừng tiến triển để giữ safety.
+- **“Self-healing luôn tốt.”** Signal hoặc remediation sai có thể khuếch đại outage.
+- **“Failover xong là hoàn tất.”** Còn validation, reconciliation, rebuild redundancy và failback.
+- **“DR là việc của infrastructure team.”** Business, security, application, data, legal và operations đều tham gia.
+
+---
+
+#### 13. Checklist tổng kết
+
+1. Critical user journeys và minimum viable service?
+2. SLI/SLO/SLA/error budget và measurement window?
+3. Durability, RTO, RPO và business acceptance criteria?
+4. Failure model và largest failure domain?
+5. SPOFs/common-mode dependencies?
+6. Remaining capacity sau instance/AZ/region loss?
+7. Timeout, idempotency, retry budget và backpressure?
+8. Bulkheads, circuit breakers, degradation và load shedding?
+9. Health/readiness signals và failover authority?
+10. Fencing/split-brain protection và quorum placement?
+11. Replication lag, consistency và data-loss contract?
+12. Backup scope, PITR, retention và immutable/offline copy?
+13. Restore order, key/config/IAM recovery và reconciliation?
+14. DR tier/site, global routing và recovery capacity?
+15. Incident command, communication và offline runbooks?
+16. Safe deploy/rollback/change freeze during incident?
+17. Failback và rebuild redundancy procedure?
+18. Test gần nhất đo actual RTO/RPO/correctness khi nào?
+19. Postmortem actions có owner, deadline và retest không?
+20. Reliability cost/complexity có phù hợp business risk không?
+
+#### 14. Ý chính cần nhớ
+
+- Reliability là khả năng giữ business journey đúng trước, trong và sau failure.
+- Failure model và SLO biến “reliable” thành một claim có thể kiểm chứng.
+- Availability, durability, RTO và RPO đo các mục tiêu khác nhau.
+- Redundancy cần independent failure domains, healthy state và remaining capacity.
+- Isolation, bounded resources và degradation giới hạn blast radius.
+- Failover cần detection, fencing, routing, validation và rebuild—not chỉ promote.
+- Retry cần timeout, idempotency, backoff, jitter và budget.
+- Replication bảo vệ availability; backup/PITR bảo vệ historical recovery.
+- Immutable/offline backup và access separation quan trọng với ransomware.
+- Distributed recovery cần replay và business reconciliation.
+- Quorum bảo vệ safety nhưng có thể hy sinh progress khi mất majority.
+- DR phục hồi con người, quy trình, identity, network, app và data theo đúng thứ tự.
+- Automation cần guardrails; quyết định rủi ro cao cần authority rõ.
+- Failback là một change nguy hiểm và phải được thử.
+- Diagram/runbook không phải bằng chứng; successful drills với actual metrics mới là bằng chứng.
+- Reliability là quá trình liên tục, không phải milestone hoàn thành một lần.
+
+#### Công thức ghi nhớ
+
+> **Reliable distributed system = SLO + failure model + redundancy/isolation + safe failure handling + protected data + rehearsed recovery + observable operations + continuous learning.**
+
+---
+
+#### 15. Chuyển sang Security in System Design
+
+Reliability giả định các thành phần có thể hỏng; security còn giả định có đối tượng chủ động tìm cách làm hệ thống sai, lộ dữ liệu hoặc mất kiểm soát.
+
+Phần tiếp theo sẽ mở rộng threat model sang:
+
+- authentication và authorization;
+- encryption và key management;
+- network/application/data security;
+- secrets, least privilege và zero trust;
+- abuse, attack surface và secure architecture;
+- detection, incident response và compliance.
+
+Reliability và security gắn chặt với nhau: ransomware làm backup/recovery trở thành vấn đề security; credential compromise có thể phá mọi region; security control lỗi cũng có thể gây outage. Một hệ thống chỉ thực sự đáng tin khi vừa phục hồi được trước failure vừa chống chịu được trước tấn công.
+
+---
+
+## Phần 10 — Security in System Design
+
+### Bài 57. Introduction to Security in System Design
+
+#### 1. Vì sao security là yêu cầu kiến trúc?
+
+Security là non-functional requirement nền tảng. Nó không trực tiếp tạo feature, nhưng quyết định người dùng và doanh nghiệp có thể tin hệ thống hay không.
+
+Một sự cố bảo mật có thể gây:
+
+- rò rỉ dữ liệu cá nhân, tài chính hoặc bí mật kinh doanh;
+- account takeover và giao dịch trái phép;
+- dữ liệu/configuration bị sửa;
+- downtime do DDoS hoặc ransomware;
+- mất khả năng vận hành và phục hồi;
+- vi phạm pháp lý/hợp đồng;
+- thiệt hại tài chính và uy tín dài hạn.
+
+Security không phải lớp gắn thêm trước release. Architectural choices về identity, data flow, trust boundary, isolation, key management và observability phải được quyết định từ đầu.
+
+> **Secure by design: hệ thống được thiết kế với assumption rằng input, network, identity và dependencies đều có thể bị lạm dụng hoặc compromise.**
+
+---
+
+#### 2. CIA Triad và các thuộc tính bổ sung
+
+| Thuộc tính | Câu hỏi | Controls ví dụ |
+|---|---|---|
+| **Confidentiality** | Ai được phép đọc dữ liệu? | Encryption, access control, data minimization |
+| **Integrity** | Làm sao biết dữ liệu/code/message không bị sửa trái phép? | MAC/signature, authorization, constraints, audit |
+| **Availability** | Legitimate users có truy cập được khi cần không? | DDoS controls, redundancy, quotas, recovery |
+
+CIA là nền tảng nhưng chưa đủ để mô tả mọi yêu cầu:
+
+- **Authenticity:** principal/message có đúng nguồn tuyên bố không?
+- **Accountability:** có truy vết được ai làm gì, khi nào, qua quyền nào không?
+- **Non-repudiation:** có bằng chứng đủ mạnh để chủ thể khó phủ nhận action theo use case không?
+- **Privacy:** dữ liệu cá nhân có được thu thập, sử dụng, chia sẻ và lưu giữ đúng mục đích không?
+- **Safety:** security failure có gây tổn hại vật lý/con người không?
+
+Hash/checksum đơn thuần phát hiện lỗi ngẫu nhiên nhưng không chống attacker nếu họ có thể sửa cả data lẫn hash. Integrity trước adversary thường cần keyed MAC, digital signature hoặc trusted authenticated channel.
+
+---
+
+#### 3. Vì sao distributed systems khó bảo mật hơn?
+
+Monolith có ít process/network boundaries hơn. Distributed system làm tăng:
+
+- public và internal APIs;
+- service identities và credentials;
+- message brokers, caches, databases và object stores;
+- east-west network traffic;
+- cloud accounts, clusters và control planes;
+- third-party integrations/webhooks;
+- CI/CD, artifact registry và software supply chain;
+- logs, traces và analytics chứa dữ liệu nhạy cảm;
+- nhiều teams cùng thay đổi policy/configuration.
+
+Mỗi boundary là nơi identity, authorization, encryption, validation và audit phải được xem xét. “Internal network” không phải trust guarantee: một compromised workload, credential hoặc developer account có thể gọi các services khác.
+
+```text
+Internet -> Edge -> API/App -> Services -> Data stores
+               |       |          |             |
+           trust boundaries và policy enforcement points
+```
+
+---
+
+#### 4. Các nguyên tắc thiết kế bảo mật
+
+##### 4.1 Least privilege
+
+Chỉ cấp đúng quyền, đúng resource, đúng thời gian và đúng context cần thiết. Tránh shared admin credentials và wildcard permissions.
+
+##### 4.2 Deny by default / secure by default
+
+Không có policy cho phép thì từ chối. Default configuration không public data, không mở port thừa, không dùng credential mặc định.
+
+##### 4.3 Defense in depth
+
+Nhiều lớp controls độc lập tương đối:
+
+```text
+edge filtering -> authentication -> authorization -> validation
+-> service isolation -> data access control -> encryption -> detection/recovery
+```
+
+Không control nào hoàn hảo; lớp sau giới hạn hậu quả khi lớp trước thất bại.
+
+##### 4.4 Minimize attack surface
+
+Không expose service/port/API/data không cần thiết; xóa feature/credential/dependency cũ; giới hạn administrative interfaces.
+
+##### 4.5 Separation of duties
+
+Không để một identity vừa tạo vừa phê duyệt vừa xóa control quan trọng. Áp dụng cho production deploy, key management, payment và backup deletion.
+
+##### 4.6 Fail securely
+
+Khi auth/policy/dependency lỗi, hệ thống trở về trạng thái an toàn theo business risk. Không bypass authorization chỉ để tăng availability.
+
+##### 4.7 Assume breach / Zero Trust
+
+Xác minh identity, device/workload, authorization và context cho từng access path; không tin mặc định vì traffic nằm “bên trong”. Zero Trust không có nghĩa mọi request dùng cùng một công nghệ hoặc bỏ hoàn toàn network segmentation.
+
+##### 4.8 Minimize data and secrets
+
+Không thu thập, truyền, log hoặc giữ dữ liệu không cần thiết. Dữ liệu không tồn tại thì không thể bị rò từ hệ thống đó.
+
+---
+
+#### 5. Threat modeling — tư duy trước khi chọn controls
+
+Threat modeling trả lời:
+
+1. **Đang xây gì?** Components, data flows, protocols, dependencies.
+2. **Bảo vệ gì?** Assets, business operations, identities, secrets.
+3. **Ai/cái gì có thể gây hại?** External attacker, malicious insider, compromised service, automation error.
+4. **Trust boundaries ở đâu?** Internet/edge, tenant, account, cluster, service, data store, admin plane.
+5. **Có thể sai thế nào?** Threat scenarios theo STRIDE/abuse cases.
+6. **Risk là bao nhiêu?** Likelihood, impact, exploitability và existing controls.
+7. **Xử lý thế nào?** Avoid, mitigate, transfer hoặc accept có owner.
+8. **Làm sao kiểm chứng?** Security requirements, tests, telemetry và incident playbook.
+
+Quy trình thực dụng:
+
+```text
+Architecture/Data-flow diagram
+ -> Assets + entry points + trust boundaries
+ -> Threats/abuse cases
+ -> Risk ranking
+ -> Mitigations + owners
+ -> Verification
+ -> Residual-risk acceptance
+```
+
+Threat model là living artifact: cập nhật khi thêm feature, data flow, integration, privilege hoặc major infrastructure change.
+
+---
+
+#### 6. STRIDE
+
+| STRIDE | Threat | Security property bị ảnh hưởng | Ví dụ |
+|---|---|---|---|
+| **S — Spoofing** | Giả mạo identity | Authenticity | Stolen service token gọi API |
+| **T — Tampering** | Sửa data/code/message | Integrity | Thay payment amount hoặc artifact |
+| **R — Repudiation** | Phủ nhận action, thiếu bằng chứng | Accountability/non-repudiation | Admin action không có audit trail |
+| **I — Information Disclosure** | Lộ dữ liệu | Confidentiality | API trả quá nhiều fields, public bucket |
+| **D — Denial of Service** | Làm service/resource unavailable | Availability | Flood, expensive query, queue exhaustion |
+| **E — Elevation of Privilege** | Có quyền cao hơn được phép | Authorization | Tenant user thành admin |
+
+STRIDE là checklist tìm threat, không tự xếp risk hay cung cấp mitigation. Sau khi tìm threat vẫn phải đánh giá theo context và business impact.
+
+DREAD có thể xuất hiện trong tài liệu phỏng vấn, nhưng scoring chủ quan dễ tạo cảm giác chính xác giả. Có thể dùng risk matrix hoặc phương pháp của tổ chức miễn criteria và owner rõ ràng.
+
+---
+
+#### 7. Attack surface và entry points
+
+Attack surface gồm mọi nơi attacker có thể tương tác hoặc ảnh hưởng hệ thống:
+
+- login, password reset, registration và account recovery;
+- APIs, GraphQL, file upload và search;
+- admin/support consoles;
+- webhooks và third-party callbacks;
+- message topics/queues;
+- public storage/CDN origins;
+- SSH/debug/metrics/health endpoints;
+- DNS, certificates và domain management;
+- CI/CD, repositories, packages và artifacts;
+- cloud IAM/control-plane APIs;
+- user-generated content và import/export.
+
+Đánh giá mỗi entry point theo:
+
+- ai được truy cập và từ đâu;
+- authentication/authorization nào;
+- input/payload/rate limits;
+- data nào vào/ra;
+- side effects và idempotency;
+- logging/audit nhưng không lộ secret;
+- failure/abuse behavior;
+- owner, patching và deprecation.
+
+---
+
+#### 8. Các attack vectors phổ biến
+
+##### 8.1 Insecure APIs
+
+Broken object-level authorization, excessive data exposure, missing rate limits, weak token validation và unsafe mass assignment. API gateway giúp enforce một số controls nhưng service vẫn phải kiểm tra resource-level authorization.
+
+##### 8.2 Misconfiguration
+
+Public buckets, permissive security groups, default credentials, debug mode, wildcard IAM, exposed management ports. Policy as code, secure baselines và continuous configuration scanning giúp giảm drift.
+
+##### 8.3 Weak identity/session recovery
+
+Credential stuffing, weak MFA, token theft, insecure password reset, long-lived sessions và missing revocation. Account recovery thường là đường vòng yếu hơn login chính.
+
+##### 8.4 Supply-chain compromise
+
+Malicious/vulnerable dependency, compromised build runner, stolen signing key hoặc poisoned artifact. Cần pinned/verified dependencies, isolated builds, artifact provenance/signing và controlled promotion.
+
+##### 8.5 Secrets exposure
+
+Hardcoded API keys, secrets trong logs/image/repository hoặc broad access. Dùng secret manager/workload identity, short-lived credentials, rotation và leak detection.
+
+##### 8.6 Excessive exposure
+
+Port/service/endpoint không cần thiết làm tăng cơ hội khai thác. Network segmentation hữu ích nhưng không thay application identity/authorization.
+
+---
+
+#### 9. Bốn nhóm attack trong transcript
+
+##### 9.1 DDoS
+
+Đánh vào availability bằng traffic hoặc expensive operations. Phòng thủ nhiều lớp:
+
+- upstream/edge scrubbing và anycast capacity;
+- CDN/caching;
+- network/WAF/bot controls;
+- per-identity/IP/tenant/resource rate limits;
+- request size/complexity và connection limits;
+- queues/concurrency budgets, load shedding;
+- autoscaling có cost/downstream guardrails;
+- playbooks và provider coordination.
+
+Autoscaling một mình không chống DDoS: attacker có thể làm chi phí tăng hoặc đánh sập database/dependency không scale được.
+
+##### 9.2 Man-in-the-Middle (MITM)
+
+Attacker nghe hoặc sửa traffic. TLS với certificate/hostname validation bảo vệ confidentiality, integrity và server authentication trên channel. Với service-to-service có thể dùng mTLS/workload identity khi threat model yêu cầu.
+
+Certificate pinning có thể giảm một số trust risks trong controlled clients nhưng làm rotation/recovery khó; không phải mặc định cho mọi ứng dụng.
+
+##### 9.3 Injection
+
+Untrusted input bị diễn giải thành command/query/template. Mitigation chính:
+
+- parameterized queries/prepared statements;
+- context-aware output encoding;
+- safe APIs và allowlists;
+- tách code khỏi data;
+- least-privilege DB/service account;
+- validation về type/range/structure;
+- WAF chỉ là lớp bổ sung, không sửa vulnerable code.
+
+##### 9.4 Spoofing
+
+Giả mạo user, service, email, IP hoặc DNS identity. Mitigation phụ thuộc loại identity: phishing-resistant MFA, signed tokens/messages, mTLS, DNS/email controls, certificate validation và anti-replay. IP allowlist đơn thuần không phải strong identity.
+
+---
+
+#### 10. API security là end-to-end concern
+
+Một secure API path cần:
+
+```text
+TLS
+ -> authenticate caller
+ -> authorize action + resource + tenant
+ -> validate schema/size/content
+ -> enforce rate/quota/complexity
+ -> execute với least privilege
+ -> filter/minimize response
+ -> audit security-relevant action
+```
+
+Các lỗi phổ biến:
+
+- chỉ check role mà không check object ownership/tenant;
+- trust claims do client tự gửi;
+- API gateway auth xong nhưng internal endpoint bypass gateway;
+- log token/password/PII;
+- trả stack trace/internal IDs;
+- không giới hạn pagination, upload hoặc GraphQL depth/cost;
+- webhook không verify signature, timestamp và replay;
+- CORS bị xem như access-control mechanism của server;
+- error responses tiết lộ user/account tồn tại.
+
+---
+
+#### 11. Authentication và authorization — phần mở đầu
+
+- **Authentication (AuthN):** principal là ai?
+- **Authorization (AuthZ):** principal được làm gì với resource cụ thể trong context nào?
+
+OAuth 2.0 là framework cho delegated authorization. OpenID Connect (OIDC) bổ sung identity/authentication layer trên OAuth 2.0. Không dùng access token như bằng chứng danh tính ngoài contract; validate issuer, audience, signature, time claims và token type.
+
+JWT là một token format, không phải security architecture. Trade-offs:
+
+- local validation giảm lookup nhưng revocation/state change khó thấy ngay;
+- token lớn dễ bị log/leak;
+- algorithm/key/issuer/audience validation phải chặt;
+- long TTL tăng exposure;
+- opaque tokens + introspection hoặc server-side sessions có thể phù hợp hơn.
+
+Access token thường short-lived; refresh token thường sống lâu hơn và cần secure storage, rotation/reuse detection, revocation và audience/client binding theo design. Không có TTL “15 phút” đúng cho mọi hệ thống.
+
+Browser app thường ưu tiên secure, `HttpOnly`, `SameSite` cookies theo architecture để giảm token exposure tới JavaScript; vẫn cần CSRF strategy khi dùng cookie authentication.
+
+---
+
+#### 12. Encryption và key management
+
+##### Data in transit
+
+TLS bảo vệ channel. TLS termination ở edge/LB không đồng nghĩa traffic từ LB tới service nên plaintext; re-encrypt hoặc dùng authenticated internal channel theo trust boundaries.
+
+Cần quản lý:
+
+- certificate issuance/renewal/rotation;
+- hostname/service identity validation;
+- approved protocol/cipher policy;
+- HSTS cho web origin phù hợp;
+- private-key protection;
+- telemetry cho expiry/handshake failures.
+
+##### Data at rest
+
+Encrypt database, object storage, disks và backups. Nhưng encryption at rest không chặn ứng dụng/identity đã được cấp decrypt permission lấy data. Access control, data minimization và monitoring vẫn cần.
+
+##### Keys
+
+Key management quyết định chất lượng encryption:
+
+- KMS/HSM hoặc protected key service;
+- envelope encryption;
+- least-privilege decrypt/sign permissions;
+- separation of duties;
+- rotation/versioning;
+- audit và anomaly detection;
+- backup/recovery/escrow theo requirement;
+- revoke/delete có safety controls.
+
+Hashing, encryption, MAC và digital signature giải các bài toán khác nhau; không dùng từ “mã hóa” thay cho mọi primitive.
+
+---
+
+#### 13. Secure data storage trong cloud
+
+1. phân loại data và xác định owner/purpose/retention;
+2. private-by-default network/storage policies;
+3. encrypt at rest với key policy tách biệt phù hợp;
+4. IAM least privilege theo service/workload identity;
+5. row/object/tenant-level authorization trong application/data layer;
+6. secrets không nằm trong source, image hoặc logs;
+7. versioning/immutable backups cho recovery;
+8. audit reads/writes/admin/key usage;
+9. masking/tokenization cho môi trường non-production;
+10. retention/deletion và legal hold có kiểm soát;
+11. monitoring public exposure, anomalous access và exfiltration;
+12. test restore mà không làm lộ dữ liệu.
+
+RBAC chỉ là một authorization model. ABAC/policy-based controls có thể cần cho tenant, data sensitivity, region, time hoặc device context.
+
+---
+
+#### 14. Microservices security
+
+Threats chính:
+
+- unauthorized east-west calls;
+- confused deputy và token forwarding sai;
+- service account quyền quá rộng;
+- sensitive data trong APIs/events/logs;
+- compromised service lateral movement;
+- inconsistent policy giữa services;
+- shared broker/topic không tách tenant;
+- gateway/control-plane spoof/bypass;
+- missing centralized detection nhưng logging tập trung lại thành data target.
+
+Controls:
+
+- workload/service identity;
+- mTLS hoặc authenticated channels;
+- token audience và least-privilege scopes;
+- authorization tại service/resource boundary;
+- network segmentation/microsegmentation;
+- per-service accounts/secrets và short-lived credentials;
+- schema validation và message signing/MAC khi cần;
+- centralized policy/telemetry nhưng distributed enforcement;
+- rate/concurrency limits và bulkheads;
+- software supply-chain controls.
+
+Service mesh có thể hỗ trợ mTLS/policy/telemetry nhưng không tự sửa object-level authorization hoặc insecure business logic.
+
+---
+
+#### 15. Security trong Software Development Lifecycle
+
+| Giai đoạn | Hoạt động security |
+|---|---|
+| Requirements | Data classification, compliance, abuse cases, security requirements |
+| Design | Threat modeling, trust boundaries, least privilege, secure protocols |
+| Development | Secure coding, peer review, safe libraries, secret prevention |
+| Build | Dependency/SBOM scanning, isolated runners, artifact signing/provenance |
+| Test | SAST, DAST, fuzzing, IaC/container scanning, authz negative tests |
+| Deploy | Policy gates, secrets/workload identity, canary, rollback, hardened config |
+| Operate | Monitoring, patching, vulnerability management, incident response |
+| Retire | Revoke credentials, remove exposure, migrate/delete data và dependencies |
+
+“Shift left” không có nghĩa chuyển toàn bộ trách nhiệm sang developer hoặc bỏ runtime detection. Security cần **shift left + stay right**: phòng ngừa sớm và quan sát/ứng phó liên tục trong production.
+
+---
+
+#### 16. Logging, detection và incident response
+
+Security logs nên trả lời:
+
+- identity nào làm action gì;
+- trên resource/tenant nào;
+- qua source/session/device/service nào;
+- policy/role nào cho phép hoặc từ chối;
+- thời điểm/correlation ID nào;
+- key/config/admin changes nào;
+- dữ liệu có được export/download hàng loạt không.
+
+Yêu cầu:
+
+- timestamps/correlation nhất quán;
+- tamper-resistant/append-oriented storage theo risk;
+- access và retention chặt;
+- redact tokens, passwords, secrets và unnecessary PII;
+- alert/actionable detection thay vì chỉ lưu logs;
+- playbooks, ownership và evidence preservation;
+- test detections bằng simulation/tabletop.
+
+Centralized logging giúp correlation nhưng cũng tập trung dữ liệu nhạy cảm; cần phân quyền và data minimization.
+
+---
+
+#### 17. Security và Reliability gắn với nhau
+
+| Security event | Reliability impact |
+|---|---|
+| DDoS | Saturation, latency, outage |
+| Ransomware | Data/service unavailable, DR activation |
+| Credential compromise | Multi-region/control-plane takeover |
+| Integrity attack | Trả kết quả sai dù uptime vẫn cao |
+| Aggressive security rule | False positive, legitimate traffic bị chặn |
+| Certificate/key expiry | Distributed outage |
+| Patch khẩn cấp | Deployment risk và temporary capacity loss |
+
+Controls cũng có failure modes. Authorization service, KMS, WAF hoặc certificate automation trở thành critical dependencies. Thiết kế phải quyết định fail-open/fail-closed theo từng action, cache policy an toàn, emergency access và tested recovery.
+
+---
+
+#### 18. Bảy câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Thiết kế authentication system an toàn cho distributed application?**
+
+Dùng trusted IdP và OIDC cho user authentication; OAuth 2.0 cho delegated API authorization. Access token short-lived, đúng audience/scope; refresh token bảo vệ, rotate và detect reuse. HTTPS/mTLS theo boundary, MFA cho risk cao, phishing/credential-stuffing defenses, secure session/cookie storage, key rotation, revocation và audit. JWT là một lựa chọn format, không bắt buộc.
+
+**Q2. CIA triad áp dụng vào system design thế nào?**
+
+Confidentiality: encryption + access/data minimization. Integrity: authorization, authenticated messages/signatures, constraints và audit. Availability: DDoS protection, quotas, redundancy và recovery. Giải thích trade-off theo asset/journey; không nên nói “availability cao đòi mở endpoint” vì endpoint public vẫn phải authenticated/authorized phù hợp.
+
+**Q3. Threats trong microservices và mitigation?**
+
+Unauthorized calls, stolen service identity, data leakage, lateral movement, policy inconsistency, broker/API abuse và supply-chain compromise. Giảm bằng workload identity, mTLS, audience/scope checks, service/resource authorization, least privilege, segmentation, schema/rate limits, centralized detection, per-service secrets và signed artifacts.
+
+**Q4. Bảo vệ hệ thống trước DDoS?**
+
+Dùng upstream/edge scrubbing, CDN/anycast, WAF/bot filtering, multi-dimensional rate limits, request complexity/size bounds, load shedding và provider playbook. Autoscaling có guardrails và downstream caps; đo legitimate-vs-attack traffic, saturation, cost và false positives.
+
+**Q5. TLS/HTTPS đóng vai trò gì?**
+
+TLS bảo vệ confidentiality, integrity và xác thực server qua certificate/hostname validation; mTLS có thể xác thực client/workload. Quản lý certificate/key lifecycle, approved versions/ciphers, HSTS cho web phù hợp và re-encrypt sau TLS termination theo trust boundary. TLS không cung cấp application authorization hay bảo vệ endpoint đã compromise.
+
+**Q6. Secure data storage trên cloud thế nào?**
+
+Data classification/minimization, private defaults, encryption với KMS/HSM, least-privilege workload identities, fine-grained authorization, secure secrets, audit/anomaly detection, backups/versioning, retention/deletion và non-prod masking. KMS key policy và recovery quan trọng không kém bật encryption.
+
+**Q7. Threat modeling là gì và tích hợp vào design process ra sao?**
+
+Mô hình hóa architecture/data flows, assets, actors, entry points và trust boundaries; dùng STRIDE/abuse cases để tìm threats; xếp risk; tạo mitigations/requirements có owner và verification; ghi residual risk. Thực hiện sớm và cập nhật theo mỗi thay đổi đáng kể, không chỉ audit cuối dự án.
+
+---
+
+#### 19. Sai lầm thường gặp
+
+- Security review chỉ diễn ra trước release.
+- Tin internal network nên bỏ AuthN/AuthZ/TLS.
+- Dùng OAuth 2.0 và OIDC như hai tên đồng nghĩa.
+- Chọn JWT vì “stateless” nhưng không có revocation/key/audience strategy.
+- Dùng refresh token ngắn hạn như access token hoặc lưu token trong nơi dễ bị script đọc.
+- API gateway kiểm tra auth nhưng backend không enforce object/tenant authorization.
+- Dùng WAF thay parameterized query/secure coding.
+- Bật encryption nhưng application role có wildcard decrypt/read.
+- Hardcode secrets hoặc log tokens/PII.
+- TLS terminate ở edge rồi để internal network plaintext không qua threat model.
+- Autoscale để chống DDoS nhưng không giới hạn cost/database load.
+- Centralize logs nhưng không bảo vệ/log-minimize hệ thống logging.
+- Security control fail-open cho sensitive action vì ưu tiên availability.
+- Threat model không cập nhật sau thêm integration/data flow.
+- Chỉ fix vulnerabilities, không đo residual risk và owner.
+
+---
+
+#### 20. Checklist security ban đầu
+
+1. Critical assets, data classes và business operations là gì?
+2. Threat actors, motivations và capabilities?
+3. Architecture/data-flow diagram và trust boundaries?
+4. Public/internal/admin entry points và attack surface?
+5. AuthN/AuthZ cho user, service, admin và machine identities?
+6. Tenant/object/action-level authorization ở đâu?
+7. Least privilege, separation of duties và emergency access?
+8. Secrets/keys/certificates được issue, store, rotate, revoke, recover thế nào?
+9. Encryption in transit/at rest và key policy?
+10. Input/schema/size/complexity và output encoding?
+11. Rate limit, quota, DDoS/load-shedding controls?
+12. Network/workload/data segmentation và egress control?
+13. Dependency/build/artifact provenance và patching?
+14. Data minimization, retention, deletion, backup và non-prod use?
+15. Audit trail, detection, redaction và evidence retention?
+16. Threats được rank, mitigations có owner/verification?
+17. Residual risk được đúng authority chấp nhận?
+18. Security tests gồm negative authz, SAST/DAST/fuzz/IaC?
+19. Incident response, key compromise và ransomware playbooks?
+20. Controls có failure/reliability/operational recovery plan không?
+
+#### 21. Ý chính cần nhớ
+
+- Security là thuộc tính kiến trúc và vận hành xuyên suốt vòng đời.
+- CIA bảo vệ confidentiality, integrity và availability; authenticity/accountability/privacy bổ sung context.
+- Distributed systems tăng identities, APIs, data flows và trust boundaries.
+- Least privilege, secure defaults, minimal exposure và defense in depth giảm blast radius.
+- Threat modeling đi từ assets/data flows tới threats, risk, controls và verification.
+- STRIDE giúp tìm threat classes nhưng không tự xếp risk.
+- Internal traffic không mặc định đáng tin; service calls cần identity và authorization.
+- Gateway, WAF, mesh và encryption là controls, không thay secure business logic.
+- OAuth 2.0 là authorization framework; OIDC bổ sung authentication layer.
+- JWT là token format; TTL/revocation/key/audience strategy mới quyết định mức an toàn.
+- TLS bảo vệ channel nhưng không thay application authorization.
+- Encryption mạnh phụ thuộc key management và permission boundaries.
+- DDoS defense cần upstream filtering, limits và degradation; autoscaling đơn độc không đủ.
+- Shift left phải đi cùng runtime monitoring, patching và incident response.
+- Security và reliability cùng bảo vệ trust; security controls cũng phải được thiết kế cho failure.
+
+#### Công thức ghi nhớ
+
+> **Secure system design = assets/data flows rõ + trust boundaries + threat model + strong identity/least privilege + protected data/channel + minimized attack surface + layered controls + continuous verification/detection/response.**
+
+---
+
+### Bài 58. Authentication & Authorization
+
+#### 1. AuthN và AuthZ giải hai câu hỏi khác nhau
+
+- **Authentication (AuthN):** principal là ai, và hệ thống tin điều đó tới mức nào?
+- **Authorization (AuthZ):** principal có được thực hiện action này trên resource này, trong context hiện tại không?
+
+```text
+credential/evidence
+ -> authentication
+ -> authenticated principal + assurance/context
+ -> authorization policy
+ -> allow / deny / step-up / require approval
+```
+
+Ví dụ: cả Alice và Bob đều đăng nhập thành công, nhưng chỉ Alice có quyền `approve` invoice của department mình dưới hạn mức cho phép.
+
+“Authentication luôn trước authorization” là mô hình phổ biến cho protected resources, nhưng không tuyệt đối: public endpoint có thể authorize anonymous access; policy cũng có thể yêu cầu authentication mạnh hơn trước action nhạy cảm. Quan trọng là mọi access decision đều có subject/context rõ và **deny by default**.
+
+AuthN không tự cấp quyền. AuthZ cũng không chỉ chạy ở menu/UI; server phải enforce ở mỗi protected action/resource boundary.
+
+---
+
+#### 2. Thành phần của hệ thống identity
+
+| Thành phần | Vai trò |
+|---|---|
+| **Subject/principal** | User, service, device hoặc workload đang hành động |
+| **Credential** | Bằng chứng như password, private key, authenticator, certificate |
+| **Identity Provider (IdP)** | Xác thực identity và phát assertion/token theo protocol |
+| **Client/Relying Party** | Ứng dụng yêu cầu login hoặc token |
+| **Authorization Server** | Phát access tokens sau khi policy/consent cho phép |
+| **Resource Server/API** | Nhận token/session và enforce access tới resource |
+| **Policy Decision Point (PDP)** | Đánh giá policy và trả decision |
+| **Policy Enforcement Point (PEP)** | Chặn request và thực thi decision |
+| **Identity store/directory** | Users, credentials metadata, groups, lifecycle state |
+
+Identity lifecycle quan trọng như login:
+
+- provisioning/invitation;
+- verification và enrollment;
+- role/group assignment;
+- MFA/passkey registration;
+- credential/key rotation;
+- suspension, termination và deprovisioning;
+- session/token revocation;
+- audit và access review.
+
+Một nhân viên nghỉ việc nhưng token/service credential còn hiệu lực là lỗi lifecycle, không phải lỗi màn hình login.
+
+---
+
+#### 3. Các authentication methods
+
+##### 3.1 Password
+
+Server lưu password bằng password-hashing algorithm có salt và cost phù hợp, không lưu plaintext hay reversible encryption. Cần rate limit, breached-password checks, MFA/risk controls và secure recovery.
+
+##### 3.2 HTTP Basic Authentication
+
+Client gửi username/password ở mỗi request dưới dạng Base64, **không phải encryption**. TLS là bắt buộc nhưng credential vẫn bị phơi ra ở mọi request và khó hỗ trợ session risk/lifecycle. Phù hợp rất hạn chế cho controlled tooling/integration; không phải mặc định cho consumer authentication.
+
+##### 3.3 One-time code / magic link
+
+Phụ thuộc security của email/SMS/channel; code phải short-lived, single-use, rate-limited và bound đúng transaction/session. SMS có phishing/SIM-swap risk.
+
+##### 3.4 Passkey/security key/biometric-backed credential
+
+Public-key credential giảm password reuse và có thể chống phishing tốt hơn khi origin/RP binding đúng. Biometric thường mở khóa private key trên thiết bị; server không nhất thiết nhận raw biometric.
+
+##### 3.5 Certificate/workload identity
+
+Phù hợp service-to-service/device identity qua mTLS hoặc signed workload tokens. Cần issuance, rotation, revocation và workload binding tự động.
+
+Chọn phương thức theo threat model, assurance level, recovery UX, device/client type và operational capability.
+
+---
+
+#### 4. Session-based authentication
+
+Flow truyền thống:
+
+```text
+login -> server xác thực -> tạo session state
+      -> gửi opaque session ID cookie
+request -> cookie -> lookup session -> principal/context
+```
+
+Session store có thể local, shared Redis/database hoặc managed identity/session layer.
+
+**Ưu điểm:**
+
+- revocation/logout và policy change có thể có hiệu lực nhanh;
+- token client chỉ là random opaque identifier;
+- server kiểm soát session lifecycle/device/context;
+- phù hợp browser/web application.
+
+**Trade-offs:**
+
+- session-store availability/latency;
+- replication/partition và cache consistency;
+- cleanup/TTL và memory;
+- sticky session nếu state local làm failover/scaling khó;
+- central store có thể là critical dependency.
+
+Cookie nên có `Secure`, `HttpOnly`, `SameSite` phù hợp, scope `Domain/Path` tối thiểu và TTL hợp lý. Rotate session ID sau login/privilege change để chống session fixation. Cookie tự gửi theo request nên cần CSRF protection theo architecture.
+
+Không lưu sensitive business data trực tiếp trong session cookie nếu không có authenticated encryption và lifecycle phù hợp; ưu tiên opaque ID.
+
+---
+
+#### 5. Token-based authentication/authorization
+
+Client mang credential/token tới API:
+
+```text
+client -> Authorization: Bearer <access_token> -> resource server
+```
+
+Token có thể:
+
+- **opaque:** API/gateway introspect hoặc lookup token state;
+- **self-contained:** chứa claims và signature, ví dụ JWT.
+
+**Lợi ích:**
+
+- dùng tốt qua nhiều APIs/services;
+- delegation, audience/scope và client context rõ;
+- local validation có thể giảm synchronous central lookup;
+- phù hợp mobile/API/service workloads.
+
+**Rủi ro:**
+
+- bearer token bị lấy thì kẻ cầm token có thể dùng;
+- replay;
+- token leakage qua URL/log/browser storage;
+- stale role/tenant/user state;
+- revocation khó với long-lived self-contained tokens;
+- signature/key/claim validation sai;
+- token size và excessive claims/PII.
+
+Không có quy tắc “distributed system phải dùng token/JWT”. Opaque session/token có thể đơn giản và an toàn hơn nếu immediate revocation hoặc centralized policy quan trọng.
+
+---
+
+#### 6. JWT — hiểu đúng
+
+JWT thường gồm:
+
+```text
+base64url(header).base64url(payload).base64url(signature)
+```
+
+JWS-signed JWT bảo vệ authenticity/integrity của claims, **không mã hóa payload**. Ai có token đều có thể đọc claims trừ khi dùng cơ chế encryption riêng.
+
+Resource server phải:
+
+1. parse theo thư viện an toàn;
+2. allowlist algorithm dự kiến, không tin `alg` tùy ý;
+3. chọn key theo trusted issuer/JWKS policy;
+4. verify signature;
+5. verify `iss`;
+6. verify `aud` đúng API;
+7. verify `exp`, `nbf`, `iat` với clock-skew policy;
+8. kiểm tra token type/purpose, scope/claims;
+9. enforce tenant/resource authorization;
+10. không log raw token.
+
+Asymmetric signing thường giúp issuer giữ private key còn services chỉ cần public keys; HMAC chia sẻ secret và làm nhiều validators có khả năng ký nếu cùng secret.
+
+JWT local validation không loại server-side state hoàn toàn. Hệ thống vẫn quản lý users, signing keys/JWKS, refresh tokens, consent, revocation events và policy versions.
+
+---
+
+#### 7. Access token, ID token và refresh token
+
+| Token | Audience/chức năng | Không nên dùng để |
+|---|---|---|
+| **Access token** | Resource server; cấp quyền theo scope/audience | Làm session/profile assertion tùy tiện ở client khác |
+| **ID token** | OIDC client/relying party; thông tin authentication event/user | Gọi API như bearer access token |
+| **Refresh token** | Authorization server; đổi lấy token mới | Gửi tới resource APIs |
+
+Access token thường short-lived để giảm exposure. Refresh token thường sống lâu hơn nên cần:
+
+- secure storage;
+- bind với client/session/device khi phù hợp;
+- rotation mỗi lần dùng;
+- reuse detection;
+- revoke theo logout/compromise/lifecycle;
+- giới hạn audience/scope và inactivity/absolute lifetime;
+- bảo vệ khỏi CSRF/XSS theo client architecture.
+
+Token expiration không phải revocation. Forced logout có thể cần revoke refresh/session, denylist/high-risk token state, key/epoch changes hoặc chấp nhận access token còn sống tới TTL.
+
+---
+
+#### 8. OAuth 2.0 và OpenID Connect
+
+##### OAuth 2.0
+
+Framework delegated authorization: resource owner cho client quyền giới hạn truy cập resource server mà không giao password cho client.
+
+Vai trò điển hình:
+
+- resource owner;
+- client;
+- authorization server;
+- resource server.
+
+Authorization Code flow với PKCE phù hợp nhiều public/browser/mobile clients vì code verifier giúp chống intercepted authorization code. Machine-to-machine thường dùng client credentials hoặc workload identity theo trust model.
+
+##### OpenID Connect (OIDC)
+
+Identity layer trên OAuth 2.0 để client xác minh authentication event và nhận identity claims chuẩn. OIDC thêm ID token, UserInfo/discovery và các validation semantics.
+
+```text
+OAuth 2.0: client được phép truy cập gì?
+OIDC: user đã được IdP xác thực là ai trong login transaction?
+```
+
+Không dùng OAuth access token để suy ra user identity nếu token/profile contract không cho phép. Không gửi ID token tới API thay access token.
+
+Authorization request/response cần bảo vệ `state`; OIDC dùng `nonce` để bind ID token với authentication request. Redirect URIs phải exact/allowlisted theo policy.
+
+---
+
+#### 9. SSO và Identity Federation
+
+- **Single Sign-On (SSO):** authenticate một lần tại IdP rồi truy cập nhiều relying applications trong trust domain.
+- **Identity Federation:** các organizational/security domains thiết lập trust để chấp nhận identity assertions của nhau.
+
+Protocols thường gặp: OIDC và SAML; OAuth 2.0 tự nó không phải login/SSO protocol.
+
+**Lợi ích:**
+
+- giảm password sprawl/fatigue;
+- centralize MFA, lifecycle và risk policy;
+- deprovision nhanh hơn;
+- audit và compliance dễ hơn;
+- UX tốt hơn.
+
+**Rủi ro/trade-offs:**
+
+- IdP trở thành high-value target và availability dependency;
+- compromise một account/session mở rộng blast radius;
+- application mapping sai groups/claims gây privilege escalation;
+- logout/revocation propagation không đồng nhất;
+- federation metadata/signing-key rotation phức tạp;
+- tenant/account linking có thể bị takeover.
+
+SSO cần phishing-resistant MFA cho risk cao, break-glass accounts, HA/DR, application-level authorization và periodic access reviews.
+
+---
+
+#### 10. MFA, assurance và step-up authentication
+
+Authentication factors:
+
+- **something you know:** password/PIN;
+- **something you have:** authenticator/device/security key;
+- **something you are:** biometric characteristic.
+
+Hai passwords không phải hai factors vì cùng category. MFA strength phụ thuộc phishing resistance, enrollment/recovery và session binding, không chỉ số bước.
+
+Risk-based/step-up authentication yêu cầu assurance cao hơn khi:
+
+- thay password/MFA/recovery info;
+- export sensitive data;
+- chuyển tiền/thay payment destination;
+- cấp admin role;
+- login từ device/location bất thường;
+- thực hiện destructive operation.
+
+Account recovery phải mạnh tương xứng MFA; nếu support agent có thể bỏ qua mọi factor bằng vài câu hỏi yếu, attacker sẽ nhắm recovery channel.
+
+---
+
+#### 11. Authorization models
+
+##### 11.1 RBAC — Role-Based Access Control
+
+```text
+user -> role -> permissions
+```
+
+Dễ hiểu/audit cho broad job functions. Rủi ro: role explosion, quyền tích lũy và stale assignments.
+
+##### 11.2 ABAC — Attribute-Based Access Control
+
+Decision dựa trên subject, resource, action và environment attributes:
+
+```text
+allow if subject.department == resource.department
+     && subject.clearance >= resource.classification
+     && request.time within approved window
+```
+
+Fine-grained/dynamic nhưng policy, attribute quality, explainability và testing phức tạp. ABAC không tự động “tốt hơn RBAC”; thường kết hợp.
+
+##### 11.3 ReBAC — Relationship-Based Access Control
+
+Decision dựa trên graph relationship như owner, editor, member-of-team, parent-folder. Phù hợp sharing/collaboration và hierarchical resources.
+
+##### 11.4 DAC — Discretionary Access Control
+
+Resource owner có quyền chia sẻ/cấp quyền trong policy cho phép. Linh hoạt nhưng có thể lan quyền ngoài dự kiến.
+
+##### 11.5 MAC — Mandatory Access Control
+
+Central authority enforce labels/classifications và clearances; user/resource owner không tùy ý thay policy. Phù hợp môi trường assurance cao.
+
+Production system thường hybrid: RBAC cho coarse role, ReBAC cho ownership/sharing, ABAC cho tenant/context/risk và explicit deny/constraints cho sensitive actions.
+
+---
+
+#### 12. Authorization architecture
+
+```text
+Request
+ -> PEP thu subject/action/resource/context
+ -> PDP đánh giá policy
+ -> decision + obligations/reason
+ -> PEP enforce
+ -> audit
+```
+
+Có thể centralized PDP nhưng distributed enforcement. Trade-offs:
+
+- remote policy call làm tăng latency/availability dependency;
+- local cache giảm latency nhưng policy/role revocation bị stale;
+- token claims nhanh nhưng không phản ánh dynamic resource state;
+- duplicated policy trong mỗi service dễ drift;
+- centralized policy engine cần HA, versioning và decision logs.
+
+Best practices:
+
+- deny by default;
+- authorization ở backend/resource owner service;
+- check action + specific resource + tenant;
+- không tin object/tenant ID do client gửi nếu chưa bind;
+- consistent policy version và safe rollout;
+- cache với TTL/invalidation theo risk;
+- audit allow/deny cho sensitive actions;
+- explainability không làm lộ policy internals cho attacker;
+- negative/abuse-case tests.
+
+---
+
+#### 13. Multi-tenant và object-level authorization
+
+Một trong các lỗi API nguy hiểm nhất là caller đổi `resource_id` và truy cập object của người/tenant khác (thường gọi BOLA/IDOR).
+
+Sai:
+
+```text
+GET /invoices/123
+-> chỉ kiểm tra user đã login
+```
+
+Đúng về ý tưởng:
+
+```text
+authorize(subject, "read", invoice:123, tenant, context)
+-> query/bind data trong tenant + permission scope
+```
+
+Controls:
+
+- tenant identity lấy từ trusted context/token mapping;
+- query luôn scope theo tenant/ownership;
+- row/object-level policy defense in depth;
+- unique IDs không được xem là authorization;
+- export/list/search cũng enforce từng visibility scope;
+- background jobs/service accounts giữ tenant context;
+- cache key gồm tenant/security-relevant dimensions;
+- audit cross-tenant/admin access;
+- automated negative tests với object IDs khác.
+
+Ẩn ID hoặc dùng UUID chỉ giảm khả năng đoán, không thay authorization.
+
+---
+
+#### 14. Service-to-service authentication và authorization
+
+Không dùng một shared API key cho toàn bộ microservices. Mỗi workload cần identity riêng:
+
+- mTLS certificates/workload identity;
+- short-lived signed service tokens;
+- cloud IAM/workload federation;
+- broker/database credentials theo service;
+- audience-bound tokens;
+- least-privilege scopes/roles.
+
+Phải quyết định khi service gọi thay user:
+
+- propagate user identity/delegation token;
+- token exchange/downscope;
+- service acts as itself;
+- both user and service identities được audit.
+
+Tránh confused deputy: service có quyền mạnh bị caller lừa dùng quyền đó trên resource không thuộc caller. Service phải authorize end-user/resource context chứ không chỉ tin rằng upstream đã kiểm tra.
+
+---
+
+#### 15. Session/token theft và replay
+
+Threats:
+
+- XSS đọc token khỏi browser-accessible storage;
+- malware/device compromise;
+- token trong logs, URL, referrer hoặc analytics;
+- MITM khi TLS/validation sai;
+- CSRF khi browser tự gửi cookie;
+- replay bearer token;
+- refresh-token theft/reuse;
+- session fixation;
+- signing-key compromise.
+
+Mitigations phối hợp:
+
+- TLS và correct certificate validation;
+- `HttpOnly`, `Secure`, `SameSite` cookies theo architecture;
+- CSRF tokens/origin checks khi dùng cookie auth;
+- strong XSS prevention/CSP và output encoding;
+- short-lived access tokens;
+- refresh rotation + reuse detection;
+- sender-constrained tokens khi threat model yêu cầu;
+- session ID rotation;
+- redact logs và cấm token trong URL;
+- device/session inventory, revoke/logout-all;
+- anomaly/risk detection;
+- key rotation và incident response.
+
+Cookie giảm khả năng JavaScript đọc token nhưng không tự giải quyết CSRF; localStorage tránh CSRF auto-send nhưng tăng exposure trước XSS. Chọn storage theo full browser threat model, không theo slogan.
+
+---
+
+#### 16. Reliability của identity plane
+
+IdP, authorization server, session store và policy engine là critical dependencies.
+
+Thiết kế cần:
+
+- HA qua failure domains;
+- key/JWKS distribution và rotation không làm outage;
+- clock synchronization và bounded skew;
+- rate limits chống credential attacks nhưng không lockout abuse;
+- safe cached decisions/keys với expiry;
+- fail-open/fail-closed theo action risk;
+- emergency/break-glass access được audit;
+- backup/DR cho identity/config/keys;
+- degraded behavior khi IdP unavailable;
+- revoke compromised identity nhanh;
+- observability cho login, token, policy và MFA failures.
+
+Ví dụ: public read có thể phục vụ cached content khi IdP lỗi; admin write phải fail closed. Không dùng một global behavior cho mọi action.
+
+---
+
+#### 17. Năm câu hỏi phỏng vấn từ tài liệu PDF
+
+**Q1. Vì sao JWT thường được dùng cho “stateless authentication” trong distributed systems?**
+
+Signed JWT chứa claims và được APIs verify cục bộ bằng trusted key nên tránh session lookup ở mỗi request, hỗ trợ đa ngôn ngữ/service. Nhưng JWT không mã hóa payload, không tự revoke, có stale claims và cần strict issuer/audience/type/algorithm/time validation. Chỉ request validation là stateless; identity/key/refresh/revocation lifecycle vẫn có state.
+
+**Q2. OAuth 2.0 khác OpenID Connect thế nào?**
+
+OAuth 2.0 là delegated authorization framework và access token dành cho resource API. OIDC là identity/authentication layer trên OAuth, cung cấp ID token và login semantics cho client. ID token không phải access token; OAuth một mình không phải protocol đăng nhập chuẩn.
+
+**Q3. RBAC khác ABAC; môi trường dynamic nên dùng gì?**
+
+RBAC gán permissions qua roles, đơn giản và dễ audit nhưng dễ role explosion. ABAC dùng subject/resource/action/environment attributes, linh hoạt/context-aware nhưng policy và data quality phức tạp. Dynamic environment thường cần ABAC hoặc hybrid RBAC+ABAC/ReBAC; lựa chọn dựa trên policy complexity, explainability và operational maturity.
+
+**Q4. Lợi ích của SSO?**
+
+Một lần authentication cho nhiều apps, giảm credential sprawl/helpdesk, centralize MFA/lifecycle/audit và cải thiện UX. Đổi lại IdP là high-value target/availability dependency và compromise có blast radius lớn; vẫn cần app-level authorization, federation mapping an toàn, HA/DR và break-glass.
+
+**Q5. Các security concerns của token-based authentication?**
+
+Theft, replay, leakage, long TTL, difficult revocation, stale claims, audience/issuer confusion, algorithm/key errors và insecure browser storage. Giảm bằng TLS, secure storage, short access TTL, refresh rotation/reuse detection, strict validation, least scopes, revocation/session controls, logging redaction và anomaly monitoring.
+
+---
+
+#### 18. Sai lầm thường gặp
+
+- Chỉ ẩn nút trên UI thay vì backend authorization.
+- Login thành công được xem là có quyền truy cập mọi object.
+- Basic Auth được coi an toàn vì Base64.
+- JWT payload được tưởng là encrypted.
+- API nhận ID token thay access token.
+- OAuth 2.0 được dùng như authentication protocol mà không có OIDC/profile an toàn.
+- Access token không kiểm tra audience/issuer/token type.
+- Đặt roles/permissions quá nhiều trong long-lived JWT gây stale authorization.
+- Dùng một shared service credential cho toàn hệ thống.
+- Trust `tenant_id`, role hoặc owner do client gửi.
+- UUID/khó đoán ID được dùng thay object authorization.
+- Session cookie thiếu `HttpOnly`/`Secure`/`SameSite` và CSRF strategy.
+- Lưu bearer token vào URL/log/local storage mà không phân tích XSS risk.
+- Refresh token không rotate/revoke/reuse-detect.
+- SSO centralize login nhưng applications map groups thành admin sai.
+- MFA mạnh nhưng account recovery yếu.
+- Policy engine fail-open cho sensitive write khi unavailable.
+- Logout UI xong nhưng refresh/session vẫn còn usable.
+
+---
+
+#### 19. Checklist thiết kế identity và access
+
+1. Subjects gồm users, services, devices, jobs và admins nào?
+2. Assurance level cho từng action/risk tier?
+3. Authentication factors và recovery/enrollment controls?
+4. Session, opaque token hay JWT—vì sao?
+5. Access/ID/refresh token audiences và lifetimes?
+6. Issuer, audience, signature, type và time validation?
+7. Token/session storage theo browser/mobile/service threat model?
+8. Revocation, logout-all, user disable và key compromise behavior?
+9. OAuth/OIDC flow, PKCE, `state`, `nonce`, redirect URI?
+10. AuthZ model: RBAC, ABAC, ReBAC, DAC/MAC hay hybrid?
+11. Backend checks action + resource + tenant + context chưa?
+12. Policy PDP/PEP location, caching, consistency và fail behavior?
+13. Service-to-service identity, delegation và downscoping?
+14. Least privilege và access review/deprovisioning?
+15. SSO/federation trust, claim mapping và IdP outage?
+16. MFA step-up cho admin/export/payment/recovery?
+17. CSRF, XSS, replay, fixation và token leakage controls?
+18. Audit ai/action/resource/decision/policy version?
+19. Negative authorization và cross-tenant tests?
+20. Identity plane HA, DR, break-glass và incident playbooks?
+
+#### 20. Ý chính cần nhớ
+
+- AuthN xác minh principal; AuthZ quyết định action trên resource trong context.
+- AuthZ phải enforce ở backend cho từng protected resource/action.
+- Identity lifecycle gồm provision, rotate, suspend, revoke và deprovision—not chỉ login.
+- Session-based auth hỗ trợ revocation nhanh nhưng cần reliable shared state khi scale.
+- Token-based auth hỗ trợ delegation/distribution nhưng bearer theft và revocation là rủi ro.
+- JWT là signed claims format, không mặc nhiên encrypted hay “không có state”.
+- Access token dành cho API; ID token dành cho OIDC client; refresh token chỉ tới authorization server.
+- OAuth 2.0 xử lý delegated authorization; OIDC bổ sung authentication/login layer.
+- SSO giảm credential sprawl nhưng IdP là high-value target và dependency.
+- RBAC đơn giản; ABAC linh hoạt; ReBAC phù hợp ownership/sharing; hybrid thường thực dụng.
+- Unique/unguessable ID không thay object/tenant authorization.
+- MFA phải xét phishing resistance và recovery path.
+- Service identity phải riêng, short-lived và least privilege.
+- Authorization cache/token claims tạo staleness; policy change/revocation cần strategy.
+- Identity plane phải có HA, DR, safe failure và audit.
+
+#### Công thức ghi nhớ
+
+> **Identity system an toàn = AuthN assurance phù hợp + session/token lifecycle chặt + AuthZ theo action-resource-tenant-context + least privilege + service identity + revocation/audit + identity plane có HA/DR.**
+
+---
+
+### Bài 59. Data Protection & Secure Communication
+
+#### 1. Mục tiêu của bảo vệ dữ liệu
+
+Bảo vệ dữ liệu không chỉ là “bật encryption”. Kiến trúc phải bảo vệ dữ liệu trong toàn bộ vòng đời:
+
+- **At rest:** đang nằm trong database, disk, object storage, cache, log hoặc backup.
+- **In transit:** đang đi giữa browser–API, service–service, database–application hoặc giữa các region.
+- **In use:** đang được giải mã trong memory để CPU/application xử lý.
+
+Trước khi chọn thuật toán, cần trả lời:
+
+1. Dữ liệu nào nhạy cảm và ai được phép dùng?
+2. Cần bảo vệ khỏi đối thủ nào: mất ổ đĩa, nghe lén mạng, operator nội bộ, application bị chiếm quyền hay cloud account bị compromise?
+3. Cần **confidentiality**, **integrity**, **authenticity**, hay cả ba?
+4. Key được tạo, lưu, phân quyền, xoay và thu hồi như thế nào?
+5. Khi key hoặc certificate bị lộ, hệ thống phát hiện và phục hồi ra sao?
+
+> Encryption mạnh nhưng key management yếu vẫn là một thiết kế yếu.
+
+---
+
+#### 2. Giảm dữ liệu trước khi bảo vệ dữ liệu
+
+Control hiệu quả nhất cho dữ liệu không cần thiết là **không thu thập hoặc không giữ nó**.
+
+- Phân loại: public, internal, confidential, restricted/regulated.
+- Chỉ thu thập dữ liệu cần cho mục đích đã xác định.
+- Đặt retention và deletion policy; không giữ vô thời hạn theo thói quen.
+- Tách dữ liệu nhạy cảm khỏi dữ liệu thông thường để giảm blast radius.
+- Mask dữ liệu trong UI/log và môi trường non-production.
+- Dùng tokenization hoặc pseudonymization khi workflow không cần giá trị gốc.
+- Hạn chế data export, bulk read và quyền truy cập của con người.
+
+Phân loại dữ liệu quyết định encryption layer, key boundary, audit, backup, residency và recovery requirements.
+
+---
+
+#### 3. Phân biệt các công cụ mật mã
+
+| Công cụ | Có đảo ngược? | Mục tiêu chính | Ví dụ sử dụng |
+|---|---:|---|---|
+| **Encoding** | Có, không cần secret | Biểu diễn/transport dữ liệu | Base64, UTF-8 |
+| **Encryption** | Có key phù hợp | Confidentiality; nếu dùng AEAD còn có integrity/authenticity | Mã hóa file, database field, network channel |
+| **Cryptographic hash** | Không được thiết kế để đảo ngược | Fingerprint/integrity building block | Content digest, deduplication |
+| **HMAC/MAC** | Không | Integrity và authenticity với shared secret | Xác minh webhook/message |
+| **Digital signature** | Verify bằng public key | Integrity, authenticity và bằng chứng key holder đã ký | Ký artifact, certificate, transaction |
+
+Các điểm hay nhầm:
+
+- Base64 là encoding, **không phải encryption**.
+- Hash không che được dữ liệu có miền giá trị nhỏ; attacker có thể thử mọi khả năng.
+- Hash trần chỉ phát hiện lỗi ngẫu nhiên khi giá trị chuẩn được bảo vệ; nó không chống attacker thay cả message lẫn hash. Dùng HMAC hoặc chữ ký khi cần authenticity.
+- Encryption không mặc nhiên chống sửa đổi. Nên dùng authenticated encryption như **AEAD** thay vì ghép thuật toán tùy tiện.
+
+---
+
+#### 4. Mã hóa đối xứng và bất đối xứng
+
+##### Symmetric encryption
+
+Cùng một secret key được dùng để mã hóa và giải mã.
+
+```text
+Ciphertext = Encrypt(secret_key, plaintext, nonce, associated_data)
+Plaintext  = Decrypt(secret_key, ciphertext, nonce, associated_data)
+```
+
+- Nhanh, phù hợp với dữ liệu dung lượng lớn.
+- Thường dùng AES hoặc thuật toán hiện đại tương đương trong mode authenticated.
+- Khó khăn chính là phân phối và bảo vệ secret key.
+- Với nhiều AEAD mode, **nonce không được tái sử dụng với cùng key**.
+
+##### Asymmetric encryption
+
+Dùng một key pair:
+
+- **Public key:** có thể phân phối rộng.
+- **Private key:** phải được bảo vệ chặt.
+
+Nó hỗ trợ authentication, key establishment và digital signatures nhưng chậm hơn symmetric cryptography vì phép toán phức tạp hơn. Vì vậy, hệ thống thực tế dùng mô hình **hybrid**:
+
+```text
+Asymmetric mechanism: xác thực peer + thiết lập/thỏa thuận session key
+Symmetric mechanism:  dùng session key để bảo vệ bulk traffic
+```
+
+Trong TLS hiện đại, session key thường được thỏa thuận bằng cơ chế ephemeral key exchange; không nên hình dung mọi kết nối đều “mã hóa AES key bằng RSA”.
+
+---
+
+#### 5. Bảo vệ dữ liệu at rest
+
+Có nhiều lớp mã hóa với threat boundary khác nhau:
+
+| Lớp | Bảo vệ tốt trước | Không tự bảo vệ trước |
+|---|---|---|
+| Disk/volume encryption | Ổ đĩa, snapshot hoặc media bị lấy cắp | Application/DB account hợp lệ bị compromise |
+| Database TDE | Data files, logs và backup ở tầng storage | Query từ principal có quyền |
+| Object-storage server-side encryption | Object/media at rest trong storage service | Quyền đọc object bị lạm dụng |
+| Application/field-level encryption | Chọn field nhạy cảm; có thể tách trust khỏi database | Application có quyền giải mã bị compromise |
+| Client-side/end-to-end encryption | Provider hoặc trung gian không có plaintext/key | Search, analytics, recovery và key UX trở nên khó hơn |
+
+Thiết kế at-rest protection cần bao phủ cả:
+
+- primary data, replicas và caches;
+- snapshots, backups và exports;
+- logs, traces, dead-letter queues và analytics pipelines;
+- temporary files và developer/test environments;
+- metadata nhạy cảm, không chỉ payload chính.
+
+Mã hóa at rest phải đi cùng least privilege, network isolation, audit, retention và secret management.
+
+---
+
+#### 6. Key management và envelope encryption
+
+Không hard-code key trong source code, image, config public hoặc log. Nên dùng **KMS/HSM** với policy và audit rõ ràng.
+
+Envelope encryption tách key dùng cho dữ liệu khỏi master key:
+
+```text
+Plaintext --encrypt bằng DEK--> Ciphertext
+DEK       --wrap bằng KEK-----> Encrypted DEK
+
+Lưu: Ciphertext + Encrypted DEK + metadata thuật toán/key version
+KMS/HSM giữ hoặc kiểm soát KEK
+```
+
+- **DEK (Data Encryption Key):** mã hóa một object, record, tenant hoặc data partition.
+- **KEK (Key Encryption Key):** wrap/protect DEK; thường được quản lý bởi KMS/HSM.
+- Có thể rotate KEK bằng cách re-wrap DEK mà không cần giải mã và mã hóa lại toàn bộ dữ liệu.
+- Rotate DEK thường đòi hỏi re-encryption hoặc lazy migration.
+
+Key lifecycle phải bao gồm generation, distribution, storage, usage policy, rotation, revocation/destruction, backup/recovery và audit. Tách quyền quản trị key khỏi quyền đọc dữ liệu để giảm rủi ro một principal nắm cả hai.
+
+---
+
+#### 7. Bảo vệ dữ liệu in transit bằng TLS/HTTPS
+
+TLS cung cấp ba thuộc tính chính cho một secure channel:
+
+- **Confidentiality:** người nghe lén không đọc được nội dung.
+- **Integrity:** thay đổi trên đường truyền bị phát hiện.
+- **Peer authentication:** client xác minh server qua certificate; với mTLS, hai phía cùng xác minh certificate.
+
+Luồng TLS ở mức khái niệm:
+
+```text
+Client                         Server
+  | ---- phiên bản, cipher, key share ----> |
+  | <--- certificate, key share, proof ---- |
+  | -- xác minh chain + hostname + hạn dùng |
+  | == hai bên tạo session traffic keys == |
+  | <====== encrypted application data ===> |
+```
+
+Certificate không tự “mã hóa website”; nó bind public key với identity và giúp xác thực endpoint. Sau handshake, symmetric session keys bảo vệ traffic vì hiệu quả hơn.
+
+##### TLS termination là một trust boundary
+
+```text
+Client --TLS--> CDN/LB/API Gateway --TLS hoặc mTLS--> Service
+```
+
+Nếu proxy terminate TLS rồi gửi HTTP plaintext tới backend, protection chỉ kéo dài tới proxy. Private network không đồng nghĩa với trusted network; cần chủ động quyết định re-encryption/mTLS dựa trên threat model và chi phí vận hành.
+
+##### mTLS
+
+mTLS phù hợp cho machine/workload identity ở service-to-service, partner API hoặc admin channel. Tuy nhiên:
+
+- Nó xác thực peer ở channel, không tự quyết định quyền business.
+- Vẫn cần authorization theo action/resource/tenant.
+- Cần certificate issuance, short lifetime, rotation, revocation và clock/identity operations đáng tin cậy.
+
+---
+
+#### 8. PKI và chuỗi tin cậy
+
+Public Key Infrastructure gồm certificate, Certificate Authority (CA), registration/issuance process, trust stores, revocation/status mechanisms và operational policy.
+
+Khi xác minh certificate, client thường kiểm tra:
+
+1. Chuỗi chữ ký dẫn tới trust anchor được tin cậy.
+2. Hostname/service identity khớp SAN.
+3. Certificate còn hiệu lực và được phép dùng cho mục đích đó.
+4. Thuật toán, key usage và policy đáp ứng yêu cầu.
+5. Trạng thái thu hồi khi ecosystem/policy áp dụng.
+
+CA compromise hoặc phát hành sai có blast radius lớn. Giảm rủi ro bằng offline/root protection, intermediate CAs, HSM, short-lived certificates, issuance automation, audit và rotation drills. CRL/OCSP có thể hỗ trợ revocation checking nhưng không nên là kế hoạch duy nhất; hành vi kiểm tra tùy client và hệ sinh thái.
+
+Digital signature hỗ trợ authenticity và integrity. “Non-repudiation” không phải bảo đảm tuyệt đối chỉ nhờ thuật toán; còn phụ thuộc key custody, audit, identity proofing và quy trình pháp lý.
+
+---
+
+#### 9. Lưu mật khẩu đúng cách
+
+Mật khẩu **không nên được mã hóa để có thể giải mã lại**. Hãy lưu password verifier bằng password-hashing/KDF chuyên dụng:
+
+```text
+stored = Argon2id(password, unique_random_salt, cost_parameters)
+```
+
+Có thể dùng Argon2id, scrypt, bcrypt hoặc PBKDF2 theo chuẩn và nền tảng của tổ chức.
+
+- Mỗi password có một random salt riêng để chặn precomputed/rainbow-table attacks và làm hai mật khẩu giống nhau cho kết quả khác nhau.
+- Cost phải đủ cao để làm brute force tốn kém nhưng vẫn đáp ứng login SLO.
+- Lưu algorithm/version/cost cùng verifier để nâng cấp dần khi user đăng nhập.
+- Pepper là secret dùng chung tùy chọn, phải nằm ngoài database trong secret manager/HSM và cần kế hoạch rotation/recovery.
+- Không dùng MD5, SHA-1 hoặc SHA-256 đơn thuần—even khi có salt—vì chúng quá nhanh cho password storage.
+
+Salt không cần bí mật; mục tiêu của nó là tính duy nhất. Pepper mới là secret.
+
+---
+
+#### 10. Giao tiếp API an toàn
+
+HTTPS là nền tảng nhưng API production cần nhiều lớp:
+
+- Xác thực server và, khi cần, client/workload bằng certificate.
+- Authentication token ngắn hạn, đúng issuer/audience/scope; không đặt bearer token trong URL hoặc log.
+- Authorization tại backend cho từng action và resource.
+- Request validation, size/time limits và chống injection.
+- Rate limit/quota để giảm abuse; đây không thay authorization.
+- Replay defense cho operation nhạy cảm bằng expiry, nonce, timestamp hoặc idempotency semantics phù hợp.
+- HMAC/digital signature khi message cần được xác minh ngoài lifetime của một TLS hop, ví dụ webhook.
+- Secret/certificate rotation tự động và audit có redaction.
+- IP allowlist chỉ là control bổ sung; địa chỉ mạng không phải business identity đáng tin cậy.
+
+Token xác thực hoặc ủy quyền cho caller; bản thân token không bảo vệ tính toàn vẹn của transport. TLS, MAC hoặc signature mới thực hiện vai trò đó theo từng phạm vi.
+
+---
+
+#### 11. Bảo vệ dữ liệu in use
+
+Khi application cần xử lý, plaintext thường xuất hiện trong memory. Đây là điểm mà at-rest encryption và TLS không còn bảo vệ trực tiếp.
+
+Giảm rủi ro bằng:
+
+- thu nhỏ process/service có quyền giải mã;
+- least privilege và memory-safe implementation;
+- không ghi plaintext/secret vào log, crash dump hoặc telemetry;
+- giải mã đúng lúc, xóa buffer khi khả thi và giới hạn caching;
+- isolation/sandbox hoặc confidential-computing capability nếu threat model thực sự yêu cầu;
+- application-level access control và monitoring cho bulk reads/exports.
+
+Không có một lớp encryption duy nhất bảo vệ được cả ba trạng thái dữ liệu.
+
+---
+
+#### 12. Câu hỏi phỏng vấn từ tài liệu bổ sung
+
+##### Câu 1: Hashing khác encryption như thế nào?
+
+Encryption là phép biến đổi có thể đảo ngược bằng key phù hợp và chủ yếu bảo vệ confidentiality. Hash mật mã là phép một chiều tạo digest và thường là building block cho integrity, fingerprint hoặc password verification. Với dữ liệu do attacker có thể sửa, hash trần chưa đủ authenticity; dùng HMAC hoặc digital signature. Password phải dùng password KDF chậm/memory-hard cùng salt, không dùng SHA-256 đơn thuần.
+
+##### Câu 2: Vì sao asymmetric encryption chậm hơn symmetric encryption?
+
+Asymmetric cryptography dùng các phép toán số học phức tạp và key lớn hơn nên tốn CPU hơn. Symmetric algorithms được tối ưu cho bulk data. Hệ thống thực tế kết hợp cả hai: asymmetric mechanisms để xác thực và thiết lập/thỏa thuận session key, sau đó symmetric AEAD bảo vệ dữ liệu phiên.
+
+##### Câu 3: PKI xây dựng trust như thế nào?
+
+PKI bind identity với public key qua certificate do CA ký. Client xác minh signature chain tới trust anchor, hostname/SAN, hạn dùng, key usage và policy/status liên quan. Trust không chỉ nằm trong file certificate mà còn phụ thuộc quy trình cấp phát, bảo vệ CA/private keys, rotation, revocation và audit.
+
+##### Câu 4: Bảo vệ dữ liệu at rest và in motion ra sao?
+
+- At rest: mã hóa disk/database/object/field theo threat boundary; kiểm soát access; bảo vệ cả backup, log và replica; quản lý key qua KMS/HSM.
+- In motion: dùng TLS/HTTPS; cân nhắc mTLS cho service identity, VPN/IPsec ở network use case phù hợp; kiểm tra certificate và tránh plaintext sau TLS termination.
+- Ở cả hai: áp dụng least privilege, classification, minimization, monitoring, rotation và incident response.
+
+---
+
+#### 13. Các lỗi thiết kế thường gặp
+
+- Nói “dữ liệu đã được mã hóa” nhưng không chỉ rõ layer và threat nào được xử lý.
+- Dùng Base64 như một security control.
+- Dùng encryption không authenticated hoặc tái sử dụng nonce sai quy tắc.
+- Lưu key cạnh ciphertext với cùng quyền truy cập.
+- Hard-code key/token trong source, image hoặc CI log.
+- Dùng một key vĩnh viễn cho mọi tenant và mọi environment.
+- Chỉ mã hóa primary database nhưng quên backup, log, cache và export.
+- Cho rằng TDE ngăn được attacker có database credentials.
+- Terminate TLS ở gateway rồi mặc định toàn bộ internal network đáng tin.
+- Chấp nhận mọi certificate được một CA tin cậy ký nhưng không kiểm tra hostname/service identity.
+- Dùng SHA-256 nhanh để lưu password.
+- Coi mTLS hoặc signed JWT là sự thay thế cho authorization.
+- Rotation trên giấy nhưng chưa từng thử re-wrap, re-encrypt hoặc emergency revocation.
+- Log plaintext, authorization header, private key hoặc dữ liệu cá nhân.
+
+---
+
+#### 14. Checklist thiết kế data protection
+
+1. Dữ liệu được phân loại và có owner/retention chưa?
+2. Threat model cho at rest, in transit và in use là gì?
+3. Cần confidentiality, integrity, authenticity hay non-replay ở phạm vi nào?
+4. Encryption layer có đúng threat boundary không?
+5. Có dùng authenticated encryption và quản lý nonce đúng không?
+6. Key nằm ở đâu; ai/app nào được dùng; có separation of duties không?
+7. Có envelope encryption, key versioning và audit không?
+8. Rotation/revocation/recovery đã được diễn tập chưa?
+9. Replicas, backups, caches, logs, exports và non-production đã được bao phủ chưa?
+10. TLS certificate chain, hostname, lifetime và algorithm policy được validate chưa?
+11. Traffic sau CDN/LB/gateway còn được bảo vệ không?
+12. Có cần mTLS; service authorization được enforce ở đâu?
+13. Password có dùng password KDF, unique salt và cost phù hợp không?
+14. Tokens/secrets có xuất hiện trong URL, log hoặc telemetry không?
+15. Bulk read/export và anomalous key use có monitoring/alert không?
+16. Kịch bản key/CA compromise có runbook và blast-radius containment không?
+17. Data deletion có xử lý replicas, derived data và backup retention không?
+
+#### 15. Ý chính cần nhớ
+
+- Data protection là bài toán toàn vòng đời, không phải một checkbox encryption.
+- Phân loại và giảm dữ liệu phải diễn ra trước khi chọn cryptography.
+- Encryption, hashing, HMAC và digital signature giải quyết các mục tiêu khác nhau.
+- Symmetric cryptography phù hợp bulk data; asymmetric mechanisms hỗ trợ identity, signature và key establishment.
+- Dùng hybrid cryptography và authenticated encryption thay vì tự ghép primitive.
+- At-rest encryption chỉ bảo vệ trong threat boundary của layer được chọn.
+- TLS bảo vệ một connection/hop; termination tạo trust boundary mới.
+- mTLS xác thực workload/peer nhưng không thay business authorization.
+- PKI là cả hệ thống vận hành trust, không chỉ certificate và CA.
+- Password phải dùng password-specific KDF với unique salt.
+- KMS/HSM, envelope encryption, rotation, revocation và audit quan trọng ngang thuật toán.
+- Backups, logs, caches, exports và data in use đều nằm trong phạm vi bảo vệ.
+
+#### Công thức ghi nhớ
+
+> **Data protection vững = data minimization + đúng primitive + đúng encryption boundary + TLS/peer validation + key lifecycle an toàn + least privilege + audit/incident readiness.**
+
+---
+
+### Bài 60. Network & Infrastructure Security
+
+#### 1. Mục tiêu của network security
+
+Network security không chỉ nhằm “chặn người ngoài”. Mục tiêu là giữ cho hệ thống:
+
+- **Confidential:** traffic và tài nguyên không bị truy cập trái phép.
+- **Integrity-protected:** packet/request/configuration không bị sửa đổi ngoài ý muốn.
+- **Available:** hệ thống vẫn phục vụ khi bị abuse, traffic spike hoặc DDoS.
+- **Contained:** nếu một workload bị compromise, attacker khó di chuyển sang tài nguyên khác.
+- **Observable and recoverable:** hoạt động bất thường được phát hiện, điều tra và cô lập nhanh.
+
+Các sự cố thực tế thường bắt đầu từ những lỗi đơn giản như public port không cần thiết, firewall rule quá rộng, credential bị lộ, storage public hoặc cloud configuration sai. Sau initial access, attacker thường tìm cách **lateral movement** để tới database, secrets, control plane hoặc tài nguyên có quyền cao hơn.
+
+Vì vậy, kiến trúc hiện đại dùng **defense in depth** và coi mỗi network hop là một trust decision, thay vì xem toàn bộ “mạng nội bộ” là đáng tin.
+
+```text
+Prevent initial access
+        ↓
+Detect suspicious behavior
+        ↓
+Contain lateral movement
+        ↓
+Respond, recover, learn
+```
+
+---
+
+#### 2. Threat model và attack surface
+
+Trước khi đặt firewall rules, hãy lập bản đồ:
+
+1. Entry points: DNS, CDN, public IP, VPN, API, SSH/RDP, admin console, webhook.
+2. Assets: data, secrets, identities, control plane và business operations.
+3. Trust boundaries: internet–edge, edge–service, service–service, app–database, cloud account–account.
+4. Allowed flows: source identity/segment, destination, port, protocol và business purpose.
+5. Egress paths: workload được phép gọi ra internet hoặc third party nào.
+6. Failure/attack scenarios: DDoS, credential theft, SSRF, compromised pod, malicious insider, supply-chain artifact.
+
+**Attack surface reduction** thường mang lại lợi ích lớn hơn việc thêm nhiều detector:
+
+- Không cấp public IP nếu không cần.
+- Đóng port và protocol không sử dụng.
+- Tách management plane khỏi data plane.
+- Chỉ cho phép flow đã biết; ưu tiên default-deny.
+- Loại bỏ legacy service, default account và stale credentials.
+
+---
+
+#### 3. Firewall, reverse proxy và WAF
+
+Ba thành phần có thể cùng xuất hiện nhưng hoạt động ở các phạm vi khác nhau:
+
+| Thành phần | Nhìn thấy/chặn theo | Vai trò chính | Giới hạn |
+|---|---|---|---|
+| **Firewall** | IP, port, protocol, connection state; một số loại hiểu application | Giảm network attack surface, kiểm soát ingress/egress | Không mặc nhiên hiểu business semantics của HTTP/API |
+| **Reverse proxy** | Host, path, header, HTTP request; tùy sản phẩm | Là public frontend, route/load balance, TLS termination, cache, auth integration | Không mặc nhiên là security product hoặc DDoS shield |
+| **WAF** | HTTP request/response và application attack patterns | Chặn/giảm injection, malicious payload, bot/abuse theo rules | Có false positive/negative; không thay secure code và authorization |
+
+```text
+Internet
+   |
+[Edge DDoS/CDN]
+   |
+[Network firewall]
+   |
+[Reverse proxy / WAF / API gateway]
+   |
+[Private application services]
+```
+
+Điểm cần nhớ:
+
+- Firewall quyết định network flow nào được phép; reverse proxy quản lý cách application traffic hợp lệ tới backend.
+- “Ẩn IP backend” không đủ nếu backend vẫn có public route hoặc security rule cho phép bypass proxy.
+- TLS termination tại proxy tạo một trust boundary; cần quyết định bảo vệ hop tới backend.
+- DDoS volumetric phải được hấp thụ/chặn trước khi đường truyền hoặc regional capacity bị bão hòa. Một reverse proxy nằm sau bottleneck không thể tự giải quyết mọi DDoS.
+
+---
+
+#### 4. Rate limiting, throttling và IP filtering
+
+##### Rate limiting
+
+Giới hạn số request hoặc resource units trong một interval nhằm:
+
+- chống brute force và API abuse;
+- bảo vệ dependency đắt tiền;
+- bảo đảm fair usage giữa tenants;
+- kiểm soát chi phí và blast radius của buggy client.
+
+Các thuật toán thường gặp:
+
+| Thuật toán | Đặc điểm |
+|---|---|
+| Fixed window | Đơn giản nhưng có boundary burst |
+| Sliding window/log | Chính xác hơn, tốn state hơn |
+| Token bucket | Cho phép burst có giới hạn rồi refill theo rate |
+| Leaky bucket | Làm phẳng output rate/queue theo tốc độ ổn định |
+
+Limit nên chọn identity phù hợp: user, tenant, API key, endpoint, cost unit hoặc workload—not chỉ IP. Nhiều users có thể dùng chung NAT; attacker cũng có thể phân tán qua nhiều IP.
+
+Khi vượt limit, API thường trả `429 Too Many Requests`, có thể kèm retry guidance. Client nên dùng bounded exponential backoff với jitter. **Exponential backoff là hành vi retry của client, không phải một rate-limiting algorithm.**
+
+##### Throttling
+
+Throttling giảm tốc hoặc giảm lượng work được chấp nhận khi hệ thống chịu áp lực. Tùy protocol và kiến trúc, hệ thống có thể delay, queue, degrade hoặc reject. Cố giữ connection và “làm chậm” attacker đôi khi còn tiêu tốn tài nguyên; cần bounded queues và load shedding.
+
+##### IP filtering
+
+IP allowlist/blocklist hữu ích cho admin endpoint, partner network hoặc coarse-grained control nhưng không phải identity mạnh:
+
+- IP có thể thay đổi, dùng chung hoặc đi qua proxy/NAT.
+- Phải xác định trusted proxy chain trước khi tin `X-Forwarded-For`.
+- Spoofed source IP đặc biệt liên quan tới connectionless/reflection attacks; TCP handshake và upstream controls làm threat khác với mô tả “giả IP để đăng nhập”.
+
+---
+
+#### 5. Network segmentation và isolation
+
+Mục tiêu của segmentation là giới hạn blast radius và lateral movement. Không đặt toàn bộ workload vào một flat network.
+
+Ví dụ zone:
+
+```text
+Internet
+   |
+Public/DMZ: CDN, LB, reverse proxy
+   |  chỉ application ports cần thiết
+Application segment: stateless services
+   |  chỉ DB/cache ports từ đúng service identity/segment
+Data segment: database, cache, queue
+   |
+Management segment: bastion/PAM/operations plane tách riêng
+```
+
+Các lớp enforcement có semantics khác nhau:
+
+- **VPC/VNet, subnet, route table:** chia address/routing domain; subnet tự nó chưa phải access control đầy đủ.
+- **Security group/firewall:** stateful allow rules quanh workload/interface tùy cloud.
+- **Network ACL:** thường stateless ở subnet boundary; phải hiểu cả chiều request/response.
+- **Kubernetes NetworkPolicy:** kiểm soát pod ingress/egress nếu network plugin hỗ trợ; policy không có tác dụng nếu CNI không enforce.
+- **Service mesh/application policy:** kiểm soát theo workload identity và L7 attributes.
+
+Best practice là default-deny rồi mở đúng source → destination → port/protocol có owner và lý do. Đồng thời kiểm soát **egress**: compromised workload không nên tùy ý kết nối internet, exfiltrate data hoặc gọi metadata/control-plane endpoints.
+
+---
+
+#### 6. Zero Trust
+
+Zero Trust không phải một sản phẩm và cũng không có nghĩa “không tin ai”. Đây là mô hình:
+
+- không cấp trust chỉ vì request đến từ internal network;
+- xác minh rõ identity của user, device và workload;
+- quyết định quyền theo resource, action, context và risk;
+- cấp least privilege, ưu tiên credential ngắn hạn;
+- giả định breach và giới hạn blast radius;
+- liên tục thu thập telemetry, đánh giá và thu hồi quyền khi risk thay đổi.
+
+```text
+Request
+  → authenticate identity/device/workload
+  → evaluate authorization + context + policy
+  → grant minimum scoped access
+  → monitor session/action
+  → re-evaluate or revoke when risk changes
+```
+
+“Always verify” không nhất thiết là chạy lại login/MFA ở từng packet. Kiến trúc có thể dùng short-lived session/token và policy enforcement có phạm vi rõ, miễn trust không dựa duy nhất vào network location.
+
+Zero Trust cần cả identity plane, segmentation, device/workload posture, policy, telemetry và incident response. Chỉ bật mTLS chưa tạo thành Zero Trust.
+
+---
+
+#### 7. Cloud security và shared responsibility
+
+Chuyển lên cloud làm thay đổi ranh giới trách nhiệm, không chuyển toàn bộ trách nhiệm cho provider.
+
+- Provider thường bảo vệ physical facilities, hardware và managed-service infrastructure theo service model.
+- Customer vẫn phải quản lý data, identities, permissions, configuration, application code, workload và nhiều network controls.
+- Phạm vi cụ thể khác nhau giữa IaaS, PaaS, SaaS và từng dịch vụ; phải đọc contract/service responsibility matrix.
+
+Các control quan trọng:
+
+1. **IAM:** MFA cho human/admin, workload identity, short-lived credentials, least privilege, permission boundaries và access review.
+2. **Organization/account structure:** tách production, security/logging và sandbox; dùng guardrails ở cấp organization.
+3. **Network:** private endpoints, controlled ingress/egress, segmentation và DNS security.
+4. **Data:** encryption, KMS policy, backup, retention và residency.
+5. **Audit:** control-plane/data-plane logs, central immutable storage, alert và time synchronization.
+6. **Posture management:** CSPM/config rules phát hiện public resource, broad policy, disabled logging hoặc drift.
+7. **Incident readiness:** break-glass, credential revocation, account isolation và forensic evidence preservation.
+
+CSPM giúp tìm misconfiguration và drift; nó không chứng minh hệ thống an toàn hay thay threat modeling, code security và runtime detection.
+
+---
+
+#### 8. Securing serverless workloads
+
+Serverless bỏ bớt server operations nhưng vẫn có application, identity, dependency và event risks.
+
+- Mỗi function/workload có IAM role riêng, chỉ đúng resource/action.
+- Không dùng một execution role rộng cho mọi function.
+- Validate mọi event source, payload, webhook và queue message.
+- Giới hạn timeout, memory, concurrency và retry để tránh runaway cost hoặc retry storm.
+- Đặt reserved concurrency/backpressure cho dependency nhạy cảm.
+- Quản lý secret qua secret manager/KMS; không nhúng trong source/package/environment dump.
+- Quét dependency và artifact; ký/attest build khi supply-chain risk yêu cầu.
+- Hạn chế egress và private-network access; bảo vệ metadata/credential endpoint.
+- Log invocation, identity, policy decision và failure nhưng redact dữ liệu nhạy cảm.
+
+API gateway là enforcement point hữu ích cho authentication, request validation, quota và rate limit, nhưng asynchronous triggers và internal invocations cũng cần policy riêng.
+
+---
+
+#### 9. Securing containers và Kubernetes
+
+Container isolation không tương đương VM boundary. Cần bảo vệ toàn chuỗi build → registry → admission → runtime → cluster control plane.
+
+##### Build và image
+
+- Dùng minimal, maintained base image phù hợp; “nhỏ” không tự động đồng nghĩa “an toàn”.
+- Pin version/digest; tạo SBOM; scan OS packages và application dependencies.
+- Ký image/provenance và verify tại admission khi threat model yêu cầu.
+- Không bake secrets vào image hoặc layer history.
+
+##### Workload runtime
+
+- Chạy non-root; `allowPrivilegeEscalation: false`; drop Linux capabilities không cần.
+- Dùng read-only root filesystem, seccomp/AppArmor/SELinux theo nền tảng.
+- Tránh privileged pod, host network/PID/IPC và hostPath nếu không thật sự cần.
+- Đặt CPU/memory/ephemeral-storage requests và limits; giới hạn process khi phù hợp.
+- Dùng service account riêng và tắt automount token nếu workload không gọi Kubernetes API.
+
+##### Cluster và control plane
+
+- RBAC least privilege cho users, controllers và service accounts.
+- NetworkPolicy default-deny ingress/egress và mở flow theo workload.
+- Mã hóa/protect secrets at rest; ưu tiên external secret manager và rotation.
+- Audit Kubernetes API, bảo vệ etcd, kubelet, admission và cluster-admin paths.
+- Tách namespaces/clusters theo trust, tenant và blast-radius requirements.
+- Runtime detection hỗ trợ phát hiện process/network/file behavior bất thường nhưng cần tuning và response playbook.
+
+> **Cập nhật:** PDF nhắc tới Pod Security Policy (PSP). PSP đã bị loại bỏ từ Kubernetes v1.25; dùng **Pod Security Admission/Pod Security Standards** hoặc admission policy/webhook phù hợp như OPA Gatekeeper/Kyverno. Xem [tài liệu Kubernetes chính thức](https://kubernetes.io/docs/concepts/security/pod-security-policy/).
+
+---
+
+#### 10. Security trong microservices và service mesh
+
+Microservices làm tăng số identity, API, certificate, policy và network paths. Mỗi service call cần:
+
+1. Xác thực workload/caller.
+2. Bảo vệ channel bằng TLS/mTLS khi phù hợp.
+3. Authorization theo service/action/resource/tenant.
+4. Validate input và propagate identity/delegation có kiểm soát.
+5. Timeout, retry budget, rate limit và circuit breaker.
+6. Trace/audit identity và policy decision xuyên suốt request chain.
+
+Service mesh có thể chuẩn hóa:
+
+- workload certificate issuance/rotation và mTLS;
+- service-to-service policy;
+- traffic telemetry;
+- routing/resilience controls.
+
+Nhưng service mesh cũng thêm control plane, sidecar/ambient data plane, certificate dependency và policy complexity. Nó không tự sửa broken access control trong business logic, không validate mọi payload và không thay API gateway/WAF ở edge.
+
+> Platform nên cung cấp secure defaults và reusable controls; từng service vẫn chịu trách nhiệm cho data validation và business authorization của mình.
+
+---
+
+#### 11. OWASP Top 10 như một checklist kiến trúc
+
+PDF sử dụng tên nhóm rủi ro từ phiên bản OWASP cũ. Không nên học thuộc một danh sách cố định vì taxonomy thay đổi. Bản phát hành **OWASP Top 10:2025** hiện gồm: Broken Access Control, Security Misconfiguration, Software Supply Chain Failures, Cryptographic Failures, Injection, Insecure Design, Authentication Failures, Software or Data Integrity Failures, Security Logging and Alerting Failures, và Mishandling of Exceptional Conditions. Xem [OWASP Top 10:2025](https://owasp.org/Top10/).
+
+Các pattern cần nhớ:
+
+| Risk pattern | Control tiêu biểu |
+|---|---|
+| Broken access control | Server-side authorization cho từng action/resource/tenant; deny by default; negative tests |
+| Security misconfiguration | Hardened templates, policy as code, CSPM, config drift detection |
+| Supply-chain failure | Dependency inventory/SBOM, trusted registry, signing/provenance, patch process |
+| Cryptographic failure | Data classification, TLS, at-rest encryption, KMS và key lifecycle |
+| Injection | Parameterized queries, context-aware output handling, safe APIs và input constraints |
+| Insecure design | Threat modeling, abuse cases, security requirements và architectural controls |
+| Authentication failure | MFA, secure sessions/tokens, password KDF, rate limit và recovery hardening |
+| Software/data integrity failure | Verify artifacts/updates/messages; protect CI/CD and trust roots |
+| Logging/alerting failure | Actionable security telemetry, tamper resistance, detection và response drills |
+| Exceptional-condition mishandling | Fail safely, bounded resources, no secret leakage, test error paths |
+
+XSS cần context-aware output encoding và CSP hỗ trợ; chỉ “sanitize mọi input” là chưa đủ. SSRF cần outbound allow policy, safe URL parsing/resolution, metadata protection và redirect/DNS handling. CSRF chủ yếu liên quan browser tự gửi ambient credentials; dùng anti-CSRF token/SameSite/origin checks theo kiến trúc authentication.
+
+---
+
+#### 12. Câu hỏi phỏng vấn từ tài liệu bổ sung
+
+##### Câu 1: Firewall khác reverse proxy như thế nào?
+
+Firewall kiểm soát network flows theo IP, port, protocol và connection state; reverse proxy là application-facing intermediary nhận request rồi route tới backend, đồng thời có thể terminate TLS, load balance, cache và tích hợp security controls. Chúng bổ sung cho nhau. Reverse proxy không mặc nhiên là WAF hay giải pháp DDoS toàn diện.
+
+##### Câu 2: Rate limiting bảo vệ backend ra sao?
+
+Nó giới hạn mức tiêu thụ theo identity/tenant/API key/endpoint/cost unit, giảm brute force, abuse, overload và noisy neighbor. Cần chọn thuật toán, scope, distributed state và fail behavior; trả 429/retry guidance phù hợp. Rate limiting là một lớp của DDoS defense, không đủ cho volumetric attack làm bão hòa upstream capacity.
+
+##### Câu 3: Zero Trust là gì và vì sao quan trọng?
+
+Zero Trust không mặc định tin request vì nó ở internal network. Hệ thống xác minh identity/context, cấp least privilege, segment tài nguyên, theo dõi hành vi và giả định breach. Điều này giảm attack surface và lateral movement trong cloud/hybrid/microservices, nơi perimeter không còn là trust boundary duy nhất.
+
+##### Câu 4: Bảo vệ containerized workload trong Kubernetes thế nào?
+
+Bảo vệ nhiều lớp: trusted/minimal image, SBOM/scan/signing; admission policy; non-root, drop capabilities, seccomp và resource limits; RBAC/service accounts; NetworkPolicy; secrets/KMS; control-plane/audit hardening; runtime detection. Không dùng PSP trên Kubernetes hiện đại—dùng Pod Security Admission/Standards hoặc policy admission phù hợp.
+
+##### Câu 5: OWASP risks phổ biến và cách giảm thiểu?
+
+Trả lời theo root-cause pattern thay vì học thuộc tên cũ: broken access control → server-side checks; misconfiguration → hardened automation; injection → parameterized/safe APIs; cryptographic failure → classification/encryption/key management; auth failure → MFA/session/password controls; supply-chain/integrity failure → verify dependencies/artifacts; logging failure → detection + response. Nêu rõ OWASP Top 10 là awareness checklist, không phải security verification standard đầy đủ.
+
+##### Câu 6: Service mesh hỗ trợ security cho microservices ra sao?
+
+Mesh có thể cấp/rotate workload certificates, bật mTLS, enforce service policy và tạo traffic telemetry nhất quán. Một số mesh/gateway integration còn cung cấp rate limiting hoặc resilience controls. Tuy nhiên mesh không thay business authorization, secure application code hay edge security; phải tính thêm control-plane và operational risk.
+
+##### Câu 7: IAM đóng vai trò gì trong cloud security?
+
+IAM xác thực principals, quyết định permissions trên cloud resources và tạo audit trail. Thiết kế tốt dùng least privilege, roles/workload identity, short-lived credentials, MFA cho human/admin, separation of duties, access review và emergency revocation. IAM thường là blast-radius control quan trọng nhất vì một identity có quyền quá rộng có thể bypass nhiều network boundaries.
+
+---
+
+#### 13. Những lỗi thiết kế thường gặp
+
+- Mặc định mọi traffic trong VPC/VNet/Kubernetes cluster là trusted.
+- Chỉ kiểm soát ingress mà bỏ quên egress và data exfiltration.
+- Security group cho phép `0.0.0.0/0` tới admin/database port.
+- Backend có public path bypass CDN/WAF/API gateway.
+- Tin `X-Forwarded-For` từ bất kỳ client nào.
+- Dùng IP address làm user/service identity chính.
+- Rate limit chỉ theo IP hoặc chỉ ở một instance nên dễ bypass/không nhất quán.
+- Queue/throttling không có bound làm memory/latency tăng vô hạn.
+- Flat network cho web, app, database và management plane.
+- Bật mTLS nhưng mọi service vẫn được gọi mọi service khác.
+- Cấp một IAM role rộng cho mọi function/pod.
+- Container chạy privileged/root, mount host path hoặc cluster-admin token.
+- Lưu secret trong image, manifest, environment dump hoặc log.
+- Tin vulnerability scan “không có cảnh báo” đồng nghĩa image an toàn.
+- Dùng OWASP/WAF như sự thay thế cho threat modeling và secure design.
+- Bật audit log nhưng không centralize, alert, protect hoặc diễn tập response.
+
+---
+
+#### 14. Checklist thiết kế network & infrastructure security
+
+1. Public entry points và management paths đã được inventory chưa?
+2. Mỗi exposed port/protocol có owner và business reason không?
+3. Backend có thể bị gọi bypass edge controls không?
+4. Firewall, reverse proxy, WAF và API gateway chịu trách nhiệm gì?
+5. TLS termination/re-encryption và certificate ownership ở đâu?
+6. Rate limit theo identity/cost nào; distributed/fail behavior ra sao?
+7. Volumetric DDoS được xử lý trước bottleneck nào?
+8. Network zones/trust boundaries và allowed-flow matrix đã rõ chưa?
+9. Default-deny ingress/egress có khả thi và được test không?
+10. DNS, metadata endpoint và outbound internet được bảo vệ chưa?
+11. Zero Trust policy dựa trên identity/context nào?
+12. IAM roles có least privilege, short-lived và review/revoke được không?
+13. Cloud audit logs có centralized, immutable và actionable alerts không?
+14. CSPM/policy-as-code có phát hiện drift và public exposure không?
+15. Serverless concurrency/retry/timeout có bảo vệ dependency và cost không?
+16. Container image, admission, runtime và control plane đều có controls chưa?
+17. Kubernetes CNI có thực sự enforce NetworkPolicy không?
+18. Service mesh outage/certificate/policy failure mode là gì?
+19. OWASP/abuse cases được đưa vào design, testing và code review chưa?
+20. Compromised workload/account scenario có containment và runbook chưa?
+
+#### 15. Ý chính cần nhớ
+
+- Network security nhằm phòng ngừa, phát hiện, cô lập và phục hồi—not chỉ chặn perimeter.
+- Firewall, reverse proxy và WAF giải quyết các lớp khác nhau.
+- Rate limiting bảo vệ fairness/capacity nhưng không tự giải quyết mọi DDoS.
+- IP là network attribute, không phải identity mạnh.
+- Segmentation và default-deny giới hạn lateral movement và blast radius.
+- Zero Trust dựa trên explicit verification, least privilege và assume breach.
+- Cloud security tuân theo shared responsibility và identity-centric controls.
+- Serverless/containers chuyển trọng tâm sang workload identity, artifact, policy và runtime.
+- Kubernetes security cần nhiều lớp; PSP là cơ chế đã bị loại bỏ.
+- Service mesh chuẩn hóa mTLS/policy/telemetry nhưng không thay application authorization.
+- OWASP Top 10 là awareness checklist; secure design cần threat model và verification rộng hơn.
+- Observability chỉ có giá trị bảo mật khi gắn với detection, ownership và response.
+
+#### Công thức ghi nhớ
+
+> **Infrastructure security vững = attack-surface reduction + identity-aware access + segmentation/default-deny + protected ingress/egress + workload hardening + continuous detection + tested response.**
+
+---
+
+### Bài 61. Summary and Recap: Designing Secure Distributed Systems
+
+#### 1. Security là thuộc tính của toàn hệ thống
+
+Security không phải một tính năng được thêm vào ở cuối dự án. Nó là tập hợp các quyết định ảnh hưởng tới mọi lớp của distributed system:
+
+```text
+User / Device
+      ↓
+Identity & Access
+      ↓
+Edge: CDN, DDoS protection, WAF, API Gateway
+      ↓
+Network: firewall, segmentation, Zero Trust
+      ↓
+Application & Services
+      ↓
+Data, Keys, Backups
+      ↓
+Logging, Detection, Response, Recovery
+```
+
+Một lớp phòng vệ có thể thất bại. Thiết kế **defense in depth** bảo đảm lớp khác vẫn có khả năng ngăn chặn, phát hiện hoặc giới hạn tác động.
+
+---
+
+#### 2. CIA Triad xác định mục tiêu bảo mật
+
+| Mục tiêu | Câu hỏi kiến trúc | Ví dụ control |
+|---|---|---|
+| **Confidentiality** | Ai được phép đọc dữ liệu? | Authentication, authorization, encryption, masking |
+| **Integrity** | Làm sao phát hiện/ngăn dữ liệu bị sửa trái phép? | AEAD, HMAC, digital signature, validation, audit |
+| **Availability** | Hệ thống có tiếp tục phục vụ khi lỗi hoặc bị tấn công? | Redundancy, rate limiting, DDoS protection, failover, recovery |
+
+Ba mục tiêu có thể tạo trade-off. Ví dụ, kiểm tra bảo mật bổ sung có thể tăng latency; redundancy tăng availability nhưng mở rộng attack surface nếu cấu hình không nhất quán. Vì vậy, mỗi control phải được đánh giá cùng performance, reliability, cost và operational complexity.
+
+---
+
+#### 3. Bắt đầu từ threat model
+
+Kiến trúc tốt phải biết mình đang bảo vệ điều gì và trước ai. Các threat phổ biến đã học gồm:
+
+- **Spoofing:** giả mạo user, service, device hoặc source.
+- **Man-in-the-middle:** nghe lén hoặc can thiệp communication path.
+- **Injection:** đưa input làm thay đổi câu lệnh hoặc hành vi của interpreter.
+- **Broken access control:** truy cập action/resource ngoài quyền.
+- **DDoS và abuse:** làm cạn network, compute, connection hoặc dependency capacity.
+- **Credential/key compromise:** chiếm quyền identity hoặc khả năng giải mã/ký.
+- **Misconfiguration:** public exposure, broad permissions, disabled logging hoặc unsafe defaults.
+- **Lateral movement:** từ một workload bị compromise di chuyển tới tài nguyên khác.
+
+Threat modeling biến câu hỏi mơ hồ “hệ thống có an toàn không?” thành các scenario, trust boundary, control và residual risk cụ thể.
+
+---
+
+#### 4. Identity và access là control plane trung tâm
+
+- **Authentication (AuthN):** xác minh principal là ai.
+- **Authorization (AuthZ):** quyết định principal có được thực hiện action trên resource trong context hiện tại hay không.
+- **Accounting/Audit:** ghi lại ai đã làm gì, khi nào, trên tài nguyên nào và policy decision ra sao.
+
+OAuth 2.0 hỗ trợ delegated authorization; OpenID Connect bổ sung identity/authentication layer; JWT chỉ là một signed claims format và không mặc nhiên encrypted hoặc dễ revoke. SSO giúp tập trung login nhưng cũng biến identity provider thành high-value dependency.
+
+RBAC, ABAC và ReBAC là các mô hình diễn đạt policy khác nhau. Dù dùng mô hình nào, backend vẫn phải enforce quyền trên từng protected action/resource/tenant. Các nguyên tắc xuyên suốt là least privilege, short-lived credentials, MFA phù hợp, service identity riêng, rotation/revocation và audit.
+
+---
+
+#### 5. Bảo vệ dữ liệu trong toàn bộ vòng đời
+
+Dữ liệu cần được bảo vệ ở ba trạng thái:
+
+- **At rest:** database, disk, object storage, cache, log và backup.
+- **In transit:** browser–server, service–service và cross-region communication.
+- **In use:** plaintext trong process memory khi application xử lý.
+
+Encryption bảo vệ confidentiality và, khi dùng AEAD đúng cách, có thể cung cấp integrity/authenticity. TLS/HTTPS bảo vệ network connection. Hashing là phép một chiều; salting làm password verifier chống precomputation tốt hơn. **Hashing và salting không phải encryption.** Password cần password-specific KDF như Argon2id, scrypt, bcrypt hoặc PBKDF2.
+
+Key management quan trọng ngang thuật toán: dùng KMS/HSM, envelope encryption, least-privileged key policy, versioning, rotation, revocation, audit và compromise runbook.
+
+---
+
+#### 6. Hạ tầng tạo nhiều lớp phòng vệ
+
+| Lớp | Vai trò |
+|---|---|
+| DDoS/CDN edge | Hấp thụ hoặc lọc traffic trước bottleneck |
+| Firewall/security group | Giới hạn network flows theo IP, port, protocol và state |
+| Reverse proxy/WAF/API gateway | Quản lý application traffic, TLS, validation, authentication integration và rate limit |
+| Segmentation/default-deny | Giảm attack surface và lateral movement |
+| Zero Trust | Không cấp trust chỉ dựa trên network location; xác minh identity/context và least privilege |
+| IAM/workload identity | Kiểm soát quyền của humans, services, functions, containers và cloud resources |
+| Monitoring/detection | Phát hiện anomalies, abuse, misconfiguration và compromise |
+
+Cloud, serverless, containers và service mesh không loại bỏ security responsibility. Chúng thay đổi trust boundaries và đưa trọng tâm sang identity, configuration, artifact integrity, policy và runtime behavior.
+
+---
+
+#### 7. Security phải bao gồm cả vòng phản ứng
+
+Prevention không thể đạt hiệu quả tuyệt đối. Hệ thống an toàn phải có đầy đủ vòng đời:
+
+```text
+Identify → Protect → Detect → Respond → Recover → Improve
+```
+
+- Inventory assets, identities, data flows và dependencies.
+- Thiết kế secure defaults và preventive controls.
+- Thu thập telemetry có thể hành động, không chỉ “có log”.
+- Định nghĩa ownership, alert threshold và escalation.
+- Cô lập workload/account, revoke credential và rotate key khi compromise.
+- Khôi phục từ backup/clean artifact và xác minh integrity.
+- Post-incident review để sửa cả control lẫn assumption kiến trúc.
+
+Security và reliability giao nhau ở availability, graceful degradation, blast-radius containment, incident response và disaster recovery.
+
+---
+
+#### 8. Khung trả lời security trong System Design Interview
+
+Khi được yêu cầu thiết kế một hệ thống an toàn, có thể trình bày theo thứ tự:
+
+1. **Assets và dữ liệu nhạy cảm:** cần bảo vệ cái gì?
+2. **Actors và trust boundaries:** users, admins, services, third parties và attackers nào?
+3. **Threats/abuse cases:** spoofing, tampering, leakage, abuse, DDoS, privilege escalation?
+4. **Identity:** AuthN assurance, session/token, service identity và MFA?
+5. **Authorization:** action-resource-tenant-context, least privilege và policy enforcement?
+6. **Data protection:** at rest/in transit/in use, KMS và secret lifecycle?
+7. **Network/edge:** ingress, egress, segmentation, WAF, rate limiting và DDoS?
+8. **Workload/software:** validation, dependency/artifact, container/serverless runtime?
+9. **Detection and response:** audit, alerts, revocation, containment và recovery?
+10. **Trade-offs và residual risk:** latency, availability, cost, usability và complexity?
+
+Không cần liệt kê mọi security product. Câu trả lời tốt liên kết mỗi threat với control, enforcement point, failure mode và trade-off.
+
+---
+
+#### 9. Checklist tổng kết Phần 10
+
+- [ ] CIA objectives và security requirements đã có SLO/acceptance criteria.
+- [ ] Threat model chỉ rõ assets, actors, entry points và trust boundaries.
+- [ ] Mọi user/workload đều có identity và credential lifecycle rõ ràng.
+- [ ] Authorization được enforce ở backend theo action/resource/tenant/context.
+- [ ] Least privilege, MFA, short-lived credentials và revocation được áp dụng phù hợp.
+- [ ] Dữ liệu at rest, in transit và in use được xử lý theo threat model.
+- [ ] Password, secret, certificate và encryption keys được quản lý đúng mục đích.
+- [ ] Public exposure, ingress, egress và backend bypass paths đã được kiểm soát.
+- [ ] Segmentation/default-deny giới hạn blast radius và lateral movement.
+- [ ] Rate limiting, capacity protection và DDoS strategy nằm đúng lớp.
+- [ ] Cloud, container, serverless và microservices có secure defaults/policy automation.
+- [ ] Dependencies/artifacts được inventory, verify và cập nhật.
+- [ ] Logs không rò dữ liệu nhạy cảm và có alert/owner/runbook.
+- [ ] Backup, failover, key compromise và account compromise được diễn tập.
+- [ ] Residual risks được ghi nhận, có owner và quyết định chấp nhận/giảm thiểu rõ.
+
+#### 10. Ý chính cần nhớ
+
+- Security là architectural quality xuyên suốt toàn hệ thống.
+- CIA Triad xác định mục tiêu; threat model xác định control cần thiết.
+- Authentication và authorization là hai bài toán khác nhau.
+- OAuth 2.0, OIDC, JWT và SSO có vai trò và trust model khác nhau.
+- Bảo vệ dữ liệu phải bao phủ at rest, in transit và in use.
+- Hashing/salting không phải encryption; password cần password KDF chuyên dụng.
+- Network location không đủ để cấp trust; identity và context mới là nền tảng Zero Trust.
+- Defense in depth giới hạn hậu quả khi một control thất bại.
+- Secure system phải detect, respond và recover—not chỉ prevent.
+- Mỗi security decision đều có trade-off với usability, performance, reliability, cost và operations.
+
+#### Công thức ghi nhớ
+
+> **Secure distributed system = CIA objectives + threat modeling + identity-centric access + protected data + segmented infrastructure + defense in depth + continuous detection + tested response/recovery.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -17540,3 +24751,251 @@ Bảng này chỉ là điểm bắt đầu. Một hệ thống thực tế thư�
 | **Partition pruning** | Bỏ qua toàn bộ partition không thỏa filter khi query. |
 | **Predicate pushdown** | Đẩy filter xuống storage/scan layer để bỏ dữ liệu sớm. |
 | **Compaction** | Gộp/rewrite nhiều file/segment nhỏ thành layout hiệu quả hơn theo transaction/snapshot semantics. |
+| **Performance engineering** | Kỷ luật định nghĩa, đo, kiểm thử và tối ưu latency/capacity/efficiency theo workload và SLO. |
+| **Latency** | Thời gian một operation mất để hoàn tất trong measurement boundary đã định. |
+| **Response time** | Thời gian end-to-end từ khi request bắt đầu tới khi response/completion được quan sát. |
+| **Service time** | Thời gian resource/component thực sự xử lý work, tách khỏi thời gian chờ queue. |
+| **Queueing delay** | Thời gian work chờ trước khi có resource/concurrency slot để xử lý. |
+| **Throughput** | Lượng work được xử lý hoặc hoàn tất trong một đơn vị thời gian. |
+| **Goodput** | Lượng work hữu ích hoàn tất đúng contract, loại lỗi/retry/duplicate không tạo giá trị. |
+| **Concurrency** | Số operation/request/user đang active hoặc in-flight đồng thời. |
+| **Utilization** | Tỷ lệ capacity/thời gian một resource đang được sử dụng. |
+| **Responsiveness** | Mức độ hệ thống phản hồi nhanh từ góc nhìn user/client. |
+| **Tail latency** | Latency ở phần đuôi distribution, thường quan sát qua P95/P99/P99.9. |
+| **Percentile** | Giá trị mà một tỷ lệ phần trăm observation nhỏ hơn hoặc bằng trong population/window đã định. |
+| **SLA** | Service Level Agreement, cam kết/thỏa thuận mức dịch vụ với bên ngoài. |
+| **SLO** | Service Level Objective, mục tiêu cho một SLI trong time window. |
+| **SLI** | Service Level Indicator, phép đo định nghĩa rõ trải nghiệm/độ tin cậy của service. |
+| **Burn rate** | Tốc độ tiêu thụ error budget so với tốc độ cho phép trong SLO window. |
+| **Little’s Law** | Quan hệ steady-state `L = λW` giữa in-flight work, rate và average time trong hệ thống. |
+| **Benchmark** | Phép đo baseline/so sánh dưới workload và environment được kiểm soát. |
+| **Load test** | Kiểm tra hệ thống dưới expected workload để xác minh SLO/capacity. |
+| **Stress test** | Đẩy vượt design capacity để tìm breaking point và failure/degradation behavior. |
+| **Spike test** | Kiểm tra phản ứng trước tải tăng/giảm đột ngột. |
+| **Soak test** | Chạy tải kéo dài để tìm leak, exhaustion và degradation theo thời gian. |
+| **Open workload model** | Arrival rate độc lập với response completion của request trước. |
+| **Closed workload model** | Số virtual users cố định, request sau phụ thuộc response/think time của request trước. |
+| **Think time** | Khoảng nghỉ mô phỏng giữa các action/request của virtual user. |
+| **Coordinated omission** | Sai lệch đo khi generator không gửi observation trong lúc system chậm/đứng nên che tail latency. |
+| **Golden Signals** | Latency, traffic, errors và saturation — bốn tín hiệu giám sát service phổ biến. |
+| **RED method** | Theo dõi Rate, Errors và Duration cho request-driven service. |
+| **USE method** | Theo dõi Utilization, Saturation và Errors cho từng resource. |
+| **APM** | Application Performance Monitoring, telemetry/tooling theo dõi request và application performance. |
+| **Synthetic monitoring** | Scripted probe chủ động kiểm tra endpoint hoặc user journey từ location định trước. |
+| **RUM** | Real User Monitoring, đo trải nghiệm thực từ client/user sessions. |
+| **Profiling** | Đo CPU/time/allocation/lock theo code path để tìm nơi tiêu tốn tài nguyên. |
+| **Performance regression** | Performance suy giảm so với baseline sau thay đổi code/config/data/infrastructure. |
+| **Cache-aside** | Application đọc cache trước; miss thì đọc source rồi populate cache. |
+| **Read-through cache** | Cache/provider loader tự lấy dữ liệu từ source khi application lookup bị miss. |
+| **Write-through cache** | Write đi qua cache layer và đồng bộ tới source trước acknowledgement theo contract. |
+| **Write-back cache** | Acknowledge write ở cache/buffer rồi persist xuống source bất đồng bộ. |
+| **Write-around cache** | Write trực tiếp source và bỏ qua/invalidate cache để tránh cache pollution. |
+| **Refresh-ahead** | Refresh entry trước khi hết freshness nhằm giảm user-facing miss latency. |
+| **Eviction policy** | Quy tắc chọn entry bị loại khi cache thiếu capacity. |
+| **LRU** | Least Recently Used, ưu tiên loại entry lâu chưa được truy cập. |
+| **LFU** | Least Frequently Used, ưu tiên loại entry có tần suất truy cập thấp. |
+| **FIFO eviction** | Loại cache entry theo thứ tự được thêm vào. |
+| **Admission policy** | Quy tắc quyết định item miss mới có đáng được đưa vào cache không. |
+| **Local cache** | Cache nằm trong process/instance, latency thấp nhưng copy bị phân mảnh giữa instances. |
+| **Distributed cache** | Cache service dùng chung qua mạng và phân bố dữ liệu trên nhiều node. |
+| **Multi-level cache** | Tổ chức nhiều tầng như L1 local, L2 distributed và source of truth. |
+| **Staleness budget** | Khoảng dữ liệu cũ tối đa mà business/operation chấp nhận. |
+| **Versioned cache key** | Cache key chứa schema/content/entity version để tránh reuse dữ liệu cũ. |
+| **TTL jitter** | Thêm ngẫu nhiên vào expiry để tránh nhiều keys hết hạn cùng lúc. |
+| **Single-flight** | Gom các miss/refresh đồng thời cho cùng key thành một computation/fetch. |
+| **Cache penetration** | Request cho key không tồn tại liên tục bypass cache và đánh source. |
+| **Cache avalanche** | Nhiều keys hoặc cache nodes đồng loạt mất/hết hạn làm origin nhận burst lớn. |
+| **Hot key** | Một key nhận tỷ lệ traffic bất thường và làm một shard/node thành bottleneck. |
+| **Cache warming** | Populate trước một working set dự kiến để giảm cold misses. |
+| **Cold cache** | Cache mới/rỗng hoặc mất working set nên hit ratio thấp và origin load cao. |
+| **Bloom filter** | Probabilistic set-membership structure có false positive nhưng không false negative theo mô hình chuẩn. |
+| **Redis** | In-memory data platform với data structures, TTL và replication/persistence options theo deployment. |
+| **Redis Cluster** | Redis deployment mode phân bố keyspace qua hash slots và nhiều nodes. |
+| **Memcached** | Distributed in-memory key-value cache có mô hình dữ liệu đơn giản. |
+| **Messaging broker** | Hệ trung gian nhận, lưu/route và deliver message theo queue/topic/log semantics. |
+| **Producer** | Thành phần tạo và publish message vào broker/channel. |
+| **Consumer** | Thành phần nhận/poll và xử lý message rồi cập nhật acknowledgement/progress. |
+| **Command message** | Message yêu cầu một capability thực hiện action, thường có một logical owner. |
+| **Event message** | Message công bố một fact đã xảy ra để các subscriber phản ứng độc lập. |
+| **Document message** | Message mang snapshot/state/data nhằm đồng bộ hoặc truyền dữ liệu. |
+| **Event bus** | Messaging backbone định tuyến/phân phối events tới subscribers theo contract. |
+| **Competing consumers** | Nhiều consumers chia nhau work của cùng queue/subscription để tăng parallelism. |
+| **Visibility timeout** | Khoảng message bị ẩn sau khi nhận; hết hạn mà chưa ack/delete thì có thể được redeliver. |
+| **Ack deadline** | Hạn consumer phải acknowledge hoặc gia hạn trước khi broker coi delivery chưa hoàn tất. |
+| **Prefetch** | Số message broker/client cấp trước cho consumer chưa acknowledge. |
+| **Queue depth** | Số message/work items đang chờ hoặc tồn tại trong queue theo metric scope. |
+| **Backlog** | Lượng work chưa hoàn tất tích lũy do arrival vượt processing hoặc consumer bị gián đoạn. |
+| **Redelivery** | Broker cung cấp lại message khi attempt trước chưa được acknowledge theo contract. |
+| **Delivery attempt** | Một lần broker giao message cho consumer, có thể lặp cho cùng logical message. |
+| **Message TTL** | Thời gian message được phép tồn tại/chờ trước khi expire hoặc chuyển theo policy. |
+| **Idempotent consumer** | Consumer xử lý duplicate delivery mà không tạo thêm business effect ngoài dự kiến. |
+| **Outbox relay** | Process/CDC component đọc outbox đã commit và publish message tới broker. |
+| **RabbitMQ** | Messaging broker với exchange, routing, queues và acknowledgement semantics theo configuration. |
+| **Apache Kafka** | Distributed partitioned event-log platform với offsets và retention-based replay. |
+| **SQS** | Managed queue service của AWS với delivery, visibility và ordering modes theo queue type. |
+| **Azure Service Bus** | Managed Azure messaging service cung cấp queues/topics và enterprise messaging features. |
+| **Parallelism** | Thực thi nhiều task đồng thời trên nhiều execution units/CPU cores. |
+| **I/O-bound** | Workload chủ yếu chờ network, disk, database hoặc external I/O. |
+| **CPU-bound** | Workload chủ yếu tiêu thụ CPU để tính toán. |
+| **Process** | Execution environment có address space và resource/fault boundary riêng. |
+| **Thread** | Execution flow trong process; chia sẻ memory với các thread cùng process và có stack riêng. |
+| **Thread pool** | Tập reusable worker threads thực thi tasks với resource usage được kiểm soát. |
+| **Worker model** | Mô hình workers lấy work từ queue/shared source để xử lý độc lập. |
+| **Context switch** | Việc CPU/runtime chuyển execution state giữa threads/tasks/processes. |
+| **Non-blocking I/O** | I/O không giữ execution thread chờ cho tới khi operation hoàn tất. |
+| **Event loop** | Vòng điều phối tasks/events và completions trong event-driven runtime. |
+| **Future/Promise** | Đại diện cho kết quả hoặc lỗi của work sẽ hoàn tất trong tương lai. |
+| **Race condition** | Outcome phụ thuộc timing/interleaving không được kiểm soát giữa concurrent operations. |
+| **Atomicity** | Một operation/transaction xuất hiện như đơn vị không bị quan sát ở trạng thái dở dang. |
+| **Memory visibility** | Việc write ở execution flow này trở nên quan sát được bởi flow khác theo memory model. |
+| **Critical section** | Đoạn code truy cập invariant/shared resource cần synchronization. |
+| **Mutex** | Primitive cung cấp mutual exclusion cho critical section theo contract. |
+| **Deadlock** | Các execution flows chờ tài nguyên theo vòng tròn nên không flow nào tiến triển. |
+| **Starvation** | Task bị trì hoãn vô hạn hoặc quá lâu vì không nhận đủ CPU/lock/resource. |
+| **Livelock** | Các task vẫn hoạt động/đổi trạng thái nhưng không tạo tiến triển hữu ích. |
+| **Thread-pool starvation** | Pool hết available threads do blocking/long-running work, khiến queued/continuation work không chạy kịp. |
+| **Amdahl's Law** | Giới hạn speedup của parallel execution do phần workload bắt buộc tuần tự. |
+| **Execution plan** | Kế hoạch access path, join, sort và operator mà database optimizer chọn để chạy query. |
+| **Query fingerprint** | Dạng chuẩn hóa gom các query cùng cấu trúc để đo frequency và tổng chi phí. |
+| **B-tree/B+tree index** | Index dạng cây cân bằng hỗ trợ equality, range và ordered access trong nhiều database. |
+| **Hash index** | Index dựa trên hash, chủ yếu cho equality lookup theo capability của engine. |
+| **Full-text index** | Index chuyên token/term search trên nội dung văn bản. |
+| **Bitmap index** | Index biểu diễn giá trị bằng bitmaps, thường hữu ích cho analytical low-cardinality predicates. |
+| **Composite index** | Index gồm nhiều columns, trong đó thứ tự columns ảnh hưởng access path. |
+| **Covering index** | Index chứa đủ dữ liệu query cần để có thể tránh lookup về base table trong điều kiện phù hợp. |
+| **Cardinality estimate** | Ước lượng số rows qua mỗi operator mà optimizer dùng để chọn plan. |
+| **Selectivity** | Tỷ lệ dữ liệu được predicate chọn; ảnh hưởng lợi ích của index và plan. |
+| **Sargable predicate** | Predicate có dạng cho phép optimizer khai thác index/search argument hiệu quả. |
+| **Database statistics** | Metadata phân bố/cardinality giúp optimizer ước lượng và chọn execution plan. |
+| **Slow-query log** | Log ghi các query vượt tiêu chí thời gian/tài nguyên để điều tra performance. |
+| **Read-after-write consistency** | Guarantee cho phép client đọc thấy write vừa hoàn tất theo phạm vi đã định. |
+| **Connection storm** | Làn sóng mở nhiều connections đồng thời làm database/proxy quá tải. |
+| **Fault tolerance** | Khả năng tiếp tục cung cấp service đúng trong phạm vi component failures đã xác định. |
+| **Disaster recovery** | Kế hoạch và năng lực phục hồi service/data sau sự cố lớn theo RTO/RPO. |
+| **MTBF** | Mean Time Between Failures; thời gian trung bình giữa các failures của repairable system. |
+| **MTTR** | Mean Time to Recovery/Restore/Repair theo định nghĩa metric; thời gian trung bình để khôi phục sau failure. |
+| **MTTD** | Mean Time to Detect; thời gian trung bình để phát hiện failure/incident. |
+| **Bulkhead** | Cô lập pools/queues/resources để failure hoặc saturation ở một phần không lan toàn hệ thống. |
+| **Failover** | Chuyển traffic, leadership hoặc workload sang capacity thay thế khi thành phần chính lỗi. |
+| **Single point of failure (SPOF)** | Thành phần mà khi lỗi có thể làm mất toàn bộ capability quan trọng. |
+| **Chaos engineering** | Thực nghiệm failure có giả thuyết và guardrails để kiểm chứng resilience assumptions. |
+| **Graceful degradation** | Giữ chức năng cốt lõi bằng cách giảm/tắt chức năng phụ khi thiếu tài nguyên hoặc dependency lỗi. |
+| **Quorum** | Số phiếu/nodes tối thiểu cần tham gia để operation hoặc quyết định được chấp nhận theo protocol. |
+| **Consensus** | Quá trình distributed nodes thống nhất một giá trị/thứ tự/state trong failure model xác định. |
+| **Common-mode failure** | Một nguyên nhân chung làm nhiều thành phần dự phòng thất bại đồng thời. |
+| **Availability budget** | Phân bổ mục tiêu availability/downtime qua các components và critical request path. |
+| **High availability (HA)** | Khả năng giữ service sẵn sàng trong SLO bằng redundancy, detection, failover và recovery. |
+| **N+1 redundancy** | Provision thêm một đơn vị ngoài N đơn vị tối thiểu cần cho capacity theo failure assumption. |
+| **Hot standby** | Standby đang chạy và đồng bộ gần đủ để promotion nhanh. |
+| **Warm standby** | Standby đã chuẩn bị một phần nhưng còn cần start/scale/promote trước khi phục vụ đầy đủ. |
+| **Cold standby** | Recovery capacity cần provision/deploy/restore khi sự cố, thường có RTO dài hơn. |
+| **Readiness probe** | Signal cho biết instance có nên nhận traffic/work mới hay không. |
+| **Liveness probe** | Signal cho biết process có cần được restart vì không còn tiến triển hay không. |
+| **Failback** | Chuyển service/role từ site hoặc component thay thế về topology ưu tiên sau khi ổn định. |
+| **Failover time** | Thời gian từ failure đến khi replacement path phục vụ đạt điều kiện recovery đã định. |
+| **Hysteresis** | Dùng ngưỡng/thời gian chuyển trạng thái khác nhau để tránh health/failover flapping. |
+| **Restore** | Quá trình đưa dữ liệu/cấu hình từ backup trở lại storage hoặc system đích. |
+| **Full backup** | Backup toàn bộ dữ liệu trong scope tại một recovery point. |
+| **Incremental backup** | Backup changes kể từ backup gần nhất, dù backup đó là full hay incremental. |
+| **Differential backup** | Backup mọi changes kể từ full backup gần nhất. |
+| **Backup window** | Khoảng thời gian được dành hoặc cho phép để tạo backup với tác động chấp nhận được. |
+| **Retention policy** | Quy tắc backup/recovery points được giữ bao lâu, tier ở đâu và khi nào được xóa. |
+| **Immutable backup** | Backup không thể bị sửa/xóa trong thời hạn bảo vệ theo cơ chế đã cấu hình. |
+| **Air gap** | Sự cách ly vật lý/logical/credential nhằm ngăn sự cố hoặc attacker truy cập đồng thời production và backup. |
+| **3-2-1 rule** | Guideline giữ ba copies trên hai loại media/system và một copy off-site. |
+| **WAL** | Write-Ahead Log; log thay đổi được ghi trước data pages và có thể dùng cho recovery/PITR. |
+| **Binlog** | Binary log ghi database changes, thường dùng cho replication và point-in-time recovery tùy engine. |
+| **Backup catalog** | Inventory metadata về backup sets, chains, recovery points, location, integrity và retention. |
+| **Recovery runbook** | Quy trình từng bước, ownership và validation để khôi phục service/data trong sự cố. |
+| **Restore drill** | Diễn tập restore/recovery nhằm chứng minh backup usable và đo RTO/RPO thực tế. |
+| **Business Impact Analysis (BIA)** | Phân tích tác động business theo thời gian để ưu tiên capability và đặt recovery objectives. |
+| **DR plan** | Kế hoạch về authority, quy trình, kiến trúc và validation để phục hồi business capability sau disaster. |
+| **DR drill** | Diễn tập một disaster scenario nhằm đo khả năng khôi phục end-to-end. |
+| **Tabletop exercise** | Diễn tập trên bàn theo scenario để luyện quyết định, vai trò và communication mà không đổi production. |
+| **Pilot light** | DR pattern duy trì core data/services tối thiểu và kích hoạt/scale phần còn lại khi disaster. |
+| **Recovery site** | Environment hoặc địa điểm thay thế dùng để khôi phục và vận hành service khi site chính không dùng được. |
+| **Crisis communication** | Quy trình cập nhật có kiểm soát cho đội ngũ, khách hàng, đối tác và regulator trong khủng hoảng. |
+| **Incident commander** | Vai trò điều phối incident, ưu tiên, quyết định và communication giữa các workstreams. |
+| **Cutover** | Chuyển traffic/workload/source of truth từ environment hiện tại sang environment mục tiêu. |
+| **DR activation** | Quyết định và hành động chính thức kích hoạt disaster recovery plan. |
+| **Service tier** | Mức ưu tiên capability dựa trên business criticality và recovery objectives. |
+| **Dependency map** | Bản đồ quan hệ phụ thuộc giữa business journeys, services, data, infrastructure và vendors. |
+| **Recovery sequence** | Thứ tự phục hồi components/capabilities dựa trên dependencies và business priority. |
+| **CIA triad** | Ba mục tiêu nền tảng: confidentiality, integrity và availability. |
+| **Confidentiality** | Ngăn dữ liệu bị đọc hoặc tiết lộ cho chủ thể không được phép. |
+| **Integrity** | Bảo đảm dữ liệu/code/message không bị sửa trái phép và thay đổi được phát hiện/kiểm soát. |
+| **Threat modeling** | Quy trình mô hình hóa hệ thống, assets, actors, threats, risks và mitigations. |
+| **Threat actor** | Người, nhóm, workload hoặc tác nhân có thể cố ý gây hại hay lạm dụng hệ thống. |
+| **Security asset** | Dữ liệu, identity, secret, capability hoặc business operation cần bảo vệ. |
+| **Attack vector** | Con đường/kỹ thuật attacker dùng để tiếp cận hoặc tác động hệ thống. |
+| **Trust boundary** | Ranh giới nơi mức tin cậy hoặc authority thay đổi và cần kiểm tra/enforce policy. |
+| **STRIDE** | Framework tìm threats: Spoofing, Tampering, Repudiation, Information Disclosure, DoS, Elevation of Privilege. |
+| **Spoofing** | Giả mạo identity của user, service, device hoặc nguồn message. |
+| **Tampering** | Sửa data, code, configuration hoặc message trái phép. |
+| **Repudiation** | Chủ thể phủ nhận action khi hệ thống thiếu bằng chứng/audit đáng tin. |
+| **Information disclosure** | Tiết lộ dữ liệu cho chủ thể không được phép. |
+| **Denial of Service** | Làm legitimate users không truy cập được service/resource. |
+| **Elevation of privilege** | Đạt quyền cao hơn quyền được cấp hợp lệ. |
+| **Defense in depth** | Nhiều lớp controls để một lớp thất bại không dẫn thẳng tới compromise toàn hệ thống. |
+| **Least privilege** | Chỉ cấp quyền tối thiểu cần thiết theo resource, action, thời gian và context. |
+| **Secure by design** | Tích hợp security requirements/threat decisions từ kiến trúc ban đầu. |
+| **Secure by default** | Default configuration ở trạng thái hạn chế và an toàn nếu chưa có explicit policy. |
+| **Shift left** | Đưa security activities sớm hơn vào requirements, design và development. |
+| **DDoS** | Distributed Denial-of-Service; nhiều nguồn tạo tải để làm cạn tài nguyên/availability. |
+| **Security control** | Biện pháp phòng ngừa, phát hiện, phản ứng hoặc phục hồi nhằm giảm risk. |
+| **Residual risk** | Risk còn lại sau khi đã áp dụng controls/mitigations. |
+| **Risk treatment** | Quyết định tránh, giảm, chuyển giao hoặc chấp nhận một risk có owner. |
+| **Principal** | User, service, device hoặc workload có identity và thực hiện action trong hệ thống. |
+| **ID token** | OIDC token dành cho client, mô tả authentication event và identity claims theo contract. |
+| **Single Sign-On (SSO)** | Cơ chế cho phép một authentication session phục vụ nhiều relying applications được tin cậy. |
+| **Identity federation** | Quan hệ trust giữa các security/organizational domains để chấp nhận identity assertions. |
+| **RBAC** | Role-Based Access Control; permissions gán cho roles và principals được gán roles. |
+| **ABAC** | Attribute-Based Access Control; policy dựa trên attributes của subject, resource, action và environment. |
+| **ReBAC** | Relationship-Based Access Control; quyết định access dựa trên relationship graph như owner/member/editor. |
+| **DAC** | Discretionary Access Control; resource owner có thể cấp/chia sẻ quyền trong policy cho phép. |
+| **Mandatory Access Control (MAC)** | Central policy enforce labels/classifications; owner không tùy ý thay quyền. |
+| **MFA** | Multi-Factor Authentication; dùng bằng chứng từ ít nhất hai factor categories độc lập. |
+| **PKCE** | Proof Key for Code Exchange; bind authorization-code exchange với client tạo request. |
+| **XSS** | Cross-Site Scripting; attacker khiến script không tin cậy chạy trong origin của ứng dụng web. |
+| **BOLA/IDOR** | Broken Object Level Authorization; truy cập object khác do thiếu resource-level permission check. |
+| **Policy Decision Point (PDP)** | Thành phần đánh giá authorization policy và trả decision. |
+| **Policy Enforcement Point (PEP)** | Thành phần chặn request và thực thi authorization decision. |
+| **Data at rest** | Dữ liệu đang được lưu trong database, disk, object storage, cache, log hoặc backup. |
+| **Data in transit** | Dữ liệu đang được truyền qua một network connection hoặc giữa các hệ thống. |
+| **Data in use** | Dữ liệu đang được giải mã trong memory để application hoặc CPU xử lý. |
+| **Encryption** | Biến đổi plaintext thành ciphertext bằng key để bảo vệ confidentiality và có thể đảo ngược bằng key phù hợp. |
+| **Symmetric encryption** | Mã hóa dùng cùng secret key cho encryption và decryption. |
+| **Asymmetric cryptography** | Mật mã dùng public/private key pair cho key establishment, encryption hoặc digital signature tùy cơ chế. |
+| **Cryptographic hash** | Hàm một chiều tạo digest có kích thước cố định, dùng như fingerprint hoặc building block cho integrity. |
+| **HMAC** | Message Authentication Code dựa trên hash và shared secret để kiểm tra integrity cùng authenticity. |
+| **Digital signature** | Chữ ký tạo bằng private key và xác minh bằng public key để chứng minh integrity và key-holder authenticity. |
+| **AEAD** | Authenticated Encryption with Associated Data; cung cấp confidentiality và integrity/authenticity trong một construction. |
+| **Salt** | Giá trị ngẫu nhiên, riêng cho mỗi password, làm các password giống nhau tạo verifier khác nhau và chống precomputation. |
+| **Pepper** | Secret bổ sung dùng khi tạo password verifier, được giữ tách khỏi database. |
+| **Password KDF** | Hàm dẫn xuất key/hash chuyên cho password với cost có thể điều chỉnh để làm brute force tốn kém. |
+| **PKI** | Public Key Infrastructure; hệ thống certificate, CA, trust stores và quy trình vận hành trust cho public keys. |
+| **Certificate Authority (CA)** | Tổ chức hoặc service ký certificate để xác nhận binding giữa identity và public key theo policy. |
+| **Certificate chain** | Chuỗi certificate signatures nối leaf certificate qua intermediates tới trust anchor. |
+| **HSM** | Hardware Security Module; phần cứng bảo vệ key và thực hiện cryptographic operations trong security boundary. |
+| **Envelope encryption** | Dùng DEK mã hóa dữ liệu rồi dùng KEK wrap DEK để tách data encryption khỏi master-key management. |
+| **DEK** | Data Encryption Key, key trực tiếp mã hóa một phạm vi dữ liệu. |
+| **KEK** | Key Encryption Key, key dùng để wrap và bảo vệ DEK. |
+| **Key rotation** | Thay key/version theo lịch hoặc sự kiện và chuyển dữ liệu/key-wrapping sang key mới theo kế hoạch. |
+| **Tokenization** | Thay giá trị nhạy cảm bằng token tham chiếu hoặc đại diện không mang giá trị gốc trực tiếp. |
+| **Pseudonymization** | Thay identifier trực tiếp bằng pseudonym trong khi vẫn có khả năng liên kết lại dưới control riêng. |
+| **Firewall** | Control cho phép hoặc chặn network traffic theo rules như IP, port, protocol và connection state. |
+| **DMZ** | Network zone trung gian chứa public-facing systems và tách chúng khỏi internal systems. |
+| **Lateral movement** | Việc attacker di chuyển từ foothold ban đầu sang systems, identities hoặc data khác trong môi trường. |
+| **Egress control** | Kiểm soát traffic từ workload/network đi ra destination bên ngoài hoặc segment khác. |
+| **Security group** | Virtual firewall thường gắn với interface/workload trong cloud và thường có stateful semantics tùy provider. |
+| **Network ACL** | Access-control rules tại network/subnet boundary, thường cần xét độc lập cả inbound và outbound. |
+| **Kubernetes NetworkPolicy** | Policy mô tả pod ingress/egress được phép và cần CNI/network plugin hỗ trợ enforcement. |
+| **Microsegmentation** | Chia nhỏ và kiểm soát communication giữa workloads/resources ở granularity hẹp hơn network zones lớn. |
+| **Zero Trust** | Mô hình không cấp trust chỉ vì network location; yêu cầu explicit verification, least privilege và assume breach. |
+| **Shared responsibility model** | Phân định trách nhiệm bảo mật giữa cloud provider và customer theo service model cụ thể. |
+| **CSPM** | Cloud Security Posture Management, tooling liên tục phát hiện cloud misconfiguration, exposure và policy drift. |
+| **Pod Security Admission** | Kubernetes admission controller thực thi Pod Security Standards ở cấp namespace theo enforce/audit/warn modes. |
+| **Admission controller** | Thành phần kiểm tra, từ chối hoặc biến đổi Kubernetes API request sau authentication/authorization trước persistence. |
+| **SBOM** | Software Bill of Materials, danh mục components và dependencies tạo nên một software artifact. |
+| **SSRF** | Server-Side Request Forgery; attacker khiến server gửi request tới destination ngoài ý định, thường nhắm internal services hoặc metadata. |
+| **CSP** | Content Security Policy, browser policy hạn chế nguồn và kiểu nội dung/script được phép tải hoặc thực thi. |
