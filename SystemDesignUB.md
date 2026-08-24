@@ -24041,6 +24041,14730 @@ Không cần liệt kê mọi security product. Câu trả lời tốt liên k�
 
 ---
 
+## Phần 11 — The System Design Blueprint
+
+### Bài 62. The 4-Step System Design Approach: From Problem Definition to Final Solution
+
+#### 1. Vì sao cần một blueprint?
+
+Sau khi học các building blocks như networking, database, cache, messaging, scalability, reliability và security, thách thức tiếp theo là **kết nối chúng thành một thiết kế có lý do rõ ràng**.
+
+System design luôn có các mục tiêu cạnh tranh:
+
+- latency thấp nhưng chi phí cũng phải hợp lý;
+- scale lớn nhưng không tạo complexity quá sớm;
+- consistency mạnh nhưng vẫn cần availability và geographic reach;
+- reliability cao nhưng hệ thống phải dễ vận hành;
+- ra mắt nhanh hôm nay nhưng vẫn có đường tiến hóa ngày mai.
+
+Không có kiến trúc “tốt nhất” trong mọi hoàn cảnh. Một thiết kế tốt là thiết kế đáp ứng đúng requirements trong constraints đã biết và giải thích được các trade-off.
+
+Blueprint bốn bước:
+
+```text
+1. Understand the problem
+          ↓
+2. Estimate the scale
+          ↓
+3. Create the high-level design
+          ↓
+4. Make technology & infrastructure decisions
+          ↓
+Validate against requirements, risks and trade-offs
+          ↺ iterate when assumptions change
+```
+
+Đây là framework lặp, không phải waterfall cứng nhắc. Một phát hiện ở bước sau có thể buộc ta quay lại sửa requirement, assumption hoặc estimate.
+
+---
+
+#### 2. Bước 1 — Understand the Problem
+
+Sai lầm phổ biến nhất là nghe tên hệ thống rồi lập tức vẽ database, Kafka hoặc microservices. Trước hết phải làm rõ **hệ thống cần giải quyết vấn đề gì**.
+
+##### 2.1 Functional requirements
+
+Functional requirements mô tả hành vi người dùng hoặc hệ thống cần hỗ trợ.
+
+Ví dụ với URL shortener:
+
+- tạo short URL từ long URL;
+- redirect short URL tới địa chỉ gốc;
+- cho phép custom alias hoặc expiration nếu nằm trong scope;
+- cung cấp analytics ở mức nào?
+
+Cần xác định:
+
+- actors và use cases chính;
+- happy path và critical edge cases;
+- operations đọc/ghi;
+- dữ liệu đầu vào/đầu ra;
+- tính năng bắt buộc và out of scope.
+
+Không nên cố thiết kế toàn bộ sản phẩm. Trong interview, hãy chốt một scope đủ rõ để dùng thời gian cho các quyết định quan trọng.
+
+##### 2.2 Non-functional requirements
+
+NFR định hình kiến trúc nhiều hơn tên tính năng:
+
+- latency mục tiêu theo percentile, ví dụ p95/p99;
+- throughput và concurrency;
+- availability/SLO;
+- consistency và freshness;
+- durability, RPO và RTO;
+- security, privacy, compliance và data residency;
+- scalability/growth horizon;
+- maintainability, observability và deployability;
+- cost/budget và team capability.
+
+“Hệ thống phải nhanh và scalable” chưa đủ. Cần biến tính từ thành mục tiêu có phạm vi đo được.
+
+##### 2.3 Constraints và assumptions
+
+Các constraints thường bị bỏ sót:
+
+- deadline, budget, team size và kỹ năng vận hành;
+- existing stack, legacy integration hoặc vendor contract;
+- region/cloud/on-premises requirements;
+- regulatory hoặc data-sovereignty limits;
+- network/device limitations;
+- migration và backward compatibility.
+
+Nếu chưa có số liệu, hãy nêu assumption rõ ràng rồi thiết kế nhất quán với assumption đó. Assumption tốt có thể kiểm chứng; assumption ẩn dễ làm toàn bộ kiến trúc đi sai.
+
+##### 2.4 Output của bước 1
+
+```text
+- In scope / out of scope
+- Core use cases
+- NFRs và SLOs
+- Constraints
+- Explicit assumptions
+- Success criteria
+```
+
+> Thiết kế chỉ thành công khi giải quyết đúng vấn đề; hệ thống tinh vi cho sai vấn đề vẫn là thất bại.
+
+---
+
+#### 3. Bước 2 — Estimate the Scale
+
+Estimate không nhằm dự đoán chính xác đến từng byte. Mục tiêu là xác định **order of magnitude**, traffic shape và bottleneck có khả năng xuất hiện.
+
+##### 3.1 Những con số cần hỏi hoặc ước lượng
+
+- DAU/MAU và tỷ lệ concurrent users.
+- Requests per second trung bình và peak.
+- Read:write ratio.
+- Object/event/request size.
+- Data retention và growth rate.
+- Fan-out factor hoặc số recipients/subscribers.
+- Geographic distribution.
+- Cacheable fraction và freshness requirement.
+- Background jobs, retries và traffic amplification.
+
+##### 3.2 Các phép tính nền tảng
+
+```text
+Average RPS = requests per day / 86,400
+Peak RPS    = average RPS × peak factor
+
+Daily data  = writes/day × average item size
+Stored data = daily data × retention days × replication/overhead factor
+
+Bandwidth   ≈ requests/second × average payload size
+Concurrency ≈ throughput × average latency        (Little's Law dạng đơn giản)
+```
+
+Ví dụ:
+
+```text
+100 triệu reads/ngày
+Average ≈ 100,000,000 / 86,400 ≈ 1,160 RPS
+Nếu peak factor = 8 → peak ≈ 9,300 RPS
+```
+
+Kiến trúc phải chịu peak shape, không chỉ daily average. Ngoài peak định kỳ còn có burst do notification fan-out, retry storm, hot key, cache miss wave hoặc viral event.
+
+##### 3.3 Từ con số tới câu hỏi kiến trúc
+
+| Quan sát | Câu hỏi thiết kế phát sinh |
+|---|---|
+| Read-heavy | Có cache/read replica/CDN được không? Freshness bao nhiêu? |
+| Write-heavy | Partition key, batching, log/queue và write contention? |
+| Payload lớn | Object storage, multipart, CDN, bandwidth và egress cost? |
+| Fan-out lớn | Push hay pull? Async processing? Hot partition? |
+| Global users | Multi-region, data residency, consistency và latency? |
+| Burst cao | Queue/buffer, autoscaling delay, admission control và load shedding? |
+| Retention dài | Storage tiering, lifecycle, index size và deletion? |
+
+##### 3.4 Capacity có nhiều chiều
+
+Đừng chỉ đếm server. Bottleneck có thể nằm ở:
+
+- CPU hoặc memory;
+- network bandwidth/connections;
+- database IOPS, locks hoặc storage capacity;
+- queue partitions/consumer lag;
+- third-party quota;
+- KMS/authentication/control-plane throughput;
+- operational capacity của đội ngũ.
+
+##### 3.5 Output của bước 2
+
+```text
+- Average và peak traffic
+- Data volume/growth/retention
+- Read-write and fan-out characteristics
+- Latency/concurrency implications
+- Likely bottlenecks
+- Assumptions + safety margin
+```
+
+Không cần tính mọi thứ. Hãy tính những gì có khả năng thay đổi quyết định kiến trúc.
+
+---
+
+#### 4. Bước 3 — Create the High-Level Design
+
+Khi problem và scale đã rõ, mới vẽ major components và request/data flow. High-level design trả lời:
+
+- Thành phần lớn nào tồn tại?
+- Trách nhiệm thuộc về đâu?
+- Clients gọi API nào?
+- Dữ liệu đi theo đường nào?
+- Thành phần giao tiếp đồng bộ hay bất đồng bộ?
+- Source of truth nằm ở đâu?
+- Failure boundary và scaling boundary là gì?
+
+##### 4.1 Bắt đầu từ critical user journey
+
+Vẽ đường đi đơn giản nhất cho use case cốt lõi:
+
+```text
+Client
+  → DNS/CDN/Load Balancer/API Gateway
+  → Application Service
+  → Cache
+  → Database / Object Storage
+  → response
+
+Application Service
+  → Queue/Event Log
+  → Async Workers
+  → derived data / notification / analytics
+```
+
+Sau đó mới thêm:
+
+- replication, partitioning và failover;
+- background processing;
+- rate limiting và abuse controls;
+- observability;
+- multi-region behavior;
+- backup/recovery;
+- authentication/authorization và trust boundaries.
+
+##### 4.2 Define contracts và boundaries
+
+Một sơ đồ chỉ có boxes/arrows là chưa đủ. Với mỗi component, làm rõ:
+
+- responsibility và owned data;
+- API/event contract;
+- sync/async semantics;
+- timeout, retry, idempotency và ordering;
+- consistency guarantee;
+- scaling unit;
+- failure behavior và fallback.
+
+Ranh giới tốt giảm coupling và giúp teams triển khai/evolve độc lập. Nhưng chia quá nhỏ khi chưa có nhu cầu làm tăng network calls, distributed transactions và operational overhead.
+
+##### 4.3 Data model và API ở mức vừa đủ
+
+Nêu các entity/key/query quan trọng và API cốt lõi. Không cần hoàn thiện toàn bộ schema, nhưng phải chứng minh storage/access pattern tương thích:
+
+```text
+POST /resources
+GET  /resources/{id}
+
+Resource:
+  id
+  owner_id
+  payload/reference
+  status/version
+  created_at
+```
+
+Data model nên xuất phát từ access patterns, invariants và lifecycle—not chỉ từ format payload.
+
+##### 4.4 Validate bằng failure scenarios
+
+Đi qua sơ đồ với các câu hỏi:
+
+- Một instance chết thì sao?
+- Database leader hoặc region unavailable thì sao?
+- Cache mất toàn bộ working set thì sao?
+- Queue chậm hoặc duplicate message thì sao?
+- Dependency timeout có tạo retry storm không?
+- Một tenant/key trở nên cực nóng thì sao?
+- Credential bị compromise hoặc gateway bị bypass thì sao?
+
+##### 4.5 Output của bước 3
+
+```text
+- Component diagram
+- Critical request/data flows
+- API/event contracts
+- Data ownership and access patterns
+- Sync/async decisions
+- Scaling/failure/trust boundaries
+- Major trade-offs
+```
+
+---
+
+#### 5. Bước 4 — Make Technology & Infrastructure Decisions
+
+Chỉ sau ba bước trên mới chọn database, cache, broker, cloud service hoặc deployment model. Technology là phương tiện đáp ứng requirement, không phải điểm xuất phát.
+
+##### 5.1 Dùng decision criteria thay cho sở thích
+
+Ví dụ chọn data store:
+
+| Requirement | Hướng lựa chọn cần đánh giá |
+|---|---|
+| Transactions và relational constraints | Relational database |
+| Key-based access, flexible aggregate, horizontal scale | Key-value/document store |
+| Ordered event stream và replay | Distributed log/event platform |
+| Large immutable blobs | Object storage |
+| Graph traversal | Graph-oriented model/store |
+
+Đây không phải mapping tuyệt đối. Cần xét capability thực tế, consistency, operational maturity, cost, ecosystem và team expertise.
+
+##### 5.2 Các quyết định hạ tầng thường gặp
+
+- Managed service hay self-hosted?
+- Monolith, modular monolith hay microservices?
+- VM, container, Kubernetes hay serverless?
+- Single-region, active-passive hay multi-region active-active?
+- Vertical, horizontal hay diagonal scaling?
+- CDN/cache ở tầng nào; invalidation/freshness ra sao?
+- Queue/topic/log nào; delivery và ordering contract gì?
+- Observability, deployment, rollback và incident tooling?
+
+##### 5.3 Đánh giá theo trade-off matrix
+
+| Tiêu chí | Câu hỏi |
+|---|---|
+| Correctness | Có giữ invariant và consistency yêu cầu? |
+| Performance | Latency/throughput ở peak có đạt? |
+| Scalability | Scaling unit và bottleneck là gì? |
+| Reliability | Failure, failover, backup và recovery thế nào? |
+| Security | Identity, authorization, encryption và audit ra sao? |
+| Operations | Team có deploy, monitor, debug và upgrade được không? |
+| Cost | Compute, storage, network, license và people cost? |
+| Evolution | Migration, schema/API compatibility và exit path? |
+
+##### 5.4 Tránh premature complexity
+
+Thiết kế nên là **giải pháp đơn giản nhất đáp ứng requirements với margin hợp lý**. Không cần microservices, multi-region active-active, sharding hoặc event sourcing chỉ vì chúng phổ biến.
+
+Thay vì “future-proof” mọi thứ, hãy xác định evolution path:
+
+```text
+Current design
+  → metric/threshold cho biết khi nào giới hạn tới gần
+  → mitigation ngắn hạn
+  → migration path dài hạn
+```
+
+##### 5.5 Output của bước 4
+
+```text
+- Selected technologies/services
+- Decision criteria and rejected alternatives
+- Deployment/topology
+- Capacity and scaling policy
+- Security/reliability/operations plan
+- Cost model
+- Risks, migration triggers and evolution path
+```
+
+---
+
+#### 6. Liên kết bốn bước bằng traceability
+
+Mỗi thành phần lớn nên truy ngược được về requirement hoặc risk:
+
+| Requirement/constraint | Estimate/evidence | Architecture decision | Technology choice |
+|---|---|---|---|
+| p99 read latency thấp | Peak read RPS, hit locality | Cache-aside trước DB | Redis/memory cache phù hợp |
+| Không mất accepted writes | Write rate, RPO = 0 trong failure scope | Durable replicated write path | Database/quorum configuration phù hợp |
+| Burst gấp 20 lần | Peak shape và autoscaling delay | Queue + bounded workers | Managed queue/broker |
+| Global static content | Geography và egress | Edge caching | CDN |
+
+Nếu một component không liên kết được với requirement, scale estimate hoặc risk, hãy hỏi liệu nó có thực sự cần thiết.
+
+---
+
+#### 7. Ví dụ rút gọn: thiết kế dịch vụ upload ảnh
+
+##### Bước 1 — Problem
+
+- User upload và xem ảnh.
+- p95 upload completion hợp lý; download latency thấp toàn cầu.
+- Ảnh phải bền vững; metadata cần phân quyền theo owner.
+- Malware/format validation và privacy là bắt buộc.
+
+##### Bước 2 — Scale
+
+- Ước lượng uploads/day × average image size để ra storage growth và ingress bandwidth.
+- Ước lượng views/day × delivered size để ra CDN origin/egress pressure.
+- Peak upload/view RPS, retention và replication overhead.
+
+##### Bước 3 — High-level design
+
+```text
+Client → API: xin upload authorization
+Client → Object Storage: upload trực tiếp bằng URL/quyền tạm thời
+Object event → Queue → Scan/Resize workers
+Metadata Service → Database
+Viewer → CDN → Object Storage
+```
+
+##### Bước 4 — Technology
+
+- Object storage cho blobs; relational/document store cho metadata theo access pattern.
+- CDN cho delivery; queue cho scan/resize async.
+- KMS, short-lived upload authorization, private bucket và signed delivery URL.
+- Autoscaling workers theo queue lag; lifecycle storage theo retention.
+
+Điểm quan trọng không phải tên sản phẩm, mà là chuỗi lý do từ requirement → scale → architecture → technology.
+
+---
+
+#### 8. Cách dùng blueprint trong phỏng vấn
+
+Một buổi interview thường có thời gian hạn chế. Có thể timebox linh hoạt:
+
+1. **Clarify problem:** khoảng 5–10 phút.
+2. **Estimate scale:** khoảng 3–5 phút, chỉ tính con số ảnh hưởng thiết kế.
+3. **High-level design:** phần lớn thời gian; trình bày critical flow trước.
+4. **Deep dive/technology:** đi sâu vào bottleneck hoặc chủ đề interviewer chọn.
+5. **Validate/recap:** nhắc lại trade-offs, failure modes và evolution path.
+
+Trong lúc trình bày:
+
+- nói rõ assumption trước khi dùng;
+- giải thích “vì sao” cho mỗi component;
+- chủ động nêu trade-off và alternative;
+- kiểm tra lại với requirements sau mỗi quyết định lớn;
+- không sa vào chi tiết thứ yếu trước khi có end-to-end design;
+- lắng nghe interviewer để chọn deep dive đúng trọng tâm.
+
+---
+
+#### 9. Những lỗi thường gặp
+
+- Bắt đầu bằng tên technology hoặc pattern yêu thích.
+- Không chốt scope nên thiết kế lan man.
+- NFR dùng từ mơ hồ, không có metric/phạm vi.
+- Tính average nhưng bỏ qua peak, burst và retry amplification.
+- Tạo nhiều con số nhưng không dùng chúng cho quyết định nào.
+- Vẽ boxes/arrows mà không mô tả data flow, ownership hoặc failure semantics.
+- Chia microservices trước khi có domain/team/scaling boundary.
+- Chọn SQL/NoSQL chỉ bằng khẩu hiệu “consistency vs scale”.
+- Thêm cache nhưng không nói freshness/invalidation/failure behavior.
+- Thêm queue nhưng không nói delivery, idempotency, ordering và backlog.
+- Thiết kế happy path nhưng bỏ qua overload, dependency failure và recovery.
+- Over-engineer cho tương lai không có evidence.
+- Không tính operational complexity và team capability.
+- Không quay lại chứng minh final design đáp ứng requirements.
+
+---
+
+#### 10. Checklist 4 bước
+
+##### Step 1 — Problem
+
+- [ ] Actors, use cases và critical journeys?
+- [ ] In scope/out of scope?
+- [ ] Functional requirements?
+- [ ] Latency, availability, consistency, durability, security và cost goals?
+- [ ] Constraints và explicit assumptions?
+
+##### Step 2 — Scale
+
+- [ ] DAU/concurrency và average/peak RPS?
+- [ ] Read:write ratio và traffic shape?
+- [ ] Payload/object/event size?
+- [ ] Storage growth, retention và replication overhead?
+- [ ] Bandwidth, fan-out, cacheability và likely bottlenecks?
+
+##### Step 3 — High-level design
+
+- [ ] Critical request/data flow end-to-end?
+- [ ] Components, responsibilities và ownership?
+- [ ] APIs/events và sync/async semantics?
+- [ ] Data model/access patterns/source of truth?
+- [ ] Scaling, failure và trust boundaries?
+
+##### Step 4 — Technology
+
+- [ ] Decision criteria và alternatives?
+- [ ] Database/cache/broker choices có trace tới requirements?
+- [ ] Deployment, scaling và multi-region strategy?
+- [ ] Reliability, security, observability và operations?
+- [ ] Cost, risks, thresholds và evolution path?
+
+#### 11. Ý chính cần nhớ
+
+- System design là quá trình ra quyết định có chủ đích dưới constraints và trade-offs.
+- Bắt đầu bằng problem, không bắt đầu bằng technology.
+- Functional requirements xác định hành vi; NFRs định hình kiến trúc.
+- Estimate nhằm tìm order of magnitude và bottleneck, không nhằm tạo độ chính xác giả.
+- High-level design phải thể hiện flow, ownership, contracts và failure boundaries.
+- Technology choices phải là kết quả của requirement + scale + architecture reasoning.
+- Thiết kế đơn giản nhất đáp ứng yêu cầu thường tốt hơn kiến trúc phức tạp không có nhu cầu.
+- Future-ready nghĩa là có observability, thresholds và migration path—not xây mọi thứ từ ngày đầu.
+- Blueprint cần được dùng lặp lại khi assumption hoặc requirement thay đổi.
+- Một câu trả lời mạnh luôn liên kết: **requirement → evidence → decision → trade-off**.
+
+#### Công thức ghi nhớ
+
+> **System Design Blueprint = hiểu đúng bài toán + ước lượng đúng bậc quy mô + vẽ rõ kiến trúc/luồng dữ liệu + chọn công nghệ bằng tiêu chí và trade-off.**
+
+---
+
+## Phần 12 — Design a URL Shortener (TinyURL)
+
+### Bài 63. Problem Definition, Requirements & Short-Key Generation
+
+#### 1. Bài toán URL Shortener
+
+URL shortener biến một URL dài thành một link ngắn, dễ chia sẻ:
+
+```text
+https://example.com/products/category/item?id=123&campaign=summer
+                         ↓
+https://tiny.example/aB3x9K
+```
+
+Short URL không chứa toàn bộ destination. Nó gồm domain của dịch vụ và một **short key/alias** dùng để tra mapping tới long URL.
+
+Luồng cốt lõi:
+
+```text
+Create path
+Client → gửi long URL → tạo short key → lưu mapping → trả short URL
+
+Redirect path
+Browser → GET /{short_key} → tra mapping → trả HTTP redirect → destination
+```
+
+Chức năng trông đơn giản nhưng ở production phải giải quyết:
+
+- sinh key duy nhất ở quy mô lớn;
+- redirect cực nhanh với read traffic cao;
+- giữ mapping bền vững trong thời gian dài;
+- xử lý hot links và traffic burst;
+- chống abuse, phishing và malicious destinations;
+- hỗ trợ expiration, ownership và analytics;
+- tránh một lần outage làm mọi short link ngừng hoạt động.
+
+---
+
+#### 2. Giá trị của URL shortener
+
+##### 2.1 Convenience
+
+- Dễ copy, nhập và chia sẻ hơn.
+- Hữu ích trong SMS, QR code, social media hoặc nơi giới hạn ký tự.
+- Làm link hiển thị gọn hơn, dù không nên coi short link là “đáng tin” chỉ vì nhìn đẹp.
+
+##### 2.2 Analytics
+
+Mọi lượt click đi qua redirect service nên hệ thống có thể đo:
+
+- tổng click và unique/approximate visitors;
+- thời gian, referrer, device hoặc geographic region;
+- campaign attribution và conversion funnel.
+
+Analytics phải tuân theo privacy/retention policy, tránh lưu dữ liệu nhận dạng không cần thiết. Redirect path không nên phải chờ analytics write hoàn tất.
+
+##### 2.3 Branding
+
+Custom domain hoặc branded short link giúp tổ chức dễ nhận diện hơn. Tuy nhiên domain ownership, TLS certificate, tenant isolation và chống domain takeover trở thành requirements bổ sung.
+
+---
+
+#### 3. Xác định scope
+
+Case study này có thể chốt scope ban đầu như sau.
+
+##### In scope
+
+- Tạo short URL từ một HTTP/HTTPS long URL hợp lệ.
+- Redirect short URL tới destination.
+- Optional custom alias và expiration.
+- Registered user quản lý link của mình.
+- Thu thập click analytics bất đồng bộ.
+
+##### Out of scope ở phiên bản đầu
+
+- Trình tạo QR code và campaign-management đầy đủ.
+- Preview/unfurl engine.
+- Link-in-bio hoặc landing-page builder.
+- Billing và advertisement platform.
+- Crawling toàn bộ nội dung destination.
+
+Scope phải được chốt trước vì analytics, custom domains, editability và abuse prevention có thể làm kiến trúc phức tạp hơn nhiều so với redirect đơn thuần.
+
+---
+
+#### 4. Functional requirements
+
+##### FR1 — Shorten URL
+
+User gửi long URL hợp lệ; hệ thống trả về một short URL duy nhất trong namespace áp dụng.
+
+Các câu hỏi cần chốt:
+
+- Chỉ cho phép `http`/`https` hay thêm scheme khác?
+- Maximum URL length?
+- Có canonicalize URL trước khi lưu không?
+- Link có expiration mặc định không?
+- Anonymous user có được tạo link không?
+
+##### FR2 — Redirect
+
+Khi truy cập `/{short_key}`, hệ thống:
+
+1. Xác định tenant/domain namespace nếu có custom domain.
+2. Tìm mapping còn hiệu lực.
+3. Kiểm tra trạng thái disabled/deleted/unsafe.
+4. Trả redirect tới destination.
+5. Gửi click event cho analytics ngoài critical path.
+
+Nếu key không tồn tại hoặc hết hạn, trả trang/response phù hợp thay vì redirect mơ hồ.
+
+##### FR3 — Duplicate long URLs
+
+Transcript đề xuất cùng long URL nên trả cùng short link để tiết kiệm storage. Đây là **một lựa chọn product semantics**, không phải mặc định luôn đúng.
+
+Hai mô hình:
+
+| Mô hình | Ưu điểm | Vấn đề |
+|---|---|---|
+| Global deduplication | Ít mapping hơn; cùng URL có cùng key | Trộn ownership, analytics, expiration, campaign và privacy giữa users |
+| Mỗi create tạo link mới | Analytics/config/lifecycle độc lập | Tốn thêm mapping nhưng thường rất nhỏ so với click data |
+
+Phương án thực dụng:
+
+- custom alias luôn là resource riêng;
+- registered user có thể idempotently retry bằng idempotency key;
+- nếu muốn deduplicate, chỉ deduplicate trong đúng owner/tenant và cùng configuration;
+- không dùng global reverse lookup `long_url → short_key` nếu product cần campaign-level analytics.
+
+##### FR4 — User management
+
+Registered users có thể:
+
+- liệt kê và quản lý links đã tạo;
+- đặt expiration hoặc disable link;
+- xem analytics;
+- dùng custom alias/domain nếu được cấp quyền.
+
+Mọi management API phải kiểm tra ownership/tenant authorization; short key khó đoán không thay access control.
+
+##### FR5 — Analytics
+
+Ghi click event với semantics và privacy scope rõ ràng. Analytics có thể eventual-consistent; redirect correctness không nên phụ thuộc analytics availability.
+
+---
+
+#### 5. Non-functional requirements
+
+##### 5.1 Availability
+
+Redirect là đường đọc critical: khi dịch vụ ngừng hoạt động, toàn bộ short links bị “gãy” tạm thời. Transcript nêu availability trên 99.9%, nhưng thiết kế thực tế nên chốt SLO theo product impact:
+
+```text
+99.9%  ≈ 8 giờ 46 phút downtime/năm
+99.99% ≈ 52 phút 36 giây downtime/năm
+```
+
+Create path và analytics có thể có SLO thấp hơn redirect path.
+
+##### 5.2 Low latency
+
+- Redirect nên thêm rất ít latency vào hành trình của user.
+- Nên đặt mục tiêu theo percentile như p95/p99, region và cache state.
+- Hot link phải không làm một database partition hoặc instance quá tải.
+
+##### 5.3 Scalability
+
+Workload thường **read-heavy**: một link được tạo một lần nhưng có thể được click hàng triệu lần. Cần scale redirect reads độc lập với create writes và analytics ingestion.
+
+##### 5.4 Durability và reliability
+
+Mapping đã acknowledge phải không bị mất trong failure model đã định. Cần replication, backup/restore và recovery drills. Durability của mapping thường quan trọng hơn click event riêng lẻ.
+
+##### 5.5 Security và abuse resistance
+
+- Chống spam, phishing, malware redirection và bulk key enumeration.
+- Rate limit create/management APIs.
+- Không cho phép unsafe schemes hoặc open-redirect behavior ngoài mapping đã quản lý.
+- Bảo vệ custom alias khỏi impersonation/reserved-name abuse.
+- Có takedown/disable workflow và audit.
+
+##### 5.6 Maintainability và observability
+
+Theo dõi redirect latency/error rate, cache hit ratio, not-found rate, hot keys, DB saturation, create collision/retry, queue lag và abuse decisions.
+
+---
+
+#### 6. API contract sơ bộ
+
+##### Tạo short URL
+
+```http
+POST /v1/links
+Idempotency-Key: <client-generated-key>
+
+{
+  "long_url": "https://example.com/path",
+  "custom_alias": "summer-sale",
+  "expires_at": "..."
+}
+```
+
+Response:
+
+```json
+{
+  "short_url": "https://tiny.example/aB3x9K",
+  "key": "aB3x9K",
+  "expires_at": "..."
+}
+```
+
+##### Redirect
+
+```http
+GET /aB3x9K
+→ 302 Location: https://example.com/path
+```
+
+`301` có thể được browser/CDN cache mạnh và khó thay đổi destination sau này. `302`, `307` hoặc `308` phải được chọn theo product semantics, HTTP method preservation và cache strategy—not theo thói quen. Với short-link redirect dùng `GET`, `302` thường là lựa chọn linh hoạt ban đầu.
+
+##### Quản lý
+
+```text
+GET    /v1/links/{key}
+PATCH  /v1/links/{key}
+DELETE /v1/links/{key}
+GET    /v1/links/{key}/analytics
+```
+
+Management namespace nên tách rõ với public redirect path.
+
+---
+
+#### 7. Data model sơ bộ
+
+Một mapping tối thiểu:
+
+```text
+Link
+  namespace/domain
+  short_key
+  long_url
+  owner_id          nullable nếu anonymous
+  created_at
+  expires_at        nullable
+  status            active/disabled/deleted/unsafe
+  redirect_policy   status code/cache policy
+  version
+
+Primary lookup: (namespace, short_key) → link metadata
+```
+
+Access path quan trọng nhất là point lookup theo short key. Analytics click events nên đi sang stream/queue và analytical store riêng thay vì update một counter row đồng bộ trên mỗi redirect; nếu không, popular link trở thành hot-write contention point.
+
+Nếu hỗ trợ user dashboard, cần index/access path theo `(owner_id, created_at)` ngoài primary short-key lookup.
+
+---
+
+#### 8. Các chiến lược sinh short key
+
+Short key phải đủ ngắn, duy nhất trong namespace, dễ route/store và đáp ứng yêu cầu unpredictability nếu có.
+
+##### 8.1 Random string
+
+Sinh chuỗi ngẫu nhiên từ alphabet như Base62.
+
+```text
+key = random(Base62 alphabet, length = k)
+```
+
+Ưu điểm:
+
+- Không cần counter tuần tự toàn cục.
+- Khó đoán hơn nếu dùng CSPRNG và đủ entropy.
+- Có thể scale generation phân tán.
+
+Nhược điểm:
+
+- Có xác suất collision; cần conditional insert/unique constraint rồi retry.
+- Khi keyspace đầy dần, collision rate tăng.
+- Random generator yếu hoặc key quá ngắn làm enumeration dễ hơn.
+
+Birthday paradox cho thấy collision đáng quan tâm trước khi keyspace “gần đầy”; cần chọn độ dài bằng số lượng links dự kiến và collision budget.
+
+##### 8.2 UUID
+
+Ưu điểm là tạo phân tán, xác suất collision cực thấp. Nhưng textual UUID quá dài cho mục tiêu “short”. Có thể dùng UUID/128-bit ID nội bộ rồi encode, nhưng output vẫn thường dài hơn sequential 64-bit ID.
+
+##### 8.3 Hash của long URL
+
+```text
+candidate = truncate(Base62(Hash(long_url + nonce/context)))
+```
+
+Ưu điểm:
+
+- Deterministic nếu input/context cố định.
+- Có thể hỗ trợ dedup semantics trong scope cụ thể.
+
+Nhược điểm:
+
+- Truncate làm collision có thể xảy ra; vẫn cần kiểm tra mapping.
+- Canonicalization của URL rất khó: query order, fragments, case, default port và tracking parameters có thể có semantics khác nhau.
+- Thêm salt không tự biến short URL thành “secure”; security phụ thuộc entropy, secret handling và threat model.
+- Global deterministic hash có thể rò việc một URL đã tồn tại hoặc gây ownership/config conflicts.
+
+##### 8.4 Numeric ID + Base62 encoding
+
+Sinh numeric ID duy nhất rồi encode bằng alphabet:
+
+```text
+alphabet = 0-9 + a-z + A-Z
+short_key = Base62(unique_numeric_id)
+```
+
+Capacity của keyspace:
+
+```text
+6 ký tự Base62 = 62^6 ≈ 56.8 tỷ keys
+7 ký tự Base62 = 62^7 ≈ 3.52 nghìn tỷ keys
+```
+
+Ưu điểm:
+
+- Key ngắn và không collision nếu ID generator đảm bảo uniqueness.
+- Encode/decode nhanh, deterministic.
+- Dễ estimate capacity.
+
+Nhược điểm:
+
+- Incrementing ID trực tiếp làm key có thể dự đoán/enumerate.
+- Central counter có thể thành bottleneck hoặc availability dependency.
+- Distributed ID generator làm ID/key dài hơn hoặc lộ timestamp/worker pattern.
+- Base62 chỉ là encoding, không phải encryption.
+
+##### 8.5 Custom alias
+
+User chọn key dễ nhớ. Cần:
+
+- unique constraint theo domain/namespace;
+- normalize case policy rõ ràng;
+- reserved words và route conflicts;
+- profanity/impersonation/phishing checks;
+- ownership, expiration và release/reuse policy;
+- rate limit để ngăn alias squatting.
+
+---
+
+#### 9. Chọn Base62 đúng cách
+
+Transcript chọn Base62 của incrementing ID vì compact, nhanh và đơn giản. Đây là lựa chọn hợp lý nếu requirements ưu tiên độ ngắn và enumeration risk được chấp nhận hoặc giảm thiểu.
+
+Điểm quan trọng: **Base62 không phải chiến lược tạo uniqueness độc lập**. Nó chỉ biểu diễn một số bằng alphabet 62 ký tự. Uniqueness đến từ ID generator.
+
+Các phương án cấp ID:
+
+| Phương án | Ưu điểm | Trade-off |
+|---|---|---|
+| DB auto-increment | Đơn giản, unique | Primary DB/sequence có thể là coordination bottleneck |
+| Range allocation | Mỗi node giữ một block IDs | Có gaps; cần cấp/renew range an toàn |
+| Snowflake-style ID | Tạo phân tán, sortable gần theo thời gian | ID dài hơn; clock/worker-ID operations |
+| Dedicated key-generation service | Policy tập trung | Thêm critical service và capacity/failover concern |
+
+Nếu cần key khó đoán nhưng vẫn dùng numeric ID, có thể dùng reversible permutation/obfuscation với secret hoặc tạo random aliases. Không nên tự thiết kế cryptography; và “khó đoán” vẫn không thay authorization cho management APIs.
+
+---
+
+#### 10. Collision và uniqueness contract
+
+Cho dù dùng random, hash-truncated hay custom alias, storage phải là nơi enforce uniqueness cuối cùng:
+
+```text
+generate candidate
+  → conditional insert / unique constraint
+      → success: trả key
+      → conflict: generate/retry hoặc trả alias conflict
+```
+
+Không dùng pattern “check trước rồi insert” mà thiếu atomicity:
+
+```text
+Request A: key chưa tồn tại
+Request B: key chưa tồn tại
+Request A: insert
+Request B: insert  ← race nếu storage không có uniqueness contract
+```
+
+Retry phải bounded và observable. Collision rate tăng bất thường có thể báo keyspace quá nhỏ, RNG lỗi hoặc attack.
+
+---
+
+#### 11. High-level workflow ban đầu
+
+```text
+                         ┌─────────────────────┐
+Create request ─────────▶│ URL Creation Service│
+                         └──────────┬──────────┘
+                                    │ allocate/generate key
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Durable Link Store  │
+                         └─────────────────────┘
+
+Redirect request ───────▶ Redirect Service
+                              │
+                              ├─ cache hit ───────────────┐
+                              │                           │
+                              └─ cache miss → Link Store  │
+                                                          ▼
+                                                   HTTP redirect
+
+Redirect Service ──async click event──▶ Queue/Stream ──▶ Analytics
+```
+
+Ở giai đoạn này đây mới là blueprint khái niệm. Scale estimates ở bài tiếp theo sẽ quyết định cache size, partitioning, replication, multi-region và capacity cụ thể.
+
+---
+
+#### 12. Các câu hỏi cần mang sang bước estimate
+
+1. Bao nhiêu new links mỗi ngày và peak create RPS?
+2. Bao nhiêu redirects mỗi ngày và peak/viral factor?
+3. Read:write ratio thực tế?
+4. Average/max long-URL size và metadata size?
+5. Link retention mặc định và tỷ lệ expiration?
+6. Bao nhiêu links cần lưu sau 5–10 năm?
+7. Tỷ lệ traffic tập trung vào top links—cache distribution có Zipfian không?
+8. Global traffic theo regions ra sao?
+9. Analytics event size và retention?
+10. Availability/latency SLO của redirect so với create/analytics?
+
+---
+
+#### 13. Những lỗi thiết kế thường gặp
+
+- Cho rằng cùng long URL luôn phải có cùng short key.
+- Canonicalize URL quá mạnh làm thay đổi destination semantics.
+- Dùng hash truncate nhưng không xử lý collision.
+- Gọi Base62 là encryption hoặc cho rằng nó che được sequential ID.
+- Dùng một in-memory counter không durable và không có failover.
+- Check alias tồn tại rồi insert mà không có atomic unique constraint.
+- Dùng short key khó đoán thay cho ownership authorization.
+- Update synchronous click counter trên redirect critical path.
+- Để analytics, malware scan hoặc third party làm redirect thất bại.
+- Mặc định dùng `301` mà không cân nhắc cache và khả năng sửa destination.
+- Bỏ qua expired/deleted/disabled link semantics.
+- Không có abuse, phishing takedown và reserved-alias policy.
+- Chỉ nói “99.9% HA” mà không tách SLO redirect/create/analytics.
+
+---
+
+#### 14. Checklist hoàn tất Step 1
+
+- [ ] Core create và redirect behavior đã rõ.
+- [ ] Duplicate URL semantics được quyết định theo owner/config/campaign.
+- [ ] Anonymous, registered user, custom alias và expiration nằm trong scope nào.
+- [ ] Redirect status/cache semantics đã được cân nhắc.
+- [ ] Analytics nằm ngoài critical redirect path.
+- [ ] Availability, latency, durability và scale objectives được nêu.
+- [ ] Security/abuse/privacy requirements được ghi nhận.
+- [ ] Primary access patterns và data ownership sơ bộ đã rõ.
+- [ ] Short-key strategies được so sánh bằng requirement.
+- [ ] Uniqueness được storage enforce atomically.
+- [ ] Base62 được hiểu là encoding của ID, không phải ID generator/cryptography.
+- [ ] Các input cần cho bước scale estimate đã được liệt kê.
+
+#### 15. Ý chính cần nhớ
+
+- URL shortener có hai đường chính: create và redirect; redirect thường read-heavy và critical hơn.
+- Functional requirements đơn giản nhưng NFRs quyết định phần lớn kiến trúc.
+- Duplicate long URL không mặc nhiên nên map toàn cục về một key.
+- Analytics nên bất đồng bộ để không tăng redirect latency/availability coupling.
+- Random key cần collision handling; hash truncate cũng có collision.
+- UUID dễ tạo phân tán nhưng thường quá dài cho short link.
+- Base62 làm identifier ngắn hơn nhưng không tạo uniqueness và không che được pattern.
+- Numeric ID + Base62 hợp lý khi compactness/simplicity quan trọng và ID allocation được giải quyết.
+- Storage unique constraint/conditional write là arbiter cuối cho key uniqueness.
+- Custom aliases mở thêm bài toán namespace, ownership, squatting và lifecycle.
+- Abuse prevention và takedown là requirement cốt lõi của public URL shortener.
+- Scale estimates tiếp theo phải tập trung peak redirects, storage growth, hot-key distribution và analytics volume.
+
+#### Công thức ghi nhớ
+
+> **Short URL = namespace/domain + compact unique key; hệ thống tốt = redirect nhanh và sẵn sàng + mapping bền vững + key generation đúng semantics + analytics tách rời + abuse controls.**
+
+---
+
+### Bài 64. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của bước estimate
+
+Sau khi chốt requirements, cần ước lượng quy mô trước khi vẽ kiến trúc. Con số không cần chính xác tuyệt đối; nó phải đủ tốt để trả lời:
+
+- workload đọc hay ghi nhiều hơn;
+- một database/cache đơn giản có đủ không;
+- capacity nào cần scale và bottleneck có thể nằm ở đâu;
+- peak/burst khác average bao nhiêu;
+- storage, network và chi phí tăng theo thời gian ra sao;
+- thành phần nào phải được tách khỏi critical path.
+
+Mọi estimate cần ghi kèm assumption, đơn vị và khoảng bất định. **Độ chính xác giả** nguy hiểm hơn một rough estimate có giải thích.
+
+---
+
+#### 2. Assumptions của case study
+
+Transcript dùng các giả định:
+
+| Biến | Giá trị |
+|---|---:|
+| Daily active users (DAU) | 10 triệu |
+| Monthly active users (MAU) | 300 triệu |
+| Tỷ lệ DAU tạo link/ngày | 1% |
+| Số redirect trung bình/user/ngày | 5 |
+| Kích thước một mapping | 500 bytes |
+| Kích thước traffic/redirect dùng để tính sơ bộ | 700 bytes |
+| Số hot mappings muốn cache | 1 triệu |
+
+Các giả định cần làm rõ thêm:
+
+- “1% user tạo URL” có phải mỗi user chỉ tạo một link/ngày không?
+- 5 clicks/user chỉ tính human traffic hay gồm bots/crawlers/link preview?
+- 700 bytes gồm request, response headers, TLS/network overhead hay chỉ application payload?
+- 500 bytes/mapping có gồm database row/index overhead không?
+- Links được giữ vĩnh viễn hay có expiration/retention?
+- Traffic phân bố theo region và giờ như thế nào?
+
+Trong thực tế, bot traffic và link-preview crawlers có thể đáng kể; capacity không nên chỉ dựa trên DAU con người.
+
+---
+
+#### 3. Ước lượng create traffic
+
+```text
+New links/day
+= 10,000,000 DAU × 1%
+= 100,000 links/day
+```
+
+Average create throughput:
+
+```text
+100,000 / 86,400 ≈ 1.16 creates/second
+```
+
+Ngay cả với peak factor 10:
+
+```text
+Peak create RPS ≈ 12 requests/second
+```
+
+Đây là write rate khá nhỏ. Chưa có bằng chứng cần sharding chỉ vì mapping writes. Tuy nhiên create operation còn có:
+
+- unique-key allocation/conditional insert;
+- authentication và quota;
+- custom-alias conflict;
+- URL validation/abuse checks;
+- idempotency và retry;
+- audit/analytics events.
+
+Throughput nhỏ không đồng nghĩa write path không cần correctness và availability.
+
+---
+
+#### 4. Ước lượng redirect traffic
+
+```text
+Redirects/day
+= 10,000,000 users × 5 redirects
+= 50,000,000 redirects/day
+```
+
+Average redirect RPS:
+
+```text
+50,000,000 / 86,400 ≈ 579 RPS
+```
+
+Read:write ratio:
+
+```text
+50,000,000 redirects / 100,000 creates = 500 : 1
+```
+
+Kết luận: URL shortener là workload **rất read-heavy**.
+
+Nếu dùng peak factor 10–12:
+
+```text
+Peak redirect RPS ≈ 5,800–7,000 RPS
+```
+
+Đây chưa phải quy mô buộc phải có kiến trúc cực kỳ phức tạp, nhưng cần stateless horizontal scaling, cache và database read path hiệu quả. Viral link có thể tạo peak cục bộ cao hơn estimate toàn hệ thống.
+
+---
+
+#### 5. Ước lượng cache
+
+Nếu cache 1 triệu hot mappings, mỗi mapping 500 bytes:
+
+```text
+Logical payload = 1,000,000 × 500 bytes
+                = 500,000,000 bytes
+                ≈ 500 MB decimal
+                ≈ 477 MiB binary
+```
+
+500 MB chỉ là payload. Cache production còn có:
+
+- key/object/allocator metadata;
+- expiration bookkeeping;
+- fragmentation;
+- connection/client buffers;
+- replication;
+- persistence overhead nếu bật;
+- headroom để tránh eviction liên tục.
+
+Vì vậy không nên provision đúng 500 MB. Ví dụ estimate sơ bộ:
+
+```text
+Payload                    ≈ 0.5 GB
+Runtime/metadata overhead  ≈ 1.5–2.5× tùy engine/data shape
+Primary + replica          ≈ nhân thêm theo topology
+Operational headroom       ≈ 20–40%
+```
+
+Con số thực phải được benchmark với serialization, key length và cache engine cụ thể.
+
+##### Cache hit ratio ảnh hưởng database load
+
+Với peak 7,000 redirects/s:
+
+```text
+DB reads/s = peak RPS × (1 - cache hit ratio)
+
+Hit 90% → 700 DB reads/s
+Hit 99% → 70 DB reads/s
+```
+
+Hit ratio có ý nghĩa hơn “cache top 1 triệu” nếu chưa biết access distribution. URL clicks thường skewed/Zipfian, nhưng phải đo working set và churn.
+
+---
+
+#### 6. Ước lượng network traffic
+
+Theo assumption 700 bytes/redirect:
+
+```text
+Daily traffic
+= 50,000,000 × 700 bytes
+= 35,000,000,000 bytes
+≈ 35 GB/day
+```
+
+Average throughput:
+
+```text
+35 GB / 86,400 seconds ≈ 405 KB/s ≈ 0.4 MB/s
+```
+
+Nếu thiết kế peak 5 MB/s:
+
+```text
+5,000,000 bytes/s / 700 bytes ≈ 7,140 redirects/s
+```
+
+Điều này tương ứng peak factor khoảng 12.3 so với average, khá nhất quán với RPS estimate ở trên.
+
+Tuy nhiên 700 bytes là mô hình rất giản lược:
+
+- Redirect service không truyền nội dung destination; nó chủ yếu trả headers/status.
+- TCP/TLS/HTTP overhead và connection reuse ảnh hưởng số connection/CPU.
+- HTTP/2, HTTP/3, keep-alive và CDN cache thay đổi network profile.
+- Geographic egress và request-count pricing có thể quan trọng hơn raw bandwidth.
+- DDoS/bot traffic không tuân theo user-based estimate.
+
+Với assumptions hiện tại, **network bandwidth hợp lệ chưa phải bottleneck chính**; cache/DB latency, TLS/connections, hot-key burst và availability đáng chú ý hơn.
+
+---
+
+#### 7. Ước lượng mapping storage
+
+```text
+Daily raw mapping data
+= 100,000 links × 500 bytes
+= 50 MB/day
+
+Yearly raw mapping data
+= 50 MB × 365
+≈ 18.25 GB/year
+```
+
+Transcript đề xuất budget khoảng 50 GB/năm sau khi tính index, transaction log, backup và overhead. Đây là planning estimate hợp lý ở mức sơ bộ, nhưng cần tách các hệ số:
+
+```text
+Primary rows
++ primary/secondary indexes
++ MVCC/version/storage-engine overhead
++ replication copies
++ transaction/WAL retention
++ backups/snapshots
++ safety margin
+```
+
+Ví dụ, 5 năm raw mapping data chỉ khoảng 91 GB theo assumptions hiện tại. Dataset này vẫn có thể nằm trong khả năng của một relational database được thiết kế tốt; không có lý do tự động sharding từ ngày đầu.
+
+##### Storage thường bị bỏ quên: analytics
+
+Mapping writes chỉ 100 nghìn/ngày, nhưng click events có thể là 50 triệu/ngày.
+
+Nếu một event sau serialization/compression boundary trung bình 500 bytes:
+
+```text
+50,000,000 × 500 bytes = 25 GB/day raw events
+≈ 9.1 TB/year trước retention/compression/replication
+```
+
+Analytics data có thể lớn hơn mapping data hàng trăm lần. Vì vậy:
+
+- gửi event bất đồng bộ;
+- đặt retention/tiering rõ ràng;
+- aggregate theo phút/giờ/ngày khi raw events không cần giữ lâu;
+- tách OLTP link store khỏi analytical store.
+
+---
+
+#### 8. Tổng hợp workload profile
+
+| Dimension | Estimate | Kiến trúc gợi ý |
+|---|---:|---|
+| Create writes | ~1.16 RPS average | Correctness/idempotency quan trọng hơn raw throughput |
+| Redirect reads | ~579 RPS average | Cache + optimized point lookup |
+| Peak redirects | ~5.8k–7.1k RPS theo factor 10–12 | Horizontal scaling, headroom, load test |
+| Read:write | ~500:1 | Tách read path và write path khi cần |
+| Hot cache payload | ~500 MB logical | Memory cache khả thi; provision overhead/replica/headroom |
+| Redirect network | ~35 GB/day theo 700 B/request | Peak/connections/edge quan trọng hơn average bandwidth |
+| Mapping growth | ~18.25 GB raw/năm | Chưa cần sharding chỉ vì dung lượng này |
+| Click analytics | Có thể hàng TB/năm | Async stream, aggregation, retention/tiering |
+
+---
+
+#### 9. Bottleneck 1 — Redirect read path
+
+Critical path:
+
+```text
+Client → edge/LB → redirect service → cache → link store → response
+```
+
+Nếu mọi request xuống database:
+
+- DB connection/query latency nằm trong mọi redirect;
+- viral key làm tăng traffic đột ngột;
+- DB outage làm toàn bộ redirect path lỗi;
+- read traffic cạnh tranh với create/management operations.
+
+Mitigations:
+
+- local/distributed/edge cache theo topology;
+- point lookup bằng indexed `(namespace, short_key)`;
+- stateless redirect instances và connection pooling;
+- cache negative results ngắn hạn để giảm random-key scanning;
+- request coalescing/single-flight khi miss;
+- stale-on-error hoặc fallback chỉ khi product semantics cho phép.
+
+Không cache disabled/expired link quá lâu nếu takedown cần hiệu lực nhanh. Cache invalidation và staleness budget là security/product decisions, không chỉ performance.
+
+---
+
+#### 10. Bottleneck 2 — Hot links và burst traffic
+
+Average traffic che giấu skew. Một viral link có thể nhận phần lớn request trong vài phút.
+
+Rủi ro:
+
+- một cache node/shard nhận toàn bộ hot key;
+- cache miss/restart tạo thundering herd xuống DB;
+- autoscaling phản ứng chậm hơn burst;
+- analytics partition/counter trở thành hot write;
+- downstream destination có thể bị flood ngoài ý muốn.
+
+Mitigations:
+
+- CDN/edge-cache redirect response với cache policy phù hợp;
+- replicate hot keys hoặc local cache trên nhiều redirect instances;
+- pre-warm khi campaign/launch đã biết;
+- single-flight và request collapsing;
+- capacity headroom, pre-provisioning và load shedding;
+- analytics event partitioning/aggregation, không update một counter row;
+- hot-key detection và adaptive TTL.
+
+CDN chỉ cache **redirect response**, không “phục vụ nội dung destination” trừ khi CDN đó cũng thuộc destination architecture. Caching permanent redirects có hiệu quả cao nhưng làm destination/takedown thay đổi chậm; TTL phải phù hợp lifecycle.
+
+---
+
+#### 11. Bottleneck 3 — Cache failure và cold start
+
+Cache giảm DB load nhưng có thể tạo dependency mới.
+
+Scenarios:
+
+- cache node chết;
+- cluster restart làm mất working set;
+- deployment thay key format;
+- hàng loạt keys hết TTL cùng lúc;
+- cache partition khiến application retry không kiểm soát.
+
+Mitigations:
+
+- capacity test DB cho degraded-cache mode;
+- staggered TTL/TTL jitter;
+- warm-up có kiểm soát;
+- bounded retry và circuit breaker;
+- protect origin bằng admission/load shedding;
+- replicate/shard cache theo failure model;
+- monitor hit ratio, evictions, memory fragmentation và origin load.
+
+Cache không phải source of truth; link store vẫn phải durable và recoverable.
+
+---
+
+#### 12. Bottleneck 4 — Key generation và write correctness
+
+Write throughput thấp, nhưng unique-key generation có thể là coordination point:
+
+- database sequence/central allocator unavailable;
+- range allocator cấp trùng range;
+- Snowflake worker ID/clock lỗi;
+- random generator collision/retry tăng;
+- custom alias contention/squatting;
+- client retry tạo duplicate links.
+
+Controls:
+
+- storage-enforced unique constraint/conditional write;
+- idempotency key cho create request;
+- allocator replication/failover hoặc preallocated ranges;
+- bounded collision retry và metrics;
+- explicit semantics khi alias conflict;
+- durable acknowledgement trước khi trả short URL.
+
+Không nên tối ưu write scalability vượt xa nhu cầu trong khi bỏ qua correctness.
+
+---
+
+#### 13. Bottleneck 5 — Analytics pipeline
+
+Mỗi redirect tạo một event nên analytics write rate gần redirect read rate, cao hơn mapping create rate khoảng 500 lần.
+
+```text
+Redirect Service
+    └─ best-effort/buffered publish → Queue/Log
+                                      ├─ real-time aggregate
+                                      ├─ fraud/abuse detection
+                                      └─ batch/data lake
+```
+
+Quyết định cần làm rõ:
+
+- Click event có được phép mất một tỷ lệ nhỏ không?
+- Publish failure có bao giờ làm redirect failure không?
+- At-least-once delivery tạo duplicate analytics ra sao?
+- Event key nào phân bố partition tốt mà vẫn aggregate được?
+- Raw retention và privacy deletion thế nào?
+- Bot/link-preview clicks được phân loại ra sao?
+
+Thông thường redirect phải ưu tiên availability; analytics có eventual consistency và xử lý duplicate bằng event ID/aggregation semantics.
+
+---
+
+#### 14. Bottleneck 6 — Database và long-term growth
+
+Hiện tại mapping dataset không lớn, nhưng cần theo dõi:
+
+- index working set có còn fit memory không;
+- query latency p99 và storage IOPS;
+- replica lag;
+- backup/restore time có đạt RTO không;
+- expired/deleted records có được purge/tier không;
+- tenant/domain/hot-prefix distribution;
+- schema/index write amplification.
+
+Evolution path hợp lý:
+
+```text
+Single primary + replicas
+  → partition/archive expired data
+  → shard theo stable hash(namespace, short_key) khi metric chứng minh cần
+```
+
+Sharding sớm làm tăng routing, resharding, backup và operational complexity mà chưa giải quyết bottleneck thực tế.
+
+---
+
+#### 15. Autoscaling và CDN: giới hạn cần nhớ
+
+Transcript đề xuất autoscaling và CDN cho burst/global traffic. Cả hai hữu ích nhưng không phải phép màu.
+
+##### Autoscaling
+
+- Có detection, provisioning và warm-up delay.
+- Không giúp nếu database/cache/allocator là bottleneck cố định.
+- Metric CPU có thể phản ứng muộn; RPS, concurrency, queue lag hoặc latency có thể phù hợp hơn.
+- Cần minimum capacity/headroom cho sudden burst.
+
+##### CDN/edge
+
+- Giảm latency và origin load nếu redirect response được cache.
+- Cache key phải gồm host/namespace và path đúng cách.
+- TTL phải cân bằng hit ratio với expiration, edit và takedown.
+- Query string handling phải rõ.
+- Origin phải chống bypass và có purge/invalidation workflow.
+
+---
+
+#### 16. Capacity và SLO theo từng path
+
+Không gộp toàn hệ thống thành một SLO duy nhất:
+
+| Path | Ưu tiên | Degraded behavior có thể chấp nhận |
+|---|---|---|
+| Redirect | Availability/latency cao nhất | Bỏ/delay analytics; dùng cached mapping phù hợp |
+| Create | Correctness/durability | Tạm rate-limit hoặc trả retryable error |
+| Management | AuthZ/consistency | Chậm hơn redirect; không fail-open |
+| Analytics | Throughput/eventual consistency | Queue/backlog; dashboard stale trong giới hạn |
+
+Điều này giúp phân bổ capacity, dependencies và failure policy đúng theo business impact.
+
+---
+
+#### 17. Metrics và trigger cho evolution
+
+Theo dõi tối thiểu:
+
+- redirect RPS, p50/p95/p99 latency và error rate theo region;
+- cache hit ratio, evictions, hot keys và cold-start origin surge;
+- DB QPS, p99 query latency, CPU/IOPS/connections và replica lag;
+- create success/conflict/collision/idempotency-replay rate;
+- HTTP status distribution, expired/disabled/not-found rate;
+- CDN hit ratio và purge propagation time;
+- analytics publish failure, queue lag và duplicate rate;
+- bot/abuse traffic và takedown latency;
+- storage growth, index size, backup/restore duration;
+- autoscaling reaction/warm-up time và saturation headroom.
+
+Ví dụ trigger:
+
+```text
+Nếu cache miss surge làm DB vượt safe capacity
+→ tăng origin protection, warm-up/single-flight hoặc cache topology
+
+Nếu index không còn fit memory và p99 tăng dù query tối ưu
+→ partition/archive, scale storage hoặc chuẩn bị sharding
+
+Nếu analytics lag vượt freshness SLO
+→ tăng partitions/consumers hoặc giảm event/aggregation cost
+```
+
+---
+
+#### 18. Những lỗi estimate thường gặp
+
+- Dùng MAU để tính traffic mà không quy đổi hành vi theo ngày/giờ.
+- Nói 50 triệu requests/ngày nhưng không đổi ra average và peak RPS.
+- Thiết kế theo average, bỏ qua peak factor và viral skew.
+- Tính payload cache nhưng quên metadata, replication và headroom.
+- Tính mapping storage nhưng bỏ qua analytics events.
+- Dùng một kích thước “700 bytes” mà không nói nó bao gồm gì.
+- Đồng nhất network bandwidth với request/connection/TLS capacity.
+- Kết luận cần sharding chỉ vì nghe “hàng triệu users”.
+- Cho rằng cache hit ratio cao mà không có access-distribution evidence.
+- Dùng autoscaling thay capacity headroom và overload protection.
+- Nói CDN “serve destination” trong khi nó chỉ cache redirect response.
+- Không tách redirect, create, management và analytics SLO.
+- Tạo estimate nhưng không nối con số với quyết định kiến trúc.
+
+---
+
+#### 19. Checklist Step 2
+
+- [ ] Assumptions có đơn vị, phạm vi và nguồn/owner?
+- [ ] Average và peak create/redirect RPS?
+- [ ] Read:write ratio và traffic skew/hot-link factor?
+- [ ] Bot/crawler/preview và abuse multiplier?
+- [ ] Mapping, cache và analytics event sizes?
+- [ ] Cache overhead, replicas và headroom?
+- [ ] Network estimate gồm những layer nào?
+- [ ] Mapping growth theo retention và index/replication/backup overhead?
+- [ ] Analytics raw/aggregate storage và retention?
+- [ ] Critical path DB load ở các cache hit ratios?
+- [ ] Cold-cache, viral-link và dependency-failure scenarios?
+- [ ] Key-generation/write correctness bottleneck?
+- [ ] SLO và degraded mode theo từng path?
+- [ ] Metrics và thresholds dẫn tới scale/partition/shard?
+- [ ] Mỗi estimate có dẫn tới một quyết định hoặc risk rõ ràng?
+
+#### 20. Ý chính cần nhớ
+
+- Với assumptions của case study: khoảng 100 nghìn creates/ngày và 50 triệu redirects/ngày.
+- Average throughput lần lượt khoảng 1.16 write/s và 579 read/s; read:write khoảng 500:1.
+- Peak factor 10–12 đưa redirect capacity target sơ bộ tới khoảng 5.8k–7.1k RPS.
+- 1 triệu mappings × 500 bytes bằng khoảng 500 MB logical payload, chưa gồm cache overhead/replication/headroom.
+- 35 GB redirect traffic/ngày tương đương khoảng 0.4 MB/s average theo assumption 700 bytes/request.
+- Mapping tăng khoảng 18.25 GB raw/năm; con số này chưa tự biện minh cho sharding.
+- Analytics events có thể lớn hơn mapping storage rất nhiều và cần pipeline riêng.
+- Bottleneck chính là redirect latency/availability, hot links, cache failure, analytics và correctness của key generation—not chỉ raw storage.
+- CDN cache redirect response; autoscaling có độ trễ và không sửa downstream bottleneck.
+- Estimate hữu ích khi nối được **con số → bottleneck → architectural decision → metric/trigger**.
+
+#### Công thức ghi nhớ
+
+> **TinyURL scale profile = read-heavy 500:1 + hot-key burst + cache-sensitive DB load + modest mapping growth + potentially massive analytics stream.**
+
+---
+
+### Bài 65. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của Step 3
+
+Step 3 biến requirements và scale estimates thành:
+
+- public/protected API contracts;
+- major components và trách nhiệm;
+- critical request/data flows;
+- synchronous và asynchronous communication;
+- data ownership/source of truth;
+- cache behavior;
+- failure, security và scaling boundaries.
+
+High-level design không cần chọn mọi sản phẩm cụ thể, nhưng phải đủ rõ để một request có thể được lần theo end-to-end.
+
+---
+
+#### 2. API design principles
+
+API là contract ổn định giữa client và service, không nên làm lộ implementation như loại database hoặc thuật toán sinh key.
+
+Các nguyên tắc cho TinyURL:
+
+- versioning nhất quán, ví dụ `/v1/...`;
+- resource-oriented naming thay cho RPC naming khi phù hợp;
+- validate schema, URL scheme/length và business policy;
+- idempotency cho create retry;
+- authentication và object-level authorization cho management APIs;
+- error model ổn định với machine-readable code;
+- rate limit/quota theo user, tenant và anonymous identity;
+- không đưa bearer token/secret vào URL;
+- trace/request ID cho observability nhưng không làm lộ data nhạy cảm.
+
+---
+
+#### 3. API tạo short URL
+
+Transcript dùng `POST /api/shorten`. Một contract resource-oriented, dễ tiến hóa hơn:
+
+```http
+POST /v1/links
+Authorization: Bearer <access-token>   # optional nếu cho anonymous
+Idempotency-Key: 8bb1...
+Content-Type: application/json
+
+{
+  "long_url": "https://example.com/path?q=1",
+  "custom_alias": "summer-sale",
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+```
+
+Success response:
+
+```http
+HTTP/1.1 201 Created
+Location: /v1/links/aB3x9K
+
+{
+  "key": "aB3x9K",
+  "short_url": "https://tiny.example/aB3x9K",
+  "long_url": "https://example.com/path?q=1",
+  "expires_at": "2026-12-31T23:59:59Z",
+  "created_at": "..."
+}
+```
+
+Luồng xử lý:
+
+```text
+validate input/policy
+  → authenticate optional owner/tenant
+  → check idempotency record
+  → allocate/generate candidate key
+  → conditional insert mapping
+  → commit durable state
+  → return 201
+```
+
+Không nhất thiết phải “tìm existing long URL” trên toàn hệ thống. Duplicate semantics phải theo quyết định ở Bài 63: cùng owner/tenant/config hoặc idempotent retry mới nên reuse nếu product yêu cầu.
+
+Các lỗi tiêu biểu:
+
+| HTTP status | Trường hợp |
+|---|---|
+| `400`/`422` | URL/scheme/expiration không hợp lệ |
+| `401` | Cần đăng nhập nhưng credential thiếu/sai |
+| `403` | Principal hợp lệ nhưng không được dùng domain/feature |
+| `409` | Custom alias đã tồn tại hoặc idempotency conflict |
+| `429` | Vượt create quota/rate limit |
+| `503` | Dependency tạm thời unavailable; client có thể retry có kiểm soát |
+
+---
+
+#### 4. Redirect API
+
+```http
+GET /aB3x9K HTTP/1.1
+Host: tiny.example
+```
+
+Nếu mapping hợp lệ:
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/path?q=1
+Cache-Control: public, max-age=<policy>
+```
+
+Redirect endpoint trả HTTP redirect, không trả JSON URL, để user agent tự điều hướng.
+
+##### Redirect status code
+
+| Code | Đặc điểm cần cân nhắc |
+|---|---|
+| `301 Moved Permanently` | Permanent semantics; có thể bị cache mạnh, khó đổi/takedown nhanh |
+| `302 Found` | Phổ biến cho redirect linh hoạt với `GET` |
+| `307 Temporary Redirect` | Giữ nguyên HTTP method/body |
+| `308 Permanent Redirect` | Permanent và giữ method/body |
+
+Với public short link chủ yếu nhận `GET`, `302` là điểm bắt đầu linh hoạt. Nếu link bất biến và muốn edge/browser cache dài, permanent redirect có thể phù hợp. Quyết định phải đi cùng editability, expiration, takedown và cache invalidation.
+
+##### Not found/expired/disabled
+
+- Key chưa từng tồn tại: `404` hoặc branded not-found page.
+- Link hết hạn: `410 Gone` có thể diễn đạt rõ hơn `404`, tùy muốn che history.
+- Link bị abuse/takedown: trả interstitial/blocked response theo policy; không redirect.
+- Không redirect tới fallback tùy ý vì có thể che lỗi hoặc tạo security risk.
+
+##### `HEAD` và bots
+
+Có thể hỗ trợ `HEAD` giống `GET` nhưng không có body. Link preview/crawler có thể tạo traffic và analytics giả; event cần ghi user-agent/source classification hoặc loại khỏi business click metric theo policy.
+
+---
+
+#### 5. API xóa hoặc vô hiệu hóa link
+
+Transcript dùng:
+
+```http
+DELETE /api/url/{short_key}
+Authorization: Bearer <token>
+```
+
+Contract nhất quán hơn:
+
+```http
+DELETE /v1/links/{key}
+Authorization: Bearer <access-token>
+If-Match: "<version/etag>"    # optional optimistic concurrency
+```
+
+Security flow:
+
+```text
+validate token/session
+  → identify principal + tenant
+  → load resource metadata
+  → authorize delete/disable on this exact resource
+  → atomically change status/version
+  → invalidate/purge caches
+  → emit audit/domain event
+```
+
+Authentication trả lời “ai”, authorization trả lời “được làm gì trên link nào”. Token hợp lệ không đủ; backend phải kiểm tra ownership/tenant/role.
+
+##### Soft delete thường an toàn hơn hard delete
+
+Thay vì xóa mapping ngay:
+
+```text
+status = disabled/deleted
+deleted_at = ...
+version = version + 1
+```
+
+Lợi ích:
+
+- tránh tái sử dụng key và redirect cũ tới destination mới;
+- hỗ trợ audit, takedown và recovery window;
+- phân biệt expired/disabled/not-found;
+- propagation qua cache dễ kiểm soát hơn.
+
+Hard deletion có thể thực hiện sau retention/privacy workflow. API có thể trả `204 No Content`; repeated delete nên có idempotent semantics rõ.
+
+---
+
+#### 6. Authentication APIs
+
+Nếu case study tự xây identity service:
+
+```http
+POST /v1/auth/register
+POST /v1/auth/login
+POST /v1/auth/refresh
+POST /v1/auth/logout
+```
+
+Nhưng trong production, thường nên dùng existing identity provider/OIDC platform thay vì tự xây password/token system nếu không phải năng lực cốt lõi.
+
+Các lưu ý:
+
+- Password lưu bằng password-specific KDF và unique salt.
+- Login phải có rate limiting, credential-stuffing defense và MFA/step-up theo risk.
+- Access token ngắn hạn, đúng issuer/audience/scope; refresh-token lifecycle riêng.
+- Gateway có thể validate token để giảm request rác, nhưng service vẫn phải enforce resource authorization.
+- Nếu dùng self-contained JWT, gateway/service có thể verify local signature; không nhất thiết gọi Auth Service cho mọi request.
+- Nếu dùng opaque token, có thể introspect/cache decision theo freshness/revocation requirement.
+- Public redirect không yêu cầu user authentication; create anonymous có thể yêu cầu anti-abuse controls.
+
+---
+
+#### 7. High-level architecture
+
+```text
+                                      ┌────────────────────┐
+Clients ──DNS/CDN/Edge──┬────────────▶│ API Gateway / Edge │
+                        │             └─────────┬──────────┘
+                        │                       │
+                        │          ┌────────────┼─────────────┐
+                        │          │            │             │
+                        │          ▼            ▼             ▼
+                        │   Link Creation   Management     Auth/IdP
+                        │      Service       Service       integration
+                        │          │            │
+                        │          └──────┬─────┘
+                        │                 ▼
+                        │            Link Store
+                        │           (source of truth)
+                        │
+                        └──────────────▶ Redirect Service
+                                           │       │
+                                           │       └── cache miss ──▶ Link Store
+                                           ▼
+                                      Distributed/Local Cache
+                                           │
+                                           └── async click event
+                                                      ▼
+                                                Queue / Event Log
+                                                      ▼
+                                              Analytics Consumers/Store
+```
+
+Không bắt buộc mọi request đi qua cùng một “API gateway” logic. Redirect path có thể được edge/CDN route trực tiếp tới lightweight redirect service, trong khi create/management APIs đi qua gateway đầy đủ. Điều này giảm latency và tránh gateway trở thành shared bottleneck, nhưng cần giữ rate limiting, TLS, observability và origin protection tại edge.
+
+---
+
+#### 8. Trách nhiệm của từng component
+
+##### 8.1 Edge/CDN/Load Balancer
+
+- TLS termination/re-encryption theo trust model.
+- Route public redirect và `/v1` APIs.
+- DDoS/bot filtering, coarse rate limiting.
+- Cache redirect response nếu policy cho phép.
+- Health-based routing và geographic entry point.
+
+Không nên chứa business ownership logic phức tạp.
+
+##### 8.2 API Gateway
+
+- API routing/versioning.
+- Token validation cho protected APIs.
+- Request-size/schema baseline, quota và rate limits.
+- Correlation ID, access logging và policy integration.
+
+Gateway authentication không thay service-level authorization. Backend/private origin phải không bị bypass.
+
+##### 8.3 Link Creation Service
+
+- Validate destination và product policy.
+- Enforce quota/custom-domain/custom-alias rights.
+- Handle idempotency.
+- Allocate/generate key và resolve collision.
+- Commit durable mapping.
+- Publish link-created event nếu cần.
+
+##### 8.4 Redirect Service
+
+- Parse host/namespace và key.
+- Lookup local/distributed cache rồi source of truth.
+- Enforce status/expiration/takedown.
+- Trả redirect nhanh.
+- Publish click event bất đồng bộ/buffered.
+
+Service nên stateless về durable mapping để scale ngang, dù có thể có bounded local cache.
+
+##### 8.5 Management Service
+
+- List/update/disable/delete user links.
+- Object/tenant authorization.
+- Cache invalidation và audit event.
+- Analytics query orchestration.
+
+Có thể gộp với Link Creation Service ở quy mô hiện tại. Tách logical responsibility không bắt buộc tách deployment/microservice từ ngày đầu.
+
+##### 8.6 Authentication/Identity Provider
+
+- Registration/login/federation/MFA nếu nằm trong scope.
+- Token/session issuance, rotation và revocation.
+- User identity lifecycle.
+
+Link ownership vẫn do link domain/service quản lý; Auth service không quyết định thay toàn bộ business authorization.
+
+##### 8.7 Link Store
+
+- Source of truth cho `(namespace, short_key) → mapping`.
+- Atomic uniqueness/conditional writes.
+- Durable status, owner, expiration và version.
+- Index cho user management/access patterns.
+
+User identity data và link mappings **không bắt buộc ở cùng một database**. Mỗi bounded context có thể sở hữu data store riêng khi cần; tránh distributed transaction nếu chỉ cần tham chiếu `owner_id`.
+
+##### 8.8 Cache
+
+- Accelerate hot mapping reads.
+- Có thể gồm L1 local + L2 distributed + L3 CDN/edge.
+- Không là source of truth.
+- Policy gồm TTL, invalidation, negative caching, eviction và stale-on-error.
+
+##### 8.9 Event/Analytics Pipeline
+
+- Absorb click events ngoài redirect critical path.
+- Handle at-least-once/duplicate semantics.
+- Aggregate counters, bot classification và reporting.
+- Retention/tiering cho raw events.
+
+---
+
+#### 9. Create flow end-to-end
+
+```text
+1. Client → POST /v1/links + idempotency key
+2. Edge/Gateway → authenticate optional user, rate-limit, route
+3. Creation Service → validate URL/config/tenant policy
+4. Check idempotency result
+5. Obtain candidate ID/key
+6. Conditional insert mapping into Link Store
+7. On collision: bounded retry; on custom alias conflict: 409
+8. Commit durable record
+9. Optionally emit LinkCreated event via reliable outbox
+10. Return 201 + short URL
+```
+
+Nếu event phải nhất quán với DB state, dùng transactional outbox/CDC thay vì “commit DB rồi publish” không có recovery. Click analytics thường có durability contract khác và không nhất thiết dùng cùng cơ chế.
+
+---
+
+#### 10. Redirect flow: cache-aside
+
+```text
+1. Client/Browser → GET /{key}
+2. CDN/edge cache hit? → trả cached redirect
+3. Redirect Service → L1/local cache lookup
+4. L2/distributed cache lookup
+5. Cache miss → Link Store point lookup
+6. Validate status + expiration + redirect policy
+7. Populate cache với bounded TTL
+8. Return 302 + Location
+9. Publish/buffer click event async
+```
+
+Pseudo-flow:
+
+```text
+mapping = cache.get(namespace, key)
+
+if missing:
+    mapping = link_store.get(namespace, key)
+    if not found:
+        negative_cache.put(key, short_ttl)
+        return 404
+    cache.put(key, mapping, ttl_based_on_lifecycle)
+
+if mapping is expired/disabled/unsafe:
+    return policy_response
+
+async_record_click(...)
+return redirect(mapping.long_url)
+```
+
+Production flow cần single-flight/request coalescing để nhiều misses đồng thời cho cùng hot key không cùng đánh DB.
+
+---
+
+#### 11. Cache invalidation và delete propagation
+
+Khi link bị update/disable/delete:
+
+```text
+Management Service
+  → update Link Store status/version
+  → publish LinkChanged event / purge CDN
+  → invalidate distributed + local caches
+```
+
+Trade-off:
+
+- Cache TTL dài: redirect nhanh, origin load thấp nhưng takedown/edit propagation chậm.
+- Cache TTL ngắn: freshness tốt hơn nhưng nhiều DB misses hơn.
+- Event invalidation nhanh nhưng có thể mất/delay; TTL là safety net.
+
+Nếu abuse takedown cần hiệu lực trong vài giây, phải thiết kế purge propagation SLO và có denylist/status check phù hợp—not chỉ đặt TTL nhiều giờ.
+
+Race cần cân nhắc:
+
+```text
+T1: redirect miss đọc version cũ từ DB/replica
+T2: management disable link và invalidate cache
+T3: redirect ghi lại version cũ vào cache
+```
+
+Giảm bằng versioned cache value/key, read consistency phù hợp, invalidation ordering và TTL giới hạn.
+
+---
+
+#### 12. Communication patterns
+
+| Communication | Kiểu | Lý do |
+|---|---|---|
+| Client → create/management | Synchronous HTTP | Client cần biết kết quả operation |
+| Browser → redirect | Synchronous HTTP | Phải nhận `Location` ngay |
+| Service → cache/Link Store | Synchronous | Nằm trên correctness/lookup path |
+| Redirect → analytics | Asynchronous | Không để analytics tăng redirect latency/coupling |
+| Link change → cache/CDN invalidation | Event + explicit purge | Propagate thay đổi; TTL làm safety net |
+| Auth token verification | Local verify hoặc controlled introspection | Tùy token model và revocation/freshness |
+
+Mỗi sync call phải có timeout, retry policy và error mapping. Retry chỉ an toàn khi operation idempotent hoặc có idempotency key. Mỗi async flow cần delivery, ordering, deduplication, retention và poison-message contract.
+
+---
+
+#### 13. Distributed unique ID generation
+
+Transcript chỉ ra đúng vấn đề: nếu nhiều service instance dùng local counter độc lập, chúng có thể tạo trùng ID.
+
+```text
+Instance A local counter → 42 → Base62(42)
+Instance B local counter → 42 → Base62(42)
+                         → collision
+```
+
+Tuy nhiên, kết luận “mọi ID phải xin từ một global ZooKeeper counter” không phải lựa chọn tốt mặc định.
+
+##### Vì sao global counter trên ZooKeeper dễ thành bottleneck?
+
+- Mỗi create cần một coordination round trip.
+- Một serialized counter giới hạn throughput và tăng latency.
+- ZooKeeper được tối ưu cho coordination metadata, không phải high-rate ID allocation từng request.
+- Lock/counter operations tạo operational coupling giữa create path và coordination cluster.
+
+Với estimate chỉ khoảng 1.16 creates/s average, nó có thể chạy về mặt throughput, nhưng vẫn là complexity không cần thiết và tạo critical dependency.
+
+##### Các lựa chọn tốt hơn
+
+| Cách | Uniqueness | Trade-off |
+|---|---|---|
+| Database sequence/auto-increment | Strong trong DB scope | Đơn giản; DB là allocator dependency |
+| Hi/Lo hoặc range allocation | Coordinator cấp block, node phát ID cục bộ | Gaps khi node chết; cần lease/fencing/range uniqueness |
+| Snowflake-style ID | Timestamp + worker + sequence | Phân tán; cần worker-ID/clock discipline; key dài hơn |
+| Random Base62 + conditional insert | Probabilistic candidate, storage arbiter | Collision retry; cần đủ entropy |
+| Hash/truncated candidate + conditional insert | Có thể deterministic trong scope | Canonicalization/collision/privacy semantics |
+
+##### ZooKeeper dùng hợp lý ở đâu?
+
+ZooKeeper/coordination service có thể cấp **worker IDs**, lease hoặc ID ranges với tần suất thấp, thay vì increment global counter cho từng URL:
+
+```text
+ZooKeeper/Coordinator → cấp range [1,000,000..1,999,999] cho node A
+Node A → tạo ID cục bộ trong range, không round trip mỗi request
+```
+
+Ngay cả khi allocator cam kết uniqueness, Link Store vẫn nên có unique constraint/conditional insert làm defense-in-depth.
+
+> Transcript có một lần nói “Base64”; thiết kế đang dùng **Base62**. Base64 chuẩn còn chứa ký tự cần xử lý trong URL như `+`, `/`, `=` tùy variant, nên không đồng nhất với alphabet Base62 đã chọn.
+
+---
+
+#### 14. Database/source-of-truth considerations ở mức HLD
+
+Primary access path:
+
+```text
+(namespace, short_key) → long_url + status + expiration + version
+```
+
+Requirements:
+
+- atomic uniqueness;
+- durable acknowledged writes;
+- fast point reads;
+- index/list by owner cho dashboard;
+- status/version cho delete/invalidation races;
+- backup/restore và replica/failover behavior.
+
+Không cần distributed transaction giữa user DB và link DB chỉ để tạo link: token cung cấp stable `owner_id`, link service lưu reference. Nếu user bị xóa, dùng event/workflow để disable/anonymize links theo product/privacy policy.
+
+Read replicas chỉ nên dùng nếu staleness không làm link vừa tạo `404` hoặc link vừa disable vẫn redirect quá lâu. Có thể:
+
+- read primary/strong path cho read-after-create window;
+- populate cache ngay sau successful create;
+- route client/session với consistency token;
+- chấp nhận bounded staleness theo SLO.
+
+---
+
+#### 15. Reliability và degraded modes
+
+| Failure | Hành vi mong muốn |
+|---|---|
+| Analytics unavailable | Redirect vẫn thành công; buffer/drop theo telemetry contract |
+| Cache unavailable | Fallback DB có protection; có thể shed/rate-limit để giữ DB |
+| Link Store read unavailable | Serve safe cached mapping nếu freshness/takedown policy cho phép |
+| Link Store write unavailable | Không trả short URL chưa durable; create trả retryable failure |
+| Auth/IdP unavailable | Public redirect hoạt động; protected writes fail-safe hoặc dùng valid cached/local token verification |
+| ID allocator unavailable | Dùng preallocated range/random fallback nếu contract thiết kế; không tạo duplicate |
+| CDN purge delay | TTL/denylist/version policy giới hạn stale redirect |
+
+Không để optional dependency như analytics hoặc user-profile service nằm trên redirect critical path.
+
+---
+
+#### 16. Scaling boundaries
+
+Các workload có profile khác nhau nên scale độc lập về logic:
+
+- Redirect Service: read-heavy, latency-sensitive, bursty.
+- Creation/Management: low write volume, correctness/security-sensitive.
+- Auth: credential/security-sensitive, high-value dependency.
+- Cache: memory/hot-key/connection-sensitive.
+- Link Store: durable lookup/source of truth.
+- Analytics: high event volume, throughput/retention-oriented.
+
+Tuy nhiên “scale độc lập” không bắt buộc “microservice độc lập” ngay lập tức. Có thể bắt đầu bằng modular service/deployment nhỏ rồi tách redirect/analytics khi load hoặc ownership chứng minh cần.
+
+---
+
+#### 17. Security boundaries
+
+```text
+Public:
+  GET /{key}
+
+Anonymous/limited:
+  POST /v1/links (nếu product cho phép, có CAPTCHA/quota/abuse controls)
+
+Authenticated:
+  list/get analytics/update/delete own links
+
+Privileged:
+  takedown, reserved alias, domain verification, audit access
+```
+
+Controls:
+
+- backend object/tenant authorization;
+- destination scheme allowlist và safe URL parsing;
+- SSRF-safe preview/scanning nếu service fetch destination;
+- audit admin/takedown actions;
+- rate limit create/login/management;
+- avoid logging full sensitive URLs/tokens;
+- signed/verified custom-domain ownership;
+- protect cache/store/admin endpoints khỏi public access.
+
+URL validation không chứng minh destination vô hại. Reputation/scanning/takedown là lifecycle liên tục.
+
+---
+
+#### 18. Observability theo request flow
+
+##### Redirect
+
+- edge/CDN hit ratio;
+- redirect p50/p95/p99 latency theo region;
+- cache L1/L2 hit ratio và miss amplification;
+- DB lookup latency/error;
+- status mix: 302/404/410/blocked;
+- hot-key cardinality/skew;
+- async-event publish/drop/lag.
+
+##### Create/management
+
+- validation/abuse rejection;
+- key allocation latency;
+- collision/custom-alias conflict;
+- idempotency replay/conflict;
+- DB commit latency/error;
+- cache invalidation/purge propagation;
+- authorization denial và suspicious patterns.
+
+Trace nên nối được edge → service → cache/store/event publish nhưng cần sampling và redaction để không làm lộ long URL/token.
+
+---
+
+#### 19. Các lỗi high-level design thường gặp
+
+- Bắt buộc mọi redirect đi qua full API gateway/auth stack mà không đánh giá latency/shared bottleneck.
+- Gọi Auth Service đồng bộ trên mọi protected request dù token có thể verify local.
+- Gateway xác thực xong nhưng service không kiểm tra resource ownership.
+- Hard-delete mapping rồi tái sử dụng key.
+- Update DB nhưng quên cache/CDN invalidation.
+- TTL dài làm phishing/takedown propagation quá chậm.
+- Cache miss đồng loạt tạo thundering herd.
+- Click analytics write nằm đồng bộ trên redirect path.
+- Gộp user identity và link mapping trong cùng database mà không có lý do.
+- Mặc định tách mọi responsibility thành microservice/deployment riêng.
+- Mỗi instance dùng local counter cho global keyspace.
+- Dùng ZooKeeper global counter/lock cho từng ID mà không đánh giá coordination bottleneck.
+- Nhầm Base62 với Base64 hoặc encryption.
+- Dùng read replica stale làm link vừa tạo trả 404.
+- Retry create POST không có idempotency key.
+- Sơ đồ không mô tả timeout, failure/degraded mode và source of truth.
+
+---
+
+#### 20. Checklist Step 3
+
+- [ ] API paths/versioning/request/response/error model nhất quán?
+- [ ] Create có idempotency và atomic uniqueness?
+- [ ] Redirect status code/cache policy phù hợp edit/takedown semantics?
+- [ ] Delete là disable/soft delete hay hard delete; key reuse policy?
+- [ ] Authentication và object/tenant authorization ở đâu?
+- [ ] Redirect critical path có optional dependency nào không?
+- [ ] Edge, gateway, redirect và management routing boundary?
+- [ ] Component responsibility/data ownership/source of truth rõ chưa?
+- [ ] Cache-aside, negative caching, single-flight và invalidation?
+- [ ] Click analytics async delivery/dedup/retention semantics?
+- [ ] Distributed ID strategy có uniqueness và failover contract?
+- [ ] Có tránh global coordination trên từng ID khi không cần?
+- [ ] Sync calls có timeout/retry/idempotency; async có delivery/ordering?
+- [ ] Read-after-create và takedown consistency được xử lý?
+- [ ] Cache/DB/Auth/allocator/analytics failure modes?
+- [ ] Scaling boundary có cần deployment boundary ngay không?
+- [ ] Security/abuse/custom-domain/admin trust boundaries?
+- [ ] Metrics/traces nối được end-to-end nhưng được redact?
+
+#### 21. Ý chính cần nhớ
+
+- API phải đơn giản với client nhưng semantics về idempotency, ownership và lifecycle phải rõ.
+- Redirect là public, latency-sensitive critical path; management là authenticated và authorization-sensitive.
+- `302` thường linh hoạt; permanent redirects cần cân nhắc cache/edit/takedown.
+- Soft delete giúp tránh key reuse và giữ audit/recovery semantics.
+- Gateway có thể validate token nhưng service phải enforce business authorization.
+- Redirect path dùng layered cache-aside và không chờ analytics.
+- Cache invalidation phải đi cùng TTL safety net và version/race handling.
+- Link Store là source of truth; cache/analytics là derived state.
+- Logical separation of responsibility không bắt buộc microservices từ ngày đầu.
+- Local counters trên nhiều instances tạo collision.
+- ZooKeeper phù hợp coordination metadata/range/worker allocation hơn global increment cho từng URL.
+- Base62 chỉ encode unique numeric ID; uniqueness đến từ allocator/storage contract.
+- HLD hoàn chỉnh phải nêu flows, contracts, ownership, failure modes, scaling và trust boundaries.
+
+#### Công thức ghi nhớ
+
+> **TinyURL HLD = edge routing + tách create/redirect concerns + durable Link Store + layered cache-aside + async analytics + identity-aware management + distributed uniqueness không phụ thuộc per-request global lock.**
+
+---
+
+### Bài 66. Making Tech & Infra Decisions
+
+#### 1. Mục tiêu của Step 4
+
+Ở Step 4, ta chuyển từ logical architecture sang implementation strategy:
+
+- dùng loại database nào và vì sao;
+- short ID được tạo ở đâu;
+- cache nào, topology và failure behavior ra sao;
+- service được deploy/scale theo đơn vị nào;
+- load balancing, replication và failover bảo đảm SLO thế nào;
+- security, observability, backup và cost được vận hành ra sao;
+- khi nào baseline hiện tại phải tiến hóa.
+
+Mỗi technology decision cần truy ngược về requirement hoặc bottleneck:
+
+```text
+Requirement / evidence
+        → architectural capability
+        → technology criteria
+        → selected option
+        → trade-off + failure mode + migration trigger
+```
+
+---
+
+#### 2. Baseline phù hợp với scale hiện tại
+
+Từ Bài 64:
+
+- khoảng 100 nghìn links mới/ngày, ~1.16 writes/s average;
+- khoảng 50 triệu redirects/ngày, ~579 reads/s average;
+- peak target sơ bộ khoảng 5.8k–7.1k redirects/s;
+- mapping data tăng khoảng 18.25 GB raw/năm;
+- workload đọc nhiều hơn ghi khoảng 500:1.
+
+Một baseline thực dụng:
+
+```text
+DNS + CDN/Edge + Load Balancer
+                │
+                ├── Redirect instances ── L1 cache ── Redis ── PostgreSQL
+                │                                │
+                │                                └─ miss → PostgreSQL
+                │
+                ├── Create/Management instances ─────────────▶ PostgreSQL
+                │                                                │
+                └── Auth/IdP integration                         └─ Outbox/CDC
+                                                                       │
+Redirect click events ──▶ Managed Queue/Event Log ──▶ Analytics Store ┘
+```
+
+Đây không phải kiến trúc tối thiểu duy nhất, nhưng đáp ứng scale đã ước lượng mà chưa cần sharding, multi-region active-active hoặc một coordination platform riêng cho từng ID.
+
+---
+
+#### 3. Chọn primary database: PostgreSQL
+
+PostgreSQL là lựa chọn baseline mạnh vì:
+
+- mapping data hiện tại có quy mô vừa phải;
+- cần atomic unique constraint cho `(namespace, short_key)`;
+- transaction giúp commit mapping, idempotency và outbox nhất quán;
+- index point lookup và list theo owner phù hợp;
+- sequence/identity column hỗ trợ numeric ID cho Base62;
+- operational ecosystem, backup/PITR và managed HA trưởng thành;
+- schema/lifecycle/audit metadata có quan hệ rõ.
+
+Schema minh họa:
+
+```sql
+links(
+  id              BIGINT PRIMARY KEY,
+  namespace       TEXT NOT NULL,
+  short_key       TEXT NOT NULL,
+  long_url        TEXT NOT NULL,
+  owner_id        UUID NULL,
+  status          SMALLINT NOT NULL,
+  expires_at      TIMESTAMPTZ NULL,
+  version         BIGINT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL,
+  updated_at      TIMESTAMPTZ NOT NULL,
+  UNIQUE(namespace, short_key)
+)
+```
+
+Indexes chỉ thêm theo access pattern:
+
+```text
+UNIQUE(namespace, short_key)        → redirect lookup/uniqueness
+(owner_id, created_at DESC)         → user dashboard
+(expires_at)                        → cleanup nếu query plan/workload phù hợp
+```
+
+Không index `long_url` chỉ để global dedup nếu product semantics không yêu cầu. Long URL có thể lớn; nếu cần owner-scoped dedup, cân nhắc normalized fingerprint cùng collision verification.
+
+---
+
+#### 4. PostgreSQL sequence và Base62
+
+Luồng đơn giản:
+
+```text
+PostgreSQL sequence/identity → unique BIGINT ID → Base62(ID) → short_key
+```
+
+Sequence bảo đảm mỗi value được cấp riêng trong database scope, nhưng cần hiểu:
+
+- sequence có thể có gaps do rollback/cache/failover; gaps không ảnh hưởng uniqueness;
+- strict contiguous IDs không phải requirement;
+- sequential keys dễ enumerate và lộ gần đúng creation volume;
+- database primary/sequence là write dependency;
+- multi-primary/multi-region cần strategy khác để tránh ID overlap.
+
+Nếu unpredictability là requirement, lựa chọn gồm random Base62 + conditional insert hoặc một phép permutation/opaque ID scheme đã được review. Không xem Base62 là encryption.
+
+Một create transaction có thể:
+
+```text
+1. reserve/insert row với generated BIGINT id
+2. derive Base62 key
+3. set short_key và commit unique mapping
+4. persist idempotency/outbox trong cùng transaction nếu cần
+```
+
+Hoặc generate key trong application từ sequence value trước conditional insert. Cần tránh race và bảo đảm không trả URL trước durable commit.
+
+---
+
+#### 5. Khi nào cân nhắc NoSQL như DynamoDB?
+
+DynamoDB hoặc distributed key-value/document store phù hợp khi:
+
+- dataset/throughput cần scale ngang lớn và predictable key-value access;
+- managed multi-zone durability/availability là ưu tiên;
+- access pattern chủ yếu là point lookup theo `(namespace, short_key)`;
+- team chấp nhận model dữ liệu/index/consistency của dịch vụ;
+- capacity, partition-key distribution và cost đã được phân tích.
+
+Mapping:
+
+```text
+Partition key = namespace#short_key
+Attributes    = long_url, owner_id, status, expires_at, version, ...
+```
+
+Nhưng cần lưu ý:
+
+- DynamoDB không cung cấp auto-increment global sequence như PostgreSQL; cần random ID, Snowflake-style ID, preallocated range hoặc allocator khác.
+- Một viral short key là hot **read key**; cache/DAX/edge vẫn quan trọng dù partitions scale.
+- Secondary indexes phải thiết kế theo access patterns và có cost/write amplification.
+- Consistent read, transactions, conditional writes và global-table replication có semantics/cost riêng.
+- Scan/list tùy ý không phải access pattern miễn phí.
+- Chuyển sang NoSQL không tự động giải quyết cache invalidation, abuse, analytics hay multi-region correctness.
+
+Với estimate hiện tại, PostgreSQL đơn giản hơn và đủ khả năng. NoSQL là evolution option khi evidence về scale/topology/operations biện minh—not vì “hàng triệu users”.
+
+---
+
+#### 6. PostgreSQL và DynamoDB — decision matrix
+
+| Tiêu chí | PostgreSQL baseline | DynamoDB-style option |
+|---|---|---|
+| Point lookup | Tốt với B-tree/unique index | Tốt theo partition key |
+| Atomic uniqueness | Unique constraint/transaction | Conditional write |
+| Numeric sequence | Built-in sequence/identity | Không có global auto-increment |
+| Flexible query/admin | SQL/indexes thuận tiện | Phải model trước access patterns |
+| Horizontal scale | Cần replicas/partition/sharding khi rất lớn | Built-in partitioning theo service semantics |
+| Hot key | Vẫn cần cache/read scaling | Một partition/key vẫn có thể nóng |
+| Consistency | Transaction/isolation phong phú | Chọn eventual/strong features theo operation/region |
+| Operations | Managed PostgreSQL giảm nhiều việc | Managed service cao nhưng data modeling/cost riêng |
+| Portability | Tương đối cao | Provider/service coupling cao hơn |
+
+Quyết định đúng phụ thuộc scale, SLO, team, cost và access patterns—not nhãn SQL/NoSQL.
+
+---
+
+#### 7. Có nên lưu user data cùng database?
+
+Transcript đề xuất PostgreSQL cho cả URL mappings và user data. Điều này có thể chấp nhận ở giai đoạn đầu, nhưng cần phân biệt:
+
+- **Cùng database engine:** có thể đơn giản hóa vận hành.
+- **Cùng schema/ownership:** dễ tạo coupling và quyền truy cập quá rộng.
+- **Cùng physical cluster:** identity workload có thể tranh tài nguyên với redirect/link workload.
+
+Baseline có thể dùng cùng managed PostgreSQL cluster nhưng tách schema/database role, migrations và ownership. Khi identity dùng external IdP/OIDC, TinyURL chỉ lưu stable `owner_id` và profile/domain metadata cần thiết, không tự lưu password.
+
+Tách physical store khi security boundary, scale, availability hoặc team ownership biện minh.
+
+---
+
+#### 8. Chọn cache: Redis hay Memcached?
+
+##### Redis
+
+Phù hợp khi cần:
+
+- replicated/sharded managed cache;
+- TTL, richer data types và operational tooling;
+- atomic primitives/rate-limit counters khi dùng cẩn trọng;
+- optional persistence/failover features;
+- ecosystem tốt cho distributed cache.
+
+##### Memcached
+
+Phù hợp khi cần:
+
+- simple ephemeral key-value cache;
+- protocol/data model rất đơn giản;
+- horizontal client-side distribution;
+- không cần richer semantics/persistence.
+
+| Tiêu chí | Redis | Memcached |
+|---|---|---|
+| Data model | Rich hơn | Simple blob/string values |
+| Replication/cluster | Có theo deployment/mode | Thường client distributes; semantics đơn giản hơn |
+| Persistence | Optional | Không phải mục tiêu |
+| Memory efficiency | Tùy data structures/encoding | Tốt cho simple cache use case |
+| Operational complexity | Nhiều capability hơn | Ít capability hơn nhưng HA strategy vẫn cần |
+
+TinyURL chỉ cần mapping cache nên cả hai đều khả thi. Managed Redis thường được chọn vì HA/cluster/tooling thuận tiện, không phải vì Link Store cần Redis data structures phức tạp.
+
+---
+
+#### 9. Cache topology và policy
+
+Có thể dùng nhiều tầng:
+
+```text
+L0: CDN/edge cache redirect response
+L1: in-process cache trên Redirect Service
+L2: distributed Redis/Memcached
+L3: PostgreSQL source of truth
+```
+
+##### Cache key/value
+
+```text
+Key   = namespace + ":" + short_key
+Value = long_url + status + expires_at + version + redirect_policy
+```
+
+Không cache chỉ `long_url` nếu redirect còn phụ thuộc status/expiration/version.
+
+##### Policy
+
+- Cache-aside cho reads.
+- Populate sau successful create để hỗ trợ read-after-create.
+- TTL không vượt remaining link lifetime.
+- TTL jitter để tránh synchronized expiry.
+- Negative cache ngắn cho unknown keys, giới hạn poisoning/cardinality.
+- Single-flight trên hot miss.
+- Event-driven invalidation + TTL safety net.
+- Không write-back mapping vì cache không được trở thành source of truth.
+
+##### Failure behavior
+
+- Cache timeout rất ngắn; không để timeout dài hơn DB lookup budget.
+- Fallback DB phải có concurrency limit/admission control.
+- Circuit breaker tránh retry storm.
+- Cold-cache capacity và warm-up phải được load test.
+- Nếu cache unavailable, có thể degrade create/management hoặc shed suspicious reads để bảo vệ DB.
+
+---
+
+#### 10. Horizontal scaling: scale đúng workload
+
+Transcript nói thêm nhiều URL-generation instances. Tuy nhiên Step 2 cho thấy create chỉ ~1.16 RPS average; **Redirect Service** mới là workload cần scale ngang mạnh nhất.
+
+```text
+Load Balancer
+  ├── Redirect instance A
+  ├── Redirect instance B
+  ├── Redirect instance C
+  └── ... autoscaled/pre-provisioned
+```
+
+Điều kiện để scale ngang:
+
+- instances stateless về durable mapping/session;
+- config/certificate/policy đồng nhất;
+- connection pooling có global budget để không tạo DB connection storm;
+- health/readiness chính xác;
+- graceful shutdown/draining;
+- bounded local cache và cache coherence chấp nhận được;
+- load balancer/edge không là SPOF.
+
+Creation/Management Service vẫn nên có ít nhất hai instances cho availability, dù không cần nhiều capacity.
+
+##### Autoscaling policy
+
+Không chỉ dựa vào CPU. Signals có thể gồm:
+
+- RPS/concurrency;
+- p95/p99 latency;
+- event-loop/thread-pool saturation;
+- load-balancer queue/connection count;
+- cache/DB downstream health.
+
+Giữ minimum headroom vì viral burst đến nhanh hơn provisioning. Scale-out không giúp nếu DB/cache bị saturated; cần origin protection.
+
+---
+
+#### 11. Load balancing
+
+Load balancer cung cấp:
+
+- phân phối request tới healthy instances;
+- health-based removal;
+- TLS/routing integration;
+- zone-aware/cross-zone distribution tùy platform;
+- connection draining khi deploy/failure.
+
+Algorithms:
+
+| Algorithm | Khi phù hợp |
+|---|---|
+| Round robin | Instances tương đương, requests tương đối đồng đều |
+| Least connections/requests | Duration/concurrency khác nhau |
+| Weighted routing | Canary, instance capacity khác nhau |
+| Consistent hashing | Locality/cache-affinity use case; cần xử lý node churn/hot key |
+
+Redirect service không cần sticky session cho correctness. Sticky routing theo short key có thể tăng L1 cache locality nhưng dễ tạo hot-instance và complicate failover; phải benchmark trước.
+
+Load balancer chỉ loại bỏ SPOF ở application tier nếu chính nó là managed/redundant và dependencies khác cũng có HA.
+
+---
+
+#### 12. Database replication và high availability
+
+Baseline managed PostgreSQL HA:
+
+```text
+Application
+    │
+DB endpoint/proxy
+    │
+Primary ── synchronous/asynchronous replication ── Standby
+    └──────────────── read replicas (optional) ────┘
+```
+
+Phải phân biệt:
+
+- **Standby/failover replica:** ứng viên được promote để thay primary.
+- **Read replica:** phục vụ reads; không phải mọi read replica tự động là failover target.
+- **Synchronous replication:** giảm data-loss window nhưng tăng write latency/availability coupling.
+- **Asynchronous replication:** latency thấp hơn nhưng có lag và potential loss khi failover.
+
+Failover thực tế cần:
+
+- health detection và promotion authority;
+- fencing old primary để tránh split-brain;
+- endpoint/DNS/proxy chuyển sang new primary;
+- application reconnect/retry có backoff;
+- sequence/identity continuity;
+- cache consistency và read-after-write behavior;
+- kiểm chứng RTO/RPO bằng drill.
+
+“Có replication” không tự động bảo đảm availability hay durability. Replication cũng không thay backup: logical corruption, accidental delete hoặc attacker action có thể replicate sang bản sao.
+
+---
+
+#### 13. Read replicas có cần không?
+
+Với Redis hit ratio cao và peak DB miss load có thể chỉ hàng chục/hàng trăm reads/s, read replicas chưa chắc cần cho capacity. Chúng có thể hữu ích cho:
+
+- HA/failover topology;
+- management/reporting queries;
+- geographical read locality;
+- backup/offload use cases.
+
+Nhưng redirect đọc từ lagging replica có thể:
+
+- trả `404` ngay sau khi tạo;
+- tiếp tục redirect sau disable/takedown;
+- repopulate stale cache.
+
+Nếu dùng replica, cần bounded staleness, versioning và routing policy. Đừng thêm read replicas chỉ vì hệ thống “read-heavy” khi cache đã hấp thụ phần lớn load.
+
+---
+
+#### 14. Managed services: lợi ích và trách nhiệm còn lại
+
+Managed database/cache/queue/load balancer có thể cung cấp:
+
+- automated provisioning, patching và backups;
+- multi-zone replication/failover features;
+- metrics, snapshots và maintenance workflows;
+- giảm operational burden cho team.
+
+Nhưng managed không loại bỏ trách nhiệm:
+
+- chọn topology, sizing, consistency và retention;
+- network/IAM/KMS configuration;
+- schema/index/query design;
+- backup restore testing;
+- failover behavior của application;
+- quota/cost monitoring;
+- version upgrades và compatibility;
+- vendor-region outage/exit strategy.
+
+Managed failover thường giảm RTO, không làm disruption bằng zero. Connection reset, DNS/endpoint propagation và retry storm vẫn phải được thiết kế/test.
+
+---
+
+#### 15. CDN/edge decision
+
+CDN phù hợp để cache redirect response cho hot links và giảm global latency/origin load.
+
+Quyết định cần rõ:
+
+- cache `302`/`301` theo headers nào;
+- TTL theo expiration/editability/takedown SLO;
+- cache key gồm hostname + path, xử lý query string;
+- purge/invalidation API và propagation SLO;
+- origin chỉ nhận traffic hợp lệ từ edge hay vẫn public;
+- custom-domain TLS certificate lifecycle;
+- bot/DDoS/rate-limit capability;
+- cost theo request/region/egress.
+
+Không cache response có personalized data/cookie ngoài ý muốn. Redirect endpoint nên tối giản để response có thể cache an toàn.
+
+---
+
+#### 16. Queue/event-log và analytics technology
+
+Click analytics cần managed queue/log có:
+
+- throughput lớn hơn mapping writes;
+- partitioning và consumer scaling;
+- retention/replay theo requirement;
+- at-least-once delivery/offset semantics rõ;
+- dead-letter/error handling;
+- backpressure và lag metrics.
+
+Chọn queue hay log theo use case:
+
+| Nhu cầu | Hướng phù hợp |
+|---|---|
+| Work distribution, message lifecycle đơn giản | Managed queue |
+| Nhiều consumers, ordered partition log, replay dài | Distributed event log |
+
+Analytics store tách OLTP:
+
+- stream/batch aggregate cho dashboard;
+- columnar warehouse/lake cho historical analysis;
+- time-series/counter store nếu access pattern phù hợp;
+- raw-event retention giới hạn theo privacy/cost.
+
+Không cần Kafka chỉ vì có events; managed queue có thể đủ ở quy mô/consumer model ban đầu.
+
+---
+
+#### 17. Security infrastructure
+
+Baseline controls:
+
+- CDN/WAF/DDoS protection ở edge;
+- private subnets/endpoints cho services, cache và DB;
+- security groups/default-deny flows;
+- TLS external và TLS/mTLS internal theo threat model;
+- workload identity/roles, không static cloud keys;
+- secret manager/KMS và automatic rotation;
+- database roles tách read/write/migration/admin;
+- audit logs cho management/takedown/domain/key operations;
+- backup encryption và access separation;
+- image/dependency scanning, signed deployment artifact khi cần.
+
+Create, login và admin APIs có rate limit mạnh hơn redirect. Public redirect vẫn cần bot/abuse detection nhưng không được phụ thuộc identity login.
+
+---
+
+#### 18. Observability và operations stack
+
+##### Metrics
+
+- redirect/create RPS, latency percentiles, status/error rate;
+- CDN/L1/L2 hit ratio;
+- Redis memory, evictions, hot keys, failover;
+- PostgreSQL connections, query latency, buffer hit, locks, WAL/replica lag;
+- allocator/sequence/collision/idempotency metrics;
+- queue publish error, lag, consumer throughput;
+- autoscaling time-to-scale và capacity headroom.
+
+##### Logs/traces
+
+- structured access/security/audit logs;
+- redact tokens, secrets và sensitive query parameters;
+- sampled tracing từ edge → service → cache/DB/event publish;
+- immutable/centralized audit trail cho privileged changes.
+
+##### Runbooks/drills
+
+- cache loss/cold start;
+- database failover/reconnect;
+- restore/PITR;
+- CDN purge failure;
+- leaked token/key/certificate;
+- viral link/hot-key overload;
+- analytics backlog and replay.
+
+---
+
+#### 19. Cost model
+
+Chi phí không chỉ là server count:
+
+```text
+Total cost
+= edge/CDN requests + egress
++ application compute
++ cache memory/replicas
++ database compute/storage/IO/backups
++ queue/event retention
++ analytics storage/compute
++ observability ingest/retention
++ managed-service premium
++ engineering/operations cost
+```
+
+Ở TinyURL, click analytics và high-cardinality logs có thể tốn hơn mapping storage. Sampling, aggregation và retention policy cần được thiết kế sớm.
+
+Cost optimization không được phá SLO hoặc takedown/security semantics. Ví dụ TTL dài tăng cache hit nhưng làm purge/freshness phức tạp.
+
+---
+
+#### 20. Decision record đề xuất
+
+| Decision | Chọn baseline | Lý do | Trade-off/evolution trigger |
+|---|---|---|---|
+| Link Store | Managed PostgreSQL HA | Scale hiện tại vừa; transaction/unique index/sequence tốt | Cân nhắc partition/NoSQL khi storage/QPS/topology metrics vượt ngưỡng |
+| ID/key | BIGINT sequence + Base62 | Ngắn, đơn giản, collision-free trong DB scope | Enumeration; đổi random/Snowflake khi unpredictability/multi-writer cần |
+| Cache | Managed Redis + optional L1 | Read-heavy, HA/tooling thuận tiện | Memory/cost/invalidation; benchmark Memcached nếu chỉ cần simple cache |
+| Redirect compute | Stateless horizontally scaled instances | Burst/read path cần scale độc lập | Giới hạn bởi cache/DB/edge, cần headroom |
+| Edge | Managed LB + CDN/WAF | HA, global latency, DDoS/origin protection | Purge/TTL/vendor/cost complexity |
+| Analytics transport | Managed queue trước | Đơn giản, decouple redirect | Chuyển/đổi log platform khi replay/multi-consumer/throughput yêu cầu |
+| Auth | Existing IdP/OIDC | Giảm credential/security burden | Availability/vendor integration và token lifecycle |
+
+ADR nên ghi assumptions, alternatives bị loại và date/owner để quyết định có thể được xem lại khi scale thay đổi.
+
+---
+
+#### 21. Evolution path theo giai đoạn
+
+##### Giai đoạn 1 — Đơn giản nhưng production-ready
+
+- Một region, multi-AZ managed PostgreSQL.
+- Hai hoặc nhiều app instances sau managed load balancer.
+- Managed Redis replication/failover.
+- Managed queue cho analytics.
+- CDN cho hot redirects nếu product cần global reach.
+- Backup/PITR, metrics, alerts và runbooks.
+
+##### Giai đoạn 2 — Tăng read/burst/global traffic
+
+- Tách redirect deployment khỏi create/management.
+- L1 local cache + tuning L2 Redis.
+- CDN/edge-cache policy và hot-key detection.
+- Autoscaling theo RPS/concurrency/latency với headroom.
+- Read replica chỉ khi metrics/access pattern biện minh.
+- Analytics partitions/consumers và storage tiering.
+
+##### Giai đoạn 3 — Data/topology rất lớn
+
+- Partition/archive expired/old mappings.
+- Shard/NoSQL migration theo stable key và dual-read/write migration plan.
+- Distributed/random ID strategy cho multi-writer regions.
+- Multi-region routing/replication với conflict, consistency và takedown semantics rõ.
+- Region isolation, failover drills và global control-plane design.
+
+Không nhảy thẳng tới giai đoạn 3 khi Step 2 chưa chứng minh nhu cầu.
+
+---
+
+#### 22. Những lỗi tech/infra decision thường gặp
+
+- Chọn DynamoDB chỉ vì muốn “scale”, dù data/QPS hiện tại nhỏ và query model chưa rõ.
+- Dùng PostgreSQL auto-increment nhưng bỏ qua enumeration/multi-region strategy.
+- Cho rằng DynamoDB có auto-increment giống relational sequence.
+- Cache chỉ chứa URL, quên status/expiry/version.
+- Dùng Redis như source of truth hoặc write-back mapping.
+- Provision cache đúng bằng logical payload, không overhead/replica/headroom.
+- Chỉ scale URL-generation service trong khi redirect mới là workload chính.
+- Mỗi app instance mở pool lớn làm database connection storm.
+- Có load balancer nhưng application/database/cache vẫn single-AZ/SPOF.
+- Nói “replication” mà không phân biệt sync/async, standby/read replica và failover.
+- Nhầm replication với backup.
+- Đọc link vừa tạo/disable từ stale replica rồi cache kết quả cũ.
+- Cho rằng managed service tự giải quyết reconnect, retry, restore và cost.
+- Dùng CDN TTL dài nhưng không có purge/takedown SLO.
+- Chọn Kafka khi managed queue đơn giản đã đủ.
+- Không tính analytics/logging/egress vào cost.
+- Không có metric/trigger cho quyết định tiến hóa.
+
+---
+
+#### 23. Checklist Step 4
+
+- [ ] Technology choice truy ngược được về requirement/estimate/bottleneck?
+- [ ] PostgreSQL schema/index/sequence/transaction đáp ứng access patterns?
+- [ ] Uniqueness, idempotency và durable acknowledgement rõ?
+- [ ] Enumeration/multi-writer implications của Base62 sequence?
+- [ ] Khi nào NoSQL tốt hơn và migration trigger là gì?
+- [ ] Cache engine/topology/key/value/TTL/invalidation/failure behavior?
+- [ ] Cache sizing gồm overhead, replicas và headroom?
+- [ ] Redirect và create/management scale độc lập đúng mức?
+- [ ] Load balancer health/draining/algorithm và HA scope?
+- [ ] DB standby/read replica, sync/async, fencing, RTO/RPO?
+- [ ] Read-after-create/takedown staleness xử lý thế nào?
+- [ ] Replication và backup/restore đều được thiết kế/test?
+- [ ] CDN cache/purge/custom-domain/origin protection?
+- [ ] Queue/log delivery, partition, replay, retention và cost?
+- [ ] Identity, IAM, network, TLS, secrets và audit controls?
+- [ ] Metrics, alerts, traces, runbooks và drills?
+- [ ] Total cost gồm edge, analytics và observability?
+- [ ] ADR ghi alternatives, consequences và evolution path?
+
+#### 24. Ý chính cần nhớ
+
+- Với scale đã ước lượng, managed PostgreSQL HA là baseline đơn giản và mạnh.
+- Sequence + Base62 tạo key ngắn/unique trong DB scope nhưng dễ enumerate và không tự giải quyết multi-region writers.
+- DynamoDB phù hợp key-value scale lớn nhưng cần ID strategy và partition/access-pattern design riêng.
+- Redis/Memcached đều dùng được; chọn theo topology, HA, semantics và operational needs.
+- Cache là derived state; Link Store vẫn là source of truth.
+- Redirect Service cần horizontal scale nhiều hơn Creation Service.
+- Load balancer chỉ xử lý application-instance failure, không tự tạo HA end-to-end.
+- Replication phải đi cùng promotion, fencing, reconnect, RTO/RPO và backup.
+- Managed services giảm toil nhưng không loại bỏ architecture/operations responsibility.
+- CDN giúp hot/global redirects nhưng TTL/purge/takedown phải rõ.
+- Analytics, logging và egress có thể chi phối cost hơn mapping storage.
+- Baseline tốt phải có metric, trigger và migration path thay vì over-engineer từ đầu.
+
+#### Công thức ghi nhớ
+
+> **TinyURL tech baseline = managed PostgreSQL HA + sequence/Base62 + managed Redis cache + stateless redirect scale-out + managed edge/LB + async queue analytics + explicit failover, security, observability và evolution triggers.**
+
+---
+
+### Bài 67. The Final Design — URL Shortener
+
+#### 1. Kiến trúc cuối cùng
+
+Sau bốn bước—requirements, scale estimation, high-level design và technology decisions—baseline production được tổng hợp như sau:
+
+```text
+                                      ┌──────────────────────────┐
+Users / Browsers ── DNS / CDN / WAF ─▶│ Edge LB / API Gateway    │
+                                      └───────┬───────────┬──────┘
+                                              │           │
+                                  Create/Admin│           │Redirect
+                                              ▼           ▼
+                                    ┌──────────────┐  ┌──────────────┐
+                                    │ Link Service │  │Redirect Svc  │◀─┐
+                                    └──────┬───────┘  └──────┬───────┘  │
+                                           │                 │          │
+                                allocate ID│                 ▼          │
+                              + Base62 key │          ┌────────────┐    │
+                                           │          │ L1 Cache   │────┤ hit
+                                           │          └─────┬──────┘    │
+                                           │                │ miss      │
+                                           │                ▼           │
+                                           │          ┌────────────┐    │
+                                           │          │Redis/L2    │────┘
+                                           │          └─────┬──────┘
+                                           │                │ miss
+                                           ▼                ▼
+                                  ┌───────────────────────────────┐
+                                  │ Managed PostgreSQL HA         │
+                                  │ Link Store / source of truth  │
+                                  └──────────────┬────────────────┘
+                                                 │ outbox/change events
+                                                 ▼
+Redirect Svc ── click events ─────────────▶ Queue / Event Log
+                                                 │
+                                                 ▼
+                                      Analytics Consumers / Store
+
+Identity: external IdP/OIDC hoặc Auth Service cho create/management APIs
+Operations: metrics, logs, traces, alerts, backups/PITR và runbooks
+```
+
+Điểm quan trọng: logical responsibilities được tách rõ, nhưng Link Service và Management Service vẫn có thể nằm trong cùng deployment ban đầu. Redirect path nên tách riêng khi latency/burst/ownership biện minh.
+
+---
+
+#### 2. URL creation flow
+
+```text
+Client
+  → Edge/API Gateway
+  → Link Creation Service
+  → allocate unique ID / generate candidate key
+  → Base62 encode nếu dùng numeric ID
+  → conditional insert mapping vào Link Store
+  → populate/invalidate cache phù hợp
+  → trả short URL sau durable commit
+```
+
+Luồng chi tiết:
+
+1. Client gửi `POST /v1/links` với long URL, optional alias/expiration và `Idempotency-Key`.
+2. Edge/gateway kiểm tra request size, rate limit và token nếu endpoint yêu cầu authentication.
+3. Link Service validate scheme, syntax, tenant/domain permission và abuse policy.
+4. Service kiểm tra idempotency record để retry không tạo resource mới ngoài ý muốn.
+5. Nếu custom alias: dùng alias làm candidate và conditional insert.
+6. Nếu system-generated key: lấy unique numeric ID từ PostgreSQL sequence rồi Base62 encode, hoặc dùng distributed/random strategy đã chọn.
+7. Link Store atomically enforce `UNIQUE(namespace, short_key)` và commit mapping.
+8. Nếu cần publish `LinkCreated`, ghi outbox trong cùng transaction rồi relay bất đồng bộ.
+9. Có thể warm cache sau commit để link vừa tạo đọc được nhanh.
+10. Trả `201 Created` cùng short URL; không trả URL nếu durable commit thất bại.
+
+##### ID generation trong final design
+
+Transcript dùng ZooKeeper global counter cho từng request. Bản thiết kế hiệu chỉnh chọn:
+
+- **Baseline một write region:** PostgreSQL sequence/identity + Base62.
+- **Khi cần nhiều generators:** range/Hi-Lo allocation, Snowflake-style ID hoặc random Base62 + conditional insert.
+- **Nếu dùng ZooKeeper:** ưu tiên cấp worker ID/range/lease tần suất thấp, không serialize mọi create qua một global counter.
+
+Link Store unique constraint vẫn là arbiter/defense cuối cùng cho uniqueness.
+
+---
+
+#### 3. Redirect flow
+
+```text
+Browser → GET /{short_key}
+   │
+   ├─ CDN/edge hit ───────────────────────────────▶ 302 + Location
+   │
+   └─ Redirect Service
+         ├─ L1 hit ───────────────────────────────▶ validate + redirect
+         ├─ L2 Redis hit ─────────────────────────▶ validate + redirect
+         └─ miss → PostgreSQL point lookup
+                       ├─ not found/expired/blocked → 404/410/policy response
+                       └─ active → populate cache → 302 + Location
+
+Redirect Service ── async click event ──▶ Queue/Event Log
+```
+
+Redirect response:
+
+```http
+HTTP/1.1 302 Found
+Location: https://destination.example/path
+Cache-Control: public, max-age=<lifecycle-aware-ttl>
+```
+
+Critical-path rules:
+
+- Không gọi Auth Service cho public redirect.
+- Không chờ analytics persist.
+- Cache value phải gồm status/expiration/version, không chỉ destination.
+- Miss cho cùng hot key được single-flight/coalesce.
+- Cache/DB timeout, concurrency và retry đều có bound.
+- Disabled/unsafe link phải không được redirect dù cache còn dữ liệu cũ ngoài staleness SLO.
+
+---
+
+#### 4. Update, disable và delete flow
+
+```text
+Client → authenticated management API
+  → validate principal
+  → authorize action trên exact owner/tenant/link
+  → update status/destination/version trong Link Store
+  → write audit/outbox event
+  → purge CDN + invalidate L2/L1 caches
+  → return success
+```
+
+Final design ưu tiên soft delete/disable trước hard delete:
+
+- short key không được tái sử dụng cho destination khác;
+- audit và recovery window được giữ;
+- cache/takedown propagation dễ quản lý;
+- hard deletion diễn ra sau retention/privacy workflow.
+
+Event invalidation giảm propagation time; TTL là safety net nếu event/purge thất bại.
+
+---
+
+#### 5. Analytics flow
+
+```text
+Redirect Service
+  → publish/buffer compact ClickEvent
+  → Queue/Event Log
+      ├─ stream aggregation → near-real-time counters
+      ├─ abuse/bot classification
+      └─ batch/lake/warehouse → historical analytics
+```
+
+Click event ví dụ:
+
+```text
+event_id
+short_key / link_id
+timestamp
+coarse region/device/referrer fields theo privacy policy
+edge/service context
+bot/preview classification signals
+```
+
+Semantics:
+
+- dashboard có thể eventual-consistent;
+- at-least-once delivery có thể tạo duplicate nên aggregation cần idempotency/dedup strategy;
+- analytics outage không làm redirect thất bại;
+- raw-event retention, deletion và PII minimization phải rõ;
+- hot link không update một counter row đồng bộ trên redirect path.
+
+---
+
+#### 6. Component responsibilities cuối cùng
+
+| Component | Trách nhiệm | Không nên chịu trách nhiệm |
+|---|---|---|
+| CDN/Edge/WAF | TLS, global entry, DDoS/bot filtering, redirect cache, coarse limits | Business ownership authorization |
+| API Gateway | Route/version APIs, token validation, request quota/policy | Source of truth hoặc toàn bộ AuthZ logic |
+| Link Service | Validate, idempotency, key allocation, durable create/update | Phục vụ toàn bộ redirect volume nếu cần scale tách |
+| Redirect Service | Low-latency lookup, lifecycle policy, HTTP redirect | Đồng bộ analytics/reporting |
+| IdP/Auth | User/service authentication, token/session lifecycle | Quyết định ownership của từng link thay Link Service |
+| Redis/L1 cache | Derived hot mapping state | Durable source of truth |
+| PostgreSQL Link Store | Mapping, uniqueness, owner/status/version, durability | High-volume raw click analytics |
+| Queue/Event Log | Decouple, buffer và deliver events | Authoritative current mapping |
+| Analytics Store | Aggregate/query click data | Redirect correctness |
+
+---
+
+#### 7. Vì sao mỗi component tồn tại?
+
+| Requirement/bottleneck | Quyết định |
+|---|---|
+| Redirect read:write ~500:1 | Layered cache và redirect service tối ưu reads |
+| Viral/hot-link burst | CDN, local/distributed cache, headroom, stateless scale-out |
+| Mapping không được mất | Durable PostgreSQL HA + backup/PITR |
+| Unique compact key | Sequence/allocator + Base62 + unique constraint |
+| User quản lý own links | Identity + object/tenant authorization |
+| Analytics volume lớn | Async queue/log và analytical store riêng |
+| Low latency | Edge routing, cache hit path, không chờ optional dependencies |
+| High availability | Multi-instance app, multi-AZ data/cache/edge và tested failover |
+| Abuse/phishing | Rate limit, WAF/bot controls, validation, reputation/takedown workflow |
+| Evolvability | Logical boundaries, versioned APIs/events và ADR/migration triggers |
+
+Một component không giải quyết requirement/risk cụ thể nên bị chất vấn trước khi đưa vào thiết kế.
+
+---
+
+#### 8. High availability và failure behavior
+
+##### Edge/application
+
+- Managed/redundant edge và load balancer.
+- Redirect/Link Service có ít nhất hai healthy instances qua nhiều failure domains.
+- Readiness, graceful draining và autoscaling có minimum headroom.
+
+##### Cache
+
+- Redis replication/failover hoặc sharded managed topology.
+- Cache mất thì fallback có controlled concurrency; không để DB bị avalanche.
+- TTL jitter, warm-up, single-flight và origin protection.
+
+##### Database
+
+- Managed multi-AZ primary/standby.
+- Replication mode theo RPO/latency.
+- Promotion/fencing/reconnect được diễn tập.
+- Backup/PITR riêng với replication; restore test theo RTO.
+
+##### Degraded-mode matrix
+
+| Failure | Final behavior |
+|---|---|
+| Một Redirect instance chết | LB loại node, các node khác phục vụ |
+| Redis lỗi/mất working set | Bounded DB fallback, shed abuse, warm cache có kiểm soát |
+| PostgreSQL read tạm lỗi | Có thể dùng safe cached values trong freshness policy; unknown misses fail rõ |
+| PostgreSQL write lỗi | Create/update không acknowledge; trả retryable error |
+| Analytics queue lỗi | Buffer/drop theo contract; redirect vẫn hoạt động |
+| IdP lỗi | Public redirect vẫn chạy; protected APIs fail-safe hoặc verify valid token local theo model |
+| CDN purge delay | TTL/version/deny policy giới hạn stale redirect |
+| ID allocator lỗi | Không tạo duplicate; dùng preallocated/fallback strategy đã định hoặc tạm fail create |
+
+---
+
+#### 9. Consistency model
+
+Không dùng một nhãn consistency cho toàn hệ thống:
+
+| Dữ liệu/operation | Consistency cần |
+|---|---|
+| Short-key uniqueness | Strong/atomic trong namespace |
+| Acknowledged mapping create | Durable và read-after-create theo contract |
+| Disable/takedown | Propagation có bounded staleness rất ngắn |
+| Cache mapping | Eventual/TTL-bound derived state |
+| Click analytics | Eventual consistency; duplicate-tolerant |
+| Dashboard counters | Bounded stale/approximate có thể chấp nhận |
+
+Link vừa tạo có thể được warm vào cache hoặc đọc primary trong consistency window. Link vừa disable cần version/invalidation/purge để stale replica/cache không tái kích hoạt redirect.
+
+---
+
+#### 10. Security model cuối cùng
+
+##### Public redirect
+
+- TLS, DDoS/bot filtering và abuse monitoring.
+- Destination policy/takedown enforcement.
+- Không yêu cầu login nhưng vẫn có rate/connection protection.
+
+##### Create
+
+- Anonymous quota/CAPTCHA hoặc authenticated quota theo product.
+- URL scheme/length parser an toàn.
+- Custom domain/alias authorization.
+- Không server-side fetch destination trừ khi SSRF controls đầy đủ.
+
+##### Management/admin
+
+- AuthN + resource/tenant AuthZ ở backend.
+- MFA/step-up cho admin/takedown/domain operations.
+- Audit bất biến cho privileged actions.
+- No bearer tokens hoặc full sensitive URLs trong logs.
+
+##### Infrastructure
+
+- Private DB/cache endpoints, default-deny network flows.
+- Workload identity và least-privilege roles.
+- TLS/mTLS theo trust model; secrets/KMS rotation.
+- Separate database roles cho runtime, migration và admin.
+- Encrypted backups và separated access.
+
+---
+
+#### 11. Capacity plan cuối cùng
+
+Theo assumptions case study:
+
+```text
+Creates:          100,000/day ≈ 1.16 RPS average
+Redirects:         50,000,000/day ≈ 579 RPS average
+Peak redirects:    khoảng 5,800–7,100 RPS
+Read:write ratio:  khoảng 500:1
+Hot cache payload: khoảng 500 MB logical, trước overhead/replica/headroom
+Mapping growth:    khoảng 18.25 GB raw/năm
+Analytics:         có thể nhiều TB/năm trước aggregation/retention
+```
+
+Capacity phải được xác minh bằng load test:
+
+- edge/LB connections và TLS CPU;
+- redirect RPS/latency với L1/L2 hits;
+- cold-cache DB fallback;
+- viral single-key traffic;
+- Redis memory/eviction/failover;
+- PostgreSQL point lookup/connection budget/failover;
+- analytics queue lag và replay;
+- purge/takedown propagation.
+
+---
+
+#### 12. Deployment baseline
+
+```text
+Region A
+  ├─ Availability Zone 1
+  │    ├─ Redirect/Link instances
+  │    ├─ Redis node/replica role
+  │    └─ PostgreSQL primary hoặc standby role
+  ├─ Availability Zone 2
+  │    ├─ Redirect/Link instances
+  │    ├─ Redis node/replica role
+  │    └─ PostgreSQL standby hoặc primary role
+  └─ Managed LB, queue, monitoring và backup integration
+
+Global users → CDN/edge POPs → Region A origin
+```
+
+Single-region multi-AZ là baseline phù hợp. Multi-region active-active chỉ thêm khi latency/residency/DR SLO yêu cầu và đã giải quyết:
+
+- global ID/key uniqueness;
+- write ownership/conflicts;
+- mapping/cache/takedown replication;
+- region routing/failover;
+- analytics duplication;
+- consistency và data residency.
+
+---
+
+#### 13. Observability và SLO
+
+##### Redirect SLIs
+
+- successful redirect availability;
+- p50/p95/p99 latency theo region;
+- CDN/L1/L2 cache hit ratios;
+- Link Store lookup/error rate;
+- stale/incorrect redirect incidents;
+- takedown propagation time.
+
+##### Create/management SLIs
+
+- successful durable create latency/rate;
+- collision/idempotency/alias-conflict metrics;
+- authorization denial/abuse rate;
+- DB commit/outbox latency;
+- cache purge/invalidation completion.
+
+##### Analytics SLIs
+
+- publish success/drop rate;
+- queue lag/oldest event age;
+- processing throughput/duplicate rate;
+- dashboard freshness.
+
+SLOs nên tách theo path: redirect ưu tiên availability/latency, create ưu tiên correctness/durability, analytics ưu tiên throughput/freshness.
+
+---
+
+#### 14. Evolution triggers
+
+| Signal | Hành động tiếp theo |
+|---|---|
+| Redirect compute saturation trước downstream | Scale instances/tune runtime/L1 cache |
+| Redis hit ratio thấp hoặc hot shard | Revisit key/TTL/topology, replicate hot keys, edge caching |
+| Cold-cache DB vượt safe capacity | Origin protection, capacity/tuning, pre-warm hoặc read strategy |
+| PostgreSQL index/storage/RTO vượt limits | Archive/partition, scale-up/out, chuẩn bị shard/NoSQL migration |
+| Một write region không đáp ứng latency/residency | Thiết kế multi-region writer/ID/consistency model |
+| Analytics lag/retention cost tăng | Tăng partitions/consumers, aggregate/tier/drop raw fields |
+| Takedown không đạt SLO | Shorter TTL, fast deny path, reliable purge/version propagation |
+
+Evolution phải dựa trên metric và threshold, không dựa trên nỗi sợ “sau này có thể lớn”.
+
+---
+
+#### 15. Những điểm khác với sơ đồ đơn giản trong transcript
+
+| Transcript đơn giản hóa | Final design hiệu chỉnh |
+|---|---|
+| Mọi create xin ZooKeeper global counter | PostgreSQL sequence baseline; coordination chỉ cấp range/worker ID khi cần |
+| Mọi request qua API Gateway | Redirect có thể route trực tiếp qua edge tới specialized service |
+| Cache rồi DB | Layered cache, single-flight, negative cache, invalidation/version và failure protection |
+| DB chứa mapping và user data | Có thể dùng cùng engine ban đầu nhưng tách ownership/schema; external IdP là lựa chọn tốt |
+| Cache miss lookup rồi redirect | Phải kiểm tra status, expiration, abuse/takedown và consistency |
+| Cache hit luôn hợp lệ | Cache có staleness; value cần version/status và bounded TTL |
+| Replication tạo HA | Cần promotion, fencing, reconnect, RPO/RTO, backup và drills |
+| Final flow chỉ create/redirect | Còn management, analytics, security, observability và recovery flows |
+
+Sơ đồ transcript hữu ích để hiểu lõi, còn các bổ sung trên biến nó thành production-oriented design.
+
+---
+
+#### 16. Cách trình bày final design trong phỏng vấn
+
+Một bản recap ngắn:
+
+1. TinyURL có create path và read-heavy redirect path (~500:1).
+2. Edge/CDN/LB route request; redirect instances stateless scale ngang.
+3. PostgreSQL là source of truth; sequence + Base62 tạo compact key trong baseline.
+4. L1 + Redis + optional CDN cache giúp giảm latency và DB load.
+5. Storage enforces uniqueness; create dùng idempotency và durable commit.
+6. Click analytics đi bất đồng bộ qua queue/log.
+7. Disable/delete cập nhật version rồi purge/invalidate cache; key không reuse.
+8. Multi-AZ HA, cache/DB failover, backup/PITR và degraded modes bảo vệ availability.
+9. Identity bảo vệ management; public redirect vẫn có abuse/security controls.
+10. Khi metrics vượt ngưỡng mới partition/shard/NoSQL hoặc multi-region.
+
+Sau recap, chọn một deep dive theo interviewer: key generation, caching/hot key, database scaling, consistency/takedown, analytics hoặc multi-region.
+
+---
+
+#### 17. Final design checklist
+
+- [ ] Requirements và scale assumptions được nhắc lại.
+- [ ] Create/redirect/management/analytics flows end-to-end.
+- [ ] API status/idempotency/auth semantics rõ.
+- [ ] Unique-key strategy không dựa trên local counters.
+- [ ] Link Store atomically enforce uniqueness và durable writes.
+- [ ] Cache hierarchy, hit/miss, negative cache, single-flight và invalidation.
+- [ ] Redirect không phụ thuộc analytics/Auth/user profile.
+- [ ] Status/expiry/takedown được enforce trên cả cache path.
+- [ ] Soft-delete/key-reuse policy rõ.
+- [ ] Components scale đúng workload và không over-split.
+- [ ] LB, app, cache, DB và queue không có unexamined SPOF.
+- [ ] Replication/failover/fencing/reconnect cùng backup/restore drills.
+- [ ] Security boundaries, abuse handling và audit.
+- [ ] SLO/metrics/alerts theo từng path.
+- [ ] Load tests bao phủ hot link, cold cache và failover.
+- [ ] Cost gồm CDN, cache, analytics, logs và backups.
+- [ ] Evolution triggers và migration path được ghi lại.
+
+#### 18. Ý chính cần nhớ
+
+- Final design là kết quả của chuỗi reasoning, không phải danh sách sản phẩm.
+- Redirect path read-heavy cần edge/cache/stateless scale-out và optional dependencies nằm ngoài critical path.
+- Create path throughput thấp nhưng uniqueness, idempotency và durability phải mạnh.
+- PostgreSQL sequence + Base62 là baseline đơn giản; ZooKeeper per-ID counter không cần thiết.
+- Cache là derived state, cần invalidation, version, bounded staleness và origin protection.
+- Analytics có scale lớn hơn mapping và phải tách khỏi OLTP/redirect.
+- Soft delete và không tái sử dụng key làm lifecycle/takedown an toàn hơn.
+- High availability là thuộc tính end-to-end gồm application, cache, database, edge và operations.
+- Replication không thay backup; managed failover không thay application reconnect/drills.
+- Consistency được chọn theo từng operation, không gắn một nhãn cho cả hệ thống.
+- Security gồm public abuse controls, protected management AuthZ và private infrastructure.
+- Kiến trúc nên tiến hóa theo metric/trigger thay vì over-engineer từ đầu.
+
+#### Công thức ghi nhớ
+
+> **Final TinyURL = fast cached redirect path + correct durable creation path + asynchronous analytics + lifecycle-aware invalidation + multi-layer HA/security + metric-driven evolution.**
+
+---
+
+## Phần 13 — Design a Ticketing System (BookMyShow)
+
+### Bài 68. Problem Definition, Requirements & Booking Invariants
+
+#### 1. Bài toán ticketing system
+
+Ticketing platform cho phép user:
+
+```text
+Discover event/show
+  → xem venue/seat map và availability
+  → chọn ghế hoặc số lượng vé
+  → giữ chỗ tạm thời
+  → thanh toán
+  → nhận booking confirmation/ticket
+  → quản lý cancellation/refund theo policy
+```
+
+Nó có thể phục vụ phim, concert, thể thao hoặc các sự kiện khác. Train/flight booking có workflow tương tự ở mức khái niệm nhưng có inventory, pricing, regulation và integration phức tạp riêng; case study này tập trung mô hình event/show có ghế định danh.
+
+Thách thức không nằm ở trang tìm kiếm mà ở **correctness dưới contention**:
+
+- 100 nghìn users có thể cùng vào một giờ mở bán;
+- nhiều người chọn cùng một số ghế hiếm;
+- UI availability thay đổi liên tục;
+- payment mất vài giây hoặc thất bại/timeout;
+- retry, duplicate webhook và network partition vẫn xảy ra;
+- hệ thống phải ngăn double booking mà vẫn giữ latency/availability chấp nhận được.
+
+> Ticketing system là bài toán quản lý inventory hữu hạn theo thời gian, không chỉ là một website thương mại điện tử.
+
+---
+
+#### 2. Actors và bounded scope
+
+##### Actors
+
+- **Guest/user:** tìm kiếm và xem event/show.
+- **Authenticated customer:** hold ghế, checkout, thanh toán và quản lý booking.
+- **Organizer/admin:** tạo event/show, venue layout, quota và pricing.
+- **Payment provider:** authorize/capture/refund payment và gửi webhook.
+- **Notification provider:** email/SMS/push confirmation.
+- **Support/operations:** điều tra dispute, resend ticket, xử lý exception.
+- **Fraud/bot actor:** scraping, hoarding, scalping, credential/payment abuse.
+
+##### In scope
+
+- Browse/search events.
+- Xem lịch diễn, venue/seat map và availability.
+- Hold một hoặc nhiều ghế trong thời hạn ngắn.
+- Checkout và thanh toán.
+- Confirm booking, phát hành ticket và notification.
+- Cancellation/refund theo policy cơ bản.
+- Admin quản lý event, show, venue layout và pricing.
+- Audit các thay đổi tài chính/inventory quan trọng.
+
+##### Out of scope ở iteration đầu
+
+- Dynamic pricing phức tạp và auction.
+- Secondary-market resale/transfer marketplace.
+- Loyalty, coupons và recommendation engine đầy đủ.
+- Offline box-office reconciliation phức tạp.
+- Airline/train-specific route inventory.
+- Full fraud-scoring platform.
+
+Scope cần rõ vì assigned seating và general admission có consistency model khác nhau.
+
+---
+
+#### 3. Domain model nền tảng
+
+Các khái niệm không nên gộp lẫn:
+
+```text
+Venue
+  └─ SeatLayout / Sections / Seats
+
+Event (nội dung: phim, concert, trận đấu)
+  └─ Show (một suất cụ thể: venue + start time)
+       └─ ShowSeat / InventoryUnit (giá và trạng thái theo suất)
+
+Customer
+  └─ Hold (lease tạm thời trên inventory)
+       └─ Booking / Order
+            ├─ Payment attempt(s)
+            └─ Ticket(s)
+```
+
+- **Seat** là vị trí vật lý trong venue.
+- **ShowSeat** là inventory của ghế đó cho một show cụ thể.
+- **Hold** không phải booking hoàn tất.
+- **Payment attempt** không đồng nhất với booking; một booking có thể có nhiều attempts/retries.
+- **Ticket** chỉ được phát hành sau khi booking đạt trạng thái confirmed theo policy.
+
+---
+
+#### 4. Core inventory invariant
+
+Yêu cầu quan trọng nhất:
+
+> Với mỗi `(show_id, seat_id)`, tại một thời điểm chỉ có tối đa một booking đã xác nhận; một hold hợp lệ cũng chỉ thuộc về một checkout/customer context theo policy.
+
+Có thể diễn đạt:
+
+```text
+confirmed_bookings(show_id, seat_id) ≤ 1
+
+Nếu seat ở trạng thái HELD:
+  hold_id duy nhất
+  expires_at > current_time theo authoritative clock/lease rule
+```
+
+Invariant phải được enforcement ở authoritative inventory store bằng transaction, conditional write, unique constraint hoặc atomic state transition. UI, cache hoặc distributed lock đơn thuần không được là nơi bảo đảm cuối cùng.
+
+---
+
+#### 5. Seat state machine
+
+Một state machine rõ ràng giúp tránh “boolean is_available” mơ hồ:
+
+```text
+                  hold succeeds
+AVAILABLE ─────────────────────────▶ HELD
+   ▲                                  │  │
+   │ hold expires / user releases     │  │ payment succeeds + commit
+   └──────────────────────────────────┘  ▼
+                                      BOOKED
+                                         │
+                      cancel/refund policy│
+                                         ▼
+                               CANCELLED / AVAILABLE
+                               tùy inventory policy
+```
+
+Ví dụ fields cho inventory row:
+
+```text
+show_id
+seat_id
+state            AVAILABLE | HELD | BOOKED | BLOCKED
+hold_id          nullable
+hold_expires_at  nullable
+booking_id       nullable
+version
+price_snapshot
+```
+
+State transitions cần kiểm tra state/version hiện tại atomically. Client không được tự tuyên bố “ghế còn trống” chỉ vì UI vừa hiển thị như vậy.
+
+---
+
+#### 6. Functional requirements
+
+##### FR1 — Browse và search
+
+User có thể tìm event theo location, date, category, language hoặc venue; xem showtimes và metadata.
+
+Browse/search có thể eventual-consistent và cache mạnh. Nó không phải nguồn authoritative cho seat availability.
+
+##### FR2 — Xem show và seat map
+
+User xem:
+
+- sections/rows/seats;
+- price tiers;
+- trạng thái gần hiện tại: available/held/booked/blocked;
+- accessibility/seat attributes.
+
+Seat map phải tải nhanh, nhưng không thể hứa mọi browser trên toàn cầu luôn có ảnh snapshot tuyệt đối đồng thời. UI availability là advisory; **hold operation mới là authoritative admission check**.
+
+##### FR3 — Hold/reserve seats
+
+User chọn một hoặc nhiều seats và yêu cầu hold trong thời hạn, ví dụ vài phút.
+
+Success response cần có:
+
+- `hold_id` khó đoán;
+- danh sách inventory đã giữ;
+- immutable/controlled price snapshot;
+- `expires_at` theo server;
+- checkout token/context.
+
+Nếu bất kỳ ghế nào không còn available, contract phải rõ:
+
+- all-or-nothing hold; hoặc
+- partial success có client confirmation.
+
+All-or-nothing thường dễ hiểu hơn cho nhóm ghế liền nhau.
+
+##### FR4 — Checkout và payment
+
+User thanh toán cho hold còn hiệu lực. Hệ thống:
+
+- xác minh hold ownership, expiry và amount;
+- tạo payment attempt idempotently;
+- giao tiếp payment provider;
+- xử lý synchronous response và asynchronous webhook;
+- xác nhận booking đúng một lần về business effect;
+- xử lý timeout/unknown outcome bằng reconciliation.
+
+Không giữ database transaction hoặc row lock mở trong toàn bộ thời gian user/payment provider xử lý.
+
+##### FR5 — Booking confirmation và ticket
+
+Sau khi inventory được commit thành BOOKED và payment đạt trạng thái phù hợp:
+
+- tạo booking confirmation;
+- phát hành ticket/QR/barcode;
+- gửi email/SMS/push bất đồng bộ;
+- cho phép user xem lại trong account.
+
+Notification thất bại không được rollback confirmed booking. Có retry/resend riêng.
+
+##### FR6 — Cancellation và refund
+
+Theo event/organizer policy:
+
+- customer/admin yêu cầu cancellation;
+- booking chuyển trạng thái atomically/idempotently;
+- refund được thực hiện qua payment provider;
+- seat được release/resell hay giữ blocked tùy policy;
+- ticket cũ bị revoke;
+- audit và notification được phát.
+
+Refund thành công/chậm/thất bại là workflow lâu dài, không phải một synchronous database transaction.
+
+##### FR7 — Admin/organizer
+
+- Tạo venue và versioned seat layout.
+- Tạo event/show và sales window.
+- Gán price tiers, quotas, blocked/house seats.
+- Publish/unpublish/cancel show.
+- Xem booking/revenue/operations reports.
+
+Admin actions cần strong authorization, approval/audit cho thay đổi nhạy cảm và tránh sửa layout sau khi sales đã bắt đầu nếu làm hỏng inventory references.
+
+---
+
+#### 7. Hold là lease, không phải process lock
+
+Transcript gọi seat “temporarily locked”. Cách hiểu production-oriented là một **durable logical hold có expiry**, không phải mutex trong memory hay database lock giữ nhiều phút.
+
+```text
+Hold = quyền tạm thời trên inventory
+       + owner/checkout context
+       + server-generated expiration
+       + atomic state transition
+```
+
+Vì sao không giữ DB lock xuyên payment?
+
+- payment/user interaction kéo dài vài giây hoặc phút;
+- connection/transaction bị chiếm lâu;
+- crash/network partition để lại uncertain state;
+- lock contention làm giảm capacity;
+- không scale tốt qua services/regions.
+
+Seat hold phải tự hết hạn ngay cả khi client biến mất. Có thể dùng:
+
+- authoritative `expires_at` kiểm tra trong mỗi state transition;
+- background expiration worker để cleanup/materialize availability;
+- delayed message/timer wheel như optimization;
+- lazy expiry khi đọc/hold lại.
+
+Background worker không được là correctness arbiter duy nhất: nếu nó chạy trễ, một hold đã hết hạn vẫn phải được coi là expired theo transaction rule.
+
+---
+
+#### 8. Hold duration và fairness
+
+Hold quá dài:
+
+- seats bị hoarding;
+- inventory utilization giảm;
+- users khác thấy sold-out giả;
+- bots có lợi thế.
+
+Hold quá ngắn:
+
+- user hợp lệ không đủ thời gian thanh toán;
+- accessibility/slow network users bị bất lợi;
+- payment timeout tạo disputes.
+
+Policy có thể dựa trên:
+
+- fixed hold TTL;
+- queue/admission time không tính vào checkout TTL;
+- server-side extension một lần khi payment đã bắt đầu;
+- no arbitrary client renewals;
+- limit seats/holds theo account/device/payment identity;
+- anti-bot/virtual waiting room trước inventory service.
+
+Fairness phải được định nghĩa: first request reaching authority, randomized queue, verified fan presale, per-user quota hay lottery. “First come, first served” trên internet không hoàn toàn công bằng vì latency và bot advantage.
+
+---
+
+#### 9. Payment–booking boundary
+
+Payment provider là external distributed system nên có các trạng thái không chắc chắn:
+
+```text
+PENDING → AUTHORIZED → CAPTURED
+   ├───────────────→ FAILED
+   ├───────────────→ EXPIRED
+   └───────────────→ UNKNOWN / REQUIRES_RECONCILIATION
+```
+
+Booking cũng cần state machine:
+
+```text
+PENDING_PAYMENT
+  → CONFIRMED
+  → CANCEL_PENDING / CANCELLED
+  → REFUND_PENDING / REFUNDED
+
+hoặc → PAYMENT_FAILED / EXPIRED
+```
+
+Các invariants:
+
+- Một provider retry/webhook không tạo hai bookings/captures.
+- Booking không CONFIRMED chỉ dựa trên redirect từ browser.
+- Amount/currency/merchant/order reference phải khớp server-side state.
+- Payment success sau hold expiry cần policy: reject/refund, grace/extension đã ghi, hoặc reconciliation—không âm thầm double-book.
+- Mọi side effect dùng stable idempotency keys/business IDs.
+
+Không có distributed ACID transaction đơn giản giữa database và payment provider. Case study sau sẽ cần saga/state machine, outbox/inbox, webhook verification và reconciliation.
+
+---
+
+#### 10. API contract sơ bộ
+
+##### Browse/search
+
+```http
+GET /v1/events?city=...&date=...
+GET /v1/events/{event_id}
+GET /v1/shows/{show_id}
+GET /v1/shows/{show_id}/seats
+```
+
+##### Hold
+
+```http
+POST /v1/shows/{show_id}/holds
+Authorization: Bearer <token>
+Idempotency-Key: <key>
+
+{
+  "seat_ids": ["A-10", "A-11"]
+}
+```
+
+Response:
+
+```json
+{
+  "hold_id": "hld_...",
+  "status": "HELD",
+  "expires_at": "...",
+  "items": [
+    {"seat_id": "A-10", "price": 120000},
+    {"seat_id": "A-11", "price": 120000}
+  ],
+  "total": 240000,
+  "currency": "VND"
+}
+```
+
+Nếu ghế đã bị giữ/booked, trả conflict/business error rõ ràng; client refresh availability rồi chọn lại.
+
+##### Checkout/payment
+
+```http
+POST /v1/holds/{hold_id}/checkout
+Idempotency-Key: <key>
+
+POST /v1/payments/webhooks/{provider}
+```
+
+##### Booking
+
+```http
+GET  /v1/bookings/{booking_id}
+POST /v1/bookings/{booking_id}/cancel
+GET  /v1/bookings/{booking_id}/tickets
+```
+
+Client-provided price, owner, payment status hoặc `expires_at` không được coi là authoritative.
+
+---
+
+#### 11. Non-functional requirements
+
+##### 11.1 Correctness và consistency
+
+- Không double-book inventory.
+- Hold/booking state transitions atomic và idempotent.
+- Price/currency snapshot không bị client sửa.
+- Payment/booking eventual workflow phải reconcile được.
+- Seat UI có thể hơi stale, nhưng hold/commit phải kiểm tra authoritative state.
+
+##### 11.2 High availability
+
+Không phải mọi path có cùng availability trade-off:
+
+- Browse/search nên còn hoạt động khi booking tạm unavailable.
+- Seat view có thể degraded/stale có cảnh báo.
+- Hold/confirm phải fail-safe khi không chứng minh được inventory authority.
+- Notification/reporting có thể backlog.
+
+Availability không được đạt bằng cách fail-open và bán trùng ghế.
+
+##### 11.3 Latency
+
+- Browse/search/seat-map tải nhanh theo p95/p99.
+- Hold decision cần nhanh để giữ UX và giảm contention.
+- Payment/booking end-to-end thường mất **giây**, không thực tế khi hứa hoàn tất trong vài milliseconds vì có user/provider/network interaction.
+- Confirmation UI có thể dùng polling/WebSocket/SSE khi workflow bất đồng bộ.
+
+##### 11.4 Scalability và burst handling
+
+- Flash-sale traffic tăng trước/đúng giờ mở bán.
+- Scale reads/cache/search độc lập với inventory writes.
+- Admission control/virtual waiting room bảo vệ authoritative booking path.
+- Autoscaling có headroom; không chờ CPU spike rồi mới phản ứng.
+
+##### 11.5 Durability
+
+Booking, payment reference, ticket và audit state đã acknowledge phải bền vững theo RPO. Cache/seat-map projection có thể rebuild.
+
+##### 11.6 Security và compliance
+
+- AuthN/AuthZ, MFA/step-up cho admin.
+- Payment card data tokenized/handled bởi provider; giảm PCI scope.
+- TLS, secrets/KMS, signed webhooks và anti-replay.
+- PII minimization, retention, encryption và access audit.
+- Bot/scalper/fraud controls.
+
+##### 11.7 Auditability
+
+Mỗi transition quan trọng cần trace:
+
+```text
+who/actor
+business entity + previous/new state
+request/idempotency/correlation IDs
+policy/price/version
+timestamp và service/source
+payment provider reference
+reason/admin authority
+```
+
+Audit log không đồng nghĩa phải dùng event sourcing. Có thể dùng immutable append-only audit/events cùng transactional outbox.
+
+---
+
+#### 12. Constraints của case study
+
+Transcript giả định:
+
+- khoảng 5 triệu registered users;
+- tới 100 nghìn concurrent users trong major launch;
+- global organizers/users;
+- flash sales tạo burst lớn;
+- seat cần hold tạm thời và tự release nếu checkout không hoàn tất.
+
+Cần bổ sung trước Step 2:
+
+- số events/shows/day;
+- seats/show và assigned/general-admission ratio;
+- browse/seat-view/hold/payment requests mỗi user;
+- launch burst distribution trong 1/10/60 phút;
+- tỷ lệ hold thành booking và abandonment;
+- hold TTL;
+- payment latency/success/timeout/webhook delay;
+- region distribution và event home region;
+- booking/audit retention;
+- notification volume;
+- bot/refresh amplification.
+
+Concurrent users không tự chuyển trực tiếp thành RPS; cần nhân với hành vi và request interval.
+
+---
+
+#### 13. Global architecture constraint: event home region
+
+Global read experience không đồng nghĩa inventory của một show phải được write ở mọi region.
+
+Một mô hình giảm complexity:
+
+```text
+Global browse/search replicas/caches
+            │
+User hold/checkout
+            ▼
+Route theo show_id → authoritative home region của show
+            │
+            ▼
+Single inventory write authority per show/partition
+```
+
+Lợi ích:
+
+- giữ seat state transitions trong một consistency domain;
+- tránh multi-region write conflict trên cùng ghế;
+- dễ enforce ordering/uniqueness;
+- vẫn cache browse/catalog toàn cầu.
+
+Trade-off là booking latency cross-region cho user xa và dependency vào event home region. Có thể đặt home region gần venue/organizer/user base và xây DR/failover với fencing. Active-active inventory writers chỉ nên dùng khi đã có protocol/conflict model chứng minh không double-book.
+
+---
+
+#### 14. Availability hiển thị và authoritative availability
+
+Phân biệt hai khái niệm:
+
+| Loại | Mục tiêu | Consistency |
+|---|---|---|
+| Seat-map projection | Hiển thị nhanh ghế có vẻ available/held/booked | Có thể eventual-consistent, versioned |
+| Hold/booking authority | Quyết định có cấp seat cho user không | Atomic/strong tại inventory owner |
+
+Luồng:
+
+```text
+Seat Inventory authority
+  → events/change stream
+  → seat-map projection/cache/WebSocket updates
+  → clients
+
+Client chọn ghế dựa trên projection
+  → POST hold
+  → authority kiểm tra lại state atomically
+```
+
+Vì race là không thể tránh hoàn toàn ở UI, UX phải xử lý conflict lịch sự: thông báo ghế vừa hết, refresh map và gợi ý ghế thay thế.
+
+---
+
+#### 15. Abuse và admission control là requirement cốt lõi
+
+Flash sale dễ bị:
+
+- bot refresh/request flood;
+- account farming và credential stuffing;
+- giữ nhiều ghế rồi bỏ;
+- scalping và payment fraud;
+- inventory scraping;
+- DDoS trước giờ mở bán.
+
+Controls có thể gồm:
+
+- virtual waiting room/queue với signed admission token;
+- per-account/device/payment identity quota;
+- rate limit theo action/cost, không chỉ IP;
+- CAPTCHA/bot scoring có chọn lọc;
+- hold count/renewal limit;
+- randomized/fair admission policy;
+- presale codes/verified identity;
+- anomaly detection và manual operations controls.
+
+Waiting room phải nằm trước bottleneck và token không được forge/replay. Nó điều tiết admission, không thay inventory transaction correctness.
+
+---
+
+#### 16. Audit, reconciliation và support requirements
+
+Với financial workflow, “log để debug” chưa đủ. Cần khả năng trả lời:
+
+- User nào giữ ghế lúc nào và hold hết hạn khi nào?
+- Inventory transition nào thắng khi cạnh tranh?
+- Payment provider đã authorize/capture/refund gì?
+- Booking/ticket được tạo hay revoke bao nhiêu lần?
+- Webhook/retry nào bị duplicate?
+- Admin nào override/cancel và lý do?
+- Tiền đã thu nhưng booking chưa confirm có được phát hiện/xử lý không?
+
+Reconciliation jobs so sánh booking ledger, payment provider records và ticket state để phát hiện mismatch. Có manual-review queue và compensating action rõ.
+
+---
+
+#### 17. Những lỗi Step 1 thường gặp
+
+- Gọi mọi resource là “seat” mà không tách physical seat và show inventory.
+- Dùng một boolean `available` thay state machine/version/expiry.
+- Hứa seat availability UI “real-time tuyệt đối” trên mọi client.
+- Dùng cache/UI làm authority cho booking.
+- Giữ database row lock trong toàn bộ quá trình payment.
+- Hold chỉ dựa vào background cleanup; worker trễ thì correctness sai.
+- Cho client tự quyết định expiration hoặc price.
+- Payment success redirect từ browser được coi là bằng chứng cuối cùng.
+- Không dùng idempotency cho hold, checkout, webhook, cancel và refund.
+- Notification failure rollback booking.
+- Cố tăng availability bằng fail-open khi inventory authority unavailable.
+- Multi-region active-active writes cho cùng show mà không có ownership/fencing/protocol.
+- Không nêu fairness, bot, hoarding và waiting-room requirements.
+- Audit log mutable hoặc thiếu business IDs/state transitions.
+- Trộn booking, payment, ticket và notification thành một trạng thái duy nhất.
+
+---
+
+#### 18. Checklist hoàn tất Step 1
+
+- [ ] Ticket type: assigned seat hay general admission?
+- [ ] Actors, in-scope/out-of-scope journeys?
+- [ ] Event, show, venue, seat, inventory, hold, booking, payment và ticket được phân biệt?
+- [ ] No-double-booking invariant được viết rõ?
+- [ ] Seat và booking state machines?
+- [ ] Hold TTL, ownership, renewal và expiry semantics?
+- [ ] All-or-nothing hay partial multi-seat hold?
+- [ ] Price snapshot/tax/fee/currency authority?
+- [ ] Payment timeout/unknown/late-success policy?
+- [ ] Idempotency và reconciliation requirements?
+- [ ] Cancellation/refund/release/resale semantics?
+- [ ] UI availability staleness và authoritative hold check?
+- [ ] Browse, booking và notification availability/degraded modes?
+- [ ] Latency SLO thực tế theo từng path?
+- [ ] Global reads và event home-region write authority?
+- [ ] Flash-sale fairness, waiting room, bot/hoarding controls?
+- [ ] Security, PII/payment scope và webhook verification?
+- [ ] Audit fields, retention và support workflow?
+- [ ] Inputs cần cho scale estimation đã đủ?
+
+#### 19. Ý chính cần nhớ
+
+- Ticketing là bài toán inventory hữu hạn dưới contention và financial uncertainty.
+- ShowSeat/InventoryUnit—not physical Seat—là đơn vị được hold/book theo show.
+- UI availability có thể stale; authoritative hold transition phải atomic.
+- Core invariant là không có hơn một confirmed booking cho cùng show-seat.
+- Hold là durable lease có expiry, không phải database/process lock giữ suốt payment.
+- Expiration worker hỗ trợ cleanup nhưng authoritative expiry rule mới bảo đảm correctness.
+- Payment và booking là hai state machines; retry/webhook phải idempotent và reconcile được.
+- Không giữ distributed transaction xuyên payment provider.
+- Notification là async side effect, không quyết định booking correctness.
+- Browse/search ưu tiên availability; inventory writes ưu tiên correctness và fail-safe.
+- Single home-region/writer per show là baseline đơn giản cho global platform.
+- Virtual waiting room bảo vệ capacity/fairness nhưng không thay inventory transaction.
+- Audit/reconciliation/support workflows là functional requirements của hệ thống tài chính.
+- Step 2 phải tập trung vào concurrent behavior, flash-sale burst và hold conversion—not chỉ total users.
+
+#### Công thức ghi nhớ
+
+> **Ticketing correctness = authoritative inventory state machine + expiring holds + idempotent payment/booking workflow + no-double-booking invariant + audit/reconciliation.**
+
+---
+
+### Bài 69. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của Step 2
+
+Ticketing không thể được dimension chỉ bằng DAU hoặc requests/ngày. Cần mô hình hóa đồng thời:
+
+- average traffic;
+- flash-sale peak và ramp-up trong vài giây;
+- số users cùng tranh một show/section/seat;
+- tỷ lệ hold/booking/payment thành công;
+- số side effects cho mỗi booking attempt;
+- hold TTL và số holds đang tồn tại;
+- payment latency/timeout và requests đang in-flight;
+- bot refresh/retry/webhook amplification;
+- inventory skew theo event.
+
+Mục tiêu không phải dự báo chính xác tuyệt đối mà tìm **đúng bottleneck và correctness boundary** trước khi chọn kiến trúc.
+
+---
+
+#### 2. Assumptions của transcript
+
+| Biến | Giá trị giả định |
+|---|---:|
+| Daily active users | 1 triệu |
+| Concurrent users trong major launch | 100 nghìn |
+| Event views/user/day | 10 |
+| Bookings/ngày | 500 nghìn |
+| Peak booking rate | 2.000 bookings/giây |
+
+Bài 68 nêu 5 triệu registered users; điều này không mâu thuẫn với 1 triệu DAU nếu hiểu registered base lớn hơn active base.
+
+Các biến còn thiếu và phải hỏi:
+
+- “2.000 bookings/s” là attempts, holds, checkout starts hay confirmed bookings?
+- Số ghế trung bình/booking?
+- Tỷ lệ hold success, payment start, payment success và abandonment?
+- Users refresh seat map bao lâu một lần?
+- Một event view tạo bao nhiêu API/subresource requests?
+- Hold TTL và payment latency distribution?
+- Số seats/show, số hot shows chạy đồng thời?
+- Bot/crawler multiplier và retry rate?
+- Notification channels/recipients trên mỗi booking?
+
+Không phân biệt attempt với success sẽ làm capacity và revenue/inventory model sai rất lớn.
+
+---
+
+#### 3. Browse/read traffic
+
+Theo transcript:
+
+```text
+Daily event views
+= 1,000,000 DAU × 10 views/user/day
+= 10,000,000 views/day
+
+Average view RPS
+= 10,000,000 / 86,400
+≈ 116 views/second
+```
+
+Con số 116 RPS average khá nhỏ, nhưng “event view” là business action, không nhất thiết bằng một HTTP request. Một screen có thể gọi:
+
+- event metadata;
+- showtimes;
+- venue/seat layout;
+- availability snapshot;
+- price tiers;
+- images/recommendations.
+
+Nếu mỗi view tạo `k` API calls:
+
+```text
+Average API RPS ≈ 116 × k
+```
+
+Flash sale còn tạo polling/refresh:
+
+```text
+Seat-map RPS ≈ concurrent viewers / refresh interval
+
+100,000 viewers / 2 seconds = 50,000 RPS
+100,000 viewers / 10 seconds = 10,000 RPS
+```
+
+Đây là lý do tránh full polling tần suất cao. Cần CDN/cache cho static catalog/layout, versioned availability snapshots và có thể push/delta updates hoặc adaptive polling.
+
+---
+
+#### 4. Booking traffic
+
+```text
+Average confirmed bookings/s
+= 500,000 / 86,400
+≈ 5.79 ≈ 6 bookings/s
+```
+
+Transcript dùng peak `2.000 bookings/s`:
+
+```text
+Peak factor ≈ 2,000 / 5.79 ≈ 345× average
+```
+
+Đây là workload cực kỳ bursty. Tuy nhiên nên gọi rõ:
+
+- **Booking attempts/s:** requests cố hold/checkout.
+- **Successful holds/s:** requests thắng inventory.
+- **Confirmed bookings/s:** payment + inventory commit thành công.
+
+Với inventory hữu hạn, attempts có thể cao hơn success hàng chục/hàng trăm lần khi gần sold out. Hệ thống thường bottleneck ở contention/admission trước khi đạt 2.000 confirmed bookings/s.
+
+---
+
+#### 5. Read-heavy toàn cục, write-contentious cục bộ
+
+Transcript kết luận hệ thống read-heavy là đúng ở cấp platform:
+
+```text
+10 triệu event views/ngày
+so với 500 nghìn bookings/ngày
+≈ 20 : 1 theo business actions
+```
+
+Nhưng ratio này che hai điều:
+
+1. Một booking gồm nhiều writes/events.
+2. Writes tập trung vào cùng `show_id`/section/seat trong flash sale.
+
+Vì vậy workload profile chính xác hơn:
+
+> Browse/search là read-heavy và cache-friendly; inventory booking là low-volume trung bình nhưng **high-contention, correctness-sensitive và bursty**.
+
+Không thể dùng cùng caching/consistency strategy cho event catalog và seat authority.
+
+---
+
+#### 6. Write amplification trên một booking
+
+Một confirmed booking có thể gây ra:
+
+```text
+hold create/update
+inventory state transitions cho N seats
+booking/order row
+booking items
+payment attempt + provider references
+outbox/domain events
+ticket issuance records
+audit entries
+notification tasks
+analytics/fraud events
+```
+
+Nếu trung bình `s` seats/booking và `w` records/events ngoài seat rows:
+
+```text
+Logical write operations/booking ≈ s + w
+Peak logical writes/s ≈ peak confirmed bookings/s × (s + w)
+```
+
+Ví dụ minh họa, không phải assumption chính thức:
+
+```text
+2 seats/booking + 8 supporting writes/events
+2,000 bookings/s × 10 ≈ 20,000 logical writes/events/s
+```
+
+Database, queue và audit pipeline phải dimension theo write amplification, không chỉ booking count.
+
+---
+
+#### 7. Hold concurrency theo Little’s Law
+
+Ước lượng số holds đang sống:
+
+```text
+Concurrent holds ≈ successful hold creation rate × average hold duration
+```
+
+Nếu cho rằng 2.000 holds/s và TTL trung bình 5 phút:
+
+```text
+2,000 × 300 seconds = 600,000 concurrent holds
+```
+
+Đây có thể vượt xa số ghế của một event. Thực tế hold success bị giới hạn bởi inventory; phần lớn attempts phải bị reject/admission-controlled khi inventory cạn.
+
+Hệ quả:
+
+- không cho mọi user tạo hold trước khi qua waiting room/quota;
+- cần index/timer/expiry processing đủ cho số active holds;
+- release burst có thể xảy ra khi nhiều holds cùng hết hạn;
+- TTL jitter không áp tùy tiện nếu fairness/product hứa thời hạn chính xác, nhưng expiry buckets/work distribution phải tránh thundering herd;
+- hold renewal phải bị giới hạn để ngăn hoarding.
+
+---
+
+#### 8. Payment concurrency
+
+Payment in-flight cũng theo Little’s Law:
+
+```text
+Concurrent payment attempts
+≈ payment starts/second × average provider latency
+```
+
+Ví dụ:
+
+```text
+2,000 starts/s × 5 seconds = 10,000 in-flight attempts
+2,000 starts/s × 20 seconds = 40,000 in-flight attempts
+```
+
+Cần capacity cho:
+
+- outbound connections và provider rate limits;
+- pending payment state;
+- timeout/retry/webhook processing;
+- reconciliation backlog;
+- hold extensions hoặc late-success policy.
+
+Không để request thread/DB transaction giữ tài nguyên không giới hạn trong lúc chờ provider. Async completion/polling/webhook có thể phù hợp hơn với payment chậm.
+
+---
+
+#### 9. Storage estimate theo công thức
+
+Transcript không cung cấp record size nên không nên bịa một con số duy nhất. Dùng mô hình:
+
+```text
+Booking storage/day
+= bookings/day × average durable bytes/booking
+
+Hold churn/day
+= hold attempts/day × hold/audit bytes
+
+Audit/event storage/day
+= state transitions/day × event bytes
+```
+
+Ví dụ nếu core booking + items + payment references trung bình 2 KB:
+
+```text
+500,000 × 2 KB ≈ 1 GB/day raw core booking data
+≈ 365 GB/year trước indexes, replicas, logs, backups và audit
+```
+
+Nếu giữ mọi failed hold/payment attempt và event, operational/audit data có thể lớn hơn confirmed booking rows. Cần retention/tiering khác nhau:
+
+- booking/payment/ticket ledger: dài hạn theo business/compliance;
+- active holds: ngắn hạn, nhưng audit summary có thể giữ lâu hơn;
+- raw click/search/seat-map telemetry: aggregate/tier nhanh;
+- notification payload/log: retention tối thiểu cần thiết.
+
+---
+
+#### 10. Bottleneck 1 — Seat-allocation race
+
+Naive flow:
+
+```text
+Request A: đọc AVAILABLE
+Request B: đọc AVAILABLE
+Request A: ghi BOOKED
+Request B: ghi BOOKED
+→ double booking
+```
+
+Đây là check-then-act race. Cần atomic transition tại inventory authority:
+
+```text
+UPDATE show_seat
+SET state='HELD', hold_id=?, expires_at=?, version=version+1
+WHERE show_id=? AND seat_id=?
+  AND (
+       state='AVAILABLE'
+       OR (state='HELD' AND expires_at <= authoritative_now)
+      )
+```
+
+Success chỉ khi affected row/version đúng như expected. Với nhiều seats, transaction cần all-or-nothing hoặc contract partial rõ.
+
+Các lựa chọn sau này có thể là pessimistic row lock, optimistic concurrency/CAS, serializable transaction, partition-owner command processing hoặc conditional write. Bất kể kỹ thuật, invariant phải nằm ở authoritative store/process có fencing và durability.
+
+---
+
+#### 11. Bottleneck 2 — Hot show/partition contention
+
+Traffic không phân bố đều. Một concert có thể nhận gần như toàn bộ booking attempts:
+
+- cùng `show_id` partition;
+- cùng section/price tier;
+- thậm chí cùng vài “ghế đẹp”.
+
+Rủi ro:
+
+- row/index lock contention;
+- transaction abort/retry storm;
+- hot database partition/leader;
+- queue partition quá tải;
+- cache invalidation/update fan-out lớn;
+- fairness bị phụ thuộc scheduling/timing ngẫu nhiên.
+
+Mitigations định hướng:
+
+- waiting room/admission control theo show;
+- partition inventory theo `show_id` và có single write authority/owner;
+- serialize/sequence commands theo show hoặc subpartition nếu throughput yêu cầu;
+- giảm shared counters/rows;
+- bounded optimistic retries với jitter;
+- expose sold-out nhanh để ngừng request vô ích;
+- quota theo section/account;
+- load test skewed key, không chỉ uniform traffic.
+
+Sharding theo user ID không giúp khi contention nằm ở show inventory.
+
+---
+
+#### 12. Bottleneck 3 — Database write pressure
+
+Mỗi booking tạo nhiều writes và indexes. Khi DB chậm:
+
+- hold latency tăng, user retry;
+- retries khuếch đại load;
+- locks sống lâu hơn và contention nặng hơn;
+- connection pool đầy;
+- payment có thể hoàn tất trong khi booking commit chưa rõ;
+- queue/outbox lag tăng.
+
+Controls:
+
+- transaction nhỏ và ngắn;
+- không gọi external provider trong DB transaction;
+- indexes tối thiểu cho hot write tables;
+- connection-pool budget/admission;
+- partition/locality theo show;
+- outbox batch relay;
+- backpressure/load shedding;
+- idempotent retry chỉ cho transient errors;
+- pre-sale capacity/load test với real contention pattern.
+
+Scale-out stateless API instances không giúp nếu authoritative DB đã saturated; thậm chí còn tạo connection storm.
+
+---
+
+#### 13. Bottleneck 4 — Payment provider
+
+External payment có latency, quota, timeout, duplicate callback và unknown result.
+
+Rủi ro:
+
+- seat bị giữ quá lâu do provider chậm;
+- client timeout rồi retry tạo nhiều payment attempts;
+- provider capture thành công nhưng response/webhook mất;
+- booking hết hạn trước late success;
+- circuit open làm conversion giảm nhưng bảo vệ hệ thống;
+- một provider outage chặn toàn bộ checkout.
+
+Mitigations:
+
+- stable `booking_id/payment_attempt_id/idempotency_key`;
+- provider timeout và retry policy theo API contract;
+- signed webhook + replay protection;
+- async state machine và reconciliation;
+- clear late-success/refund/grace policy;
+- multiple providers/routing nếu business justification, không phải immediate retry mù;
+- bulkhead/circuit breaker và provider-specific queues/limits;
+- không release/confirm inventory bằng client redirect đơn thuần.
+
+Payment bottleneck là reliability/correctness boundary, không chỉ latency.
+
+---
+
+#### 14. Bottleneck 5 — Hold expiry/release
+
+Khi users abandon checkout, holds cần tự release.
+
+Scale concerns:
+
+- hàng trăm nghìn timers;
+- many holds expire cùng lúc sau launch wave;
+- delayed message có thể duplicate hoặc đến muộn;
+- worker crash/retry;
+- race giữa expiry và payment success;
+- stale seat-map projection sau release.
+
+Correctness rule:
+
+> `expires_at` và current state/version ở inventory authority quyết định hold còn hợp lệ; timer/worker chỉ kích hoạt cleanup, không định nghĩa sự thật.
+
+Worker phải idempotent:
+
+```text
+release only if
+  state = HELD
+  AND hold_id = expected_hold_id
+  AND expires_at <= authoritative_now
+```
+
+Nếu state đã BOOKED hoặc hold được gia hạn/version đổi, expired message cũ không được release seat.
+
+---
+
+#### 15. Bottleneck 6 — Seat-map read/update fan-out
+
+100 nghìn concurrent users polling toàn bộ seat map gây:
+
+- read QPS lớn;
+- payload/bandwidth cao;
+- cache churn;
+- UI stale vẫn không tránh được race;
+- WebSocket server/fan-out load nếu push mọi seat transition tới mọi client.
+
+Thiết kế cần cân bằng:
+
+- static venue layout cache/CDN;
+- dynamic availability projection theo show/version;
+- delta updates hoặc section-level snapshot;
+- adaptive polling/backoff;
+- WebSocket/SSE chỉ khi fan-out capacity/ordering/drop semantics rõ;
+- coalesce updates thay vì push từng click/attempt;
+- client refresh authoritative result khi hold conflict.
+
+Push “real-time” không làm client trở thành authority và không loại bỏ transaction check khi hold.
+
+---
+
+#### 16. Bottleneck 7 — Notification burst
+
+Nếu 500 nghìn confirmed bookings/ngày:
+
+```text
+Average booking notifications ≈ 5.79/s × channels/booking
+```
+
+Trong flash sale, 2.000 confirmations/s có thể tạo:
+
+- email + SMS + push = nhiều tasks/booking;
+- provider quotas và rate limits;
+- retry/backoff backlog;
+- duplicate sends;
+- template/personalization cost.
+
+Notification phải async:
+
+```text
+BookingConfirmed event
+  → Notification Queue
+  → channel-specific workers
+  → provider
+```
+
+Booking API trả confirmation từ authoritative state, không chờ email/SMS. Cần idempotency theo `(booking_id, notification_type, channel, template_version)` và DLQ/manual replay.
+
+---
+
+#### 17. Bottleneck 8 — Waiting room/admission
+
+Với 100 nghìn concurrent users nhưng inventory/booking authority chỉ chịu safe capacity thấp hơn, cần kiểm soát admission:
+
+```text
+arrival rate λ
+  → waiting room
+  → release rate ≤ safe booking capacity μ
+```
+
+Nếu `λ > μ` kéo dài, queue/wait time tăng; không hệ thống nào “autoscale vô hạn” để vượt constraint inventory/payment/database.
+
+Waiting room cần:
+
+- signed, short-lived, scoped admission token;
+- fair ordering/randomization policy;
+- per-event queue và release rate;
+- bot/account/device controls;
+- queue position/wait estimate với caveat;
+- multi-tab/reconnect semantics;
+- protection khỏi token sharing/replay;
+- HA và capacity cao hơn protected origin.
+
+Admission rate phải điều chỉnh theo DB/payment latency/error, không chỉ CPU.
+
+---
+
+#### 18. Bottleneck 9 — Cache và stale inventory
+
+Event metadata, venue layout, showtimes và prices versioned có thể cache mạnh. Seat availability cần thận trọng:
+
+- cache/projection dùng cho display;
+- hold/booking không tin cache là authority;
+- invalidation lag gây UX conflict nhưng không được gây double booking;
+- negative/sold-out cache có TTL/purge policy;
+- hot show có thể làm một cache key quá lớn/hot;
+- refresh wave có thể tạo cache stampede.
+
+Khi inventory store unavailable, fail-safe hold/booking thay vì dùng stale cache để cấp seat. Browse có thể tiếp tục ở degraded mode.
+
+---
+
+#### 19. Bottleneck 10 — Multi-region và failover
+
+Global users muốn latency thấp nhưng same-show inventory cần một write authority.
+
+Rủi ro:
+
+- route nhầm region sau failover;
+- old region vẫn nhận writes → split-brain/double booking;
+- replication lag làm seat map stale;
+- in-flight holds/payment callbacks tới region cũ;
+- waiting-room/admission tokens không hợp lệ sau cutover;
+- clocks/expiry interpretation khác nhau.
+
+Baseline:
+
+- event/show có home region/owner epoch;
+- global reads/projections/caches;
+- booking commands route tới owner;
+- failover có fencing/epoch change và controlled recovery;
+- không failover chỉ vì transient latency nếu nguy cơ hai writers cùng hoạt động;
+- payment/webhooks định tuyến/idempotently process theo booking ID.
+
+Correctness có thể yêu cầu fail-closed ngắn hạn trong failover thay vì bán trùng.
+
+---
+
+#### 20. Tổng hợp bottlenecks
+
+| Bottleneck | Loại vấn đề | Control direction |
+|---|---|---|
+| Seat race | Correctness | Atomic state transition/CAS/transaction |
+| Hot show | Contention/skew | Per-show admission, ownership/partitioning |
+| DB writes | Capacity/reliability | Short transactions, backpressure, pool budget |
+| Payment | External uncertainty | Idempotency, state machine, webhook/reconciliation |
+| Hold expiry | Temporal correctness | Authoritative expiry + idempotent cleanup |
+| Seat-map fan-out | Read scale/UX | Static cache + dynamic projection/deltas |
+| Notifications | Async burst | Queue, workers, provider limits, dedup |
+| Waiting room | Admission/fairness | Signed tokens, release rate ≤ safe capacity |
+| Cache staleness | UX/correctness boundary | Cache for display, authority recheck for hold |
+| Multi-region | Ownership/failover | Home region, fencing, epoch, DR workflow |
+
+---
+
+#### 21. Capacity model theo path
+
+| Path | Capacity driver | Scale strategy |
+|---|---|---|
+| Search/catalog | query/read QPS | CDN/cache/search replicas/index |
+| Seat-map view | concurrent viewers × refresh rate | cached projection, delta/push, coalescing |
+| Hold | attempts/s × seats + contention | admission, partition owner, atomic transition |
+| Checkout/payment | starts/s × provider latency | async state, connection/queue/provider limits |
+| Confirmation | confirmed bookings/s | DB commit + outbox |
+| Expiry | active holds/TTL buckets | delayed work + authoritative conditional release |
+| Notification | confirmations × channels | queue/worker/provider quota |
+| Audit/analytics | transitions/events per action | append/batch/tier/retention |
+
+Điều quan trọng là dimension mỗi path độc lập và định nghĩa overload/degraded behavior riêng.
+
+---
+
+#### 22. SLO và overload policy
+
+##### Browse/search
+
+- Ưu tiên availability và cacheability.
+- Có thể trả dữ liệu hơi stale/versioned.
+
+##### Seat map
+
+- Ưu tiên latency và bounded freshness.
+- Khi projection lag, hiển thị warning/refresh; hold vẫn authoritative.
+
+##### Hold/confirm
+
+- Ưu tiên correctness.
+- Khi inventory authority saturated/unavailable: reject/queue rõ ràng, không fail-open.
+- `429/503` kèm retry/admission guidance có thể tốt hơn timeout.
+
+##### Payment
+
+- Trạng thái pending/unknown phải quan sát được.
+- Không retry capture mù.
+
+##### Notification
+
+- Có thể backlog; booking vẫn confirmed.
+
+Error budget không được “tiêu” bằng double booking hoặc charge sai. Correctness invariant là hard boundary, khác availability SLO.
+
+---
+
+#### 23. Load-test scenarios
+
+Không chỉ test uniform RPS:
+
+1. 100 nghìn users đồng thời vào một show.
+2. 90% attempts tranh top 1% seats.
+3. Một ghế cuối nhận hàng nghìn hold attempts.
+4. Seat map refresh mỗi 2 giây.
+5. Payment latency tăng từ 3s lên 30s và timeout/late webhook.
+6. 50% holds bị abandon rồi expire cùng wave.
+7. DB connection pool gần đầy, transaction abort/retry.
+8. Cache cold start hoặc projection lag.
+9. Notification provider rate limit/outage.
+10. Home-region failover với in-flight holds/payments.
+11. Bot traffic và invalid/replayed admission tokens.
+12. Queue redelivery/duplicate webhook/worker restart.
+
+Pass criteria gồm no double booking, no duplicate charge/business effect, bounded queue/latency, accurate reconciliation và controlled degradation—not chỉ throughput.
+
+---
+
+#### 24. Metrics và evolution triggers
+
+##### Inventory
+
+- hold attempts/s, success/conflict/expiry rate;
+- transaction/CAS conflict, abort và retry count;
+- lock wait/time, hot show/seat distribution;
+- active holds, expiry lag và release latency;
+- double-booking invariant violations phải bằng 0.
+
+##### Booking/payment
+
+- checkout starts, confirmation rate/latency;
+- payment pending/unknown/late-success;
+- webhook duplicate/signature failure;
+- reconciliation mismatch và age;
+- refund backlog.
+
+##### Read/admission
+
+- concurrent viewers, seat-map RPS/payload/cache hit;
+- projection lag/version age;
+- waiting-room depth/wait/release rate;
+- admitted vs rejected/bot traffic;
+- refresh/retry amplification.
+
+##### Async
+
+- outbox/queue lag, oldest message age;
+- notification provider latency/quota/error;
+- DLQ depth và replay success;
+- audit/event storage growth.
+
+Metrics phải gắn với auto/admission policy và runbook, không chỉ dashboard.
+
+---
+
+#### 25. Những lỗi scale estimation thường gặp
+
+- Dùng 1 triệu DAU nhưng không tính hành vi/concurrency/refresh interval.
+- Gọi 10 triệu event views là 10 triệu HTTP requests.
+- Dùng 6 bookings/s average để dimension flash sale.
+- Nói 2.000 bookings/s nhưng không phân biệt attempts, holds và confirmations.
+- Không nhân write amplification theo seats, payment, outbox, ticket và audit.
+- Không tính active holds theo TTL.
+- Không tính payment in-flight theo provider latency.
+- Scale stateless API nhưng bỏ DB contention và connection budget.
+- Shard theo user dù hot key là show/seat.
+- Dùng cache để quyết định seat còn available.
+- Push WebSocket mọi update mà không tính fan-out/coalescing.
+- Dùng autoscaling thay waiting room/admission control.
+- Bỏ qua bot, retry, duplicate webhook và notification amplification.
+- Chỉ test uniform load, không test one-seat/hot-show contention.
+- Tối ưu availability bằng fail-open trong inventory path.
+
+---
+
+#### 26. Checklist Step 2
+
+- [ ] DAU, concurrent users và action interval/RPS?
+- [ ] Business action khác HTTP/API call ra sao?
+- [ ] Average, peak và ramp-up trong 1/10/60 giây?
+- [ ] Attempts, successful holds và confirmed bookings tách riêng?
+- [ ] Seats/booking và write/event amplification?
+- [ ] Hold TTL, success/abandonment và concurrent active holds?
+- [ ] Payment starts, latency percentiles, in-flight và provider quota?
+- [ ] Browse/seat-map polling/push fan-out?
+- [ ] Event/show/seat traffic skew và hottest partition?
+- [ ] Static vs dynamic/cacheable data?
+- [ ] Booking/payment/audit/telemetry storage và retention?
+- [ ] Waiting-room admission rate so với safe booking capacity?
+- [ ] DB transaction/connection/contention budget?
+- [ ] Expiry/notification/webhook/reconciliation backlogs?
+- [ ] Multi-region owner/failover and in-flight work?
+- [ ] Degraded/overload policy theo từng path?
+- [ ] Load tests mô phỏng hot keys và dependency failure?
+- [ ] Metrics/triggers nối tới kiến trúc và operations?
+
+#### 27. Ý chính cần nhớ
+
+- 10 triệu event views/ngày tương đương khoảng 116 business views/s average, chưa phải HTTP RPS thực.
+- 500 nghìn bookings/ngày tương đương khoảng 5.79/s average; peak 2.000/s lớn hơn khoảng 345 lần.
+- Ticketing read-heavy ở cấp platform nhưng booking writes cực bursty và contentious theo show/seat.
+- Booking attempts thường lớn hơn successful holds và confirmed bookings rất nhiều.
+- Write amplification gồm seats, hold, booking, payment, ticket, outbox, audit và notification events.
+- Active holds xấp xỉ hold rate × hold duration; payment in-flight xấp xỉ start rate × provider latency.
+- Seat race phải được giải quyết bằng atomic authoritative transition, không check-then-act.
+- Waiting room điều tiết arrival rate về dưới safe capacity và hỗ trợ fairness.
+- Payment, expiry, notifications và multi-region failover là correctness/reliability bottlenecks.
+- Seat-map cache/projection phục vụ UX; hold authority quyết định sự thật.
+- Scale-out API không sửa hot partition/DB contention và có thể tạo connection storm.
+- Load test phải dùng skew, one-seat contention, expiry wave và provider failure—not uniform traffic.
+- Step 2 tốt luôn nối **assumption → derived load → bottleneck → control direction → metric**.
+
+#### Công thức ghi nhớ
+
+> **Ticketing scale = huge read fan-out + flash-sale arrival burst + hot-show contention + expiring-hold population + payment uncertainty + amplified async work.**
+
+---
+
+### Bài 70. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của Step 3
+
+High-level design phải biến invariants và bottlenecks thành:
+
+- service boundaries cùng data ownership;
+- public/admin/internal APIs;
+- authoritative booking path và scalable read path;
+- state machines cho hold, booking, payment và ticket;
+- communication sync/async;
+- concurrency, expiry, idempotency và reconciliation semantics;
+- failure/degraded modes;
+- security, audit và observability boundaries.
+
+Không cần tách mọi logical responsibility thành một microservice ngay từ đầu. Boundary trước hết giúp reasoning; deployment split chỉ xảy ra khi scale, fault isolation, security hoặc team ownership biện minh.
+
+---
+
+#### 2. Kiến trúc high-level
+
+```text
+Web / Mobile / Admin Portal
+            │
+    CDN / WAF / Waiting Room
+            │ signed admission token cho hot sale
+            ▼
+       API Gateway / BFF
+            │
+ ┌──────────┼───────────────┬────────────────┬─────────────┐
+ │          │               │                │             │
+ ▼          ▼               ▼                ▼             ▼
+Catalog   Search       Seat Inventory      Booking      Identity/IdP
+Service  Service          Service        Orchestrator
+ │          │               │                │
+ │          │               │                ├──────────────▶ Payment Service
+ │          │               │                │                    │
+ │          │               │                │                    ▼
+ │          │               │                │             Payment Provider(s)
+ │          │               │                │
+ │          │               │                └── outbox/events ─────┐
+ │          │               │                                      │
+ ▼          ▼               ▼                                      ▼
+Catalog DB Search Index  Inventory DB                          Queue/Event Log
+ │                          (authority)                           │      │
+ └── cache/CDN                  │                                 │      ├─ Notification
+                               └─ change events → Seat Read Model│      ├─ Ticket issuance
+                                                    / Cache      │      ├─ Audit/analytics
+                                                                 │      └─ Reconciliation
+                                                                 ▼
+                                                            Booking DB
+```
+
+Một event/show có **home region/inventory owner**. Browse/search/read projections có thể phân phối toàn cầu; hold/confirm commands được route tới authoritative region của show.
+
+---
+
+#### 3. Edge, frontend và API Gateway
+
+##### Web/mobile frontend
+
+- Browse/search event.
+- Render static venue layout và dynamic availability projection.
+- Gửi hold/checkout requests với idempotency keys.
+- Hiển thị server-provided countdown nhưng không tự quyết định hold expiry.
+- Poll hoặc subscribe booking/payment status khi workflow bất đồng bộ.
+
+##### Admin portal
+
+- Organizer/admin tạo event, show, layout, price và sales rules.
+- Separate admin domain/path, strong AuthZ/MFA và audit.
+- Draft/publish/version workflow để tránh edit live inventory tùy tiện.
+
+##### CDN/WAF/waiting room
+
+- Cache static assets, catalog/media và venue layout.
+- DDoS/bot filtering.
+- Virtual waiting room cho hot show trước inventory bottleneck.
+- Signed, scoped, short-lived admission token.
+
+##### API Gateway/BFF
+
+- Route/version APIs.
+- Validate token/session và coarse scopes.
+- Rate limit/quota/request size.
+- Correlation/admission context propagation.
+- Optional response aggregation cho mobile/web.
+
+Gateway không thay object-level authorization hoặc inventory correctness trong backend.
+
+---
+
+#### 4. Identity Service/IdP
+
+Thay vì mỗi service tự xử lý password/login, dùng Identity Provider/OIDC hoặc Auth Service chuyên biệt:
+
+- registration/login/MFA/federation;
+- access/refresh token hoặc session lifecycle;
+- user/service identities;
+- revocation và audit.
+
+Business services verify token theo contract và vẫn kiểm tra:
+
+- customer có sở hữu hold/booking không;
+- organizer có quản lý event/show này không;
+- support/admin action có đúng role, tenant và approval context không.
+
+Không cần gọi Identity Service đồng bộ trên mọi request nếu signed token có thể verify local và freshness/revocation model cho phép.
+
+---
+
+#### 5. Catalog/Event Management Service
+
+Sở hữu:
+
+- event metadata;
+- venues và versioned seat layouts;
+- shows/schedules;
+- sales window, organizer ownership;
+- price rules/tiers và blocked allocations ở mức cấu hình.
+
+Không trực tiếp quyết định seat hiện tại AVAILABLE/HELD/BOOKED; đó là Inventory Service.
+
+Admin publish flow:
+
+```text
+Organizer → create/update draft event/show/layout
+          → validate conflicts/capacity/pricing
+          → publish immutable/versioned show configuration
+          → initialize inventory units
+          → emit Catalog/ShowPublished events
+          → update search/cache projections
+```
+
+Sau khi sales bắt đầu, thay layout/seat identifiers cần migration/version policy nghiêm ngặt.
+
+---
+
+#### 6. Search Service
+
+Catalog database là source of truth; search index là derived projection cho:
+
+- full-text query;
+- city/date/category/language filters;
+- sorting/ranking/facets;
+- geo queries khi cần.
+
+```text
+Catalog change → outbox/event → indexer → Search Index
+```
+
+Search có eventual consistency. Search outage không nên ảnh hưởng active booking nếu user đã có show ID; có thể degrade sang curated/catalog queries hạn chế.
+
+Seat-level live availability không nên được cập nhật vào full search index cho mỗi transition. Có thể index coarse states như available/sold-out với bounded delay.
+
+---
+
+#### 7. Seat Inventory Service
+
+Đây là **authoritative owner** của ShowSeat/InventoryUnit state:
+
+```text
+AVAILABLE → HELD → BOOKED
+     ▲         │
+     └─────────┘ expiry/release
+
+AVAILABLE/HELD/BOOKED ↔ BLOCKED theo privileged policy
+```
+
+Responsibilities:
+
+- atomic multi-seat hold/release/commit;
+- enforce no-double-booking invariant;
+- validate hold owner, TTL, version và show sales window;
+- maintain authoritative server time/expiry rule;
+- expose command API và versioned read/query API;
+- emit inventory change events;
+- partition/route theo show ownership;
+- audit admin block/unblock/override.
+
+Inventory store—not Redis cache—must be final arbiter.
+
+---
+
+#### 8. Booking Service / Orchestrator
+
+Booking Service điều phối workflow thay vì tự sở hữu mọi logic:
+
+```text
+create booking intent
+  → request/validate hold
+  → create payment attempt
+  → wait/process payment outcome
+  → atomically commit inventory to BOOKED
+  → confirm booking
+  → emit BookingConfirmed
+  → ticket + notification async
+```
+
+Nó sở hữu:
+
+- booking/order state machine;
+- customer/price/fee snapshots;
+- relationship tới hold và payment attempts;
+- idempotency keys;
+- saga steps/compensations;
+- cancellation/refund orchestration;
+- reconciliation status.
+
+Không giữ một synchronous distributed transaction qua Inventory, Payment Provider và Notification.
+
+---
+
+#### 9. Payment Service
+
+Payment Service là anti-corruption layer giữa domain và provider-specific APIs:
+
+- create/authorize/capture/refund payment;
+- map internal payment attempt tới provider reference;
+- provider-specific timeout/retry/idempotency;
+- verify signed webhook, timestamp và replay;
+- normalize provider states/errors;
+- reconcile unknown/late results;
+- isolate provider credentials/PCI scope.
+
+Không “retry failed payment” từ queue một cách mù quáng. Chỉ retry operation khi provider contract và idempotency semantics chứng minh an toàn. Một timeout có thể là **unknown outcome**, không đồng nghĩa failed.
+
+---
+
+#### 10. Ticket Service
+
+Sau `BookingConfirmed`:
+
+- tạo ticket identifiers/barcode/QR;
+- bind ticket với booking items/show/seat;
+- sign/protect token để chống giả mạo;
+- support validation/check-in/revocation;
+- xử lý resend/download.
+
+Ticket issuance có thể async nếu booking confirmation đã authoritative, nhưng UX/SLO cần rõ. Consumer phải idempotent để event redelivery không phát hành nhiều logical tickets.
+
+---
+
+#### 11. Notification Service
+
+Nhận domain events và gửi email/SMS/push:
+
+```text
+BookingConfirmed / BookingCancelled / RefundCompleted
+        → Notification Queue
+        → channel workers
+        → providers
+```
+
+Responsibilities:
+
+- template/version/localization;
+- per-channel provider limits;
+- retry/backoff và DLQ;
+- idempotency/dedup;
+- delivery status và support resend;
+- redact/minimize PII.
+
+Notification failure không rollback booking/payment.
+
+---
+
+#### 12. Audit và reconciliation
+
+Audit stream phải chứa immutable business transitions và actor/context, không chỉ application debug logs.
+
+Reliable publish:
+
+```text
+Service transaction
+  → business state + outbox row commit atomically
+  → outbox relay/CDC
+  → Event Log/Audit Store/Consumers
+```
+
+Reconciliation workers:
+
+- so Booking DB với Payment Provider records;
+- phát hiện charged-but-unconfirmed hoặc confirmed-without-valid-payment;
+- kiểm tra ticket/booking mismatch;
+- age pending/unknown states;
+- tạo compensating action/manual-review task.
+
+Audit async transport được phép, nhưng creation của audit/outbox evidence cho critical state change phải nằm trong cùng reliable commit boundary.
+
+---
+
+#### 13. Data ownership
+
+| Domain | Source of truth | Derived/read models |
+|---|---|---|
+| Catalog/event/show/layout | Catalog DB | CDN/cache, Search Index |
+| Seat inventory/holds | Inventory DB/partition owner | Availability cache/projection |
+| Booking/order | Booking DB | Customer booking view/reporting |
+| Payment attempts | Payment DB/ledger + provider record | Reporting/reconciliation views |
+| Tickets | Ticket Store | Wallet/download/check-in cache |
+| Identity | IdP/Identity Store | Token/session verification cache |
+| Notifications | Notification task/delivery store | Delivery dashboard |
+| Audit | Append-only audit/event store | SIEM/analytics projections |
+
+“Một database cho mỗi service” không phải luật bắt buộc. Nhiều logical domains có thể dùng cùng relational cluster ban đầu nhưng tách schema/roles/ownership. Không service nào được ghi trực tiếp vào bảng do domain khác sở hữu.
+
+---
+
+#### 14. Chọn relational hay NoSQL ở mức HLD
+
+Transcript đề xuất relational DB cho user/booking/payment và NoSQL document DB cho event/seat layout. Đây là một option, không phải mapping bắt buộc.
+
+##### Relational phù hợp khi
+
+- booking/payment/inventory cần transaction, uniqueness, constraints và auditability;
+- venue/layout có quan hệ ổn định, cần versioning/query integrity;
+- team muốn giảm polyglot operational complexity.
+
+##### Document/NoSQL phù hợp khi
+
+- event/layout aggregate biến thiên rõ và thường đọc nguyên document;
+- access pattern/key/partition model đã biết;
+- horizontal scale/topology thực sự cần;
+- application chịu trách nhiệm invariants mà store không enforce.
+
+##### Search index phù hợp khi
+
+- full-text/filter/ranking/faceting;
+- chấp nhận eventual projection;
+- không là source of truth.
+
+Baseline thực dụng có thể là relational databases cho Catalog + Inventory + Booking/Payment, search index cho discovery và cache/read projection cho views. Chỉ thêm document DB khi schema/access patterns chứng minh lợi ích.
+
+---
+
+#### 15. Cache architecture
+
+Cacheable mạnh:
+
+- event metadata và images;
+- published show schedule;
+- immutable/versioned venue layout;
+- pricing rules/version snapshot khi publication semantics cho phép;
+- search/query results có TTL;
+- seat availability projection theo show/version.
+
+Không được dùng cache làm authority cho:
+
+- cấp hold;
+- commit seat BOOKED;
+- xác nhận payment/booking;
+- ownership/authorization quyết định nhạy cảm.
+
+Seat availability flow:
+
+```text
+Inventory authority
+  → InventoryChanged event
+  → projection updater
+  → Redis/read store/WebSocket-SSE broadcaster
+  → clients
+
+Client POST hold
+  → Inventory authority rechecks atomically
+```
+
+Cache có thể hơi stale và gây hold conflict UX, nhưng không được gây double booking.
+
+---
+
+#### 16. Seat hold: không dùng Redis TTL làm correctness authority
+
+Transcript đề xuất lưu hold trong Redis với TTL 5 phút. Nếu Redis chỉ là nguồn duy nhất:
+
+- eviction/failover/data loss có thể làm hold biến mất sớm;
+- TTL expiration không atomically đổi durable inventory;
+- cache split-brain hoặc clock/replication delay gây bất nhất;
+- payment success có thể đến sau key expiry;
+- không có reliable audit/reconciliation state.
+
+Thiết kế an toàn:
+
+```text
+Inventory DB authoritative row:
+  state = HELD
+  hold_id
+  hold_owner
+  hold_expires_at
+  version
+
+Redis:
+  optional fast projection/timer/index
+  không là arbiter
+```
+
+Expiry worker/delayed message:
+
+```text
+on HoldExpiryDue(hold_id, expected_version):
+  conditional release only if
+    state = HELD
+    hold_id/version still match
+    hold_expires_at <= authoritative_now
+```
+
+Redis TTL có thể kích hoạt cleanup hoặc hỗ trợ read path, nhưng durable conditional transition mới release inventory đúng.
+
+---
+
+#### 17. Concurrency control
+
+##### Optimistic concurrency
+
+```text
+UPDATE show_seat
+SET state='HELD', hold_id=?, version=version+1
+WHERE show_id=? AND seat_id=?
+  AND state='AVAILABLE'
+  AND version=?
+```
+
+- Tốt khi conflicts không quá cao.
+- Under hot sale, nhiều losers retry có thể tạo retry storm.
+- Retry phải bounded; user thường cần chọn ghế khác, không loop vô hạn.
+
+##### Pessimistic locking
+
+```text
+SELECT ... FOR UPDATE
+→ validate all seats
+→ update hold rows
+→ commit ngay
+```
+
+- Phù hợp short critical section với contention đã kiểm soát.
+- Cần deterministic lock ordering cho multi-seat hold để giảm deadlock.
+- Tuyệt đối không giữ lock trong lúc gọi payment provider/user checkout.
+
+##### Serialized partition-owner/command queue
+
+- Commands cho cùng show/partition được xử lý theo owner/ordered stream.
+- Giảm DB lock races và tạo fairness/ordering rõ hơn.
+- Owner throughput, failover/fencing và partition hotness trở thành trade-off.
+
+##### Chọn theo contention
+
+| Pattern | Khi phù hợp |
+|---|---|
+| Optimistic CAS | Conflict thấp/vừa, transaction đơn giản |
+| Pessimistic short lock | Contention cao nhưng admission giới hạn, DB transaction nhanh |
+| Partition owner/serialized commands | Hot show lớn, cần ordering/fairness/scale theo show |
+
+Dù chọn pattern nào, no-double-booking invariant phải có storage/process enforcement và recovery semantics.
+
+---
+
+#### 18. CQRS đúng nghĩa
+
+CQRS ở đây là tách logical models/paths:
+
+```text
+Write model:
+  atomic inventory commands, booking/payment state transitions
+
+Read model:
+  event search, seat-map projection, user booking view, dashboards
+```
+
+Lợi ích:
+
+- read side scale/cache/index độc lập;
+- write side tập trung correctness;
+- read schema/payload tối ưu cho UI.
+
+Trade-off:
+
+- projection lag/eventual consistency;
+- outbox/event delivery/dedup;
+- rebuild/version/migration;
+- user phải xử lý hold conflict dù UI vừa báo available.
+
+CQRS không bắt buộc separate database ngay lập tức và không tự yêu cầu event sourcing.
+
+---
+
+#### 19. API design — catalog/admin
+
+##### Public catalog
+
+```http
+GET /v1/events?city=HCM&date=2026-09-10&page_token=...
+GET /v1/events/{event_id}
+GET /v1/events/{event_id}/shows
+GET /v1/shows/{show_id}
+GET /v1/shows/{show_id}/seats?section=A&version=...
+```
+
+List APIs cần cursor pagination, filter bounds và cache semantics.
+
+##### Admin
+
+```http
+POST  /v1/admin/events
+PATCH /v1/admin/events/{event_id}
+POST  /v1/admin/events/{event_id}/shows
+POST  /v1/admin/shows/{show_id}:publish
+PATCH /v1/admin/shows/{show_id}/pricing
+```
+
+Action endpoint như `:publish` có thể rõ hơn việc ép state transition phức tạp vào generic update. Mọi admin operation có tenant/resource AuthZ, idempotency/optimistic concurrency và audit.
+
+---
+
+#### 20. API design — hold
+
+```http
+POST /v1/shows/{show_id}/holds
+Authorization: Bearer <token>
+Idempotency-Key: <key>
+X-Admission-Token: <signed-token-if-required>
+
+{
+  "seat_ids": ["A-10", "A-11"],
+  "expected_inventory_version": "optional_projection-version"
+}
+```
+
+Success:
+
+```http
+HTTP/1.1 201 Created
+
+{
+  "hold_id": "hld_123",
+  "state": "HELD",
+  "expires_at": "...",
+  "price_snapshot": {...},
+  "booking_intent_id": "bki_123"
+}
+```
+
+Conflict:
+
+```http
+HTTP/1.1 409 Conflict
+
+{
+  "code": "SEATS_UNAVAILABLE",
+  "unavailable_seat_ids": ["A-11"],
+  "latest_inventory_version": "..."
+}
+```
+
+`400 Bad Request` không phù hợp cho ghế vừa bị người khác lấy; request hợp lệ nhưng conflict với current state nên `409` rõ hơn. `422` dùng cho business validation như sales window/seat set không hợp lệ tùy API convention.
+
+---
+
+#### 21. API design — checkout và booking
+
+Không nên dùng một `POST /bookings` mơ hồ che toàn bộ payment lâu dài nếu client cần theo dõi state.
+
+```http
+POST /v1/holds/{hold_id}/checkout
+Idempotency-Key: <key>
+
+{
+  "payment_method_token": "pm_tok_...",
+  "return_url": "https://approved-client.example/..."
+}
+```
+
+Response có thể:
+
+```http
+HTTP/1.1 202 Accepted
+
+{
+  "booking_id": "bkg_123",
+  "payment_attempt_id": "pay_123",
+  "state": "PENDING_PAYMENT",
+  "next_action": {...}
+}
+```
+
+Status APIs:
+
+```http
+GET /v1/bookings/{booking_id}
+GET /v1/bookings?cursor=...
+POST /v1/bookings/{booking_id}:cancel
+GET /v1/bookings/{booking_id}/tickets
+```
+
+Provider webhook:
+
+```http
+POST /v1/internal/payments/webhooks/{provider}
+```
+
+Webhook endpoint cần raw-body signature verification, replay/timestamp check, event dedup và provider-reference lookup. Không tin browser return URL là payment truth.
+
+---
+
+#### 22. Hold flow end-to-end
+
+```text
+1. Client có admission token và seat-map version
+2. POST hold + idempotency key
+3. Gateway validate identity/admission/rate limit
+4. Booking/Inventory route command tới show home-region owner
+5. Inventory transaction:
+     - validate sales window + all seat states/versions
+     - snapshot authoritative prices/rules
+     - set all seats HELD với hold_id/expires_at/version
+     - persist hold + outbox atomically
+6. Commit
+7. Schedule expiry event/timer asynchronously
+8. Update read projection/WebSocket via event
+9. Return hold + server expiration
+```
+
+Nếu multi-seat all-or-nothing, toàn bộ seats chuyển state trong một atomic transaction/partition command. Nếu khác partitions, nên model placement để seats của một show/section có locality hoặc dùng explicit reservation protocol—không giả vờ một local transaction bao phủ mọi nơi.
+
+---
+
+#### 23. Checkout/payment/confirm saga
+
+Một orchestration mẫu:
+
+```text
+Booking Service              Inventory             Payment
+     │                           │                     │
+     │ validate hold ------------▶                     │
+     │ create PENDING booking                          │
+     │ create payment attempt ------------------------▶│
+     │                           │                     │
+     │<--------- provider response/webhook ------------│
+     │                           │
+     ├─ success → commit hold to BOOKED --------------▶│
+     │             confirm booking + outbox             │
+     │             ticket/notification async            │
+     │
+     └─ failed/expired → release hold conditionally ----▶│
+                       mark booking/payment terminal
+```
+
+Nhưng ordering “capture tiền trước rồi book seat” có rủi ro charged-but-no-seat; “book seat trước rồi capture” có rủi ro seat booked-but-no-payment. Một pattern thường dùng:
+
+1. Hold inventory.
+2. Authorize payment trong hold window.
+3. Commit inventory/booking.
+4. Capture payment hoặc use provider capability phù hợp.
+5. Nếu commit/capture thất bại, void/refund/release bằng compensation.
+
+Exact ordering phụ thuộc provider supports auth/capture, business policy và failure model. Saga phải ghi durable state trước/giữa steps để resume/reconcile sau crash.
+
+---
+
+#### 24. Idempotency end-to-end
+
+Idempotency không chỉ dành cho payment:
+
+| Operation | Stable key/business identity |
+|---|---|
+| Create hold | client idempotency key + user/show scope |
+| Checkout | idempotency key + hold/booking intent |
+| Provider payment | payment attempt/order reference |
+| Webhook | provider event ID/reference |
+| Commit inventory | booking ID + expected hold ID/version |
+| Issue ticket | booking item/ticket logical ID |
+| Notify | booking + event type + channel + template version |
+| Cancel/refund | cancellation/refund request ID |
+
+Idempotency record phải lưu request fingerprint và prior result. Nếu cùng key nhưng payload khác, trả conflict; không âm thầm reuse.
+
+“Exactly once” end-to-end thường đạt bằng at-least-once delivery + idempotent consumers + uniqueness constraints + reconciliation, không phải một messaging guarantee duy nhất.
+
+---
+
+#### 25. Communication matrix
+
+| From → To | Pattern | Contract chính |
+|---|---|---|
+| Client → Catalog/Search | Sync HTTP | Cacheable, pagination, bounded filters |
+| Client → Hold | Sync command | Atomic result, idempotency, 409 conflict |
+| Client → Checkout | Sync initiate + async status | `202`, booking/payment state URL |
+| Booking → Inventory | Sync command hoặc ordered internal command | Hold validation/commit/release idempotently |
+| Booking → Payment | Sync initiate + async webhook/reconcile | Provider idempotency/unknown outcome |
+| Services → event bus | Async via outbox | At-least-once, versioned event schema |
+| BookingConfirmed → Ticket/Notification | Async | Idempotent consumers, retries/DLQ |
+| InventoryChanged → Read projection | Async | Ordered/partitioned by show, version-aware |
+| Admin → Catalog/Inventory | Sync protected command | Strong AuthZ/audit/concurrency control |
+
+Sync call cần timeout/retry/bulkhead. Async flow cần delivery, ordering key, dedup, retention, schema version và poison-message behavior.
+
+---
+
+#### 26. Failure/degraded-mode matrix
+
+| Failure | Hành vi mong muốn |
+|---|---|
+| Search unavailable | Browse curated/catalog fallback; active booking status vẫn truy cập được |
+| Seat projection/cache lag | UI báo version/stale; hold authority kiểm tra lại |
+| Inventory authority unavailable | Không cấp/confirm seat mới; fail-safe/queue bounded |
+| Expiry worker chậm | `expires_at` vẫn authoritative; expired hold không được commit |
+| Payment timeout | Mark unknown/pending, không charge retry mù; webhook/reconcile |
+| Payment provider outage | Circuit/bulkhead; giữ/release theo policy; alternative provider chỉ theo safe workflow |
+| Queue/event bus unavailable | Outbox giữ events; booking commit không phụ thuộc immediate delivery nếu outbox durable |
+| Notification unavailable | Queue backlog; booking/ticket vẫn valid |
+| Ticket Service lag | Booking confirmed; ticket generation pending/resumable theo SLO |
+| Home-region failure | Stop/fence old owner; controlled promotion; correctness ưu tiên |
+| IdP unavailable | Browse public có thể chạy; protected writes fail-safe hoặc verify valid cached/local tokens theo model |
+
+---
+
+#### 27. Security/trust boundaries
+
+```text
+Internet → CDN/WAF/Waiting Room → Gateway
+Gateway → private services
+Services → private DB/cache/queue
+Payment Service → external provider
+Provider → signed webhook endpoint
+Admin Portal → privileged APIs
+```
+
+Controls:
+
+- TLS mọi external hop; internal TLS/mTLS theo threat model.
+- Workload identity và least privilege.
+- Object/tenant AuthZ ở service.
+- Signed admission token, anti-replay và quota.
+- Payment method tokenization; không lưu raw card data.
+- Webhook signature + timestamp + dedup.
+- Secrets/KMS rotation.
+- PII redaction trong logs/events.
+- Admin MFA/approval/audit.
+- Ticket QR/barcode signing/revocation và anti-copy/check-in policy.
+
+---
+
+#### 28. Observability
+
+##### End-to-end correlation
+
+Propagate nhưng không expose bí mật:
+
+```text
+request_id
+user/tenant pseudonymous ID
+show_id / hold_id / booking_id / payment_attempt_id
+idempotency key hash/reference
+provider event/reference
+inventory version/owner epoch
+```
+
+##### Core signals
+
+- waiting-room depth/release rate/token failures;
+- seat projection lag/version;
+- hold success/conflict/latency/expiry;
+- lock/CAS conflict, transaction abort/deadlock;
+- booking/payment state age và reconciliation mismatch;
+- outbox/queue lag/redelivery/DLQ;
+- ticket/notification issuance latency;
+- admin/audit anomalies;
+- no-double-booking invariant alarms.
+
+Tracing phải sample thông minh trong burst; audit trail vẫn phải đầy đủ cho critical financial/inventory actions.
+
+---
+
+#### 29. Những lỗi HLD thường gặp
+
+- Tách nhiều services chỉ vì “microservices scale tốt” mà không nêu ownership/failure cost.
+- Event Service cũng trực tiếp sửa live seat inventory.
+- Booking Service ghi trực tiếp bảng của Inventory/Payment Service.
+- Redis TTL là nguồn duy nhất của seat hold.
+- Giữ pessimistic lock xuyên payment.
+- Optimistic retry vô hạn dưới hot contention.
+- Dùng cache để quyết định booking success.
+- “NoSQL vì seat layout phức tạp” mà không phân tích access pattern/transaction/operations.
+- CQRS đồng nghĩa event sourcing hoặc bắt buộc hai databases.
+- Queue tự động biến payment retry thành an toàn.
+- Publish event sau DB commit mà không outbox/recovery.
+- Gửi notification/audit provider call trong booking transaction.
+- Một `POST /bookings` synchronous che toàn bộ long-running payment, không status model.
+- Trả `400` cho seat contention thay vì conflict/business state response rõ.
+- Tin browser payment return thay signed webhook/provider verification.
+- Không định nghĩa idempotency cho hold/checkout/webhook/ticket/refund.
+- Multi-region services nhưng inventory không có home-owner/fencing.
+- Search/index/cache bị coi là source of truth.
+
+---
+
+#### 30. Checklist Step 3
+
+- [ ] Logical services và deployment boundaries có lý do?
+- [ ] Data ownership/source of truth cho catalog, inventory, booking, payment, ticket?
+- [ ] Event/show/layout publish/version semantics?
+- [ ] Search/index/cache là derived projections?
+- [ ] Inventory state machine và atomic multi-seat hold?
+- [ ] Durable hold + authoritative expiry; Redis chỉ là accelerator?
+- [ ] Concurrency pattern theo contention: optimistic/pessimistic/owner queue?
+- [ ] No DB lock/external call trong payment duration?
+- [ ] Booking/payment/ticket state machines và saga ordering?
+- [ ] Unknown/late payment outcome và compensation?
+- [ ] API tách hold, checkout, status, cancel/refund?
+- [ ] Status/error/idempotency semantics rõ?
+- [ ] Sync calls có timeout/retry/bulkhead; async có ordering/dedup/DLQ?
+- [ ] Transactional outbox/inbox/reconciliation?
+- [ ] Seat projection/update fan-out và lag handling?
+- [ ] Waiting-room/admission token tích hợp trước authority?
+- [ ] Home-region routing, owner epoch và failover fencing?
+- [ ] Security/admin/payment/ticket trust boundaries?
+- [ ] Failure/degraded matrix và observability IDs/metrics?
+
+#### 31. Ý chính cần nhớ
+
+- Service boundary phải đi cùng responsibility và data ownership, không chỉ tên hộp.
+- Catalog/search/read projections scale khác Inventory/Booking write authority.
+- Inventory Service là nơi duy nhất enforce seat state/no-double-booking.
+- Booking Service orchestrates durable saga; Payment Service cô lập provider uncertainty.
+- Redis TTL không được là authority của hold; durable state + expiry/version mới quyết định.
+- Optimistic, pessimistic và serialized-owner patterns phù hợp các mức contention khác nhau.
+- Pessimistic lock chỉ sống trong transaction ngắn, không xuyên payment.
+- CQRS tách read/write models; không bắt buộc event sourcing hoặc database riêng.
+- Search index/cache/projection eventual-consistent; hold luôn recheck authority.
+- API nên tách hold khỏi checkout và biểu diễn payment workflow bằng state/status.
+- Idempotency phải xuyên hold, payment, webhook, commit, ticket, notification và refund.
+- Outbox/inbox cùng reconciliation biến at-least-once delivery thành business effect an toàn.
+- Notification/ticket/audit consumers bất đồng bộ nhưng critical evidence phải durable.
+- Home-region owner và fencing đơn giản hóa global inventory correctness.
+- HLD production-ready phải mô tả communication, failures, security và observability—not chỉ boxes/arrows.
+
+#### Công thức ghi nhớ
+
+> **Ticketing HLD = globally scalable catalog/read projections + per-show authoritative inventory + expiring durable holds + booking/payment saga + idempotent event-driven side effects + waiting-room admission + fenced regional ownership.**
+
+---
+
+### Bài 71. Making Tech & Infra Decisions Strategically
+
+#### 1. Cách chọn công nghệ
+
+Step 4 không phải bài “kể tên stack”. Mỗi quyết định cần đi qua:
+
+```text
+Requirement/bottleneck
+  → capability cần có
+  → alternatives
+  → selected baseline
+  → failure/operational/cost trade-off
+  → metric và evolution trigger
+```
+
+Với ticketing, các hard requirements là:
+
+- no double booking;
+- atomic, expiring inventory holds;
+- flash-sale admission và hot-show contention control;
+- payment idempotency/reconciliation;
+- scalable catalog/seat-map reads;
+- async ticket/notification/audit processing;
+- home-region inventory ownership và fenced failover;
+- auditability, security và operability.
+
+---
+
+#### 2. Baseline production đề xuất
+
+```text
+Global DNS/CDN/WAF/Waiting Room
+              │
+      Managed LB / API Gateway
+              │
+      Kubernetes hoặc managed compute
+  ┌───────────┼─────────────┬─────────────┬──────────────┐
+  │           │             │             │              │
+Catalog    Inventory      Booking       Payment       Notification
+Service    Service        Service       Service       Workers
+  │           │             │             │              │
+  ▼           ▼             ▼             ▼              ▼
+PostgreSQL  PostgreSQL    PostgreSQL    PostgreSQL   Queue + SES/SMS
+  │         authoritative booking/payment/outbox state
+  ├─ outbox/change events ────────────────┐
+  ▼                                      ▼
+Search Index                         Kafka/Queue
+  │                                      │
+Redis/CDN projections ◀───────────────────┼─ seat-map updater
+                                         ├─ ticket issuance
+                                         ├─ audit/analytics
+                                         └─ reconciliation
+
+External IdP/OIDC         Payment providers
+Observability: OpenTelemetry + metrics/logs/traces/alerts
+```
+
+Đây là baseline logical. Có thể dùng chung PostgreSQL cluster hoặc deployment cho vài domains ban đầu nếu vẫn tách schema, roles và ownership; không cần một cluster/service riêng cho mỗi hộp ngay ngày đầu.
+
+---
+
+#### 3. Entry point: NGINX hay managed API Gateway?
+
+Transcript so sánh NGINX với AWS API Gateway. Chúng có overlap nhưng không hoàn toàn tương đương.
+
+##### NGINX / Ingress / reverse proxy
+
+- Kiểm soát routing, TLS, headers, connection và deployment chi tiết.
+- Có thể chạy như reverse proxy hoặc Kubernetes ingress/data plane.
+- Team chịu patching, scaling, configuration safety, HA và observability.
+- Phù hợp khi cần portability/custom traffic behavior và có platform operations maturity.
+
+##### Managed API Gateway
+
+- Managed endpoint, auth integration, quota/rate limit, API lifecycle và logs.
+- Hữu ích với serverless và cũng có thể đứng trước nhiều loại backend; không chỉ dành cho serverless.
+- Có provider limits, pricing per request, latency và feature constraints.
+- Không thay load balancer/service mesh/WAF trong mọi topology.
+
+##### Managed load balancer / Gateway / CDN combination
+
+Ticketing thường cần nhiều lớp:
+
+```text
+CDN + WAF + waiting room
+  → managed LB/API gateway
+  → Kubernetes ingress/gateway hoặc services
+```
+
+Baseline chọn managed edge/LB để giảm SPOF/toil; thêm API Gateway khi API management, auth/quota/developer lifecycle thực sự cần. NGINX/Envoy/Gateway có thể dùng ở cluster edge nếu team cần control.
+
+Tiêu chí:
+
+- peak RPS/connections và payload;
+- waiting-room/admission integration;
+- WebSocket/SSE support nếu seat updates dùng push;
+- auth/rate/quota semantics;
+- multi-region routing/failover;
+- cost per request/data;
+- configuration rollout và blast radius.
+
+---
+
+#### 4. Authentication: OAuth 2.0, OIDC và token choice
+
+Transcript nói “OAuth2 + JWT cho authentication”. Cần sửa vai trò:
+
+- **OAuth 2.0:** authorization/delegation framework.
+- **OpenID Connect (OIDC):** authentication/identity layer trên OAuth 2.0.
+- **JWT:** token/claims format; không phải toàn bộ authentication architecture.
+
+Baseline:
+
+- External/managed IdP hỗ trợ OIDC.
+- Authorization Code + PKCE cho web/mobile public clients.
+- Access token ngắn hạn với issuer/audience/scope/type validation.
+- ID token chỉ dành cho client login context, không dùng làm API access token.
+- Refresh token/session lifecycle, revocation, logout và MFA riêng.
+- Service-to-service dùng workload identity/mTLS hoặc short-lived service tokens.
+
+JWT cho phép local signature validation nhưng không làm hệ thống hoàn toàn “stateless”:
+
+- user/role/revocation/key state vẫn tồn tại;
+- permissions trong token có thể stale;
+- signing key rotation và JWKS availability/cache cần vận hành;
+- object/tenant authorization vẫn cần resource state.
+
+Opaque token + introspection cũng là option khi centralized revocation/fresh state quan trọng hơn local validation.
+
+---
+
+#### 5. Primary transactional store: PostgreSQL
+
+PostgreSQL phù hợp cho Inventory, Booking, Payment và Outbox vì:
+
+- ACID transactions;
+- unique/foreign/check constraints;
+- row/version locking và conditional updates;
+- isolation levels;
+- durable WAL, backup/PITR và managed HA options;
+- mature query/index/operations ecosystem.
+
+##### Inventory partitioning/locality
+
+Primary key/index nên bắt đầu bằng show ownership/access pattern:
+
+```text
+(show_id, seat_id)             → authoritative inventory lookup/update
+(show_id, state, section_id)   → controlled availability/admin queries
+(hold_id)                      → hold validation/expiry
+```
+
+Multi-seat hold cho cùng show nên nằm trong một transaction/partition locality nếu có thể.
+
+##### Booking/payment
+
+Tables/state cần:
+
+- booking/order và items;
+- hold/price snapshots;
+- payment attempts/provider references;
+- idempotency records;
+- refunds/cancellations;
+- outbox/inbox/audit references.
+
+##### Scale path
+
+1. Managed multi-AZ PostgreSQL, tuned indexes/transactions.
+2. Read replicas cho reporting/read models khi staleness phù hợp.
+3. Partition by show/time/tenant và archive cold data.
+4. Shard/home-region databases theo show ownership khi metrics chứng minh cần.
+
+Không đặt synchronous cross-shard transaction vào flash-sale hot path nếu có thể model aggregate ownership cùng shard.
+
+---
+
+#### 6. Catalog source: PostgreSQL hay MongoDB?
+
+MongoDB/document store có thể phù hợp nếu event/layout là aggregate biến thiên và thường đọc/ghi nguyên document. Nhưng “schema linh hoạt” không tự động là lý do đủ:
+
+- venue/show/seat/pricing có quan hệ và versioning;
+- document lớn có update/fan-out limits;
+- integrity/migration vẫn cần schema discipline;
+- thêm một database tăng backup, monitoring, security và expertise cost.
+
+Baseline đơn giản:
+
+- PostgreSQL cho canonical catalog/configuration.
+- Object storage/CDN cho images/static artifacts.
+- Search projection riêng cho discovery.
+
+Chọn MongoDB khi benchmark/access patterns/team capability chứng minh lợi ích, không chỉ vì mỗi event có fields khác nhau.
+
+---
+
+#### 7. Elasticsearch/OpenSearch là search index, không phải mặc định source of truth
+
+Elasticsearch/OpenSearch phù hợp:
+
+- full-text search;
+- filters/facets;
+- geo/date/category queries;
+- ranking/autocomplete;
+- denormalized read documents.
+
+Không phù hợp làm authoritative booking/inventory store vì:
+
+- refresh/indexing có delay;
+- distributed search semantics không thay transaction invariants;
+- document update/conflict behavior không phải seat-booking authority;
+- index có thể rebuild từ canonical source.
+
+Pipeline:
+
+```text
+Catalog PostgreSQL transaction
+  → outbox/CDC
+  → indexer
+  → Elasticsearch/OpenSearch
+```
+
+Monitor indexing lag, mapping/schema evolution, reindex capacity và fallback khi search unavailable.
+
+---
+
+#### 8. Redis: cache/projection/timer aid, không phải hold authority
+
+Redis phù hợp cho:
+
+- hot event/show metadata cache;
+- seat-map availability projection;
+- rate limit/waiting-room ephemeral counters nếu durability semantics phù hợp;
+- short-lived token/session/query caches;
+- optional expiry index/timer trigger;
+- distributed coordination primitives ở phạm vi đã review.
+
+Redis **không được là nguồn duy nhất** của seat hold:
+
+```text
+PostgreSQL Inventory row = authoritative HELD + expires_at + version
+Redis key/TTL            = fast read/timer projection
+```
+
+Nếu Redis key expire/mất/evict, inventory store vẫn giữ invariant. Expiry worker thực hiện conditional release theo expected hold/version/time.
+
+Redis topology cần:
+
+- managed primary/replica hoặc cluster theo capacity;
+- memory sizing gồm overhead/headroom;
+- eviction policy không làm mất correctness;
+- TTL jitter chỉ nơi semantics cho phép;
+- cache-stampede protection;
+- failover/cold-start load test;
+- connection-pool budget.
+
+Không dùng generic Redlock/distributed lock như sự thay thế duy nhất cho durable conditional state transition mà không phân tích failure model và fencing.
+
+---
+
+#### 9. Messaging: Kafka hay queue?
+
+Kafka phù hợp khi cần:
+
+- partitioned ordered event log;
+- nhiều consumer groups;
+- retention/replay;
+- throughput cao;
+- rebuild projections/audit/analytics streams.
+
+Managed queue/RabbitMQ/cloud queue phù hợp khi:
+
+- work distribution/ack/retry/DLQ là nhu cầu chính;
+- replay dài và multi-consumer log không cần;
+- muốn operational model đơn giản hơn.
+
+| Use case | Candidate |
+|---|---|
+| InventoryChanged → projections, audit, analytics, nhiều consumers | Kafka/event log |
+| Send email/SMS jobs | Managed queue/RabbitMQ |
+| Expiry/retry jobs có delay | Delayed queue/timer service + authoritative recheck |
+| Payment provider webhook processing | Durable queue/inbox theo ordering/idempotency |
+
+Không cần đưa mọi message vào Kafka. Có thể dùng event log cho domain changes và work queues cho task delivery.
+
+##### Reliability pattern
+
+```text
+DB transaction → outbox row
+outbox relay/CDC → Kafka/queue
+consumer → inbox/dedup + local transaction
+```
+
+Topic/queue cần partition key, retention, schema version, retry/DLQ và replay runbook rõ.
+
+---
+
+#### 10. Payment provider integration
+
+Stripe, Razorpay hoặc provider khác chỉ là ví dụ; chọn theo geography, payment methods, compliance, reliability, settlement, webhook, auth/capture và cost.
+
+Baseline:
+
+- Payment Service giữ provider adapters.
+- Tokenized payment methods; giảm raw card handling/PCI scope.
+- Một `payment_attempt_id` nội bộ map tới provider reference.
+- Idempotency key ổn định cho create/authorize/capture/refund.
+- Short timeout nhưng **không kết luận failed chỉ từ timeout**.
+- Signed webhook + timestamp + replay/dedup.
+- Durable pending/unknown state và reconciliation.
+- Circuit breaker/bulkhead/provider-specific rate limit.
+- Retry chỉ khi operation/provider contract chứng minh an toàn.
+
+##### Multiple providers
+
+Multi-provider routing tăng availability nhưng cũng tăng:
+
+- duplicate charge risk nếu failover không biết outcome provider đầu;
+- adapter/state/reconciliation complexity;
+- settlement/refund/support burden;
+- routing/compliance/cost policy.
+
+Không chuyển provider ngay sau timeout mơ hồ. Trước hết phải resolve/expire/void outcome theo workflow.
+
+---
+
+#### 11. Notification providers
+
+Transcript ghi “AWS SCS”; tên đúng là **Amazon SES (Simple Email Service)** cho email. SMS có thể dùng Twilio, cloud notification provider hoặc local provider theo geography/cost/delivery requirements. [Tài liệu Amazon SES](https://docs.aws.amazon.com/ses/).
+
+Architecture:
+
+```text
+BookingConfirmed
+  → notification work queue
+  → Email worker → SES/provider
+  → SMS worker   → Twilio/provider
+  → Push worker  → push provider
+```
+
+Thiết kế:
+
+- channel-specific quotas/retry/backoff;
+- idempotency/dedup;
+- template version/localization;
+- delivery/bounce/complaint callbacks;
+- fallback channel policy;
+- PII minimization;
+- DLQ và support resend.
+
+Provider accepted message không nhất thiết nghĩa user đã nhận; model delivery states rõ.
+
+---
+
+#### 12. Kubernetes có cần thiết không?
+
+Kubernetes cung cấp deployment, service discovery, rolling update, scheduling và workload autoscaling, nhưng không tự động làm hệ thống scalable/correct.
+
+##### Chọn Kubernetes khi
+
+- nhiều services/workloads và team có platform maturity;
+- cần standardized deployment/policy/observability;
+- workload portability/control đáng giá;
+- có khả năng vận hành cluster, networking, upgrades và security.
+
+##### Alternatives
+
+- managed container platform;
+- VM/autoscaling groups;
+- serverless/functions cho một số async jobs;
+- PaaS/app platform.
+
+Nếu hệ thống/team nhỏ, managed compute đơn giản có thể tốt hơn Kubernetes.
+
+##### Autoscaling đúng thuật ngữ
+
+- **HPA:** tăng/giảm Pod replicas dựa trên resource/custom/external metrics.
+- **Node autoscaler:** thêm/bớt cluster nodes để Pods có capacity chạy.
+- **VPA/resource tuning:** điều chỉnh resource requests/limits theo capability/deployment.
+
+Kubernetes HPA có thể dùng CPU, memory hoặc custom/external metrics; node scaling là lớp riêng. Xem [Kubernetes workload autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/) và [node autoscaling](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/).
+
+##### Flash-sale caveat
+
+Autoscaling phản ứng sau khi có signal và có provisioning/warm-up delay. Với launch đã biết:
+
+- pre-scale Pods/nodes/cache/DB connections;
+- pre-warm images/caches;
+- schedule capacity;
+- giữ headroom;
+- waiting room giữ admission dưới safe capacity;
+- scale theo RPS/concurrency/queue lag/payment latency, không chỉ CPU.
+
+Kubernetes không giải quyết hot-row contention, payment uncertainty hay double booking.
+
+---
+
+#### 13. Kubernetes workload design
+
+##### Stateless services
+
+- Catalog API, Booking API/Orchestrator, Payment adapters, Notification workers.
+- Deployments qua nhiều zones/nodes.
+- Readiness/startup/liveness probes đúng semantics.
+- PodDisruptionBudget, topology spread/anti-affinity.
+- Graceful shutdown/connection draining.
+- Resource requests/limits và HPA.
+
+##### Stateful systems
+
+PostgreSQL, Kafka, Redis và search cluster có thể chạy managed bên ngoài Kubernetes để giảm operational risk, trừ khi team có chuyên môn vận hành stateful platforms trong cluster.
+
+##### Jobs/workers
+
+- Outbox relay/indexer.
+- Expiry/reconciliation jobs.
+- Notification consumers.
+- Scale theo queue lag/oldest-message age, có max concurrency để không overload downstream.
+
+##### Security
+
+- namespace/trust segmentation;
+- RBAC/workload identity;
+- NetworkPolicy;
+- Pod Security Admission/Standards;
+- non-root, drop capabilities, read-only filesystem;
+- secret manager/KMS integration;
+- image signing/scanning/admission policy.
+
+---
+
+#### 14. Database/cache/messaging HA
+
+##### PostgreSQL
+
+- Managed multi-AZ primary/standby.
+- Replication mode theo RPO/latency.
+- Promotion + fencing + application reconnect.
+- PITR/backups và restore drills.
+- Connection proxy/pool có global budget.
+- Partition/home-region ownership.
+
+##### Redis
+
+- Replica/failover hoặc cluster theo size.
+- Cache loss không vi phạm inventory correctness.
+- Cold-cache/origin protection test.
+
+##### Kafka/queue
+
+- Multi-zone replication/quorum theo provider.
+- Partition capacity và hot-show key strategy.
+- Producer acknowledgement/idempotency phù hợp.
+- Consumer lag, DLQ và replay drills.
+
+Replication không thay backup; managed HA không thay application retry/reconnect/idempotency.
+
+---
+
+#### 15. Multi-region topology
+
+```text
+Global DNS/Edge
+  ├─ Region A: home owner cho shows A...
+  ├─ Region B: home owner cho shows B...
+  └─ global catalog/search/read projections
+```
+
+Mỗi show có:
+
+- `home_region`;
+- owner epoch/lease;
+- authoritative inventory database/partition;
+- admission queue/rate;
+- failover/runbook.
+
+Booking command route theo show ID. DR promotion phải fence old owner trước khi new owner nhận writes. Replicate booking/payment/outbox state theo RPO/DR plan; in-flight payment webhooks vẫn được idempotently route/reconcile.
+
+Active-active writers cho cùng show chỉ khi có consensus/serializable protocol rõ. Cross-region latency thấp không đáng đổi lấy double-booking risk.
+
+---
+
+#### 16. Observability stack
+
+Transcript đề xuất Prometheus, Grafana và ELK. Một stack hoàn chỉnh hơn:
+
+```text
+Instrumentation: OpenTelemetry SDK/Collector
+Metrics:         Prometheus-compatible backend
+Dashboards:      Grafana
+Logs:            Elasticsearch/OpenSearch/Loki hoặc managed log platform
+Traces:          Tempo/Jaeger/managed tracing backend
+Alerts:          SLO/error-budget + symptom/correctness alerts
+Audit:           separate protected append-only pipeline/store
+```
+
+##### Metrics trọng yếu
+
+- waiting-room depth/release/admission token failures;
+- hold attempts/success/conflict/latency/expiry;
+- DB lock/CAS abort/deadlock/connection saturation;
+- active holds và expiry lag;
+- booking/payment state age, unknown outcome và reconciliation mismatch;
+- outbox/Kafka/queue lag, DLQ;
+- seat projection lag;
+- ticket/notification completion;
+- double-booking/duplicate-charge invariant alarms.
+
+##### Logging caveat
+
+Centralized logging có thể rất tốn trong flash sale. Dùng structured logs, sampling cho noisy success paths, retention/tiering và redaction. Không sample away critical audit events.
+
+Metrics/dashboard không đủ; cần alert ownership, runbook, incident command và drills.
+
+---
+
+#### 17. Security infrastructure
+
+- CDN/WAF/DDoS/bot management và waiting-room token signing.
+- OIDC/MFA, backend resource/tenant AuthZ.
+- Workload identity, mTLS/TLS và default-deny network policy.
+- Payment tokenization, isolated Payment Service và provider secrets.
+- KMS/HSM/secret manager, rotation và audit.
+- Database roles tách runtime/migration/admin.
+- Signed webhooks, anti-replay và idempotency.
+- Signed/revocable ticket barcode/QR.
+- PII/data retention/minimization and encryption.
+- Admin portal isolation, step-up MFA và approval for sensitive changes.
+- Supply-chain controls cho container/dependency/deployment artifacts.
+
+Security controls phải được load-tested; WAF/IdP/KMS/webhook verification cũng có quota/latency và có thể thành bottleneck.
+
+---
+
+#### 18. Backup, DR và recovery
+
+Scope:
+
+- Catalog configuration/layout versions.
+- Inventory/holds/bookings/payments/refunds.
+- Ticket issuance/revocation.
+- Outbox/inbox/audit/reconciliation state.
+- Kafka/queue retention hoặc replay strategy.
+- Search/cache projections có thể rebuild.
+
+Objectives khác nhau:
+
+- confirmed bookings/payment ledger có RPO nghiêm ngặt;
+- active holds có thể expire/reconstruct theo policy nhưng failover phải tránh double booking;
+- search/cache có thể rebuild với RTO dài hơn;
+- notification backlog replay được.
+
+DR drill phải kiểm tra end-to-end:
+
+```text
+restore/promote data
+→ fence old inventory owner
+→ route commands
+→ reconnect apps
+→ process in-flight webhooks/outbox
+→ reconcile payments/bookings/tickets
+→ validate no double booking
+```
+
+---
+
+#### 19. Cost model
+
+```text
+Total cost
+= edge/WAF/waiting-room requests
++ Kubernetes/compute headroom cho flash sale
++ PostgreSQL compute/storage/IO/backups
++ Redis memory/replicas
++ Kafka/queue partitions/retention
++ Search nodes/index/reindex
++ observability ingestion/retention
++ email/SMS/provider fees
++ payment processing fees
++ cross-region replication/egress
++ platform/operations engineering
+```
+
+SMS, observability và pre-provisioned flash capacity có thể tốn đáng kể. Cost optimization:
+
+- coalesce seat updates;
+- cache static layout/catalog;
+- sample noisy traces/logs nhưng giữ audit;
+- retention/tiering events;
+- scheduled pre-scale thay permanent overprovision;
+- waiting room ngăn origin overbuild cho infinite burst;
+- dùng managed services khi premium thấp hơn operations cost.
+
+---
+
+#### 20. Decision record đề xuất
+
+| Capability | Baseline | Vì sao | Alternative/trigger |
+|---|---|---|---|
+| Edge/API | Managed CDN/WAF/LB + gateway khi cần | HA, DDoS, waiting room, lower toil | NGINX/Envoy khi custom control/portability cần |
+| Identity | External IdP + OIDC, short-lived access token | Giảm credential burden, standard flows | Opaque token/session khi revocation/freshness cần |
+| Inventory/Booking/Payment | Managed PostgreSQL HA | ACID, constraints, locking/version, PITR | Partition/shard theo show khi contention/storage metrics yêu cầu |
+| Catalog | PostgreSQL baseline | Giảm polyglot, relation/version integrity | MongoDB khi document access/schema/team evidence rõ |
+| Search | Elasticsearch/OpenSearch projection | Full-text/filter/facet | Simpler DB search ở giai đoạn nhỏ |
+| Cache/read projection | Managed Redis | Low latency, TTL/projection/tooling | Memcached/simple store nếu semantics đủ |
+| Domain event log | Managed Kafka-compatible platform | Replay, multi-consumer, ordered partitions | Managed queue khi work delivery đơn giản |
+| Task queues | Managed queue/RabbitMQ | Retry/DLQ/worker delivery | Kafka topic nếu retention/replay/multi-consumer cần |
+| Payment | Provider adapter layer | Isolate provider contract/uncertainty | Multi-provider chỉ khi business/ops justify |
+| Notification | SES/email + SMS provider | Delivery infrastructure chuyên dụng | Multi-provider/fallback theo geography/SLO |
+| Compute | Managed Kubernetes hoặc simpler managed containers | Nhiều services, pre-scale, policy/operations | PaaS/VM/serverless theo team/workload |
+| Observability | OpenTelemetry + metrics/logs/traces/SLO | Vendor-neutral instrumentation và full signals | Managed backend để giảm toil |
+
+---
+
+#### 21. Evolution path
+
+##### Giai đoạn 1 — Production baseline
+
+- Một home region cho each show, platform có thể một region multi-AZ.
+- PostgreSQL cho catalog/inventory/booking/payment với schema ownership.
+- Redis cache/projections.
+- Managed queue cho notification/expiry/outbox relay.
+- External IdP/payment/email/SMS providers.
+- Managed compute hoặc Kubernetes nếu team đã có platform.
+
+##### Giai đoạn 2 — Flash-sale/hot events
+
+- Waiting room và scheduled pre-scaling.
+- Tách Inventory/Booking deployment/DB resources.
+- Kafka/event log cho projections/audit/multi-consumer streams.
+- Search index và globally cached catalog.
+- Per-show partition ownership, adaptive admission và contention tuning.
+- Strong reconciliation/ops tooling.
+
+##### Giai đoạn 3 — Global platform
+
+- Assign shows tới regional owners.
+- Global catalog/search/read projections.
+- Fenced cross-region DR/failover.
+- Shard Inventory/Booking stores theo show/region.
+- Multi-provider payment/notification chỉ theo geography/resilience need.
+- Dedicated platform/security/data teams và tested regional evacuation.
+
+Không xây giai đoạn 3 trước khi metrics/SLO/business yêu cầu.
+
+---
+
+#### 22. Những lỗi tech/infra decision thường gặp
+
+- Gọi OAuth 2.0 là authentication protocol mà không nhắc OIDC.
+- Cho rằng JWT làm toàn hệ thống stateless và quyền không stale.
+- Chọn MongoDB chỉ vì event fields linh hoạt.
+- Dùng Elasticsearch làm authoritative event/inventory database.
+- Redis TTL là nguồn duy nhất của hold hoặc distributed lock là invariant cuối.
+- Chọn Kafka cho mọi background task dù queue đơn giản đủ.
+- Retry payment timeout/failure mù quáng; chuyển provider khi outcome chưa biết.
+- Nhầm AWS SES thành “AWS SCS”.
+- Chọn Kubernetes vì muốn autoscaling mà không có platform capability.
+- Chỉ cấu hình HPA nhưng cluster không có node capacity.
+- Dựa vào reactive autoscaling cho flash sale đã biết, không pre-scale/waiting room.
+- Chạy mọi stateful system trong Kubernetes dù team chưa vận hành được.
+- Prometheus/Grafana/ELK được coi là observability đầy đủ nhưng thiếu traces/SLO/runbooks/audit.
+- Scale API Pods nhưng bỏ hot-row contention và DB connection budget.
+- Multi-region active-active inventory writers không có fencing/consensus.
+- Replication được coi là backup và managed service được coi là zero-ops.
+- Không tính SMS/payment/search/observability/cross-region cost.
+- Technology decision không có rejected alternatives hoặc migration trigger.
+
+---
+
+#### 23. Checklist Step 4
+
+- [ ] Edge/gateway lựa chọn theo traffic/auth/waiting-room/cost?
+- [ ] OIDC/OAuth/token/session roles và lifecycle đúng?
+- [ ] Inventory/Booking/Payment transaction/partition model trên PostgreSQL?
+- [ ] Catalog source-of-truth chọn theo access/schema/team evidence?
+- [ ] Search index là rebuildable projection?
+- [ ] Redis chỉ là cache/projection; hold authority durable?
+- [ ] Kafka vs queue quyết định theo replay/order/consumer/work semantics?
+- [ ] Outbox/inbox/schema/DLQ/replay runbooks?
+- [ ] Payment timeout/idempotency/webhook/reconciliation/multi-provider policy?
+- [ ] Notification provider quota, delivery state, dedup và fallback?
+- [ ] Kubernetes có business/platform justification; alternatives được xét?
+- [ ] HPA, node autoscaler, pre-scale và waiting-room phối hợp?
+- [ ] DB/cache/stream/search HA, backup và failover behavior?
+- [ ] Home-region owner, epoch/fencing và DR workflow?
+- [ ] Security cho identity, payments, webhooks, tickets, workloads và admin?
+- [ ] Metrics/logs/traces/audit/SLO/alerts/runbooks/drills?
+- [ ] Cost model gồm headroom, providers, retention và engineering?
+- [ ] ADR ghi trade-offs, owners, metrics và evolution triggers?
+
+#### 24. Ý chính cần nhớ
+
+- Technology phải phục vụ invariant và workload, không định nghĩa kiến trúc từ đầu.
+- Managed edge/LB/gateway và NGINX có trade-off control, toil, cost và capability khác nhau.
+- OIDC xử lý login; OAuth 2.0 delegated authorization; JWT chỉ là token format.
+- PostgreSQL là baseline mạnh cho inventory/booking/payment nhờ transaction và constraints.
+- MongoDB cho catalog là option, không phải bắt buộc; Elasticsearch/OpenSearch là search projection.
+- Redis tăng tốc reads/timers nhưng không làm authority cho seat hold.
+- Kafka phù hợp event log/replay/multi-consumer; task queue phù hợp work delivery đơn giản.
+- Payment timeout là unknown outcome; reliability cần idempotency, webhook và reconciliation.
+- Amazon SES—not “SCS”—là email service; notification luôn đi qua queue/worker.
+- Kubernetes chỉ đáng dùng khi workload/team cần; HPA và node autoscaling là hai lớp khác nhau.
+- Flash sale cần pre-scale + headroom + waiting room; reactive autoscaling không đủ.
+- Observability gồm metrics, logs, traces, SLO/alerts, audit và operations response.
+- Global inventory cần home-region owner, fencing và tested DR.
+- Decision tốt có baseline đơn giản, alternatives, failure modes, cost và trigger tiến hóa.
+
+#### Công thức ghi nhớ
+
+> **Ticketing tech strategy = ACID inventory core + rebuildable search/cache projections + durable event/work pipelines + provider-isolated payments + pre-scaled admission-controlled compute + full observability/DR.**
+
+---
+
+### Bài 72. The Final Design — Ticketing System
+
+#### 1. Kiến trúc cuối cùng
+
+```text
+Customers / Organizers / Support
+               │
+      Web / Mobile / Admin Portal
+               │
+ Global DNS + CDN + WAF + Bot Protection
+               │
+      Virtual Waiting Room (hot sales)
+               │ signed admission token
+               ▼
+        API Gateway / BFF / LB
+               │
+ ┌─────────────┼──────────────┬───────────────┬───────────────┐
+ │             │              │               │               │
+ ▼             ▼              ▼               ▼               ▼
+Catalog      Search       Seat Inventory    Booking         Identity/IdP
+Service      Service         Service       Orchestrator
+ │             │              │               │
+ │             │              │               ├──────────────▶ Payment Service
+ │             │              │               │                    │
+ │             │              │               │                    ▼
+ │             │              │               │              Payment Provider
+ │             │              │               │
+ ▼             ▼              ▼               ▼
+Catalog DB  Search Index  Inventory DB    Booking/Payment DB
+ │            (projection)  (authority)       │
+ │                             │              ├─ outbox/inbox
+ └── events ───────────────────┼──────────────┘
+                               ▼
+                         Kafka / Event Log
+                         + Work Queues
+                 ┌─────────────┼───────────────┬──────────────┐
+                 │             │               │              │
+                 ▼             ▼               ▼              ▼
+          Seat Read Model   Ticket Service  Notification   Audit/Analytics/
+          + Redis Cache                     Workers        Reconciliation
+                 │                             │
+                 └─ WebSocket/SSE/poll         ├─ Email provider
+                                               ├─ SMS provider
+                                               └─ Push provider
+
+Cross-cutting:
+  workload identity, TLS/mTLS, KMS/secrets, authorization, observability,
+  backups/PITR, multi-AZ HA, home-region ownership và fenced DR failover
+```
+
+Static/global reads được phân phối rộng. Mọi command thay đổi inventory của một show được route tới **authoritative home region/partition owner**.
+
+---
+
+#### 2. Trách nhiệm và data ownership
+
+| Thành phần | Sở hữu/trách nhiệm | Derived/không authoritative |
+|---|---|---|
+| Catalog Service | Event, show, venue, versioned layout, pricing/sales configuration | CDN/catalog cache |
+| Search Service | Query full-text/filter/rank trên projection | Search index rebuild được từ Catalog |
+| Inventory Service | ShowSeat state, hold, expiry, version và no-double-booking invariant | Seat-map projection/Redis |
+| Booking Service | Booking/order saga, price snapshot, cancellation/refund orchestration | Customer booking read view |
+| Payment Service | Payment attempts, provider adapters, webhook/reconciliation | Provider là external financial record |
+| Ticket Service | Ticket issuance, signature, validation và revocation | Wallet/download cache |
+| Notification Service | Channel jobs, provider delivery state | Email/SMS/push không quyết định booking |
+| Identity/IdP | User/service authentication và token/session lifecycle | Business resource AuthZ vẫn ở domain service |
+| Event/Queue platform | Durable async delivery/replay/work distribution | Không là source of truth cho current seat state |
+| Audit/Reconciliation | Immutable evidence, mismatch detection và recovery workflows | Không thay transactional enforcement |
+
+Từng domain chỉ thay đổi state do mình sở hữu thông qua API/command/event contract; không ghi trực tiếp database của nhau.
+
+---
+
+#### 3. Browse và search flow
+
+```text
+1. Client → CDN/Gateway → Search/Catalog API
+2. Search Service query search projection
+3. Catalog metadata/layout lấy từ cache/CDN hoặc Catalog DB
+4. Seat-map API lấy dynamic availability projection theo show/version
+5. Client render layout + approximate current availability
+```
+
+Đặc điểm:
+
+- event media/static layout cache dài theo content version;
+- search/index eventual-consistent;
+- seat availability projection có version/lag metric;
+- dynamic availability chỉ hướng dẫn UI;
+- Inventory Service kiểm tra lại atomically khi hold.
+
+Nếu search hoặc projection chậm, browse có thể degrade; hệ thống không được cấp ghế dựa trên cache stale.
+
+---
+
+#### 4. Flash-sale admission flow
+
+```text
+Arrival burst
+  → WAF/bot checks
+  → per-show waiting room
+  → signed, short-lived admission token
+  → release users ở rate ≤ safe inventory/payment capacity
+  → Gateway/Inventory booking path
+```
+
+Waiting room:
+
+- bảo vệ DB, Inventory Service và payment quota;
+- enforce account/device/payment/seat quota;
+- điều chỉnh release rate theo hold latency/conflict, DB saturation và provider health;
+- định nghĩa fairness/reconnect/multi-tab semantics;
+- chống token forge/share/replay;
+- có capacity/HA lớn hơn protected origin.
+
+Nó không thay atomic inventory transition. Một user được admission vẫn có thể thua ghế do contention.
+
+---
+
+#### 5. Seat hold flow
+
+```text
+Client                     Inventory Authority
+  │ POST hold + seats + idempotency + admission token
+  ├──────────────────────────────────────▶│
+  │                                       │ route to show owner
+  │                                       │ validate user/show/sales/quota
+  │                                       │ atomic check all seats
+  │                                       │ AVAILABLE → HELD
+  │                                       │ persist hold_id/owner/expires/version
+  │                                       │ commit outbox
+  │◀──────────────────────────────────────┤ 201 hold + expires_at + price snapshot
+```
+
+Core transaction:
+
+- all requested seats còn AVAILABLE hoặc expired hold đủ điều kiện reclaim;
+- all-or-nothing cho nhóm ghế theo contract;
+- authoritative price/rules được snapshot;
+- seat rows, hold record và outbox evidence commit cùng boundary;
+- `UNIQUE/conditional state/version` enforce invariant;
+- không external call và không lock xuyên checkout.
+
+Redis có thể chứa projection/timer helper; durable Inventory DB mới là authority.
+
+---
+
+#### 6. Hold expiry/release flow
+
+```text
+Hold created
+  → delayed expiry task/index
+  → worker wakes at/after expires_at
+  → Inventory conditional release:
+       state = HELD
+       hold_id/version still match
+       expires_at <= authoritative_now
+  → AVAILABLE + version increment
+  → InventoryReleased event
+  → update seat projection/cache
+```
+
+Nếu worker/message chạy muộn hoặc duplicate, correctness vẫn giữ vì state transition kiểm tra authority. Nếu booking đã BOOKED hoặc hold được gia hạn/version đổi, expiry message cũ không có tác dụng.
+
+Lazy expiry trong hold transaction có thể reclaim seat đã quá hạn ngay cả khi cleanup backlog.
+
+---
+
+#### 7. Checkout và payment flow
+
+```text
+1. Client POST /holds/{hold_id}/checkout + Idempotency-Key
+2. Booking Service validate hold ownership/expiry/price snapshot
+3. Persist Booking=PENDING_PAYMENT + PaymentAttempt
+4. Payment Service gọi provider với stable idempotency/reference
+5. Provider có thể yêu cầu next action hoặc trả pending/authorized
+6. Browser return chỉ cập nhật UX, không là source of truth
+7. Signed provider webhook/update được dedup và process
+8. Booking saga tiếp tục theo durable state
+```
+
+Timeout ≠ failed. Nếu response mất, state là pending/unknown cho tới webhook/query/reconciliation xác định outcome.
+
+Auth/capture pattern tham khảo:
+
+```text
+Hold inventory
+  → authorize payment
+  → commit inventory + confirm booking
+  → capture payment
+
+Failure paths:
+  authorization fail  → release hold
+  inventory commit fail after auth → void authorization
+  capture fail/unknown → retry/reconcile/compensate theo policy
+```
+
+Exact ordering phụ thuộc provider và business contract; mọi step có idempotency và durable saga state.
+
+---
+
+#### 8. Booking confirmation flow
+
+```text
+Payment outcome verified
+  → Inventory conditional commit HELD → BOOKED
+       requires expected hold_id/owner/version and valid policy
+  → Booking state → CONFIRMED
+  → outbox: BookingConfirmed
+  → async consumers:
+       Ticket Service issues tickets idempotently
+       Notification Service sends email/SMS/push
+       Audit/Analytics records transition
+       Seat projection marks BOOKED
+```
+
+Core invariants:
+
+- một seat chỉ có một confirmed booking;
+- cùng webhook/retry không commit/charge/issue ticket nhiều lần;
+- booking không CONFIRMED nếu payment/inventory conditions chưa đạt;
+- notification failure không đảo ngược booking;
+- ticket issuance lag được biểu diễn bằng state, không tạo booking thứ hai.
+
+---
+
+#### 9. Cancellation và refund flow
+
+```text
+Customer/Admin → cancel command + idempotency key
+  → authorize resource/action/policy
+  → Booking → CANCEL_PENDING
+  → revoke ticket/check-in rights
+  → Payment Service initiate refund/void
+  → webhook/reconciliation
+  → Booking → CANCELLED / REFUNDED
+  → release/resell inventory nếu event policy cho phép
+  → notify + audit
+```
+
+Cancellation, refund và inventory release không phải một cross-service ACID transaction. Saga cần:
+
+- terminal/intermediate states rõ;
+- retry-safe commands;
+- compensating actions;
+- manual-review queue cho mismatch;
+- không làm ticket cũ vẫn check-in được;
+- price/refund/fee policy snapshot và audit.
+
+---
+
+#### 10. State machines cuối cùng
+
+##### Inventory
+
+```text
+AVAILABLE → HELD → BOOKED
+     ▲         │
+     └─────────┘ expiry/release
+
+Any allowed state ↔ BLOCKED theo privileged audited policy
+```
+
+##### Booking
+
+```text
+PENDING_PAYMENT
+  ├─→ CONFIRMED → CANCEL_PENDING → CANCELLED/REFUNDED
+  ├─→ PAYMENT_FAILED
+  ├─→ EXPIRED
+  └─→ RECONCILIATION_REQUIRED
+```
+
+##### Payment
+
+```text
+CREATED → PENDING → AUTHORIZED → CAPTURED
+              ├───────────────→ FAILED
+              └───────────────→ UNKNOWN
+
+AUTHORIZED/CAPTURED → VOIDED/REFUND_PENDING → REFUNDED
+```
+
+##### Ticket
+
+```text
+PENDING_ISSUANCE → ACTIVE → USED
+                         └→ REVOKED/CANCELLED
+```
+
+Transitions cần conditional current-state/version check và audit; không chấp nhận arbitrary backward transition.
+
+---
+
+#### 11. API contract cuối cùng
+
+##### Public/catalog
+
+```http
+GET /v1/events?city=...&date=...&page_token=...
+GET /v1/events/{event_id}
+GET /v1/events/{event_id}/shows
+GET /v1/shows/{show_id}/seats?section=...&version=...
+```
+
+##### Hold/checkout
+
+```http
+POST /v1/shows/{show_id}/holds
+POST /v1/holds/{hold_id}/checkout
+GET  /v1/holds/{hold_id}
+```
+
+##### Booking/ticket
+
+```http
+GET  /v1/bookings/{booking_id}
+GET  /v1/bookings?cursor=...
+POST /v1/bookings/{booking_id}:cancel
+GET  /v1/bookings/{booking_id}/tickets
+```
+
+##### Admin
+
+```http
+POST  /v1/admin/events
+POST  /v1/admin/events/{event_id}/shows
+POST  /v1/admin/shows/{show_id}:publish
+PATCH /v1/admin/shows/{show_id}/pricing
+POST  /v1/admin/shows/{show_id}/inventory: block/unblock
+```
+
+##### Internal/provider
+
+```http
+POST /v1/internal/payments/webhooks/{provider}
+```
+
+Semantics:
+
+- idempotency keys cho mọi mutation;
+- `409` cho seat/current-state conflict;
+- `202` cho long-running checkout/refund;
+- stable error codes và status resources;
+- cursor pagination;
+- backend resource/tenant authorization;
+- webhook signature/replay/dedup.
+
+---
+
+#### 12. Communication cuối cùng
+
+| Interaction | Kiểu | Lý do/guarantee |
+|---|---|---|
+| Client → browse/search | Sync HTTP | Cacheable/read optimized |
+| Client → hold | Sync command | Cần authoritative atomic decision ngay |
+| Client → checkout | Sync initiate + async completion | Payment lâu/unknown; trả booking status |
+| Booking → Inventory | Sync/ordered command | Hold validation/commit/release với idempotency |
+| Booking → Payment | Sync initiate + webhook/reconcile | External uncertainty |
+| Domain state → event bus | Transactional outbox | Không mất event sau DB commit |
+| Consumer processing | At-least-once + inbox/idempotency | Safe redelivery |
+| Inventory → seat projection | Ordered/versioned by show | Bounded eventual consistency |
+| BookingConfirmed → ticket/notification | Async queue/log | Không chặn confirmation |
+| Expiry/refund/reconcile | Delayed/scheduled work | Authoritative recheck trước action |
+
+Không tuyên bố exactly-once end-to-end chỉ vì broker có một feature; business effect safety đến từ keys, constraints, state machines, inbox/outbox và reconciliation.
+
+---
+
+#### 13. Data stores cuối cùng
+
+##### PostgreSQL/relational core
+
+- Catalog configuration nếu không có lý do dùng document DB.
+- Inventory/holds.
+- Booking/payment/refund/ticket ledgers.
+- Idempotency, outbox/inbox và audit references.
+- Partition/home-region placement theo show.
+
+##### Search index
+
+- Elasticsearch/OpenSearch projection cho discovery.
+- Rebuildable từ Catalog events/source.
+
+##### Redis
+
+- Event/show cache.
+- Seat read projection.
+- Rate/admission ephemeral state theo failure contract.
+- Optional timer/expiry helper.
+- Không là booking/hold authority.
+
+##### Event log/queues
+
+- Kafka-compatible log cho domain changes, projections, audit/analytics nếu replay/multi-consumer cần.
+- Managed queue/RabbitMQ cho channel work, delayed/retry/DLQ.
+
+##### Object storage/CDN
+
+- Event media, static venue layout artifacts, generated ticket assets nếu phù hợp và access-controlled.
+
+---
+
+#### 14. Correctness guarantees
+
+| Guarantee | Enforcement |
+|---|---|
+| Không double-book show-seat | Inventory atomic state/version + unique constraints/serialized owner |
+| Multi-seat hold all-or-nothing | Same transaction/partition command hoặc explicit reservation protocol |
+| Hold tự hết hạn | Durable expires_at + conditional release/lazy expiry |
+| Không duplicate booking/payment effect | Idempotency records, state constraints, provider keys, webhook dedup |
+| Không mất domain event sau commit | Transactional outbox/CDC |
+| Consumer redelivery an toàn | Inbox/dedup + local transaction |
+| Payment unknown được giải quyết | Webhook/query/reconciliation/manual review |
+| Ticket không dùng sau cancel | Revocation/check-in authority |
+| Region failover không có hai writers | Owner epoch/lease + fencing trước promotion |
+
+Correctness invariant không được đánh đổi để “tăng availability” bằng fail-open.
+
+---
+
+#### 15. Availability và degraded modes
+
+| Failure | Degraded behavior |
+|---|---|
+| Search index lỗi | Catalog fallback/curated list; booking status vẫn truy cập |
+| Redis/cache lỗi | Browse chậm hơn; inventory authority vẫn đúng; origin protected |
+| Seat projection lag | UI hiển thị stale/version warning; hold recheck authority |
+| Inventory DB/owner lỗi | Dừng/queue bounded new holds/commits; không bán dựa trên cache |
+| Booking Service restart | Resume saga từ durable state/outbox/inbox |
+| Payment timeout/provider outage | Pending/unknown + webhook/reconcile; circuit/bulkhead |
+| Event bus lỗi | Outbox backlog; committed business state còn durable |
+| Expiry worker lag | Authoritative expiry/lazy reclaim vẫn ngăn commit expired hold |
+| Notification provider lỗi | Queue backlog/DLQ; booking/ticket không mất |
+| Home-region outage | Fence owner, controlled promote/cutover, reconcile in-flight work |
+| IdP lỗi | Public browse có thể chạy; protected mutation fail-safe/token validation theo model |
+
+Browse và read projection ưu tiên availability; inventory/payment mutation ưu tiên correctness.
+
+---
+
+#### 16. Scalability model cuối cùng
+
+##### Scale ngang tốt
+
+- CDN/catalog/search reads;
+- stateless APIs/BFF;
+- projection updaters theo show partitions;
+- notification/ticket workers theo queue partitions;
+- analytics consumers.
+
+##### Không scale chỉ bằng thêm Pods
+
+- one-seat/hot-show contention;
+- authoritative DB transaction/lock/CAS throughput;
+- payment provider quota/latency;
+- home-region writer ownership;
+- waiting-room fairness/order;
+- cross-region consensus/fencing.
+
+##### Flash-sale plan
+
+```text
+T-60 phút: verify capacity/provider quotas/health
+T-30 phút: pre-scale Pods/nodes, warm cache/search, freeze risky deploys
+T-5 phút: enable waiting room, bot rules, operational war room
+T0: release admissions theo safe capacity
+During: adapt rate theo inventory/payment/DB SLO
+After: drain queue, reconcile, restore normal capacity, review metrics
+```
+
+Autoscaling là lớp bổ sung, không thay scheduled readiness.
+
+---
+
+#### 17. Multi-region và DR
+
+```text
+Global reads:
+  CDN + regional Catalog/Search/Seat projections
+
+Inventory writes:
+  show_id → home_region + owner_epoch
+  all hold/commit commands → current owner
+```
+
+Failover:
+
+1. Detect/declare owner unavailable theo policy.
+2. Stop/fence old writer bằng epoch/lease/credentials/network controls.
+3. Promote/restore authoritative data within RPO.
+4. Increment owner epoch và update routing/admission.
+5. Reconnect services; process outbox/inbox/webhooks.
+6. Reconcile holds, bookings, payments và tickets.
+7. Validate no double booking trước full admission.
+
+Active-active inventory write cho cùng show không phải baseline. RTO ngắn hơn không được đổi lấy split-brain.
+
+---
+
+#### 18. Security model cuối cùng
+
+- OIDC login, access/refresh lifecycle, MFA/step-up cho admin.
+- Backend action-resource-tenant AuthZ.
+- Signed admission tokens và bot/hoarding/quota controls.
+- TLS external; internal workload identity/mTLS theo threat model.
+- Payment tokenization, isolated credentials, signed webhooks và anti-replay.
+- Secret manager/KMS/HSM where appropriate; rotation/audit.
+- Private DB/cache/stream endpoints và default-deny network policy.
+- Signed/revocable ticket artifacts và authoritative check-in.
+- PII/payment/audit retention và encryption.
+- Admin approval/audit cho pricing, inventory override, cancel/refund.
+- Supply-chain/container/Kubernetes security controls.
+
+Security/anti-bot controls cũng phải có capacity và fail behavior rõ trong flash sale.
+
+---
+
+#### 19. Observability và operations
+
+##### Business correctness
+
+- double-booking count = 0;
+- duplicate charge/booking/ticket effects = 0;
+- charged-but-unconfirmed và confirmed-without-valid-payment;
+- inventory/payment/ticket reconciliation mismatch age.
+
+##### Traffic/capacity
+
+- waiting-room depth/release/admission/replay failures;
+- seat-map RPS/payload/projection lag;
+- hold attempt/success/conflict/expiry;
+- DB lock/CAS/deadlock/connection/transaction latency;
+- payment/provider latency/quota/unknown outcomes;
+- outbox/queue lag/DLQ;
+- notification/ticket latency.
+
+##### SLO/runbook
+
+- separate browse, seat-map, hold, checkout, confirmation, notification SLOs;
+- symptom + correctness alerts;
+- owner/escalation/runbooks;
+- chaos/load/DR/reconciliation drills;
+- no sampling loss cho critical audit events;
+- correlation IDs nối user → hold → booking → payment → ticket.
+
+---
+
+#### 20. Design decisions đối chiếu requirements
+
+| Requirement/bottleneck | Final decision |
+|---|---|
+| 100k concurrent flash-sale users | Waiting room, pre-scale, bot controls, adaptive admission |
+| Read-heavy browse | CDN/cache/search/read projections |
+| Real-time-ish seat view | Versioned projection + delta/push; authoritative recheck on hold |
+| No double booking | Per-show inventory authority + atomic transitions |
+| Hold abandonment | Durable lease/expiry + conditional cleanup/lazy reclaim |
+| Payment slow/unknown | Payment Service, saga, idempotency, webhook/reconciliation |
+| Notification burst | Async queues/workers/provider quotas |
+| Audit/disputes | Outbox + protected append-only audit + business IDs |
+| Global users | Global read plane + event home-region write authority |
+| Region failure | Owner epoch/fencing + controlled DR/reconciliation |
+| Maintainability | Explicit domain/data ownership và versioned contracts |
+
+---
+
+#### 21. Những điểm hiệu chỉnh so với sơ đồ đơn giản
+
+| Transcript đơn giản hóa | Final design production-oriented |
+|---|---|
+| Mọi request qua một API Gateway | Edge/waiting room/gateway/BFF được bố trí theo traffic/security need |
+| Authentication Service tập trung mọi kiểm tra | IdP xác thực; domain service vẫn enforce resource AuthZ |
+| MongoDB hoặc Elasticsearch lưu event data | Canonical Catalog DB riêng; Elasticsearch/OpenSearch là search projection |
+| Redis giữ seat availability/temporary reservations | Redis chỉ cache/projection; Inventory DB giữ durable hold/expiry/version |
+| Kafka cho mọi async task | Event log cho replay/multi-consumer; task queue cho work delivery/delay |
+| Retry failed payment | Timeout có thể unknown; retry chỉ theo idempotent provider contract + reconcile |
+| Audit log gửi async | Critical outbox/audit evidence commit cùng business state, delivery async |
+| Booking Service “reserve + pay + confirm” | Durable saga/state machine với compensation và status API |
+| Service separation tự tạo scale | Data ownership, contention, admission và downstream limits mới quyết định scale |
+| Kubernetes autoscaling xử lý flash sale | Pre-scale + node capacity + HPA + waiting room + safe-capacity control |
+
+---
+
+#### 22. Cách trình bày final design trong phỏng vấn
+
+Recap 90 giây:
+
+1. Tách read plane cache/search/projection khỏi authoritative inventory write plane.
+2. Mỗi show có home-region owner; atomic state transition ngăn double booking.
+3. User qua waiting room, nhận admission token rồi tạo durable hold có TTL.
+4. Booking Service chạy saga với Payment Service/provider bằng idempotency và webhook/reconciliation.
+5. Confirm booking chỉ sau khi inventory/payment conditions đạt; ticket/notification đi async.
+6. Redis hiển thị availability nhanh nhưng không là hold authority.
+7. PostgreSQL đảm bảo inventory/booking/payment transactions; outbox/inbox bảo vệ events.
+8. Kafka/log phục vụ projections/audit; queue phục vụ notification/expiry jobs.
+9. Multi-AZ HA, home-region fencing/DR và reconciliation bảo vệ failure cases.
+10. Pre-scale + waiting room bảo vệ flash sale; metrics correctness quan trọng ngang latency.
+
+Deep dives nên chuẩn bị:
+
+- seat-locking/hold algorithm;
+- payment saga và unknown outcome;
+- waiting-room fairness/admission;
+- read projection/WebSocket fan-out;
+- sharding/hot show;
+- multi-region failover/fencing;
+- idempotency/outbox/inbox/reconciliation.
+
+---
+
+#### 23. Final checklist
+
+- [ ] Domain/inventory/booking/payment/ticket state machines rõ?
+- [ ] No-double-booking invariant có authoritative enforcement?
+- [ ] Multi-seat hold atomicity/locality?
+- [ ] Durable hold, server expiry, conditional cleanup và lazy reclaim?
+- [ ] Redis/cache/projection không nằm trong correctness authority?
+- [ ] Waiting room, admission token, fairness và bot/hoarding controls?
+- [ ] Payment auth/capture/timeout/late-success/refund workflow?
+- [ ] Idempotency cho mọi mutation và webhook?
+- [ ] Outbox/inbox, event ordering/version, DLQ/replay?
+- [ ] Ticket/notification consumers idempotent và async?
+- [ ] Canonical source vs search/cache projections?
+- [ ] Data ownership và service authorization?
+- [ ] Home-region routing, epoch/fencing và DR?
+- [ ] Browse/hold/payment/notification degraded modes?
+- [ ] Capacity/pre-scale/HPA/node/DB/provider quotas?
+- [ ] Backups/PITR/restore/reconciliation drills?
+- [ ] Security cho identity, payment, admin, ticket và workloads?
+- [ ] Metrics/SLO/alerts/runbooks cho performance lẫn correctness?
+- [ ] Cost và evolution triggers được ghi trong ADR?
+
+#### 24. Ý chính cần nhớ
+
+- Ticketing final design được xây quanh inventory correctness, không quanh UI hoặc tên công nghệ.
+- Read plane phân tán/cache được; write authority cho cùng show cần ownership rõ.
+- Seat-map “real time” là projection; hold mới là authoritative decision.
+- Hold là durable expiring lease, không phải Redis TTL hoặc DB lock xuyên payment.
+- Booking và payment là durable saga với unknown outcomes và compensation.
+- Idempotency/outbox/inbox/reconciliation tạo business effect an toàn dưới retry/redelivery.
+- Notification và ticket issuance bất đồng bộ, không kéo dài booking transaction.
+- Waiting room biến uncontrolled arrival burst thành admission rate hệ thống chịu được.
+- PostgreSQL phù hợp transactional core; search/cache/event systems là derived/supporting layers.
+- Kubernetes/autoscaling không sửa hot-row contention; flash sale cần pre-scale và admission.
+- Global platform nên dùng home-region inventory owner và fenced failover.
+- Availability phải degrade theo path; inventory mutation không được fail-open.
+- Auditability/support/reconciliation là phần của product correctness.
+- Kiến trúc tốt giải thích được vì sao mỗi component tồn tại và khi nào nó cần tiến hóa.
+
+#### Công thức ghi nhớ
+
+> **Final Ticketing System = scalable discovery plane + admission-controlled authoritative inventory + durable expiring holds + idempotent payment saga + asynchronous ticket/notification + fenced HA/DR + continuous audit/reconciliation.**
+
+---
+
+## Phần 14 — Design a News Feed (Twitter/Instagram)
+
+### Bài 73. Understanding the Problem & Defining the Scope
+
+#### 1. News feed là gì?
+
+News feed/home timeline là dòng nội dung được cá nhân hóa mà user thấy khi mở ứng dụng:
+
+```text
+Accounts/pages/communities user follows
+              ↓
+        candidate posts
+              ↓
+  eligibility + ordering/ranking
+              ↓
+    paginated home timeline
+```
+
+Nó không chỉ là `SELECT * FROM posts ORDER BY created_at`. Hệ thống phải:
+
+- nhận và lưu post/media;
+- duy trì social graph;
+- tìm candidate phù hợp cho từng user;
+- áp privacy/block/mute/moderation rules;
+- sắp xếp hoặc ranking;
+- cung cấp feed nhanh, fresh và không lặp khó chịu;
+- cập nhật engagement counts;
+- scale khi một author có hàng triệu followers.
+
+Chất lượng feed ảnh hưởng trực tiếp tới engagement và cảm nhận về toàn bộ sản phẩm.
+
+---
+
+#### 2. Chốt loại feed trước khi thiết kế
+
+“News feed giống Twitter/Instagram” vẫn quá rộng. Cần quyết định:
+
+| Feed type | Semantics | Tác động kiến trúc |
+|---|---|---|
+| Following chronological | Post từ accounts đang follow, gần reverse chronological | Candidate/order đơn giản hơn, dễ reason |
+| Ranked following feed | Candidate từ follows nhưng sắp theo relevance | Cần feature/ranking pipeline và snapshot semantics |
+| Recommended/discovery feed | Có post từ accounts chưa follow | Candidate generation, safety và ML phức tạp hơn |
+| Mixed feed | Following + recommendations + ads/modules | Policy/ranking/dedup/placement phức tạp nhất |
+
+Scope baseline của case study:
+
+- home feed chủ yếu từ accounts user follow;
+- ordering reverse chronological hoặc ranking nhẹ, không thiết kế ML ranking chi tiết;
+- text, image và video posts;
+- likes, replies/comments và repost/share ở mức cơ bản;
+- public accounts trước, sau đó ghi rõ privacy hooks;
+- fan-out strategy là trọng tâm.
+
+Nếu không chốt chronological hay ranked, khó định nghĩa freshness, pagination, consistency và cache correctness.
+
+---
+
+#### 3. Actors và journeys
+
+##### Actors
+
+- **Reader:** mở/refresh/scroll feed và tương tác.
+- **Creator/author:** tạo, sửa/xóa post và upload media.
+- **Follower:** follow/unfollow account.
+- **Private-account owner:** approve/reject follow request nếu nằm trong scope.
+- **Moderator/safety system:** hide/remove/restrict content/account.
+- **Advertiser/recommendation system:** ngoài baseline nhưng cần insertion hooks nếu product yêu cầu.
+
+##### Core journey
+
+```text
+Alice follows Bob
+  → Bob publishes Post P
+  → P becomes eligible for Alice
+  → Alice opens/refreshes feed
+  → Feed contains P within freshness target
+  → Alice likes/replies/reposts
+```
+
+Central question:
+
+> Khi Bob đăng một post, hệ thống thực hiện công việc phân phối ngay lúc write hay chờ Alice đọc feed mới tổng hợp?
+
+---
+
+#### 4. Domain model nền tảng
+
+```text
+User/Profile
+  ├─ FollowEdge(follower_id, followee_id, state, version)
+  ├─ Block/Mute/Privacy relationships
+  └─ HomeTimeline / Feed state
+
+Post
+  ├─ author_id
+  ├─ text/caption
+  ├─ media references
+  ├─ visibility/audience
+  ├─ created_at/version/status
+  └─ reply/repost references
+
+MediaAsset
+  ├─ object key/variants
+  ├─ processing state
+  └─ safety/visibility state
+
+Engagement
+  ├─ like/reaction
+  ├─ reply/comment
+  └─ repost/share
+
+TimelineEntry
+  ├─ viewer/timeline owner
+  ├─ post_id
+  ├─ ordering/ranking metadata
+  └─ generation/source/version
+```
+
+Phân biệt:
+
+- **Post Store:** source of truth của content/status/visibility.
+- **Social Graph Store:** source of truth của follow/block/mute relationships.
+- **Timeline/Feed Store:** materialized candidate/read model; có thể rebuild và không phải authority cho post còn được phép hiển thị.
+- **Ranking system:** quyết định order, không sở hữu content.
+- **Media Store/CDN:** lưu và phân phối bytes, khác post metadata.
+
+---
+
+#### 5. Functional requirements
+
+##### FR1 — Create/publish post
+
+User có thể tạo post text và optional media.
+
+Flow khái niệm:
+
+```text
+upload media/receive media references
+  → create post metadata
+  → durable commit
+  → publish PostCreated event
+  → distribute/generate feed candidates
+```
+
+Cần chốt:
+
+- post được publish ngay hay chờ media processing/safety scan;
+- edit/delete semantics;
+- audience: public/followers/private list;
+- maximum size/media count;
+- idempotency khi mobile retry.
+
+##### FR2 — Follow/unfollow
+
+User follow/unfollow accounts; private account có thể cần pending/approved edge.
+
+Follow change ảnh hưởng:
+
+- future fan-out;
+- existing timeline entries có backfill/remove không;
+- authorization để xem post;
+- counts/notifications;
+- block/mute precedence.
+
+##### FR3 — Home timeline/feed
+
+User mở feed và nhận page nội dung:
+
+- từ eligible authors/sources;
+- sắp theo chronological/ranked contract;
+- dùng cursor pagination;
+- không lặp trong một browsing session ngoài policy;
+- bỏ deleted/blocked/private/ineligible posts;
+- có next-page token và snapshot/generation semantics.
+
+##### FR4 — Engagement
+
+- Like/unlike.
+- Reply/comment.
+- Repost/share.
+- Xem counts/recent state.
+
+Engagement write cần idempotency/uniqueness, ví dụ một user chỉ có tối đa một active like trên một post. Counts có thể eventual/approximate; user-specific “đã like chưa” cần semantics rõ hơn.
+
+##### FR5 — Rich media
+
+- Upload trực tiếp tới object storage qua quyền tạm thời.
+- Transcode/resize/thumbnail bất đồng bộ.
+- CDN delivery.
+- Media state/variants.
+- Safety/moderation, ownership và deletion propagation.
+
+API server không nên proxy toàn bộ video bytes nếu direct upload an toàn giải quyết tốt hơn.
+
+##### FR6 — Delete/hide/moderate
+
+Author có thể delete post; moderator có thể hide/remove/restrict. Hệ thống phải ngừng hiển thị trong freshness/takedown SLO dù timeline caches còn entry.
+
+Delete nên cập nhật authoritative Post status rồi propagate tombstone/invalidation; không cần đồng bộ xóa entry khỏi hàng triệu timelines trước khi acknowledge nếu serve-time eligibility check bảo vệ đúng.
+
+---
+
+#### 6. Out of scope ban đầu
+
+- ML recommendation/ranking model chi tiết.
+- Ads auction và placement.
+- Stories/live streaming.
+- Direct messaging.
+- Trending/search toàn platform.
+- Creator monetization/subscription.
+- Full moderation classifier/policy engine.
+- Cross-platform federation.
+
+Vẫn cần interfaces/hooks cho ranking, safety và ads nếu biết sẽ có, nhưng không thiết kế chúng đầy đủ trong case study này.
+
+---
+
+#### 7. Non-functional requirements
+
+##### 7.1 Feed latency
+
+- First page p95/p99 theo region/device/network.
+- Pagination latency ổn định.
+- Media bytes đi qua CDN; feed API trả metadata/references.
+- Cold start và cache miss được tính riêng.
+
+“Gần như tức thì” phải chuyển thành SLO đo được, ví dụ user-visible API latency không đồng nhất với full media render time.
+
+##### 7.2 Freshness
+
+Post mới từ normal account xuất hiện cho follower trong vài giây theo percentile target. Celebrity post có thể có freshness budget khác do fan-out lớn.
+
+Freshness gồm:
+
+```text
+post commit
+→ event publish
+→ fan-out/candidate generation
+→ feed store/cache visibility
+→ client refresh/push
+```
+
+Mỗi stage cần lag metric.
+
+##### 7.3 Availability
+
+- Read feed thường ưu tiên availability cao.
+- Post creation phải durable trước acknowledgement.
+- Ranking service lỗi có thể fallback chronological.
+- Engagement counts có thể stale.
+- Media variant chưa sẵn có thể dùng placeholder.
+- Safety/privacy enforcement không được fail-open cho protected content.
+
+##### 7.4 Scalability
+
+- Millions users/posts/reads.
+- Follower count có power-law distribution.
+- Feed reads, fan-out writes, engagement events và media traffic scale khác nhau.
+- Hot celebrities/content/hashtags tạo skew.
+
+##### 7.5 Durability
+
+- Acknowledged post metadata/media phải bền vững theo RPO.
+- Timeline candidates/cache có thể rebuild.
+- Like counts/analytics có thể reconstruct tùy retention, nhưng user actions cần contract.
+
+##### 7.6 Consistency/UX stability
+
+- Không cần global strong consistency cho toàn feed.
+- Tránh missing/duplicate trong một pagination snapshot.
+- Deleted/blocked content phải biến mất trong policy SLO.
+- Follow/unfollow có bounded propagation.
+- Counts có thể eventual; content visibility cần authority check.
+
+##### 7.7 Security/privacy/safety
+
+- Object-level authorization theo audience/follow/block.
+- Private account và approved edge.
+- Media upload validation/signed URLs.
+- Abuse/spam/bot rate limits.
+- Takedown, legal/privacy deletion.
+- PII minimization và access audit.
+- Ranking/safety policy versioning và explainability/operations phù hợp.
+
+---
+
+#### 8. Feed correctness không giống database consistency
+
+Feed là derived, ordered collection thay đổi liên tục. “Consistent feed” cần được định nghĩa bằng UX properties:
+
+- Post đã trả trong page trước không lặp lại vô lý ở page sau.
+- Cursor không làm mất hàng loạt items khi post mới chèn đầu feed.
+- Deleted/blocked/ineligible post bị filter.
+- Một post có stable identity dù counts thay đổi.
+- Reordering do ranking được quản lý theo session/generation.
+- Page không phụ thuộc offset trên dataset đang đổi nhanh.
+
+Cursor có thể encode:
+
+```text
+feed_generation / snapshot_time
+last_sort_key hoặc rank boundary
+viewer/context version
+opaque integrity-protected state
+```
+
+Offset pagination dễ duplicate/missing khi feed có insert mới.
+
+---
+
+#### 9. Ordering: chronological hay ranked?
+
+##### Reverse chronological
+
+```text
+ORDER BY event_time/post_id DESC
+```
+
+Ưu điểm:
+
+- dễ giải thích và debug;
+- cursor đơn giản hơn;
+- freshness trực tiếp;
+- không cần online feature/ranking dependency.
+
+Trade-off:
+
+- user follow nhiều account dễ bỏ lỡ post quan trọng;
+- spam/high-frequency authors chiếm feed;
+- late-arriving/fan-out events cần ordering rule.
+
+##### Ranked feed
+
+Candidate được chấm điểm theo freshness, relationship, predicted engagement, diversity, safety và product policy.
+
+Trade-off:
+
+- ranking latency/feature freshness;
+- reproducibility và pagination stability;
+- feedback loops/bias;
+- fallback khi model/feature store lỗi;
+- experimentation và versioning.
+
+Baseline case study có thể dùng chronological first, sau đó thêm ranking stage trên candidate set. Không để ranking system sở hữu canonical post/social graph.
+
+---
+
+#### 10. Social graph semantics
+
+Follow graph thường là directed:
+
+```text
+Alice → follows → Bob
+```
+
+Access patterns:
+
+- `following(user_id)` để fan-out-on-read/candidate generation.
+- `followers(author_id)` để fan-out-on-write.
+- relationship check `(viewer, author)` cho privacy/eligibility.
+- follower/following counts.
+
+State:
+
+```text
+PENDING → ACTIVE → REMOVED
+BLOCKED/MUTED relationships override visibility/delivery
+```
+
+Unfollow semantics cần chốt:
+
+- dừng nhận future posts ngay sau propagation;
+- purge existing materialized entries eager hay filter lazy;
+- private post đã cached có bị serve không;
+- block cần propagation nhanh hơn mute/unfollow thường.
+
+Counts là derived; follow edge mới là authority.
+
+---
+
+#### 11. Media workflow trong scope
+
+```text
+Client → request upload authorization
+Client → Object Storage direct multipart upload
+Storage event → Media Processing Queue
+             → virus/type validation
+             → image resize/video transcode/thumbnail
+             → moderation/safety
+             → variants + READY/REJECTED state
+Post references media_id/version
+CDN serves approved variants
+```
+
+Cần quyết định:
+
+- post publish trước khi media READY hay ở trạng thái PROCESSING;
+- retry/idempotency của transcoding;
+- object lifecycle/orphan cleanup;
+- signed/private media delivery;
+- delete/takedown propagation qua CDN;
+- original vs variants retention.
+
+Media bandwidth/storage thường lớn hơn feed metadata và phải estimate riêng ở Step 2.
+
+---
+
+#### 12. Fan-out on write
+
+Khi author publish:
+
+```text
+PostCreated
+  → lấy follower IDs
+  → ghi TimelineEntry(post_id) vào feed của từng follower
+```
+
+Ưu điểm:
+
+- feed read rất nhanh;
+- computation đã làm trước;
+- phù hợp authors có follower count nhỏ/vừa và active readers.
+
+Nhược điểm:
+
+- write amplification theo follower count;
+- celebrity post có thể tạo hàng triệu writes/backlog;
+- ghi vào feed của inactive users lãng phí;
+- follow/unfollow/delete cần backfill/invalidation semantics;
+- freshness phụ thuộc fan-out lag;
+- duplicate/redelivery cần idempotent timeline insert.
+
+Fan-out event nên partition/batch và timeline entry chỉ lưu post reference + ordering metadata, không copy toàn bộ content.
+
+---
+
+#### 13. Fan-out on read
+
+Khi reader mở feed:
+
+```text
+following IDs
+  → lấy recent posts của từng author
+  → merge/sort/rank
+  → filter eligibility
+  → return page
+```
+
+Ưu điểm:
+
+- post write rẻ;
+- không materialize feeds cho inactive users;
+- celebrity publish không tạo massive fan-out writes;
+- relationship/visibility mới dễ áp tại read time.
+
+Nhược điểm:
+
+- read amplification theo following count;
+- k-way merge/ranking tăng latency/CPU;
+- hot reader/cache miss gây nhiều backend reads;
+- khó giữ pagination snapshot ổn định;
+- social graph/post-store availability nằm trên read path.
+
+Cần per-author recent-post index/cache và giới hạn candidate window; không query tùy ý hàng nghìn databases tuần tự.
+
+---
+
+#### 14. Hybrid fan-out — baseline thực dụng
+
+Không phải chọn một phía cho toàn platform:
+
+```text
+Normal authors:
+  fan-out on write → followers' materialized timelines
+
+Celebrity/high-follower authors:
+  do not push to every follower
+  → store recent author posts
+  → merge on read
+
+Reader feed:
+  precomputed timeline
+  + pulled celebrity posts
+  + optional recommendations/modules
+  → eligibility filter
+  → rank/order/dedup
+```
+
+Threshold không nên chỉ dựa follower count. Có thể xét:
+
+- active follower count;
+- author post rate;
+- follower overlap;
+- fan-out backlog/cost;
+- freshness SLO;
+- reader activity;
+- regional distribution.
+
+Hybrid biến bài toán thành policy/operations: khi account vượt threshold, historical entries xử lý thế nào và mode changes có tạo duplicate/missing không?
+
+---
+
+#### 15. Sources of truth và derived state
+
+| Data | Authority | Derived state |
+|---|---|---|
+| Post metadata/status/audience | Post Store | Feed entries, search index, caches |
+| Media bytes/status | Object/Media Store | CDN variants/caches |
+| Follow/block/mute edges | Social Graph Store | follower lists cache/counts |
+| Engagement action | Engagement Store | counters/trending/features |
+| Home timeline candidates | Feed Store/materialized timeline | Feed cache/client page |
+| Ranking score/order | Ranking pipeline/version | Ranked page/session cache |
+
+Nếu timeline entry còn tồn tại sau post delete/block, serve layer phải kiểm tra tombstone/eligibility cache trong bounded SLO. Không coi fan-out copies là canonical content.
+
+---
+
+#### 16. API contract sơ bộ
+
+##### Post/media
+
+```http
+POST   /v1/media/uploads
+POST   /v1/posts
+GET    /v1/posts/{post_id}
+PATCH  /v1/posts/{post_id}
+DELETE /v1/posts/{post_id}
+```
+
+Create post dùng `Idempotency-Key`; client gửi media IDs đã được cấp quyền, không tự gửi arbitrary object references.
+
+##### Social graph
+
+```http
+PUT    /v1/users/{user_id}/followers/me
+DELETE /v1/users/{user_id}/followers/me
+POST   /v1/users/{user_id}:block
+POST   /v1/users/{user_id}:mute
+```
+
+Hoặc resource model riêng cho relationships; cần stable idempotent semantics.
+
+##### Feed
+
+```http
+GET /v1/feed/home?limit=20&cursor=<opaque_cursor>
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "post": {...},
+      "author": {...},
+      "viewer_state": {"liked": false},
+      "counts": {"likes": 123},
+      "feed_reason": "following"
+    }
+  ],
+  "next_cursor": "...",
+  "generation": "..."
+}
+```
+
+##### Engagement
+
+```http
+PUT    /v1/posts/{post_id}/likes/me
+DELETE /v1/posts/{post_id}/likes/me
+POST   /v1/posts/{post_id}/replies
+POST   /v1/posts/{post_id}:repost
+```
+
+`PUT/DELETE` vào viewer-specific like resource làm retry tự nhiên idempotent hơn `POST /like` toggle.
+
+---
+
+#### 17. Privacy và eligibility invariant
+
+Hard rule:
+
+> Feed chỉ được trả post nếu viewer hiện được phép xem theo post visibility, author/account state, approved-follow edge, block/mute policy và moderation/takedown state.
+
+Eligibility có thể được precompute một phần nhưng cần serve-time protection cho high-priority changes:
+
+- block;
+- private-account revoke/unfollow;
+- post delete;
+- moderation/legal takedown;
+- account suspension.
+
+Cache key và shared CDN response phải không làm private feed/content rò sang user khác. Feed API thường personalized/private cache; media access cũng cần phù hợp audience policy.
+
+---
+
+#### 18. Freshness và consistency contracts
+
+Ví dụ contracts:
+
+- Post creation: author đọc thấy post của mình ngay sau commit.
+- Normal follower: post xuất hiện trong feed trong `X` giây ở p95.
+- Celebrity: post có thể merge-on-read; freshness phụ thuộc recent-author index.
+- Like action: user thấy trạng thái của mình read-after-write; aggregate count eventual.
+- Delete/block: không serve sau bounded takedown propagation target.
+- Follow: future eligibility áp dụng ngay/bounded; backfill recent posts là product choice.
+- Pagination: cùng generation tránh duplicate/missing trong session ở mức best effort/contract.
+
+Không cần strong global order giữa mọi posts. Có thể dùng sortable IDs/event time với tie-breaker, nhưng clock skew/late events cần rule rõ.
+
+---
+
+#### 19. Availability và degraded modes ban đầu
+
+| Failure | Degraded behavior |
+|---|---|
+| Ranking service lỗi | Fallback chronological/cached feed |
+| Fan-out backlog | Feed thiếu post mới tạm thời; expose freshness lag, pull fallback nếu cần |
+| Engagement counter lỗi | Feed vẫn hiển thị post với stale/hidden counts |
+| Media processing chậm | Placeholder/PROCESSING, post policy tùy product |
+| Social graph read lỗi | Serve safe cached eligibility trong policy hoặc fail closed cho private content |
+| Feed cache lỗi | Rebuild/DB fallback có bound; không avalanche origin |
+| Notification lỗi | Không ảnh hưởng post/feed core |
+| Moderation/takedown path lỗi | Không fail-open cho known restricted content |
+
+Feed read ưu tiên availability, nhưng privacy/safety là hard boundary.
+
+---
+
+#### 20. Constraints cần mang sang Step 2
+
+Transcript chưa cho số cụ thể. Cần estimate:
+
+- DAU/MAU và peak concurrent readers.
+- Feed opens/refreshes/pages/user/day.
+- Page size và average post metadata/media references.
+- Posts/user/day và peak post rate.
+- Follower/following distribution, không chỉ average.
+- Celebrity max/percentiles và active follower count.
+- Fan-out writes/day/second và backlog/freshness target.
+- Post/media size, upload/transcode/storage/egress.
+- Likes/replies/reposts per post/read.
+- Feed timeline retention/window per user.
+- Active vs inactive user ratio.
+- Delete/block/unfollow/moderation propagation rate/SLO.
+- Region distribution và cross-region replication/egress.
+- Ranking candidates/features/latency nếu ranked feed.
+
+Power-law/social graph skew và media bandwidth có thể quan trọng hơn tổng user count.
+
+---
+
+#### 21. Những lỗi Step 1 thường gặp
+
+- Không chốt chronological hay ranked feed.
+- Trộn Post Store, Feed Store và Ranking Service thành một database.
+- Coi materialized timeline là source of truth của content/privacy.
+- Chỉ nói “feed gồm posts từ người follow” nhưng bỏ block/mute/private/moderation.
+- Dùng offset pagination trên feed đang thay đổi liên tục.
+- Sao chép full post/media vào từng user timeline.
+- Chọn fan-out-on-write cho cả celebrity hàng triệu followers.
+- Chọn fan-out-on-read cho mọi reader mà không tính merge/read amplification.
+- Nói hybrid nhưng không định nghĩa threshold/mode-transition semantics.
+- Feed “consistent” nhưng không nêu duplicate/missing/staleness/takedown contract.
+- Like toggle dùng non-idempotent retry.
+- Upload video qua application API thay vì direct object upload mà không có lý do.
+- Feed cache/shared CDN làm rò private content.
+- Ranking failure làm toàn feed unavailable, không fallback.
+- Không đưa deletion/moderation/tombstone propagation vào requirements.
+- Chỉ estimate metadata, bỏ media storage/transcode/egress.
+
+---
+
+#### 22. Checklist hoàn tất Step 1
+
+- [ ] Feed type: chronological, ranked, recommended hay mixed?
+- [ ] Core actors/journeys và in/out scope?
+- [ ] User, FollowEdge, Post, Media, Engagement, TimelineEntry models?
+- [ ] Authorities: post, graph, media, engagement, feed projection?
+- [ ] Create/edit/delete and media processing semantics?
+- [ ] Follow/unfollow/private/block/mute behavior?
+- [ ] Feed eligibility/privacy invariant?
+- [ ] Cursor/generation/dedup/pagination contract?
+- [ ] Likes/replies/reposts idempotency và count consistency?
+- [ ] Freshness SLO normal vs celebrity authors?
+- [ ] Fan-out write/read/hybrid trade-off?
+- [ ] Hybrid threshold và mode transition?
+- [ ] Deleted/moderated content purge/filter SLO?
+- [ ] Availability/degraded modes và ranking fallback?
+- [ ] Security, spam/bot, media safety và privacy controls?
+- [ ] Scale inputs gồm distribution/skew/media—not chỉ averages?
+
+#### 23. Ý chính cần nhớ
+
+- News feed là candidate generation + eligibility + ordering/ranking + low-latency delivery.
+- Phải chốt chronological/ranked/recommended scope trước khi thiết kế.
+- Post Store và Social Graph Store là authorities; Timeline Store là derived read model.
+- Feed correctness là UX contract về duplicates, missing, staleness, pagination và eligibility.
+- Cursor pagination phù hợp feed biến động hơn offset pagination.
+- Media bytes đi qua object storage/CDN; feed API trả metadata/references.
+- Fan-out-on-write tối ưu reads nhưng tạo write amplification/celebrity problem.
+- Fan-out-on-read tối ưu writes nhưng tạo read amplification/merge latency.
+- Hybrid thường push normal authors và pull celebrity posts rồi merge/rank/dedup khi đọc.
+- Follower count alone chưa đủ; active followers/post rate/backlog/cost cũng ảnh hưởng policy.
+- Materialized timeline không được bypass block/private/delete/moderation checks.
+- Engagement action có thể strongly idempotent; aggregate counts thường eventual.
+- Ranking có fallback; availability không được fail-open privacy/safety.
+- Step 2 phải estimate graph distribution, feed reads, fan-out, engagement và media separately.
+
+#### Công thức ghi nhớ
+
+> **News Feed = authoritative posts + social graph + hybrid candidate delivery + eligibility filtering + stable pagination + ranking/order + media/CDN + safety/privacy controls.**
+
+---
+
+### Bài 74. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của Step 2
+
+Với news feed, tổng user count chưa đủ. Cần dimension nhiều workload độc lập:
+
+- feed opens, refreshes và pagination pages;
+- post creation và fan-out entries;
+- social graph reads/writes;
+- likes, replies, reposts và counter updates;
+- media uploads, transcoding, storage và delivery egress;
+- ranking candidates/features/inference;
+- delete/block/moderation invalidation;
+- notification và analytics events;
+- celebrity/hot-content skew;
+- active vs inactive readers.
+
+Điểm cốt lõi là **amplification**: một post có thể tạo hàng triệu timeline writes; một feed page có thể cần hàng trăm candidate reads và nhiều enrichments.
+
+---
+
+#### 2. Assumptions của transcript
+
+| Biến | Giá trị giả định |
+|---|---:|
+| Registered users | 500 triệu |
+| Daily active users | 200 triệu |
+| Posts/ngày | 1 tỷ |
+| Feed opens/user/ngày | 10 |
+| Feed requests/ngày | khoảng 2 tỷ cho first opens |
+| Media uploads/ngày | “hàng trăm triệu” |
+| Engagement events/ngày | “hàng tỷ” |
+
+Các con số cần bổ sung:
+
+- pages/open và items/page;
+- refresh/prefetch/background requests;
+- average/percentile following/follower counts;
+- active-follower ratio;
+- celebrity max followers và post rate;
+- tỷ lệ text/image/video cùng average/percentile sizes;
+- media views/post và bitrate/variant mix;
+- engagement events cụ thể;
+- timeline window/retention per user;
+- freshness SLO normal/celebrity;
+- geographic/diurnal peak factor;
+- bot/crawler/spam multiplier;
+- ranked-feed candidate count và feature cost.
+
+“80% workload là timeline reads” trong transcript là một illustrative ratio, chưa được suy ra đầy đủ từ các assumptions. Cần đo theo logical actions, backend operations, bytes và compute riêng.
+
+---
+
+#### 3. User activity ratios
+
+```text
+DAU / registered users
+= 200M / 500M
+= 40%
+```
+
+Theo assumptions:
+
+```text
+Posts per DAU/day
+= 1B / 200M
+= 5 posts/user/day average
+```
+
+Đây là average toàn DAU; distribution thực tế rất skewed:
+
+- phần lớn users chỉ đọc;
+- một nhóm creators đăng thường xuyên;
+- bots/spam accounts có post rate cao;
+- brands/news/celebrities tạo disproportionate fan-out.
+
+Capacity phải dùng percentile/distribution, không áp 5 posts cho mọi user.
+
+---
+
+#### 4. Post write throughput
+
+```text
+Average post creation rate
+= 1,000,000,000 / 86,400
+≈ 11,574 posts/second
+```
+
+Peak theo factor minh họa:
+
+```text
+5× average  ≈ 57,900 posts/s
+10× average ≈ 115,700 posts/s
+```
+
+Peak thực phụ thuộc timezone, live event, breaking news và bot activity. Mỗi post còn tạo:
+
+- Post Store write;
+- outbox/event publish;
+- fan-out/candidate work;
+- search/moderation indexing;
+- media association/state;
+- notification/analytics features;
+- cache invalidation/update.
+
+Do đó 11.6k posts/s không đồng nghĩa chỉ 11.6k backend writes/s.
+
+---
+
+#### 5. Feed read throughput
+
+```text
+Feed opens/day
+= 200M DAU × 10 opens
+= 2B opens/day
+
+Average first-page feed RPS
+= 2B / 86,400
+≈ 23,148 requests/s
+```
+
+Nếu mỗi open trung bình đọc 3 pages:
+
+```text
+6B page requests/day
+≈ 69,444 page requests/s average
+```
+
+Nếu peak factor 5:
+
+```text
+First-page peak ≈ 115,700 RPS
+3-page peak     ≈ 347,200 RPS
+```
+
+Đây chỉ là API page requests. Media/image/video requests đi CDN riêng và thường lớn hơn nhiều về request/byte volume.
+
+##### Read amplification
+
+Một feed request có thể cần:
+
+```text
+timeline/candidate refs
+  + post metadata
+  + author/profile summary
+  + viewer relationship/eligibility
+  + engagement counts + viewer state
+  + media variants
+  + ranking features/scores
+```
+
+Nếu không batch/denormalize/cache, một page 20 posts có thể tạo N+1 calls và fan-out downstream khổng lồ.
+
+---
+
+#### 6. Feed response bandwidth
+
+Giả sử feed API metadata page sau compression trung bình `P` bytes:
+
+```text
+API egress/day = page requests/day × P
+```
+
+Ví dụ minh họa với 3 pages/open và 20 KB/page:
+
+```text
+6B × 20 KB ≈ 120 TB/day feed metadata
+```
+
+Con số thật phụ thuộc payload, compression, profile/media duplication và client cache. Cần tránh nhúng media bytes/Base64 vào feed JSON; chỉ trả CDN URLs/variants cùng compact metadata.
+
+---
+
+#### 7. Fan-out-on-write amplification
+
+Với mỗi post của author có `F` eligible followers:
+
+```text
+Timeline entry writes/post ≈ F
+Total fan-out writes/day   ≈ Σ follower_count(author_of_post)
+```
+
+Không thể dùng simple average follower count của toàn users nếu posters có distribution khác. Cần **post-weighted follower distribution**.
+
+Ví dụ minh họa:
+
+```text
+1B posts/day × 200 eligible followers/post
+= 200B timeline-entry writes/day
+≈ 2.31M writes/s average
+```
+
+Nếu một celebrity có 100 triệu followers:
+
+```text
+1 post → tối đa 100M materialization writes
+```
+
+Ngay cả khi batch 1.000 entries/request, vẫn là 100.000 batches. Fan-out lag có thể vượt freshness SLO và cạnh tranh với normal authors.
+
+Hệ quả: fan-out-on-write cho mọi author là không kinh tế; cần hybrid policy, active-user filtering, batching và backpressure.
+
+---
+
+#### 8. Fan-out-on-read amplification
+
+Nếu reader theo `G` accounts và lấy `K` recent posts mỗi source:
+
+```text
+Raw candidate reads/request ≈ G × K
+```
+
+Ví dụ:
+
+```text
+500 following × 10 recent posts = 5.000 raw candidates
+→ filter/merge/rank để trả 20 items
+```
+
+Không thể đồng bộ gọi 500 author services/stores tuần tự. Cần:
+
+- recent-post index/cache theo author;
+- batch/multi-get;
+- bounded candidate window;
+- parallelism có giới hạn;
+- merge theo sorted lists;
+- cached/precomputed candidates;
+- hybrid pull chỉ cho một subset như celebrities.
+
+Fan-out-on-read giảm write amplification nhưng chuyển cost sang mỗi feed read—workload vốn lớn hơn post writes.
+
+---
+
+#### 9. Hybrid fan-out capacity model
+
+Chia authors:
+
+```text
+Push set: normal authors
+Pull set: celebrity/high-cost authors
+```
+
+Cost estimate:
+
+```text
+Push work/day
+= Σ posts(author) × active_eligible_followers(author)
+   cho author trong Push set
+
+Pull work/day
+= feed_reads × pulled_authors_per_reader × recent-window cost
+```
+
+Chọn threshold/policy để minimize total cost trong freshness/latency budget:
+
+- follower count;
+- active follower ratio;
+- author post frequency;
+- reader activity;
+- regional dispersion;
+- fan-out queue lag/cost;
+- overlap với other sources;
+- celebrity recent-post cache hit ratio.
+
+Mode switch cần version/source marker để merge/dedup, tránh post vừa được push vừa bị pull xuất hiện hai lần.
+
+---
+
+#### 10. Timeline storage estimate
+
+Materialized timeline thường lưu compact reference, không copy full post.
+
+Giả sử:
+
+```text
+active timelines             = U
+entries retained/timeline    = T
+bytes/entry                  = E
+replication/overhead factor  = R
+
+Timeline storage ≈ U × T × E × R
+```
+
+Ví dụ minh họa:
+
+```text
+200M active users × 1.000 entries × 32 bytes
+= 6.4 TB raw refs
+```
+
+Sau key/index/LSM/replication/headroom có thể lớn hơn nhiều. Nếu materialize cho toàn bộ 500M registered users, raw refs thành 16 TB với cùng assumptions và phần lớn có thể lãng phí cho inactive users.
+
+Evolution choices:
+
+- chỉ materialize active users;
+- bounded window/TTL;
+- compact sortable IDs;
+- tier older entries;
+- rebuild từ author post indexes/events khi cần;
+- avoid full content duplication.
+
+---
+
+#### 11. Post metadata storage
+
+```text
+Post metadata/day
+= posts/day × average metadata bytes
+```
+
+Ví dụ 1 KB/post:
+
+```text
+1B × 1 KB ≈ 1 TB/day raw metadata
+≈ 365 TB/year trước replication/index/log/backups
+```
+
+Text length, entities, audience, edit history và media refs thay đổi size. Replies/reposts có thể là post types/references riêng. Partition key phải tránh hot author/time partition và hỗ trợ:
+
+- get by `post_id`;
+- recent posts by author;
+- lifecycle/delete/moderation state;
+- creation-time ordering/tie-break;
+- regional ownership/residency.
+
+---
+
+#### 12. Social graph scale
+
+Nếu average active user follows `G` accounts:
+
+```text
+Follow edges ≈ users × G
+```
+
+Ví dụ 500M users × 300 following:
+
+```text
+≈ 150B directed follow edges
+```
+
+Need both access directions:
+
+- following list cho pull/eligibility;
+- follower list cho push;
+- point relationship check;
+- block/mute/private edge overlays.
+
+Celebrity follower adjacency lists rất lớn và hot. Cần sharding/pagination/versioning/cache; follower counts là derived counters. Follow/unfollow spikes và bot graph creation cũng tạo write load.
+
+---
+
+#### 13. Engagement events
+
+Gọi số engagement events/ngày là `E_d`:
+
+```text
+Average engagement events/s = E_d / 86,400
+```
+
+Ví dụ 5B/day:
+
+```text
+≈ 57,870 events/s average
+```
+
+Một like/repost có thể tạo:
+
+- unique user-post edge write/delete;
+- aggregate counter delta;
+- ranking feature event;
+- notification candidate;
+- analytics/fraud event;
+- cache/read-model update.
+
+Không update một shared `like_count` row đồng bộ trên hot post. Use sharded counters/deltas/stream aggregation và tolerate eventual counts. User-specific like edge vẫn cần idempotency/uniqueness.
+
+Hot post có thể nhận millions engagements/minute, tạo hot key/partition và notification storm.
+
+---
+
+#### 14. Media upload storage
+
+Gọi:
+
+- `I` = image uploads/day, average original size `S_i`;
+- `V` = video uploads/day, average original size `S_v`;
+- `M` = variants/transcode storage multiplier;
+- `R` = replication/erasure/overhead factor.
+
+```text
+Media ingest/day ≈ (I × S_i + V × S_v) × M × R
+```
+
+Ví dụ minh họa:
+
+```text
+150M images × 2 MB  = 300 TB/day
+20M videos × 20 MB  = 400 TB/day originals
+Total originals     ≈ 700 TB/day
+```
+
+Variants/thumbnails/transcodes có thể tăng storage; compression/lifecycle giảm nó. “Hàng trăm TB/ngày” trong transcript hợp lý tùy media mix, nhưng phải tính bằng measured size distribution, không dùng một average duy nhất cho video.
+
+Object count/request cost, orphan uploads, metadata, legal retention và regional replication cũng quan trọng.
+
+---
+
+#### 15. Media delivery bandwidth
+
+Upload volume thường nhỏ hơn read delivery volume. Nếu:
+
+```text
+media views/day = feed items viewed × media attachment rate
+average delivered bytes/view = B
+
+CDN egress/day ≈ media views/day × B
+```
+
+Ví dụ minh họa:
+
+```text
+200M DAU × 100 media views/day × 500 KB
+= 10 PB/day delivered bytes
+```
+
+Video adaptive streaming có bitrate/session duration khác hẳn image. CDN hit ratio, regional egress, variant choice, autoplay/prefetch policy và client cache quyết định cost/performance.
+
+Media pipeline capacity:
+
+- upload authorization/direct multipart;
+- virus/type/safety checks;
+- image resize/video transcode GPU/CPU queues;
+- thumbnail/manifest generation;
+- backpressure/retry/DLQ;
+- publish readiness latency.
+
+---
+
+#### 16. Bottleneck 1 — Timeline fan-out backlog
+
+Khi post event rate hoặc follower count tăng:
+
+- fan-out queue lag tăng;
+- post freshness giảm;
+- popular author monopolizes workers/partitions;
+- retries tạo duplicate timeline entries;
+- inactive users nhận writes vô ích;
+- downstream timeline store saturates.
+
+Controls:
+
+- hybrid push/pull;
+- partition/bucket followers;
+- batch/multi-write;
+- idempotent key `(timeline_owner, post_id, source/generation)`;
+- per-author/tenant fairness và quotas;
+- separate hot-user workload pools;
+- skip/materialize only active users;
+- dynamic mode fallback từ push sang pull khi backlog vượt SLO;
+- queue lag/freshness metric theo author class.
+
+---
+
+#### 17. Bottleneck 2 — Celebrity/hot-user write storm
+
+Một celebrity post có thể đồng thời tạo:
+
+- massive timeline fan-out;
+- follower notification storm;
+- likes/reposts/comment spike;
+- hot Post Store/cache key;
+- media CDN surge;
+- ranking/feature events.
+
+Mitigations:
+
+- celebrity posts pull-on-read/recent-author cache;
+- cache replicated/hot-key-aware;
+- engagement counters sharded;
+- notifications sampled/batched/policy-limited;
+- separate priority/fairness queues;
+- CDN pre-warm/publish coordination for planned events;
+- protect origins from cache stampede;
+- rate limit abuse but not legitimate read popularity blindly.
+
+“Hot user” là multi-dimensional bottleneck, không chỉ fan-out write count.
+
+---
+
+#### 18. Bottleneck 3 — Feed assembly latency
+
+Ranked/hybrid feed request phải:
+
+```text
+load precomputed refs
++ pull recent celebrity posts
++ optional recommendation candidates
+→ merge/dedup
+→ filter eligibility/tombstones
+→ fetch/enrich post/author/count/viewer state
+→ rank/order/diversify
+→ paginate/serialize
+```
+
+Rủi ro:
+
+- N+1 service/database calls;
+- slow social graph/feature/ranking dependency;
+- huge candidate sets;
+- cache miss fan-out;
+- tail-latency multiplication;
+- duplicate from push + pull;
+- cursor invalidation/reordering.
+
+Controls:
+
+- batch/multi-get;
+- denormalized feed cards with version/freshness strategy;
+- strict candidate/fan-out budgets;
+- parallel calls with deadlines/bulkheads;
+- request-level cache và prefetch;
+- ranking fallback chronological;
+- partial response/omit non-critical counts;
+- stable feed generation/cursor;
+- per-stage latency/timeout metrics.
+
+---
+
+#### 19. Bottleneck 4 — Cache population và invalidation
+
+Feed hệ thống dùng nhiều caches:
+
+- home feed first page;
+- timeline refs;
+- recent posts by author;
+- post/author metadata;
+- social relationships/eligibility;
+- engagement counts;
+- media manifests/URLs.
+
+Rủi ro:
+
+- personalized cache cardinality rất lớn;
+- cold start/thundering herd;
+- deleted/private/blocked content còn cache;
+- TTL đồng loạt;
+- hot-key overload;
+- cache value quá lớn;
+- rank/policy version mismatch.
+
+Controls:
+
+- layered cache and versioned keys;
+- TTL theo data semantics;
+- event invalidation/tombstones + TTL safety net;
+- single-flight/refresh-ahead;
+- cap page/value size;
+- cache only active users/first pages;
+- safe eligibility check/filter for high-priority policy changes;
+- origin capacity/load shedding.
+
+Cache hit ratio cao không được đánh đổi private-content leakage hoặc takedown SLO.
+
+---
+
+#### 20. Bottleneck 5 — Social graph lookup
+
+Fan-out write cần followers(author); fan-out read cần following(viewer); eligibility cần point/overlay checks.
+
+Rủi ro:
+
+- celebrity adjacency list quá lớn;
+- follower/following cache invalidation;
+- block/private changes phải propagate nhanh;
+- graph partition/region lookup latency;
+- bot follow/unfollow storms;
+- privacy fail-open khi graph unavailable.
+
+Controls:
+
+- shard adjacency lists into pages/buckets;
+- versioned follow edges;
+- separate follower/following indexes/projections;
+- bounded caches and invalidation;
+- relationship point-check store for sensitive eligibility;
+- fail closed for private content, degrade counts/recommendations;
+- rate/abuse limits on graph mutations.
+
+---
+
+#### 21. Bottleneck 6 — Engagement counters/hot posts
+
+Naive:
+
+```text
+UPDATE posts SET like_count = like_count + 1 WHERE post_id = hot_post
+```
+
+→ single hot row/leader/lock.
+
+Better direction:
+
+```text
+Like edge conditional insert/delete
+  → EngagementEvent
+  → partitioned/sharded counter deltas
+  → periodic/stream aggregate
+  → cached approximate count
+```
+
+Need:
+
+- uniqueness/idempotency `(user_id, post_id, reaction_type)`;
+- unlike compensation/delta;
+- hot partition mitigation;
+- read-your-own-action UI;
+- eventual aggregate count;
+- anti-fraud/bot filtering;
+- replay/rebuild semantics.
+
+Notifications/trending/ranking consumers không nên block the like response.
+
+---
+
+#### 22. Bottleneck 7 — Delete/block/moderation propagation
+
+Một post/user có copies/references ở:
+
+- millions timelines;
+- feed caches;
+- search index;
+- ranking candidate cache;
+- notifications;
+- CDN media caches;
+- analytics/data lake.
+
+Không thể đồng bộ purge toàn bộ trước acknowledgement. Pattern:
+
+```text
+authoritative status/tombstone commit
+  → high-priority invalidation event
+  → serve-time deny/tombstone cache
+  → async cleanup projections/search/CDN
+  → audit/retention workflow
+```
+
+Measure takedown propagation p95/p99. Block/private change có security priority cao hơn stale like count. Eventual consistency không được dùng như lý do để tiếp tục rò content ngoài policy.
+
+---
+
+#### 23. Bottleneck 8 — Ranking/feature pipeline
+
+Nếu ranked feed:
+
+- online candidate feature fetch;
+- model inference;
+- feature freshness/consistency;
+- experiment assignment;
+- safety/diversity rules;
+- feedback events;
+- model/version rollout.
+
+Risks:
+
+- feature store/ranker tail latency;
+- stale/missing features;
+- model outage;
+- rank instability giữa pages;
+- feedback loop/hot-content bias;
+- high compute cost;
+- privacy/safety feature failures.
+
+Controls:
+
+- candidate/ranking latency budgets;
+- default features;
+- cached/precomputed embeddings/scores nơi phù hợp;
+- chronological/lightweight fallback;
+- pinned feed generation/model version per session;
+- circuit breaker và experiment kill switch;
+- model/safety observability beyond CPU latency.
+
+Baseline chronological feed tránh phần lớn bottleneck này nhưng vẫn cần interface để evolution.
+
+---
+
+#### 24. Bottleneck 9 — Media pipeline và CDN origin
+
+Rủi ro:
+
+- upload burst và slow clients;
+- giant/malicious files;
+- transcode backlog;
+- GPU/CPU saturation;
+- partially uploaded/orphan objects;
+- viral media cache miss at edge;
+- CDN purge after takedown;
+- high egress cost;
+- origin/key hot spots.
+
+Controls:
+
+- direct multipart upload với signed scoped authorization;
+- size/type/quota checks;
+- asynchronous processing state machine;
+- priority/format-specific worker pools;
+- content-address/versioned variants;
+- CDN shielding/pre-warm for expected hot media;
+- object lifecycle/orphan cleanup;
+- adaptive bitrate/lazy load/client cache;
+- origin protection và purge SLO;
+- safety scan before public delivery according policy.
+
+---
+
+#### 25. Bottleneck 10 — Multi-region freshness và ownership
+
+Global platform có:
+
+- regional post writes;
+- follower graph partitions;
+- timeline/feed stores gần readers;
+- media object/CDN distribution;
+- cross-region fan-out events.
+
+Risks:
+
+- post visible ở region A nhưng fan-out region B lag;
+- duplicate events qua replication;
+- ordering khác giữa regions;
+- block/delete propagation chậm;
+- home-region outage;
+- cross-region egress cost.
+
+Direction:
+
+- globally unique/sortable post IDs với ordering caveats;
+- author/post home region hoặc partition ownership;
+- event IDs/idempotent consumers;
+- regional timeline/read caches;
+- replicated tombstone/eligibility deny path ưu tiên cao;
+- per-region lag/freshness SLO;
+- rebuild/replay fan-out;
+- DR/fencing cho writers;
+- không hứa total global ordering.
+
+---
+
+#### 26. Tổng hợp bottlenecks
+
+| Bottleneck | Amplification/skew | Control direction |
+|---|---|---|
+| Feed reads | pages × enrichments/candidates | Cache, batch, bounded fan-out, fallback |
+| Normal-author fan-out | posts × active followers | Batch, active-only, timeline store, backpressure |
+| Celebrity posts | millions followers + engagement spike | Pull-on-read, hot caches, isolated queues |
+| Timeline storage | users × retained refs | Compact refs, active users, bounded windows |
+| Social graph | billions edges + celebrity lists | Sharded adjacency, bidirectional indexes/caches |
+| Engagement | events × counters/notifications/features | Idempotent edges, sharded aggregate, async consumers |
+| Media | uploads × variants; views × bytes | Object storage, workers, CDN, lifecycle |
+| Feed assembly | candidates × dependencies | Batch/multi-get, deadlines, rank fallback |
+| Delete/privacy | copies across stores/caches | Tombstone/deny path + async cleanup |
+| Ranking | candidates × features/inference | Budgets, caches/defaults, version/fallback |
+| Multi-region | fan-out/replication/egress | Ownership, idempotency, regional projections |
+
+---
+
+#### 27. SLO/degraded policy theo path
+
+| Path | Ưu tiên | Degrade safely |
+|---|---|---|
+| Post create | Durability + acceptable latency | Acknowledge only after authoritative commit; fan-out async |
+| Feed first page | Low latency + availability | Cached/chronological fallback, omit non-critical enrichments |
+| Pagination | Stability | Keep generation/cursor; bounded stale okay |
+| Fan-out | Freshness | Backlog/replay, pull fallback for hot author |
+| Engagement action | Idempotent user state | Aggregate count stale |
+| Media upload | Durability + processing status | PROCESSING placeholder, retry transcode |
+| Ranking | Relevance | Chronological/lightweight fallback |
+| Delete/block/moderation | Privacy/safety | Fail closed/deny cache; cleanup async |
+
+Không mọi data đều cần same consistency. Privacy/takedown priority cao hơn count freshness.
+
+---
+
+#### 28. Load-test scenarios
+
+1. Uniform post/feed traffic theo average và peak.
+2. Celebrity 100M followers publish một post.
+3. Breaking-news wave với nhiều celebrities cùng đăng.
+4. Fan-out queue backlog và worker restart/redelivery.
+5. 200M active users cold-start first-page caches.
+6. Reader theo 5.000 accounts mở feed cache miss.
+7. Viral post nhận millions likes/reposts/minute.
+8. Block/delete/takedown trong lúc post đang ở cache/fan-out.
+9. Ranking/feature store timeout → fallback.
+10. Social graph partition unavailable cho private account.
+11. Upload/transcode burst và CDN cold viral media.
+12. Cross-region event duplication/lag/outage.
+13. Pagination giữa các page khi posts mới/ranking reorder.
+14. Bot post/follow/engagement amplification.
+
+Pass criteria gồm latency/freshness, no privacy leak, bounded queue/origin load, no uncontrolled duplicate và ability to replay/rebuild.
+
+---
+
+#### 29. Metrics và evolution triggers
+
+##### Feed
+
+- feed RPS/pages/session, p50/p95/p99 latency;
+- first-page/feed cache hit;
+- candidate count/stage latency/drop;
+- duplicate/missing rate proxies và cursor errors;
+- ranking fallback rate;
+- empty-feed rate.
+
+##### Fan-out
+
+- posts/s, entries/s, batch size;
+- queue lag/oldest event age;
+- post-to-feed freshness by author class/region;
+- celebrity pull ratio;
+- idempotency duplicate/conflict;
+- active-user materialization ratio.
+
+##### Graph/engagement
+
+- follower/following list latency/size distribution;
+- hot adjacency/counter partitions;
+- engagement edge success/conflict;
+- aggregate count lag;
+- block/unfollow propagation.
+
+##### Media
+
+- upload bytes/s/object count;
+- processing queue lag/variant success;
+- CDN hit ratio/origin egress;
+- playback startup/rebuffer;
+- takedown purge time;
+- storage/egress cost.
+
+##### Safety/privacy
+
+- delete/block/moderation propagation p95/p99;
+- ineligible-content serve incidents phải bằng 0 theo defined control boundary;
+- stale eligibility cache age;
+- audit/replay status.
+
+Triggers có thể chuyển author push → pull, tăng workers/partitions, thu hẹp timeline window, pre-warm CDN hoặc degrade ranking.
+
+---
+
+#### 30. Những lỗi estimate thường gặp
+
+- Từ 2B feed opens kết luận 23k RPS rồi quên pagination/prefetch/peak.
+- Gọi 1B posts/ngày là 1B writes/ngày, bỏ fan-out/index/events.
+- Dùng average followers thay post-weighted distribution.
+- Materialize feed cho mọi registered user dù nhiều user inactive.
+- Chỉ tính post metadata, bỏ timeline refs/social graph/engagement.
+- Nói hàng trăm TB media nhưng không tách image/video/variants/replication.
+- Tính upload bytes nhưng không tính CDN delivery egress.
+- Không tính N+1/enrichment/ranking read amplification.
+- Không dimension delete/block/moderation propagation.
+- Một hot post dùng shared counter row.
+- Chỉ load-test uniform keys, không celebrity/hot media.
+- Dùng cache hit ratio làm success metric nhưng bỏ privacy staleness.
+- Không tách feed latency, fan-out freshness và media render latency.
+- Hứa total global ordering dù cross-region events/clock skew.
+
+---
+
+#### 31. Checklist Step 2
+
+- [ ] Feed opens, pages/open, items/page, refresh/prefetch?
+- [ ] Average/peak feed page RPS và response bytes?
+- [ ] Post rate average/peak và downstream write amplification?
+- [ ] Follower/following percentiles, celebrity max và active follower ratio?
+- [ ] Post-weighted fan-out distribution?
+- [ ] Push entries/s, queue lag và freshness target?
+- [ ] Pull candidates/read amplification và following limits?
+- [ ] Hybrid policy cost/threshold/mode switch?
+- [ ] Timeline refs/users/window/bytes/replication storage?
+- [ ] Post/social graph/engagement storage/access paths?
+- [ ] Engagement events/counter hotness/notifications?
+- [ ] Image/video counts, sizes, variants, transcode capacity?
+- [ ] Media views, average delivered bytes, CDN/origin/egress?
+- [ ] Ranking candidate/feature/inference budgets?
+- [ ] Delete/block/moderation propagation volume/SLO?
+- [ ] Regional distribution/fan-out lag/egress/ownership?
+- [ ] Load tests dùng celebrity, hot post, cold cache và failure?
+- [ ] Metrics/triggers nối tới fan-out/cache/ranking/degrade policy?
+
+#### 32. Ý chính cần nhớ
+
+- 1B posts/ngày ≈ 11.6k post creates/s average trước amplification.
+- 2B feed opens/ngày ≈ 23.1k first-page RPS average; pagination có thể nhân nhiều lần.
+- Feed read workload lớn nhưng fan-out-on-write có thể tạo hàng triệu timeline writes/s.
+- Cost push phụ thuộc post-weighted active follower distribution, không phải simple average.
+- Celebrity post có thể tạo 100M writes nếu push naïvely; hybrid fan-out tránh write storm.
+- Fan-out-on-read tạo candidate/merge/enrichment amplification trên workload đọc lớn.
+- Timeline chỉ lưu compact refs; materialize active users và bounded window để giảm storage.
+- Social graph có thể hàng trăm tỷ directed edges và hot celebrity adjacency lists.
+- Engagement actions cần idempotent edges và async/sharded counters.
+- Media ingest có thể hàng trăm TB/ngày; delivery có thể đạt PB/ngày và chi phối cost.
+- Feed assembly tail latency đến từ nhiều dependencies; batch/budget/fallback là bắt buộc.
+- Delete/block/moderation propagation là privacy bottleneck, không chỉ cleanup.
+- Ranking phải có candidate/latency/version/fallback budget.
+- Multi-region không cần total order nhưng cần idempotency, ownership và freshness metrics.
+- Estimate tốt nối **logical action → physical amplification → skew → bottleneck → control → SLO/metric**.
+
+#### Công thức ghi nhớ
+
+> **News Feed scale = massive read pages + amplified fan-out writes + power-law social graph + hot engagement keys + media PB-scale delivery + bounded-freshness privacy propagation.**
+
+---
+
+### Bài 75. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của Step 3
+
+Sau khi đã chốt requirements và ước lượng tải, bước này trả lời ba câu hỏi:
+
+1. Hệ thống được chia thành những service nào và mỗi service sở hữu trách nhiệm gì?
+2. Client giao tiếp với hệ thống qua những API contract nào?
+3. Công việc nào cần xử lý đồng bộ, công việc nào nên chạy bất đồng bộ?
+
+News Feed không nên là một khối làm tất cả. Các workload rất khác nhau:
+
+- đọc feed có QPS cao và nhạy với latency;
+- tạo post cần durability;
+- fan-out tạo write amplification lớn;
+- media cần truyền file và xử lý nặng;
+- engagement tạo hot keys;
+- notification không nên nằm trên critical path.
+
+Tách service giúp từng workload scale và evolve độc lập. Tuy nhiên, ranh giới service chỉ có giá trị khi đi kèm **data ownership**, invariant và contract rõ ràng; nhiều service cùng sửa một database chung vẫn tạo coupling.
+
+---
+
+#### 2. Sơ đồ high-level
+
+```text
+Mobile/Web Client
+   │
+   ├── media bytes ───────────────────────────────┐
+   │                                              ▼
+   ▼                                      Object Storage
+Edge/CDN/WAF                                     │
+   │                                      Media Workers
+   ▼                                              │
+API Gateway / BFF ◄──────────────────────── Media Service
+   │
+   ├── User/Profile Service ───────── Profile Store
+   ├── Social Graph Service ───────── Graph Store
+   ├── Post Service ───────────────── Post Store
+   ├── Engagement Service ─────────── Engagement Store
+   └── Feed/Timeline Service ──────── Timeline Store/Cache
+                  │                         ▲
+                  │                         │ compact post refs
+                  ▼                         │
+             Post/Graph Stores       Fan-out Workers
+                                            ▲
+                                            │
+                       Durable Event Log / Queue
+                       ├── Notification Service
+                       ├── Search/Analytics projections
+                       └── Cache invalidation/moderation
+```
+
+Hai đường chính:
+
+```text
+Write path: create post → durable Post Store commit → PostCreated event → fan-out/projections
+
+Read path: get feed → load candidates → merge push/pull sources
+                         → eligibility/filter/dedup → hydrate/rank → page response
+```
+
+---
+
+#### 3. API Gateway/BFF — cửa vào, không phải business authority
+
+API Gateway/BFF cung cấp:
+
+- TLS termination, routing và API versioning;
+- xác thực token ở edge;
+- rate limiting, quota, abuse protection;
+- request-size limits, schema validation cơ bản;
+- correlation/request ID;
+- response aggregation nếu phù hợp với client.
+
+Gateway **không thay thế authorization trong domain service**. Ví dụ, Post Service hoặc Feed Service vẫn phải kiểm tra viewer có quyền xem post/private account hay không. Nếu chỉ tin vào gateway, một internal call sai hoặc đường truy cập mới có thể vượt quyền.
+
+Gateway và các service nên stateless ở request-processing tier để bất kỳ instance khỏe mạnh nào cũng phục vụ được request. Điều này không có nghĩa toàn hệ thống “không có state”; state nằm trong databases, caches, logs và object storage.
+
+---
+
+#### 4. User/Profile Service và Social Graph Service
+
+Transcript gộp user profile và social graph vào User Service. Đây là lựa chọn hợp lý ở giai đoạn đầu; khi graph đủ lớn/hot, có thể tách thành hai boundary.
+
+##### User/Profile Service
+
+- hồ sơ user, handle, avatar, account status;
+- public/private account flag;
+- profile lookup;
+- không sở hữu follow edges nếu đã tách Graph Service.
+
+##### Social Graph Service
+
+- follow/unfollow hoặc pending/approved follow;
+- follower/following indexes;
+- block/mute relationships;
+- kiểm tra relationship/eligibility;
+- phát `FollowCreated`, `FollowRemoved`, `BlockCreated`… để projections cập nhật.
+
+Social Graph Store là source of truth của quan hệ. Feed cache không được coi là bằng chứng vĩnh viễn rằng một post còn được phép hiển thị.
+
+---
+
+#### 5. Post/Tweet Service
+
+Post Service sở hữu lifecycle của nội dung:
+
+- tạo, lấy, sửa/xóa post;
+- author, text/caption, media references;
+- audience/visibility;
+- reply/repost references;
+- version và trạng thái `DRAFT | PROCESSING | PUBLISHED | DELETED | HIDDEN`;
+- publish event sau durable commit.
+
+Post Store là source of truth của post metadata và status. Timeline chỉ nên lưu compact references như `post_id`, `author_id`, ordering/ranking metadata; không nên copy toàn bộ post thành hàng triệu authoritative records.
+
+Để tránh tình huống database đã lưu post nhưng event bị mất, dùng **transactional outbox**:
+
+```text
+DB transaction:
+  INSERT post
+  INSERT outbox(PostCreated)
+COMMIT
+
+Outbox publisher → durable event log → consumers
+```
+
+Mobile retry phải gửi `Idempotency-Key`; cùng key không được tạo hai post.
+
+---
+
+#### 6. Media Service
+
+Media tách khỏi Post Service vì file lớn và có pipeline riêng:
+
+1. Client xin upload authorization.
+2. Media Service trả pre-signed/scoped URL và `media_id`.
+3. Client upload trực tiếp lên object storage.
+4. Worker scan, resize/transcode, tạo thumbnail/manifest.
+5. Media record chuyển `UPLOADING → PROCESSING → READY` hoặc `FAILED`.
+6. Post tham chiếu `media_id`; CDN phục vụ variants đã cho phép.
+
+Nên lưu object key/asset ID trong canonical metadata, không phụ thuộc một CDN URL vĩnh viễn. Post publish ngay hay chờ media `READY` là product contract cần chốt. Notification/media processing chạy async và không kéo dài post-create request.
+
+---
+
+#### 7. Engagement Service
+
+Engagement Service sở hữu:
+
+- like/unlike;
+- reply/comment relationship;
+- repost/share;
+- viewer-specific state như “tôi đã like chưa”;
+- event phát sang counters, ranking, notification và analytics.
+
+Một action cần idempotent/unique, ví dụ:
+
+```text
+unique(user_id, post_id, reaction_type)
+```
+
+Canonical like edge quan trọng hơn aggregate count. Count có thể được sharded/stream-aggregated và eventual; response cho user có thể phản ánh read-your-own-action trong khi public count cập nhật chậm hơn.
+
+---
+
+#### 8. Notification Service
+
+Notification không nằm trên critical path của create post/like/reply:
+
+```text
+EngagementCreated/PostCreated
+        → event/queue
+        → policy + dedup + preference check
+        → push/email/in-app delivery
+```
+
+Service cần:
+
+- preference và quiet-hours policy;
+- deduplication/idempotency;
+- batching/digest và celebrity fan-out controls;
+- provider retry/backoff/DLQ;
+- delivery status và observability.
+
+“Đã like thành công” không nên phụ thuộc push provider đang khỏe.
+
+---
+
+#### 9. Feed/Timeline Service
+
+Feed Service là nơi ghép news feed. Nó không sở hữu post hoặc social relationship; nó sở hữu quy trình assembly và read models liên quan.
+
+Trách nhiệm:
+
+- đọc timeline candidates đã materialize;
+- kéo recent posts của hot/celebrity authors;
+- merge và deduplicate nhiều nguồn;
+- kiểm tra post status, audience, follow/block/mute/safety rules;
+- hydrate post, author, media và engagement state bằng batch calls/multi-get;
+- chronological ordering hoặc gọi Ranking Service;
+- cursor pagination và feed-generation stability;
+- degraded fallback khi dependency chậm/lỗi.
+
+Timeline Store/Cache là derived state, có thể replay/rebuild. Mất timeline cache làm feed chậm hoặc thiếu tạm thời, không được làm mất canonical post.
+
+---
+
+#### 10. Fan-out Worker
+
+Fan-out Worker nhận `PostCreated` và quyết định materialization policy:
+
+```text
+if author_class == NORMAL:
+    enumerate active eligible followers in buckets
+    batch insert compact TimelineEntry refs
+else if author_class == HOT:
+    update RecentPostsByAuthor index
+    do not write millions of follower timelines
+```
+
+Worker cần:
+
+- consumer idempotency/inbox hoặc conditional insert;
+- key duy nhất như `(timeline_owner_id, post_id, source)`;
+- follower pagination/bucketing;
+- batching, backpressure và fairness giữa authors;
+- retry/DLQ/replay;
+- queue-lag và post-to-feed-freshness metrics;
+- dynamic switch từ push sang pull khi follower count/backlog vượt threshold.
+
+Fan-out asynchronous nghĩa create-post response nhanh, nhưng feed freshness là eventual và phải có SLO đo được.
+
+---
+
+#### 11. Hybrid timeline generation
+
+##### Fan-out-on-write — push
+
+```text
+normal author publishes P
+  → PostCreated
+  → fetch eligible/active follower buckets
+  → append P reference to each home timeline
+```
+
+Ưu điểm: read nhanh, timeline gần như đã chuẩn bị sẵn. Nhược điểm: write amplification và storage lớn.
+
+##### Fan-out-on-read — pull
+
+```text
+reader opens feed
+  → get followed hot authors
+  → fetch their recent posts
+  → merge/sort with precomputed timeline
+```
+
+Ưu điểm: celebrity post rẻ hơn lúc write. Nhược điểm: read phải merge nhiều nguồn và có tail latency.
+
+##### Hybrid
+
+- push post của normal authors tới timeline của active followers;
+- pull recent posts của hot/celebrity authors khi đọc;
+- có thể skip inactive-user materialization và rebuild khi họ quay lại;
+- policy dựa trên measured cost: active followers, publish rate, read probability, queue pressure và freshness SLO—not chỉ một follower threshold cố định.
+
+Hybrid cân bằng read latency, write amplification và chi phí vận hành.
+
+---
+
+#### 12. Data ownership
+
+| Data | Source of truth | Derived/read models |
+|---|---|---|
+| User profile/account status | Profile Store | Profile cache/search projection |
+| Follow/block/mute edges | Social Graph Store | Adjacency caches, eligibility cache |
+| Post content/status/audience | Post Store | Post cache, search index, feed cards |
+| Media metadata/status | Media metadata store | CDN manifests/edge cache |
+| Media bytes | Object storage | CDN variants |
+| Like/repost edges | Engagement Store | Sharded/aggregated counts |
+| Home-feed candidates | Rebuildable Timeline Store | First-page cache |
+| Notification intent/status | Notification Store | Provider delivery queues |
+
+Không cho nhiều service ghi trực tiếp vào cùng bảng “tiện lợi”. Cross-domain change nên đi qua API hoặc versioned event contract.
+
+---
+
+#### 13. Core API contracts
+
+Tên endpoint chỉ minh họa; contract và semantics quan trọng hơn spelling.
+
+##### Khởi tạo media upload
+
+```http
+POST /v1/media/uploads
+Authorization: Bearer <token>
+Idempotency-Key: <key>
+
+{
+  "content_type": "image/jpeg",
+  "size_bytes": 1834920,
+  "checksum": "..."
+}
+```
+
+```json
+{
+  "media_id": "med_...",
+  "upload_url": "temporary signed URL",
+  "expires_at": "..."
+}
+```
+
+##### Tạo post
+
+```http
+POST /v1/posts
+Authorization: Bearer <token>
+Idempotency-Key: <key>
+
+{
+  "text": "...",
+  "media_ids": ["med_..."],
+  "audience": "FOLLOWERS"
+}
+```
+
+Response `201 Created` khi post đã durable; fan-out có thể chưa hoàn tất.
+
+##### Đọc feed
+
+```http
+GET /v1/me/feed?limit=20&cursor=<opaque-token>
+```
+
+```json
+{
+  "items": ["feed cards..."],
+  "next_cursor": "opaque-token",
+  "generation": "feed snapshot/version"
+}
+```
+
+Dùng opaque cursor thay offset để tránh chi phí scan và giảm duplicate/missing khi feed thay đổi giữa các page.
+
+##### Follow/unfollow
+
+```http
+PUT    /v1/users/{target_user_id}/following
+DELETE /v1/users/{target_user_id}/following
+```
+
+`PUT/DELETE` hoặc idempotency key giúp retry an toàn. Private account có thể trả trạng thái `PENDING` thay vì `FOLLOWING`.
+
+##### Engagement
+
+```http
+PUT    /v1/posts/{post_id}/likes
+DELETE /v1/posts/{post_id}/likes
+POST   /v1/posts/{post_id}/replies
+POST   /v1/posts/{post_id}/reposts
+```
+
+Mọi mutation phải xác thực identity, authorize object/audience, validate request và có semantics rõ khi retry.
+
+---
+
+#### 14. Luồng tạo post end-to-end
+
+```text
+Client
+  → API Gateway: auth/rate limit/request ID
+  → Post Service: AuthZ + validate media ownership/readiness
+  → Post DB transaction: post + outbox event
+  ← return post_id/status
+
+Outbox publisher
+  → PostCreated event
+       ├─ Fan-out Worker → normal-follower timeline refs
+       ├─ Recent-post index → hot-author pull source
+       ├─ Search/analytics projections
+       └─ Notification policy/workers
+```
+
+Không để client chờ hoàn tất hàng triệu timeline writes. Nếu event pipeline chậm, post vẫn tồn tại trong Post Store và có thể replay fan-out từ durable log/outbox.
+
+---
+
+#### 15. Luồng đọc feed end-to-end
+
+```text
+Client → GET /feed(cursor)
+  → Gateway/BFF
+  → Feed Service
+      1. đọc materialized timeline refs/first-page cache
+      2. lấy recent posts từ followed hot authors
+      3. merge + dedup + apply cursor/generation
+      4. filter deleted/hidden/private/block/mute/ineligible
+      5. batch hydrate post/profile/media/engagement state
+      6. rank/order/diversify hoặc chronological fallback
+      7. trả items + next_cursor
+```
+
+Điểm quan trọng:
+
+- check cache trước nhưng cache không là authority;
+- tránh N+1 bằng batch/multi-get;
+- áp deadline/budget cho từng dependency;
+- có thể bỏ stale/non-critical count khi chậm;
+- không fail-open privacy/safety;
+- dedup post xuất hiện đồng thời từ push và celebrity pull.
+
+---
+
+#### 16. Follow/unfollow, block và delete propagation
+
+##### Follow
+
+```text
+commit follow edge
+  → event
+  → optional backfill recent posts
+  → future fan-out includes follower
+```
+
+##### Unfollow/block
+
+```text
+commit relationship change
+  → update high-priority eligibility/deny state
+  → future requests filter immediately/boundedly
+  → async cleanup old timeline entries/caches
+```
+
+##### Delete/moderate post
+
+```text
+Post Store commits DELETED/HIDDEN tombstone
+  → high-priority invalidation event
+  → serve-time deny/tombstone check
+  → async purge feed/search/cache/CDN references
+```
+
+Không cần xóa đồng bộ khỏi hàng triệu timeline trước khi acknowledge, nhưng phải ngừng serve trong takedown/privacy SLO.
+
+---
+
+#### 17. Đồng bộ hay bất đồng bộ?
+
+Quy tắc đơn giản từ transcript: **user có đang chờ kết quả trực tiếp không?** Nhưng cần bổ sung correctness boundary.
+
+| Operation | Kiểu chính | Lý do |
+|---|---|---|
+| Get feed/post/profile | Sync | User cần response ngay |
+| Create post authoritative commit | Sync | Chỉ acknowledge sau durable commit |
+| Fan-out timeline entries | Async | Work lớn, eventual freshness chấp nhận được |
+| Like/unlike canonical edge | Sync | User cần biết action đã được nhận |
+| Aggregate count/ranking feature | Async | Có thể stale/rebuild |
+| Follow/unfollow canonical edge | Sync | Mutation cần kết quả rõ |
+| Backfill/cleanup timelines | Async | Không nằm trên request path |
+| Media upload authorization | Sync | Client cần URL/media ID |
+| Upload bytes | Direct client→object store | Tránh proxy file lớn qua app service |
+| Transcode/scan/thumbnail | Async | CPU/GPU nặng, trạng thái theo dõi riêng |
+| Notification delivery | Async | Provider chậm/lỗi không block business action |
+| Privacy/authorization decision khi serve | Sync/local deny check | Không được fail-open |
+
+Async không đồng nghĩa “fire-and-forget”. Cần durable broker/log, retry, idempotency, dead-letter handling, replay và metrics.
+
+---
+
+#### 18. Event contracts và delivery semantics
+
+Một event tối thiểu:
+
+```json
+{
+  "event_id": "evt_...",
+  "event_type": "PostCreated",
+  "aggregate_id": "post_...",
+  "aggregate_version": 7,
+  "occurred_at": "...",
+  "producer": "post-service",
+  "schema_version": 2,
+  "payload": {}
+}
+```
+
+Thiết kế theo thực tế **at-least-once delivery**:
+
+- producer dùng transactional outbox;
+- consumer lưu inbox/dedup hoặc dùng conditional/upsert;
+- ordering chỉ nên yêu cầu trong scope cần thiết, thường theo `post_id`, `author_id` hoặc timeline partition;
+- event mang version để bỏ update cũ đến muộn;
+- schema có compatibility policy;
+- poison messages vào DLQ nhưng critical projection phải được replay/reconcile;
+- không hứa “exactly once end-to-end” nếu external side effects không hỗ trợ.
+
+Event log phù hợp cho nhiều consumer/replay; task queue phù hợp cho một công việc cần worker thực hiện. Không cần ép mọi async use case vào cùng một primitive.
+
+---
+
+#### 19. Cache và read-model strategy
+
+Các cache/read model chính:
+
+- first-page personalized feed;
+- bounded timeline refs;
+- recent posts by hot author;
+- post/profile cards;
+- eligibility/relationship point checks;
+- engagement counts/viewer state;
+- media manifest/variants.
+
+Nguyên tắc:
+
+- versioned keys và bounded TTL;
+- cache-aside/refresh-ahead tùy access pattern;
+- single-flight chống stampede;
+- cap timeline/page value size;
+- materialize active users và bounded history;
+- tombstone/invalidation cho delete/block/moderation;
+- origin có capacity và load shedding cho cache miss;
+- cache hit không được vượt privacy correctness.
+
+Timeline entry thường chỉ giữ compact reference; feed hydration lấy canonical/latest state hoặc safe snapshot theo contract.
+
+---
+
+#### 20. Consistency và user-visible semantics
+
+| Data/action | Consistency kỳ vọng |
+|---|---|
+| Post create acknowledgement | Durable; read-your-own-post nên được hỗ trợ |
+| Fan-out appearance | Eventual với freshness SLO |
+| Feed ranking/order | Eventual; ổn định theo cursor/generation |
+| Like edge của chính user | Idempotent/read-your-own-action |
+| Public engagement count | Eventual/approximate được |
+| Follow/unfollow effect | Bounded propagation |
+| Delete/block/private/moderation | Bounded, high-priority; không fail-open |
+| Timeline cache | Stale/rebuildable được nếu serve-time rules an toàn |
+
+Không cần distributed transaction xuyên Post, Timeline, Notification và Analytics. Durable domain commit + events + idempotent projections thường phù hợp hơn.
+
+---
+
+#### 21. Failure và degraded behavior
+
+| Failure | Hành vi an toàn |
+|---|---|
+| Fan-out queue backlog | Post vẫn durable; freshness giảm; replay/pull fallback cho hot authors |
+| Timeline cache lỗi | Đọc bounded store/rebuild hoặc trả cached stale-safe page |
+| Ranking service timeout | Chronological/lightweight fallback |
+| Engagement count store chậm | Bỏ count hoặc trả stale count; không làm feed fail |
+| Profile enrichment chậm | Dùng cached/minimal author card |
+| Media processing chậm | `PROCESSING` placeholder; không serve variant chưa an toàn |
+| Notification provider lỗi | Retry/backoff/DLQ; không rollback like/post |
+| Social graph/eligibility lỗi | Fail closed cho private/protected content; có thể bỏ recommendations |
+| Post Store lỗi khi create | Không acknowledge success; idempotent retry |
+| Outbox publisher lỗi | Event còn trong DB và được publish lại |
+| Duplicate/out-of-order event | Dedup + aggregate version/conditional write |
+
+Feed availability cao không có nghĩa trả bất kỳ dữ liệu nào. Có thể degrade relevance/counts, nhưng không degrade privacy thành fail-open.
+
+---
+
+#### 22. Scaling và partitioning direction
+
+- Post Store: partition theo `post_id`/author/time tùy access pattern; tránh một timestamp-only hot partition.
+- Social Graph: sharded adjacency lists/buckets; duy trì follower và following access paths.
+- Timeline Store: partition theo `timeline_owner_id`; cap recent window và active-user materialization.
+- Event log: partition key giữ ordering cần thiết nhưng tránh celebrity partition monopolization.
+- Engagement: edge store + sharded counter deltas cho hot posts.
+- Media: object storage + CDN; app servers chỉ xử lý metadata/control plane.
+- Feed workers: autoscale theo queue lag/oldest-event age, không chỉ CPU.
+- Isolate hot-author pools và dùng fairness/backpressure để một celebrity không làm starve normal posts.
+
+Horizontal scale chỉ hiệu quả khi data partition, hot-key strategy và downstream capacity cũng được thiết kế.
+
+---
+
+#### 23. Multi-region direction
+
+Một hướng đơn giản:
+
+- client vào region gần nhất;
+- profile/feed caches và media/CDN gần reader;
+- mỗi post/author partition có write authority/home region;
+- durable events replicate tới regional timeline consumers;
+- event IDs và consumers idempotent;
+- không hứa total global order;
+- delete/block/tombstone propagation dùng priority lane;
+- failover writer cần ownership epoch/fencing để tránh split-brain.
+
+Theo dõi post-to-feed freshness và policy propagation theo từng region, không chỉ global average.
+
+---
+
+#### 24. Security và privacy
+
+- AuthN ở gateway/IdP; AuthZ trong domain/read path.
+- Kiểm tra audience, approved follow, block/mute và account/post status.
+- Pre-signed upload URL ngắn hạn, scoped theo object/size/type/checksum.
+- Scan media, không tin MIME/header do client gửi.
+- Rate limit theo user/device/IP/action; anti-spam/bot/abuse controls.
+- Không log token, private content hoặc PII không cần thiết.
+- Encrypt in transit/at rest; least privilege cho service identities.
+- Audit moderation/admin actions và protect event/admin interfaces.
+- Signed/authorized media delivery cho private assets nếu cần; CDN cache key không được trộn public/private audiences.
+
+---
+
+#### 25. Observability và SLOs
+
+##### Request path
+
+- create-post và get-feed p50/p95/p99/error rate;
+- latency budget theo Gateway → Feed → candidate/filter/hydrate/rank;
+- cache hit/miss và dependency timeout/fallback;
+- empty/duplicate/cursor-error rate.
+
+##### Async path
+
+- outbox unpublished age;
+- queue lag/oldest event age;
+- fan-out entries/s và retry/DLQ;
+- post-commit-to-feed-visible freshness theo author class/region;
+- notification/media processing lag.
+
+##### Correctness/safety
+
+- duplicate timeline/engagement actions;
+- delete/block/private propagation p95/p99;
+- ineligible-content serve incidents;
+- replay/reconciliation drift;
+- consumer schema/version errors.
+
+Correlation IDs, business IDs và event IDs phải nối được request đồng bộ với toàn bộ async chain.
+
+---
+
+#### 26. Những điểm hiệu chỉnh so với mô hình đơn giản
+
+| Cách nói đơn giản | Thiết kế production-oriented |
+|---|---|
+| User Service quản lý mọi user + graph | Có thể bắt đầu chung, nhưng ownership profile/graph rõ và tách khi workload yêu cầu |
+| Gateway xác thực là đủ | Gateway kiểm token; service vẫn enforce object-level AuthZ |
+| Lưu tweet rồi đẩy event | Transactional outbox tránh dual-write mất event |
+| Timeline là danh sách tweet hoàn chỉnh | Timeline là derived compact refs; canonical Post Store giữ status/audience |
+| Redis là timeline source of truth | Redis/cache có thể mất/rebuild; không giữ correctness authority |
+| Fan-out-on-write hoặc fan-out-on-read | Hybrid theo author/workload class, có thể đổi động theo pressure |
+| Celebrity quyết định bằng follower count | Dựa trên active followers, publish rate, read probability, backlog và cost |
+| Async là gửi message rồi xong | Durable delivery, idempotency, retry/DLQ/replay/reconciliation |
+| Like/reply direct call là đủ | Canonical idempotent mutation sync; counts/notifications/features async |
+| Media upload trả CDN URL | Trả media ID + scoped upload; canonical metadata không phụ thuộc URL vĩnh viễn |
+| Xóa entry khỏi mọi timeline đồng bộ | Commit tombstone/deny first, filter khi serve, cleanup projections async |
+| Stateless nghĩa không lưu state | Compute tier stateless; durable/shared state nằm trong stores/brokers |
+
+---
+
+#### 27. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Client đi qua edge/API Gateway; gateway xử lý cross-cutting concerns, domain services giữ AuthZ.
+2. Profile, Social Graph, Post, Engagement, Media, Feed và Notification có responsibility/data ownership rõ.
+3. Post create chỉ trả success sau Post Store + outbox commit.
+4. `PostCreated` kích hoạt fan-out và projections bất đồng bộ.
+5. Normal authors dùng fan-out-on-write; celebrities dùng fan-out-on-read; Feed Service merge/dedup hai nguồn.
+6. Feed read filter eligibility/tombstones, batch hydrate rồi chronological/rank, dùng cursor generation.
+7. Timeline/cache là rebuildable; Post và Graph stores mới là authorities.
+8. Likes/follows là idempotent canonical mutations; counts/notifications async.
+9. Media upload trực tiếp object storage, xử lý async, delivery qua CDN.
+10. Outbox/inbox, retry/replay, degraded fallbacks và freshness/privacy metrics bảo vệ failure cases.
+
+Deep dives nên sẵn sàng:
+
+- hybrid fan-out threshold/policy;
+- feed assembly, cursor và dedup;
+- celebrity/hot-key handling;
+- social graph partitioning;
+- outbox/idempotency/event ordering;
+- delete/block/private propagation;
+- media pipeline và CDN;
+- multi-region ownership/freshness.
+
+---
+
+#### 28. Checklist Step 3
+
+- [ ] Mỗi service có single responsibility và data owner rõ?
+- [ ] Post/Graph/Engagement/Media authorities khác Timeline/Cache projections?
+- [ ] Gateway và service-level authorization đều rõ?
+- [ ] Create post durable trước acknowledgement?
+- [ ] Transactional outbox tránh DB/broker dual-write?
+- [ ] Event consumers idempotent, có version/order/DLQ/replay?
+- [ ] Hybrid fan-out policy và hot-author fallback?
+- [ ] Timeline lưu compact refs, bounded window/active users?
+- [ ] Feed merge/dedup/filter/hydrate/rank pipeline?
+- [ ] Cursor/generation semantics thay offset?
+- [ ] Delete/block/private/moderation có high-priority deny/tombstone path?
+- [ ] Engagement edge idempotent, aggregate count async?
+- [ ] Media direct upload, processing state, CDN và private delivery?
+- [ ] Sync/async decisions dựa trên user wait + correctness boundary?
+- [ ] Cache stampede/invalidation/hot-key controls?
+- [ ] Degraded modes không fail-open privacy?
+- [ ] Partition keys và celebrity fairness/backpressure?
+- [ ] Multi-region ownership/idempotency/fencing?
+- [ ] Latency, queue lag, freshness và policy propagation SLOs?
+
+#### 29. Ý chính cần nhớ
+
+- Chia service theo business capability và workload, không chỉ để sơ đồ đẹp.
+- Gateway là front door; domain service vẫn chịu trách nhiệm authorization.
+- Post Store và Social Graph Store là authorities; Timeline Store là derived read model.
+- Create post = durable commit + outbox; fan-out không nằm trên user request path.
+- Hybrid fan-out giữ read nhanh cho common case và tránh celebrity write storm.
+- Feed read phải merge, dedup, filter eligibility, batch hydrate, rank/order và paginate ổn định.
+- Timeline cache không được làm rò deleted/private/blocked content.
+- Canonical engagement mutation có thể sync; counts, notifications và ranking features async.
+- Media bytes đi thẳng object storage/CDN; service quản lý metadata, quyền và processing state.
+- Async cần durability, idempotency, retry, replay và observability—not fire-and-forget.
+- Có thể degrade relevance/counts, nhưng privacy/safety phải fail closed.
+- API contract phải nói rõ idempotency, pagination, consistency và processing status.
+- Thiết kế tốt nối **requirement → owner → API/event → data model → consistency → failure behavior**.
+
+#### Công thức ghi nhớ
+
+> **News Feed HLD = domain-owned write models + durable event pipeline + hybrid fan-out + eligibility-safe feed assembly + rebuildable read models + explicit degraded behavior.**
+
+---
+
+### Bài 76. Making Tech & Infra Decisions Strategically
+
+#### 1. Mục tiêu của Step 4
+
+Sau khi kiến trúc, ownership, API và communication flow đã rõ, ta mới chọn công nghệ triển khai. Không có một stack duy nhất đúng cho News Feed; lựa chọn tốt phải trả lời được:
+
+- access pattern chính là gì;
+- quy mô và mức skew/hot key ra sao;
+- consistency, durability và latency SLO nào cần giữ;
+- hệ thống phải phục hồi thế nào khi lỗi;
+- team có đủ năng lực vận hành công nghệ đó không;
+- chi phí hiện tại và đường mở rộng tương lai có hợp lý không.
+
+News Feed là hệ thống:
+
+- read-heavy và latency-sensitive;
+- có write amplification từ fan-out;
+- có social graph cùng hot celebrities;
+- cần async event processing;
+- chứa media rất lớn;
+- chấp nhận eventual consistency ở một số read models, nhưng không được nới lỏng privacy/safety.
+
+Nguyên tắc trung tâm:
+
+> Chọn công nghệ sau khi biết requirement và access pattern; không bắt đầu thiết kế bằng danh sách tên sản phẩm.
+
+---
+
+#### 2. Decision framework
+
+Với mỗi component, đánh giá theo bảng sau:
+
+| Dimension | Câu hỏi cần trả lời |
+|---|---|
+| Data model | Key-value, wide-column, relational, graph, object hay search document? |
+| Access pattern | Point lookup, range scan, adjacency traversal, append, search hay aggregation? |
+| Scale/skew | Average, peak, cardinality, partition size và hot-key distribution? |
+| Consistency | Strong, conditional write, read-your-own-write hay eventual? |
+| Durability | Có phải source of truth? RPO/RTO và retention? |
+| Latency | p95/p99 target và network hops cho phép? |
+| Failure | Replica/region/broker lỗi thì fallback hoặc rebuild thế nào? |
+| Operations | Managed hay self-hosted, backup, upgrades, staffing và on-call? |
+| Cost | Storage, request, compute, replication, egress và idle capacity? |
+| Evolution | Migration path khi scale hoặc semantics thay đổi? |
+
+Không nên dùng một database cho mọi domain chỉ vì nó “scale tốt”. User profile, social graph, post, timeline, engagement và media có access patterns khác nhau.
+
+---
+
+#### 3. Technology map đề xuất
+
+| Capability | Representative choice | Lý do chính | Lưu ý |
+|---|---|---|---|
+| User/profile authority | PostgreSQL hoặc distributed SQL/NoSQL phù hợp | Constraints, point lookup, account lifecycle | Scale theo workload thực tế, không cần NoSQL mặc định |
+| Post metadata | Cassandra/DynamoDB hoặc sharded relational store | Write/read lớn, lookup theo ID/author-time | Schema phải query-driven; audience/status vẫn authoritative |
+| Social graph | DynamoDB/Cassandra/wide-column hoặc specialized graph storage | Adjacency lists lớn, horizontal partitioning | Cần cả follower và following access paths |
+| Timeline store | Cassandra/DynamoDB/wide-column store | Append/range-by-user, throughput lớn | Derived compact refs, bounded window |
+| Engagement edges | PostgreSQL/sharded SQL hoặc distributed KV/wide-column | Uniqueness/idempotency theo user-post | Redis không nên là canonical store mặc định |
+| Engagement counts | Stream aggregate + sharded KV/cache | Hot counter writes và eventual reads | Rebuild/reconcile từ canonical events/edges |
+| Cache | Redis hoặc Memcached | In-memory low-latency hot reads | Không giữ sole source of truth |
+| Event log | Kafka hoặc managed equivalent | Replay, partitioned streams, nhiều consumers | Không tự tạo exactly-once business effects |
+| Work queue | RabbitMQ/SQS hoặc queue tương đương | Task delivery, retry/delay/routing | Khác semantics với durable event history |
+| Media bytes | S3/GCS/object storage | Massive durable blobs, lifecycle | App server không proxy toàn bộ bytes |
+| Media delivery | CloudFront/Cloudflare/Akamai hoặc CDN | Edge caching, global latency/origin protection | Private content cần signed access/cache isolation |
+| Search | Elasticsearch/OpenSearch | Full-text/search/filter ranking | Derived index, không phải post authority |
+| Compute orchestration | Kubernetes/ECS hoặc managed containers | Independent deployment/scaling | Chỉ dùng độ phức tạp phù hợp với team |
+| Edge/API traffic | Managed API Gateway/Nginx/Envoy + WAF/LB | Routing, policy, rate limits | Envoy là proxy/data plane; full gateway cần control/policy layer |
+| Metrics/dashboards | Prometheus + Grafana hoặc managed observability | SLOs, metrics, alerting | Cần thêm logs và distributed traces |
+
+Đây là các lựa chọn minh họa, không phải checklist bắt buộc.
+
+---
+
+#### 4. User/Profile Store
+
+User/profile data thường cần:
+
+- lookup theo `user_id` hoặc handle;
+- uniqueness của handle/email tùy product;
+- account status, privacy settings và version;
+- update không quá cao so với feed traffic;
+- audit/security cho thay đổi nhạy cảm.
+
+PostgreSQL là lựa chọn mạnh khi cần constraints, transactions và team đã vận hành tốt. Khi global scale hoặc availability model yêu cầu, có thể dùng distributed SQL, globally distributed KV hoặc sharding. Không cần đưa toàn bộ user data vào Cassandra chỉ vì feed lớn.
+
+Ví dụ authoritative model:
+
+```text
+users(
+  user_id PK,
+  handle UNIQUE,
+  account_status,
+  privacy_mode,
+  profile_version,
+  ...
+)
+```
+
+Profile card cache/search index là derived; account-disabled/private status cần propagation và serve-time safety phù hợp.
+
+---
+
+#### 5. Post Store — Cassandra, DynamoDB hay relational?
+
+Post access patterns chính:
+
+- lấy một post theo `post_id`;
+- lấy recent posts theo `author_id` với cursor;
+- tạo post với high write throughput;
+- cập nhật lifecycle/status/version;
+- không scan toàn bộ table để dựng feed.
+
+Wide-column/KV store như Cassandra hoặc DynamoDB phù hợp khi cần horizontal scale và predictable key/range queries. Schema thường được denormalize theo query:
+
+```text
+PostById:
+  key = post_id
+
+RecentPostsByAuthor:
+  partition = author_id + time_bucket
+  sort key = created_at + post_id
+```
+
+Trade-offs:
+
+- DynamoDB: managed, autoscaling/on-demand options, nhưng cần kiểm soát partition-key skew, request/index cost và item limits.
+- Cassandra: kiểm soát topology và throughput tốt, nhưng compaction, repair, capacity, tombstones và operations phức tạp hơn.
+- Sharded PostgreSQL/distributed SQL: hữu ích khi cần richer transactions/constraints và scale còn phù hợp; operational familiarity có thể quan trọng hơn theoretical maximum.
+
+Không chọn NoSQL chỉ vì “nhiều dữ liệu”; chọn vì query model, partitioning và consistency contract phù hợp.
+
+---
+
+#### 6. Timeline Store
+
+Timeline có access pattern gần wide-column:
+
+```text
+partition key = timeline_owner_id [+ bucket]
+sort key      = ordering_key/created_at + post_id
+value         = compact post reference + source/generation metadata
+```
+
+Cassandra/DynamoDB phù hợp cho:
+
+- batch append nhiều timeline entries;
+- range read trang mới nhất của một user;
+- horizontal partitions;
+- TTL/bounded retention cho derived entries.
+
+Controls bắt buộc:
+
+- time/size bucket nếu một timeline partition quá lớn;
+- conditional/upsert chống duplicate fan-out;
+- chỉ materialize active users hoặc recent window;
+- separate hot-author pull index;
+- rebuild/replay tool từ Post/Graph/event sources;
+- không coi timeline entry là bằng chứng post còn tồn tại hoặc được phép xem.
+
+Redis có thể cache first page/hot timelines, nhưng lưu toàn bộ authoritative timeline chỉ trong Redis làm durability/cost/recovery khó kiểm soát.
+
+---
+
+#### 7. Social Graph Store
+
+Hai query bắt buộc:
+
+```text
+following(viewer_id) → authors để pull candidates
+followers(author_id) → recipients để push fan-out
+```
+
+Vì vậy thường cần hai projections/indexes:
+
+```text
+FollowingByUser(user_id, followee_id, state, version)
+FollowersByUser(user_id, follower_id, state, version)
+```
+
+DynamoDB/Cassandra/wide-column store phù hợp cho adjacency pages lớn. PostgreSQL với indexes/sharding vẫn hợp lý ở quy mô vừa. Dedicated graph database chỉ nên chọn khi graph traversal nhiều-hop là core query; fan-out chủ yếu cần one-hop adjacency, nên graph DB không tự động là lựa chọn tốt nhất.
+
+Celebrity adjacency cần bucketing, pagination, cache và fairness. Block/private edge là security-relevant; cache miss/lỗi không được biến thành cho phép truy cập mặc định.
+
+---
+
+#### 8. Engagement data: Postgres/KV và vai trò đúng của Redis
+
+Engagement gồm hai loại state khác nhau:
+
+1. **Canonical edge:** user U có like/repost post P hay không.
+2. **Aggregate count:** P có khoảng bao nhiêu likes/reposts.
+
+Canonical edge cần uniqueness/idempotency:
+
+```text
+PRIMARY KEY / UNIQUE(user_id, post_id, reaction_type)
+```
+
+PostgreSQL hoặc durable distributed KV/wide-column store đều có thể phù hợp tùy scale và conditional-write semantics.
+
+Redis hữu ích cho:
+
+- hot counts;
+- short-lived viewer-state cache;
+- rate limiting;
+- dedup window;
+- ranking/cache features.
+
+Nhưng Redis không nên được xem là canonical engagement store mặc định nếu mất/restart cache có thể làm mất user action. Canonical edges/events phải durable; counts có thể stream-aggregate, shard và eventual.
+
+---
+
+#### 9. Caching — Redis hay Memcached?
+
+Cache targets:
+
+- feed first page;
+- recent posts by author;
+- post/profile cards;
+- social relationship point checks;
+- engagement counts;
+- ranking features/media manifests.
+
+##### Redis
+
+- hỗ trợ data structures, atomic operations, TTL, replication và optional persistence;
+- phù hợp cache, counters, sets, rate limits và coordination nhẹ;
+- nhiều tính năng hơn cũng làm memory/cluster behavior cần hiểu kỹ.
+
+##### Memcached
+
+- simple distributed key-value cache;
+- phù hợp object/page caching thuần;
+- ít semantics/data structures hơn.
+
+Cache strategy:
+
+```text
+request → cache hit → return
+        → miss → bounded origin read → fill cache → return
+```
+
+Cần TTL jitter, versioned keys, single-flight, negative caching có kiểm soát, refresh-ahead, hot-key replication và load shedding. Invalidation/tombstones ưu tiên cao cho delete/block/privacy; TTL đơn thuần thường không đủ cho takedown SLO.
+
+---
+
+#### 10. Kafka và RabbitMQ không hoàn toàn thay thế nhau
+
+##### Kafka/event log
+
+Phù hợp khi:
+
+- nhiều consumer đọc cùng một event stream;
+- cần retention/replay/rebuild projections;
+- throughput cao và ordering theo partition;
+- fan-out, analytics, search, counters, moderation cùng tiêu thụ events.
+
+Ví dụ topics:
+
+```text
+post-events
+social-graph-events
+engagement-events
+media-events
+moderation-events
+```
+
+##### RabbitMQ/task queue
+
+Phù hợp khi:
+
+- dispatch một task tới worker;
+- routing/ack/retry/dead-letter là trọng tâm;
+- cần work-queue semantics hơn historical replay.
+
+Ví dụ:
+
+- media transcode job;
+- notification delivery task;
+- delayed cleanup/retry.
+
+Một hệ thống có thể dùng cả event log lẫn work queue, hoặc dùng managed primitives tương đương. Tránh dùng Kafka cho mọi delayed task hoặc dùng task queue làm canonical event history mà không cân nhắc retention/replay.
+
+---
+
+#### 11. Broker design cho fan-out
+
+`PostCreated` được publish sau outbox commit. Partition key cần cân bằng ordering và hotness:
+
+- theo `author_id` giữ order của author nhưng celebrity có thể thành hot partition;
+- hash/bucket fan-out jobs giúp parallelism nhưng cần sequence/version khi merge;
+- tách normal/hot-author workload pools tránh noisy neighbor;
+- large follower list được chia thành bounded fan-out batches.
+
+Consumer controls:
+
+- idempotent timeline upsert/inbox;
+- max attempts/backoff/DLQ;
+- per-author fairness và quotas;
+- backpressure theo Timeline Store capacity;
+- replay/reconciliation;
+- autoscale theo lag/oldest-event age, không chỉ CPU.
+
+Kafka không tự đảm bảo một post chỉ xuất hiện đúng một lần trong feed; business dedup vẫn cần ở consumer/store/read assembly.
+
+---
+
+#### 12. Media storage và CDN
+
+Object storage như S3/GCS phù hợp với image/video originals và variants vì:
+
+- durability/scale cao cho blobs;
+- multipart/direct upload;
+- lifecycle tiering/expiration;
+- versioning/replication theo policy;
+- tích hợp event processing và CDN origin.
+
+Flow:
+
+```text
+Client → signed upload → object storage
+                    → media event/queue
+                    → scan/transcode/resize workers
+                    → versioned variants/manifests
+                    → CDN → viewer
+```
+
+CDN như CloudFront/Cloudflare/Akamai giảm latency và origin egress/load. Cần:
+
+- immutable/versioned asset keys;
+- cache-control phù hợp;
+- origin shielding và range requests/adaptive streaming;
+- signed URLs/cookies cho private assets;
+- purge/deny strategy cho takedown;
+- không cache chung response của audiences khác nhau;
+- theo dõi hit ratio, origin fetch, playback và egress cost.
+
+Canonical post/media metadata nên giữ object IDs/keys, không lưu một vendor CDN URL cố định như truth.
+
+---
+
+#### 13. Search là derived system
+
+Elasticsearch/OpenSearch có thể phục vụ:
+
+- full-text post/user search;
+- filters và relevance;
+- autocomplete/trending projections.
+
+Nhưng search index không nên là source of truth của post status/audience. Pipeline:
+
+```text
+PostCreated/Updated/Deleted
+  → search indexer
+  → versioned upsert/delete
+  → reconcile/reindex khi drift
+```
+
+Search results vẫn cần authorization/eligibility trước khi trả nội dung protected. Khi search cluster lỗi, create-post không nên fail nếu search chỉ là asynchronous projection.
+
+---
+
+#### 14. Compute và container orchestration
+
+Kubernetes, ECS hoặc managed container platform hỗ trợ:
+
+- deploy/rollback từng service;
+- service discovery/load balancing;
+- horizontal scaling;
+- health probes/restart;
+- config/secret integration;
+- workload isolation và batch workers.
+
+Tuy nhiên, container orchestration không tự giải quyết:
+
+- hot partitions;
+- database/broker capacity;
+- retry storms;
+- bad fan-out policy;
+- stateful correctness;
+- slow startup hoặc insufficient node capacity.
+
+Autoscaling signals nên theo workload:
+
+| Workload | Tín hiệu scale |
+|---|---|
+| API/Feed Service | concurrency, RPS, p95 latency, saturation |
+| Fan-out consumers | queue lag, oldest event age, processing rate |
+| Media workers | queue depth/age, CPU/GPU/memory, job duration |
+| Notification workers | provider quota, queue age, failure rate |
+
+Small team có thể chọn managed containers/serverless/VM autoscaling để giảm control-plane burden. Operational simplicity là một requirement hợp lệ.
+
+---
+
+#### 15. API Gateway, Nginx và Envoy
+
+Các lớp có thể gồm:
+
+```text
+Client
+ → DNS/CDN/WAF/DDoS protection
+ → global/regional load balancer
+ → API Gateway/BFF
+ → service proxy/mesh data plane
+ → service
+```
+
+- Managed API Gateway: API keys, auth integration, quotas, routing, usage policy.
+- Nginx: reverse proxy/load balancer, edge routing và caching linh hoạt.
+- Envoy: high-performance L7 proxy, thường làm ingress/service-mesh data plane.
+
+Envoy một mình không tự tạo đầy đủ product API management/control plane. Gateway xử lý authentication/token validation và rate limiting, nhưng service vẫn enforce authorization. Transcript nói “read limits”; ý đúng là **rate limits**.
+
+---
+
+#### 16. Service-to-service communication
+
+##### Synchronous
+
+- External APIs thường dùng HTTP/REST.
+- Internal latency-sensitive calls có thể dùng HTTP hoặc gRPC.
+- Đặt deadline, timeout, bounded retry, circuit breaker và concurrency limit.
+- Batch/multi-get để tránh N+1 khi hydrate feed.
+
+##### Asynchronous
+
+- Versioned events cho fan-out, projections, counters và notification triggers.
+- Task queue cho transcode/delivery/cleanup.
+- Outbox/inbox, dedup, retry, DLQ và replay.
+
+Service mesh chỉ nên được thêm nếu traffic policy, mTLS và observability benefit lớn hơn complexity/latency/cost. Không cần dùng mesh chỉ vì đã có microservices.
+
+---
+
+#### 17. Consistency và replication choices
+
+| Domain | Mức consistency/replication direction |
+|---|---|
+| User/account status | Strong/conditional writes; replicated durable authority |
+| Post create/status | Durable acknowledgement; versioned updates/tombstones |
+| Timeline entries | Eventual, replicated/rebuildable read model |
+| Follow/block/private edge | Authoritative conditional mutation; bounded propagation |
+| Like edge | Idempotent/unique mutation; read-your-own-action |
+| Engagement count | Eventual/approximate được |
+| Search/analytics | Eventual, replay/reindex được |
+| Media object | Durable object storage; variants rebuildable từ original khi policy cho phép |
+
+Replica count/quorum không nên chọn theo mặc định máy móc. Cần gắn với failure domains, latency, consistency và RPO/RTO. Multi-region writes cần ownership/conflict semantics rõ; “global replication” không tự tạo global total order.
+
+---
+
+#### 18. Resilience patterns
+
+- timeouts và deadlines trên mọi remote call;
+- retry chỉ cho operation idempotent hoặc có idempotency key;
+- exponential backoff + jitter;
+- circuit breaker và bulkhead/concurrency limits;
+- queue/backpressure để hấp thụ bursts;
+- rate limiting/load shedding/admission control;
+- multi-AZ replicas và health-based failover;
+- cache/ranking/count fallbacks;
+- DLQ + replay + reconciliation;
+- backup/PITR và restore drills cho authorities;
+- chaos/failure tests cho critical paths.
+
+Không retry vô hạn. Retry có thể biến partial outage thành overload. Budget retries theo deadline và downstream safe capacity.
+
+---
+
+#### 19. Observability stack
+
+Prometheus và Grafana xử lý metrics/dashboards tốt, nhưng production observability cần ba signals:
+
+```text
+Metrics  → rate, errors, duration, saturation, queue lag, freshness
+Logs     → structured events/errors/audit with IDs
+Traces   → request path và async trace linkage
+```
+
+Có thể dùng OpenTelemetry để instrument và xuất tới backend phù hợp.
+
+Các dashboard/alerts quan trọng:
+
+- get-feed/create-post latency và error budget;
+- cache hit/miss/eviction/hot keys;
+- database partition latency/throttling/replica health;
+- Kafka consumer lag/oldest event/DLQ;
+- post-to-feed freshness theo author class/region;
+- CDN hit ratio/origin egress/media processing lag;
+- delete/block/moderation propagation;
+- ranking fallback và partial-response rate;
+- infrastructure saturation/cost.
+
+Alert trên user/business symptoms trước, resource metric sau. CPU cao nhưng SLO vẫn tốt có thể chưa cần page; feed freshness/privacy breach thì cần ưu tiên ngay.
+
+---
+
+#### 20. Security và secrets
+
+- WAF/DDoS controls ở edge;
+- OAuth/OIDC/JWT validation phù hợp và service-level AuthZ;
+- mTLS/workload identity cho internal traffic nếu threat model cần;
+- least-privilege IAM cho DB, broker, object storage và KMS;
+- secrets manager, rotation và không bake secrets vào image;
+- encryption in transit/at rest;
+- scoped/short-lived signed media upload/download;
+- network segmentation/private endpoints;
+- dependency/image scanning và patch process;
+- protected audit logs cho admin/moderation;
+- Redis/broker/databases không public internet.
+
+Private media/CDN cache policy phải được thiết kế cùng authorization; mã hóa transport không ngăn cache nhầm audience.
+
+---
+
+#### 21. Managed service hay self-managed?
+
+| Chọn managed khi | Cân nhắc self-managed khi |
+|---|---|
+| Team nhỏ, muốn giảm on-call/upgrade/backup burden | Cần topology/tuning/control rất đặc thù |
+| Availability/backup/failover tích hợp tạo giá trị | Scale đủ lớn để economics justify đội vận hành chuyên sâu |
+| Time-to-market quan trọng | Compliance/data locality không được managed option đáp ứng |
+| Workload phù hợp service limits | Vendor limits/lock-in cản requirements thực tế |
+
+Managed không có nghĩa “không cần vận hành”: vẫn phải thiết kế partition keys, quotas, cost controls, backups, restore, capacity, alerts và incident response.
+
+---
+
+#### 22. Cost model cần tính
+
+News Feed cost thường đến từ:
+
+- timeline write amplification;
+- database read/write requests và replicated storage;
+- Redis memory;
+- event retention/throughput;
+- media object variants;
+- CDN delivery và cross-region egress;
+- transcode CPU/GPU;
+- ranking/feature inference;
+- observability cardinality/retention;
+- idle/pre-provisioned capacity.
+
+Các optimization lớn:
+
+- hybrid fan-out và active-user materialization;
+- bounded timeline window/TTL;
+- batch writes/reads;
+- compact entries;
+- CDN/client caching và optimized variants;
+- data lifecycle/tiering;
+- sampling đúng chỗ nhưng không làm mất security/audit evidence;
+- managed/on-demand vs provisioned capacity theo workload profile.
+
+Đừng tối ưu cost bằng cách giảm replica/retention nếu phá RPO, privacy hoặc replay requirement.
+
+---
+
+#### 23. Technology decision record minh họa
+
+```text
+Decision: Timeline Store dùng wide-column managed database
+
+Context:
+- append/range-by-viewer là query chính
+- fan-out tạo write throughput rất lớn
+- entries là derived, bounded và rebuildable
+
+Choice:
+- partition theo timeline_owner + bucket
+- sort theo ordering_key + post_id
+- Redis cache first page
+
+Trade-offs:
+- denormalized/query-specific schema
+- cần chống hot/large partitions
+- eventual consistency và replay tooling
+
+Rejected for now:
+- Redis-only: memory/durability/recovery cost
+- single relational instance: write/partition growth risk
+
+Triggers to revisit:
+- partition p99/throttling vượt SLO
+- storage/cost tăng vượt budget
+- access pattern/ranking snapshot semantics thay đổi
+```
+
+Mỗi quyết định lớn nên ghi context, alternatives, trade-offs, failure model, owner và evolution trigger—not chỉ tên công nghệ.
+
+---
+
+#### 24. Những điểm hiệu chỉnh so với transcript
+
+| Transcript đơn giản hóa | Cách hiểu chính xác hơn |
+|---|---|
+| Cassandra/DynamoDB lưu users, tweets và timelines | Chọn store riêng theo từng access pattern/authority; relational vẫn phù hợp nhiều domain |
+| NoSQL vì scale ngang và nhiều reads/writes | Cần partition key, hot-key, query model, consistency và cost phù hợp—not label NoSQL |
+| Postgres hoặc Redis lưu engagement | Postgres/durable store cho canonical edges; Redis chủ yếu cache/counter/ephemeral acceleration |
+| Kafka hoặc RabbitMQ cho mọi async work | Kafka thiên event log/replay/multi-consumer; RabbitMQ/queue thiên work delivery/routing/retry |
+| CDN “deliver files” | CDN cache/deliver variants; object storage giữ originals/canonical bytes và access policy |
+| Kubernetes/ECS tự động scale services | Cần workload metric, node/downstream capacity, startup time và correct limits |
+| API Gateway hoặc Envoy | Gateway là policy/control capability; Envoy thường là proxy/data plane component |
+| Gateway enforce authentication | Domain services vẫn enforce resource authorization |
+| Retries/circuit breakers/queues tạo resilience | Phải có deadlines, idempotency, budgets, backpressure, DLQ/replay và degraded semantics |
+| Prometheus/Grafana là observability đầy đủ | Còn cần structured logs, traces, business/freshness/privacy metrics và runbooks |
+
+---
+
+#### 25. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Tôi chọn store theo access pattern và data authority, không dùng một database cho tất cả.
+2. Post, social graph và timeline có query models riêng; timeline là derived wide-column read model.
+3. Redis/Memcached cache first page/hot entities nhưng không giữ canonical post/engagement truth.
+4. Canonical engagement edges durable; hot counts được shard/stream aggregate eventual.
+5. Kafka/event log phát domain events cho fan-out, search, counters và replay; work queue xử lý transcode/notification tasks.
+6. Media upload trực tiếp object storage, workers tạo variants và CDN phục vụ toàn cầu.
+7. Containers scale API/workers theo latency/concurrency/queue lag; orchestration không sửa hot partition.
+8. Gateway/edge xử lý routing, AuthN, rate limits; domain service giữ AuthZ.
+9. Multi-AZ replication, outbox/inbox, timeouts, bounded retries, circuit breakers và fallbacks bảo vệ failures.
+10. Metrics/logs/traces theo dõi latency, queue lag, freshness, privacy propagation và cost.
+
+---
+
+#### 26. Checklist Step 4
+
+- [ ] Mỗi technology choice gắn với requirement/access pattern?
+- [ ] Canonical store và derived cache/index/timeline được phân biệt?
+- [ ] Partition/sort keys phục vụ queries đã biết?
+- [ ] Hot user/post/partition và bucket strategy?
+- [ ] Consistency/durability/RPO/RTO theo từng domain?
+- [ ] Redis/Memcached dùng như acceleration, không vô tình thành sole authority?
+- [ ] Kafka/event log và task queue được chọn theo semantics?
+- [ ] Outbox/inbox/idempotency/replay/reconciliation?
+- [ ] Media direct upload/object lifecycle/CDN/private access/purge?
+- [ ] Gateway, WAF, AuthN và service AuthZ?
+- [ ] Autoscaling metric phản ánh workload và downstream limit?
+- [ ] Timeout/retry/circuit-breaker/backpressure/load-shedding policies?
+- [ ] Multi-AZ/multi-region ownership/failover/fencing?
+- [ ] Backup/PITR/restore và projection rebuild drills?
+- [ ] Metrics/logs/traces/business correctness/freshness alerts?
+- [ ] Managed-vs-self-managed và team capability?
+- [ ] Storage/request/egress/compute/observability cost model?
+- [ ] Alternatives, trade-offs và evolution triggers ghi trong ADR?
+
+#### 27. Ý chính cần nhớ
+
+- Không có stack duy nhất đúng; requirement và access pattern dẫn dắt lựa chọn.
+- Cassandra/DynamoDB phù hợp query-driven horizontal scale, nhưng không mặc định tốt cho mọi data.
+- Timeline Store là bounded/rebuildable wide-column read model; Redis cache first page.
+- Social graph thường cần follower và following indexes; celebrity lists cần bucketing.
+- Canonical engagement edge phải durable/idempotent; Redis phù hợp cache/hot counts hơn.
+- Kafka mạnh ở retained event streams/replay; RabbitMQ/task queue mạnh ở work delivery semantics.
+- Object storage giữ media bytes; CDN phục vụ variants gần user và bảo vệ origin.
+- Kubernetes/ECS hỗ trợ deploy/scale, nhưng không giải quyết data hot spots hay bad retries.
+- Gateway xử lý AuthN/routing/rate limits; service vẫn enforce AuthZ.
+- Async messaging cần outbox/inbox, idempotency, DLQ, replay và reconciliation.
+- Resilience là bounded retry + timeout + backpressure + isolation + degraded behavior.
+- Observability phải đo cả feed freshness, privacy propagation và business correctness—not chỉ CPU.
+- Managed service giảm toil nhưng không loại bỏ capacity, schema, backup và incident design.
+- Cost của News Feed thường bị chi phối bởi fan-out, memory cache, media/CDN egress và cross-region traffic.
+- Mỗi quyết định nên có context, trade-off, rejected alternatives và trigger để xem xét lại.
+
+#### Công thức ghi nhớ
+
+> **Tech strategy = access-pattern fit + explicit consistency/durability + hot-key-aware partitioning + operable failure model + measurable cost + reversible evolution path.**
+
+---
+
+### Bài 77. The Final Design — News Feed
+
+#### 1. Bài toán cuối cùng cần giải
+
+Hệ thống phải cung cấp timeline cá nhân hóa cho hàng triệu user với:
+
+- first-page latency thấp;
+- post mới xuất hiện trong bounded freshness SLO;
+- khả năng chịu celebrity/hot-post traffic;
+- post và media đã acknowledge phải durable;
+- availability cao và degraded behavior an toàn;
+- không hiển thị content đã delete, block, private hoặc bị moderation ngoài policy;
+- khả năng scale từng workload và vận hành được trong thực tế.
+
+Final design không phải tập hợp các “box” độc lập. Nó là hai data planes liên kết bằng durable events:
+
+```text
+Authoritative write plane
+  Post + Graph + Engagement + Media metadata
+                 │
+                 ▼
+          Durable event pipeline
+                 │
+                 ▼
+Derived read/delivery plane
+  Timeline + caches + recent-author index + search + counts + CDN
+```
+
+Write plane bảo vệ durability/invariants. Read plane được denormalize, cache, replicate và rebuild để phục vụ nhanh.
+
+---
+
+#### 2. Kiến trúc hoàn chỉnh
+
+```text
+                                      ┌───────────────────────────────┐
+                                      │       Observability           │
+                                      │ metrics · logs · traces · SLO │
+                                      └───────────────────────────────┘
+
+ Mobile/Web Client
+   │       │ direct media upload/download
+   │       └───────────────────────────────────────────────────────────────┐
+   ▼                                                                       ▼
+ DNS / CDN / WAF / DDoS protection                               Object Storage
+   │                                                                       │
+   ▼                                                               Media Workers
+ Global/Regional Load Balancer                                             │
+   │                                                                       ▼
+   ▼                                                               Media Metadata
+ API Gateway / BFF ◄────────────────────────────── Media Service ──────────┘
+   │
+   ├── Profile Service ─────────────── Profile Store/Cache
+   ├── Social Graph Service ────────── Graph Store/Eligibility Cache
+   ├── Post Service ────────────────── Post Store + Outbox
+   ├── Engagement Service ──────────── Engagement Edge Store
+   └── Feed/Timeline Service ───────── Timeline Store + First-page Cache
+               │                              ▲
+               │                              │ compact timeline refs
+               ├── Recent-post index ─────────┤
+               ├── Ranking/Policy interface   │
+               └── batch hydration ───────────┘
+
+ Post/Graph/Engagement/Media events
+               │
+               ▼
+       Durable Event Log / Queues
+        ├── Fan-out Workers ────────── Timeline Store
+        ├── Counter Aggregators ────── Count Store/Cache
+        ├── Search Indexers ────────── Search Projection
+        ├── Notification Workers ───── Push/Email/In-app providers
+        ├── Media Jobs ─────────────── Scan/Transcode/Thumbnail
+        └── Invalidation/Moderation ── Tombstone/Deny/Purge paths
+```
+
+Các service có thể scale độc lập, nhưng vẫn phải tôn trọng shared downstream capacity, contracts và data ownership.
+
+---
+
+#### 3. Trách nhiệm và source of truth
+
+| Component | Trách nhiệm | Source of truth/read model |
+|---|---|---|
+| API Gateway/BFF | AuthN, routing, rate limits, request policy/aggregation | Không là domain authority |
+| Profile Service | Profile, handle, account/privacy status | Profile Store |
+| Social Graph Service | Follow/unfollow, block/mute, relationship checks | Graph Store |
+| Post Service | Post lifecycle, audience, status, media refs | Post Store |
+| Engagement Service | Like/repost/reply canonical actions | Engagement Edge Store |
+| Media Service | Upload authority, metadata, processing/access state | Media metadata + Object Storage |
+| Feed Service | Candidate merge, filter, hydrate, order/rank, paginate | Timeline/Feed read models là derived |
+| Fan-out Workers | Materialize compact refs theo hybrid policy | Không sở hữu canonical post |
+| Ranking/Policy | Order/diversity/safety decision | Scores/features/policies; không sở hữu content |
+| Notification Service | Preference, dedup, delivery workflow | Notification state; không block business action |
+| Search/Counter systems | Query/aggregate projections | Derived và rebuildable |
+
+Quy tắc quan trọng:
+
+> Feed cache nói “có candidate”; Post và Graph authorities mới quyết định candidate đó còn tồn tại và viewer còn được phép xem hay không.
+
+---
+
+#### 4. Client và entry path
+
+Mọi metadata/API request đi qua:
+
+```text
+Client → DNS/CDN/WAF → Load Balancer → API Gateway/BFF → Domain Service
+```
+
+Entry layers xử lý:
+
+- TLS, DDoS/WAF và bot controls;
+- token validation/identity propagation;
+- routing/versioning;
+- rate limits, quotas, request-size limits;
+- request/correlation IDs;
+- coarse validation và optional client-specific aggregation.
+
+Domain service vẫn thực hiện object-level authorization. Media bytes upload/download đi trực tiếp giữa client, object storage và CDN bằng quyền tạm thời/scoped để không làm app servers thành data-transfer bottleneck.
+
+---
+
+#### 5. Luồng publish post
+
+```text
+1. Client gửi POST /posts với Idempotency-Key và media_ids.
+2. Gateway xác thực/rate-limit rồi route tới Post Service.
+3. Post Service kiểm tra author, audience và media ownership/readiness.
+4. Một DB transaction ghi Post + Outbox(PostCreated).
+5. Sau COMMIT, service trả post_id/status cho author.
+6. Outbox publisher đưa PostCreated vào durable event log.
+7. Consumers độc lập xử lý fan-out, search, analytics và notifications.
+```
+
+Success boundary:
+
+```text
+Acknowledged post = canonical post commit durable
+                  ≠ all follower timelines already updated
+```
+
+Nhờ vậy user không chờ hàng triệu fan-out writes. Nếu broker hoặc worker lỗi, outbox/event log cho phép publish lại và replay.
+
+Read-your-own-post có thể được đảm bảo bằng cách Feed Service merge recent posts của chính viewer/author hoặc trả post trực tiếp từ Post Store trước khi fan-out hoàn tất.
+
+---
+
+#### 6. Hybrid fan-out pipeline
+
+##### Normal author — fan-out-on-write
+
+```text
+PostCreated
+  → classify author/workload
+  → page active eligible follower buckets
+  → create bounded batch jobs
+  → idempotent append compact TimelineEntry refs
+```
+
+##### Hot/celebrity author — fan-out-on-read
+
+```text
+PostCreated
+  → update RecentPostsByAuthor
+  → avoid millions of immediate timeline writes
+  → Feed Service pulls recent posts when followers read
+```
+
+##### Dynamic policy
+
+Push/pull decision dựa trên:
+
+- active follower count/distribution;
+- author publish rate;
+- follower read probability;
+- write/read cost;
+- fan-out queue pressure;
+- Timeline Store throttling;
+- freshness target và region.
+
+Worker pools được tách/fair-share để celebrity không làm starve normal-author posts. Một post đi qua push và pull paths phải có stable `post_id` để Feed Service deduplicate.
+
+---
+
+#### 7. Luồng đọc feed
+
+```text
+Client → GET /me/feed?cursor=...
+  → Gateway/BFF
+  → Feed Service
+      1. đọc first-page cache hoặc materialized timeline refs
+      2. lấy followed hot authors và recent-post indexes
+      3. optional recommendation/module candidates
+      4. merge + dedup + apply feed generation/cursor
+      5. filter post status/audience/follow/block/mute/moderation
+      6. batch hydrate post/profile/media/count/viewer state
+      7. chronological order hoặc ranking/diversity policy
+      8. trả feed cards + opaque next_cursor
+```
+
+Để giữ tail latency:
+
+- batch/multi-get thay N+1;
+- parallel dependency calls với deadline và concurrency budget;
+- bounded candidate pool;
+- cached/default profile/count data;
+- chronological/lightweight fallback nếu ranker lỗi;
+- bỏ non-critical enrichments khi deadline sắp hết;
+- không fail-open protected content;
+- dùng stable feed generation/tie-breaker để giảm duplicate/missing giữa pages.
+
+---
+
+#### 8. Timeline data model
+
+```text
+TimelineEntry
+  partition: timeline_owner_id + time/size_bucket
+  sort key:  ordering_key + post_id
+  fields:    post_id, author_id, source, generation,
+             candidate_time, optional lightweight features
+```
+
+Timeline chỉ lưu compact references, không copy toàn bộ authoritative post. Thiết kế:
+
+- bounded recent window/TTL;
+- active-user materialization;
+- conditional/upsert key chống duplicate;
+- time/size buckets chống partition không giới hạn;
+- rebuild/replay từ events và canonical stores;
+- first-page cache cho user hoạt động thường xuyên.
+
+Timeline Store có thể eventual. Content visibility không được dựa riêng vào entry cũ.
+
+---
+
+#### 9. Media flow
+
+```text
+1. Client xin media_id + signed upload URL.
+2. Client multipart-upload trực tiếp vào Object Storage.
+3. Storage/media event kích hoạt scan/validation/transcode/resize.
+4. Media metadata chuyển UPLOADING → PROCESSING → READY/FAILED.
+5. Post tham chiếu media_id.
+6. Viewer nhận authorized CDN URL/manifest cho variant phù hợp.
+```
+
+Controls:
+
+- size/type/checksum/quota và ownership validation;
+- không tin MIME do client gửi;
+- virus/safety scan theo policy;
+- immutable/versioned variants;
+- origin shielding, range requests/adaptive streaming;
+- private media dùng signed access và cache isolation;
+- orphan-upload cleanup/lifecycle;
+- takedown deny/purge path và audit.
+
+Media chưa sẵn sàng có thể hiện placeholder hoặc giữ post `PROCESSING`, tùy product contract.
+
+---
+
+#### 10. Engagement flow
+
+```text
+Client → PUT /posts/{id}/likes
+  → Gateway → Engagement Service
+  → check post/eligibility + conditional insert canonical LikeEdge
+  → return success/read-your-own-state
+  → EngagementCreated event
+       ├── sharded/stream count aggregation
+       ├── notification policy
+       ├── ranking/features
+       └── analytics/abuse detection
+```
+
+Canonical action đồng bộ và idempotent; aggregate count eventual. Hot post không update một counter row duy nhất. Unlike/repost/reply dùng stable business IDs và compensation/version semantics tương tự.
+
+Notification/provider failure không rollback like. Người dùng có thể thấy trạng thái like của chính mình ngay cả khi public count đang stale.
+
+---
+
+#### 11. Follow, unfollow, block và mute
+
+```text
+Follow command
+  → atomic Graph Store mutation
+  → Graph event
+  → optional recent-post backfill + notification + counts
+
+Unfollow/block/mute
+  → authoritative relationship mutation
+  → high-priority eligibility update/invalidation
+  → future feed filters immediately/boundedly
+  → async cleanup old timeline entries
+```
+
+Private-account follow có state machine `PENDING → APPROVED/REJECTED`. Follow count là derived; relationship state là authority.
+
+Block/private changes ưu tiên correctness hơn feed completeness. Nếu eligibility dependency lỗi, protected content fail closed; feed có thể thiếu item tạm thời.
+
+---
+
+#### 12. Delete và moderation flow
+
+Một post có references ở timeline, cache, search, notification, analytics và CDN. Không thể xóa đồng bộ mọi copy trước khi trả response.
+
+```text
+Author/moderator command
+  → Post Store commits DELETED/HIDDEN + versioned tombstone
+  → priority invalidation/deny event
+       ├── serve-time tombstone/eligibility cache
+       ├── timeline/cache cleanup
+       ├── search removal
+       ├── CDN/media deny/purge
+       └── audit/retention workflow
+```
+
+Hệ thống phải đo takedown propagation p95/p99. Eventual consistency có thể áp dụng cho physical cleanup, không phải lý do để tiếp tục hiển thị content ngoài policy.
+
+---
+
+#### 13. Caching layers
+
+```text
+Edge/CDN cache        → public/static/media variants
+Gateway/BFF cache     → chỉ response an toàn để chia sẻ/cache
+Feed first-page cache → personalized page/generation
+Timeline cache        → recent compact refs
+Entity cache          → post/profile/media cards
+Eligibility cache     → relationship/status acceleration
+Count cache           → eventual engagement aggregates
+```
+
+Cache rules:
+
+- versioned keys và TTL theo semantics;
+- TTL jitter, single-flight và refresh-ahead;
+- hot-key replication/sharding;
+- bounded value/page size;
+- negative caching có thời hạn ngắn và rõ correctness;
+- tombstone/invalidation + TTL safety net;
+- origin capacity, circuit breaker và load shedding;
+- không trộn personalized/private responses giữa viewers.
+
+Cache tăng performance nhưng không phải durability hoặc authorization boundary.
+
+---
+
+#### 14. Messaging và background processing
+
+Durable event log dùng cho Post/Graph/Engagement/Moderation events vì cần nhiều consumers, retention và replay. Work queues dùng cho bounded fan-out batches, transcode, delivery hoặc delayed cleanup tùy semantics.
+
+Every message/event cần:
+
+- `event_id`, aggregate ID/version, type, timestamp và schema version;
+- at-least-once-aware consumer;
+- outbox ở producer, inbox/dedup/conditional write ở consumer;
+- ordering scope rõ, không hứa total order;
+- bounded retry/backoff/jitter;
+- DLQ với alert, replay và reconciliation;
+- poison-message isolation;
+- lag/oldest-event/failure metrics.
+
+Queues hấp thụ traffic spike trong giới hạn. Nếu arrival rate cao hơn processing rate quá lâu, backlog vẫn tăng; cần backpressure, autoscaling, admission/fan-out mode switching và capacity plan.
+
+---
+
+#### 15. Data-store choices trong final design
+
+| Data/workload | Lựa chọn đại diện | Vì sao |
+|---|---|---|
+| Profile/account | PostgreSQL/distributed SQL hoặc suitable KV | Constraints, lifecycle, point lookup |
+| Posts/recent-by-author | Cassandra/DynamoDB hoặc sharded relational | High throughput, key/range access |
+| Social graph adjacency | Wide-column/KV với bidirectional indexes | Large one-hop lists, horizontal partitioning |
+| Timeline refs | Cassandra/DynamoDB/wide-column | Append/range-by-viewer, derived state |
+| Engagement edges | Durable SQL/KV/wide-column | Idempotent/conditional user-post mutations |
+| Counts/hot reads | Stream aggregate + Redis/Memcached | Low latency, sharded eventual projections |
+| Media bytes | S3/GCS/object storage | Massive durable blobs/lifecycle |
+| Media delivery | CDN | Global edge latency/origin protection |
+| Event streams/tasks | Kafka/managed log + RabbitMQ/SQS-like queue | Replay/multi-consumer vs work delivery |
+| Search | Elasticsearch/OpenSearch | Derived full-text/query projection |
+
+Product names là đại diện. Partitioning, consistency, failure model và team capability quyết định lựa chọn cuối.
+
+---
+
+#### 16. Deployment và scaling
+
+Services/workers chạy trên Kubernetes, ECS, managed containers hoặc tương đương:
+
+- stateless API instances scale ngang;
+- Feed Service scale theo concurrency/RPS/p95 latency;
+- fan-out consumers scale theo queue lag/oldest age;
+- media workers scale theo queue và CPU/GPU/resource class;
+- notification workers bị giới hạn bởi provider quota;
+- databases/brokers/caches có independent capacity plan;
+- separate hot/normal workloads bằng quotas/pools/bulkheads.
+
+Kubernetes không sửa hot partition, bad schema hoặc retry storm. HPA phải đi cùng node capacity, startup time, resource requests/limits và downstream-safe maximum replicas.
+
+Deploy bằng canary/blue-green, backward-compatible API/event/schema changes và rollback/kill switches. Consumer cũ/mới phải cùng tồn tại an toàn trong migration window.
+
+---
+
+#### 17. Multi-AZ và multi-region
+
+##### Trong một region
+
+- service instances trải nhiều AZ;
+- load balancer bỏ unhealthy instance;
+- authoritative stores replicated theo RPO/RTO;
+- broker/cache topology tránh single point of failure;
+- backup/PITR và restore drills.
+
+##### Global
+
+- user đọc ở region gần nhất qua regional feed caches/read models;
+- post/author/graph partition có home-region write authority hoặc conflict policy rõ;
+- durable events replicate tới regional consumers;
+- media đi qua globally distributed CDN;
+- idempotent consumers xử lý duplicate/cross-region replay;
+- delete/block/moderation dùng priority propagation lane;
+- writer failover có owner epoch/fencing;
+- không hứa global total ordering.
+
+Region failure có thể làm feed stale/thiếu tạm thời, nhưng acknowledged canonical post không được mất ngoài RPO đã cam kết và protected content không fail-open.
+
+---
+
+#### 18. Reliability và degraded modes
+
+| Failure/overload | Degraded behavior |
+|---|---|
+| Ranking service lỗi | Chronological/lightweight fallback |
+| Count/profile enrichment chậm | Stale/default/omit non-critical fields |
+| Timeline first-page cache lỗi | Bounded store read/rebuild; protect origin |
+| Fan-out lag | Post vẫn durable; show pull candidates/replay; expose freshness lag |
+| Hot celebrity publish | Switch/isolate pull path, fairness queues |
+| Event duplicate/out-of-order | Idempotent/versioned consumer writes |
+| Media transcode chậm | PROCESSING placeholder; retry/DLQ |
+| CDN cache miss wave | Origin shield/single-flight/rate protection |
+| Notification provider lỗi | Queue retry/backoff/DLQ; no rollback |
+| Social graph/eligibility lỗi | Fail closed cho private; omit unsafe candidates |
+| Post Store create failure | Không trả success; idempotent retry |
+| Broker/publisher lỗi | Outbox retained; publish/replay later |
+| Region outage | Route reads/failover theo ownership/fencing/DR plan |
+
+Low latency và availability quan trọng, nhưng không vượt durability/privacy correctness.
+
+---
+
+#### 19. Security, abuse và privacy
+
+- AuthN qua IdP/gateway; AuthZ trong Post/Graph/Feed/Media domains.
+- Validate audience, account status, approved follow, block/mute và moderation.
+- WAF/DDoS protection và layered rate limits theo user/device/IP/action.
+- Anti-spam/bot/sybil controls cho posting, following và engagement.
+- Workload identity/mTLS hoặc protected internal network theo threat model.
+- Least-privilege IAM cho databases, broker, storage, CDN và KMS.
+- Signed short-lived media operations, content validation/scanning.
+- Encryption in transit/at rest và secrets rotation.
+- PII minimization, protected audit logs và admin controls.
+- GDPR/privacy deletion/retention cùng cache/search/CDN cleanup workflow.
+
+Recommendation/ranking failure có thể degrade; safety policy không được biến thành “show everything”.
+
+---
+
+#### 20. Observability và operational controls
+
+##### User-facing SLOs
+
+- feed/create-post/engagement latency và availability;
+- empty/duplicate/cursor-error rate;
+- media start/render success;
+- read-your-own-action success.
+
+##### Freshness/async SLOs
+
+- post commit → event published;
+- event → timeline visible theo author class/region;
+- fan-out queue lag/oldest event age;
+- media processing và notification lag;
+- search/count projection lag.
+
+##### Correctness/safety
+
+- duplicate post/like/timeline effects;
+- block/delete/moderation propagation p95/p99;
+- unauthorized/ineligible content incidents;
+- replay/reconciliation drift;
+- data-loss/restore verification.
+
+##### Capacity/cost
+
+- DB/cache/broker partition saturation/hot keys;
+- CDN hit ratio/origin/egress;
+- worker throughput/backpressure;
+- storage growth/TTL/lifecycle;
+- per-feed-page/post/media unit cost.
+
+Metrics, structured logs và traces phải nối qua request ID, post/user business IDs và event IDs. Runbooks, load/chaos tests và kill switches là một phần của final design.
+
+---
+
+#### 21. Bottleneck → architectural control
+
+| Bottleneck | Final control |
+|---|---|
+| Read-heavy first page | First-page/timeline/entity caches + batch hydration |
+| Normal-author fan-out | Async batched fan-out-on-write cho active followers |
+| Celebrity write storm | Pull-on-read/recent-author index + isolated workers |
+| Huge timeline storage | Compact refs, bounded windows, active-user materialization |
+| Feed assembly tail latency | Candidate budgets, parallel batch reads, deadlines/fallback |
+| Social graph skew | Bidirectional bucketed adjacency lists/caches |
+| Hot engagement counters | Canonical edges + sharded/stream-aggregated counts |
+| Media scale/latency | Direct object upload + async workers + CDN |
+| Delete/block propagation | Authoritative tombstone/deny + high-priority invalidation |
+| Traffic spike | Queues, backpressure, autoscaling, rate/admission/load shedding |
+| Duplicate/retry | Idempotency keys, outbox/inbox, conditional writes |
+| Region/instance failure | Multi-AZ replication, regional reads, fenced failover/DR |
+
+---
+
+#### 22. Requirements → final decisions
+
+| Requirement | Design decision |
+|---|---|
+| Feed latency thấp | Precomputed refs, caches, batch hydration, CDN và ranking fallback |
+| Fresh posts trong vài giây | Durable events, scalable fan-out workers và lag SLOs |
+| Celebrity scale | Hybrid fan-out, hot-author indexes và workload isolation |
+| Durable post create | Post Store + transactional outbox commit trước acknowledge |
+| High availability | Stateless services, multi-AZ stores, cache/fallback/degraded modes |
+| Stable scrolling | Opaque cursor + feed generation + deterministic tie-breaker/dedup |
+| Engagement tốc độ cao | Idempotent edge writes + async sharded counts/notifications |
+| Global media | Object storage, variants, CDN và origin protection |
+| Privacy/takedown | Domain AuthZ, eligibility checks, tombstones và priority propagation |
+| Operational scalability | Independent services/stores, queue-based decoupling và workload metrics |
+| Recoverability | Backups/PITR, retained events, projection rebuild và reconciliation |
+| Cost control | Hybrid fan-out, active-only materialization, bounded retention và CDN caching |
+
+Mỗi component tồn tại vì một requirement hoặc failure mode; nếu không giải thích được lý do, cần xem lại nó.
+
+---
+
+#### 23. Những điểm hiệu chỉnh so với sơ đồ đơn giản
+
+| Sơ đồ/transcript đơn giản hóa | Final design production-oriented |
+|---|---|
+| User Service quản lý mọi relationship | Profile và Social Graph có ownership/access paths rõ; có thể deploy chung lúc nhỏ |
+| Gateway là nơi authentication | Gateway làm AuthN/coarse policy; domain services enforce object-level AuthZ |
+| Tweet Service “lưu rồi gửi queue” | Post + outbox atomic commit tránh mất event giữa DB và broker |
+| Mọi follower được update async | Hybrid push normal authors, pull hot authors, active-user policy |
+| Timeline tối ưu fast reads | Timeline là compact, bounded, rebuildable projection với cache và cursor semantics |
+| Cache giảm database load | Còn cần invalidation/tombstone, stampede/origin protection và privacy-safe keys |
+| Queue hấp thụ traffic spikes | Chỉ hấp thụ bounded burst; sustained overload cần backpressure/admission/capacity |
+| Tách microservices tạo resilience | Isolation chỉ có khi có bulkheads, deadlines, quotas, ownership và fallbacks |
+| Engagement lưu riêng | Canonical edges khác aggregate counts; Redis không mặc định là authority |
+| Media nằm object storage + CDN | Còn cần direct upload, processing state, signed access, purge và lifecycle |
+| Dịch vụ scale độc lập | Downstream DB/broker/provider limits và hot partitions vẫn là shared constraints |
+| Final architecture “highly reliable” | Reliability cần SLOs, replication, recovery, drills và explicit degraded behavior |
+
+---
+
+#### 24. Các trade-off quan trọng
+
+| Decision | Lợi ích | Chi phí/giới hạn |
+|---|---|---|
+| Fan-out-on-write | Feed read rất nhanh | Write/storage amplification |
+| Fan-out-on-read | Write rẻ cho celebrity | Read merge/latency lớn hơn |
+| Hybrid fan-out | Cân bằng common/hot cases | Policy, dedup và operations phức tạp |
+| Denormalized timeline | Predictable range reads | Eventual consistency và invalidation/rebuild |
+| Caching | Latency/DB load thấp | Staleness, memory cost, stampede/hot keys |
+| Microservices | Scale/deploy/ownership độc lập | Network, data consistency và operational complexity |
+| Async events | Decoupling, throughput, replay | Lag, duplicates, ordering và debugging |
+| Multi-region | Reader latency/availability | Replication, ownership, egress và conflict complexity |
+| Ranking | Relevance/engagement | Compute, tail latency, stability và safety risk |
+
+Không có kiến trúc hoàn hảo. Mục tiêu là trade-off phù hợp với product, scale, team và SLO hiện tại.
+
+---
+
+#### 25. Cách trình bày final design trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Client vào qua CDN/WAF/API Gateway; metadata request tới domain services, media bytes đi object storage/CDN.
+2. Profile, Graph, Post, Engagement và Media stores giữ authoritative state; Timeline/cache/search/counts là derived.
+3. Create post commit Post + Outbox trước khi acknowledge; background consumers làm fan-out và projections.
+4. Normal authors push compact refs vào active follower timelines; celebrities dùng recent-author pull path.
+5. Feed Service merge/dedup hai nguồn, filter eligibility/tombstones, batch hydrate rồi rank/order với cursor generation.
+6. Engagement edge idempotent sync; counts, ranking features và notifications async.
+7. Delete/block/moderation commit deny/tombstone trước, serve-time filter và cleanup caches/search/CDN sau.
+8. Cassandra/DynamoDB-like stores phục vụ query-driven scale, Redis cache hot reads, event log hỗ trợ replay và object storage/CDN phục vụ media.
+9. Multi-AZ deployments, idempotency, backpressure, bounded retries, isolation và degraded fallbacks bảo vệ failures.
+10. Metrics đo latency, fan-out freshness, hot partitions, policy propagation, recovery và cost.
+
+Deep dives nên chuẩn bị:
+
+- fan-out policy/cost threshold;
+- feed assembly, cursor và ranking fallback;
+- social graph/timeline partitioning;
+- celebrity/hot-post handling;
+- outbox/inbox/event ordering/replay;
+- delete/block/private correctness;
+- media pipeline/CDN/private assets;
+- multi-region ownership và DR.
+
+---
+
+#### 26. Final checklist
+
+- [ ] Scope/feed semantics, scale assumptions và SLOs rõ?
+- [ ] Authorities khác derived read models/caches?
+- [ ] Service boundaries, invariants và data ownership rõ?
+- [ ] API idempotency, cursor và processing-status contracts?
+- [ ] Post + outbox durable trước acknowledgement?
+- [ ] Hybrid fan-out policy cho normal/hot/inactive users?
+- [ ] Timeline compact refs, bucket/window/TTL/rebuild?
+- [ ] Feed merge/dedup/eligibility/hydration/rank/fallback?
+- [ ] Canonical engagement edges và sharded eventual counts?
+- [ ] Media direct upload, scan/transcode, CDN, signed access/purge?
+- [ ] Follow/block/private/delete/moderation bounded propagation?
+- [ ] Kafka/event log vs task queue semantics?
+- [ ] Consumer idempotency, ordering/version, DLQ/replay/reconciliation?
+- [ ] Cache invalidation, stampede, hot-key và origin protection?
+- [ ] Partition keys/capacity plans cho Post/Graph/Timeline/Engagement?
+- [ ] Timeouts, retry budgets, circuit breakers, bulkheads và load shedding?
+- [ ] Multi-AZ/multi-region ownership, fencing, backup/PITR/restore?
+- [ ] Security/AuthZ/abuse/IAM/secrets/audit controls?
+- [ ] Latency, freshness, privacy, correctness, recovery và cost metrics?
+- [ ] Load/chaos/DR/rebuild drills và runbooks?
+- [ ] ADRs giải thích choices, trade-offs và evolution triggers?
+
+#### 27. Ý chính cần nhớ
+
+- Final News Feed gồm authoritative write plane và derived read/delivery plane nối bằng durable events.
+- Post create chỉ acknowledge sau canonical commit; fan-out và projections chạy async.
+- Hybrid fan-out kết hợp push cho normal authors và pull cho celebrities.
+- Feed Service không chỉ đọc timeline: nó merge, dedup, filter, hydrate, rank/order và paginate.
+- Timeline/cache chứa candidate references, không sở hữu post visibility hoặc relationship truth.
+- Delete/block/private/moderation dùng authoritative tombstone/deny trước, cleanup copies sau.
+- Engagement edge durable/idempotent; hot counts và notifications tách bất đồng bộ.
+- Media sử dụng direct object upload, processing pipeline và CDN delivery.
+- Queue chỉ hấp thụ bounded burst; sustained overload cần backpressure, isolation và capacity.
+- Microservices chỉ tạo resilience khi có ownership, timeouts, bulkheads, fallbacks và observability.
+- Có thể degrade ranking/count/profile freshness, nhưng durability và privacy không được fail-open.
+- Multi-region cần ownership/idempotency/fencing, không cần hứa total global ordering.
+- Công nghệ được chọn theo access pattern, consistency, failure model, team capability và cost.
+- SLO phải bao gồm latency, post-to-feed freshness và delete/block propagation—not chỉ uptime.
+- Kiến trúc tốt giải thích được mỗi component giải quyết vấn đề nào và đánh đổi điều gì.
+
+#### Công thức ghi nhớ
+
+> **Final News Feed = durable domain writes + hybrid asynchronous fan-out + eligibility-safe low-latency feed assembly + object-storage/CDN media + idempotent projections + observable, recoverable degraded operation.**
+
+---
+
+## Phần 15 — Design a Notification System
+
+### Bài 78. Understanding the Problem & Defining the Scope
+
+#### 1. Notification System là gì?
+
+Notification System là nền tảng nhận business events hoặc direct requests, quyết định cần thông báo gì, cho ai, qua kênh nào và vào thời điểm nào, sau đó theo dõi toàn bộ delivery lifecycle.
+
+```text
+Business event/direct request
+  → policy + recipient resolution
+  → preference/compliance check
+  → template + personalization + localization
+  → channel delivery
+  → status/receipt/audit
+```
+
+Ví dụ trigger:
+
+- có tin nhắn mới;
+- đơn hàng đã giao cho đơn vị vận chuyển;
+- thanh toán thành công/thất bại;
+- mật khẩu hoặc email vừa thay đổi;
+- OTP/password-reset request;
+- có người like/reply/follow;
+- chương trình khuyến mãi hoặc thông báo toàn hệ thống.
+
+Mục tiêu không chỉ là “gửi message”, mà là:
+
+> Gửi đúng thông tin, tới đúng người, qua đúng kênh, vào đúng thời điểm, theo đúng preference/policy và có thể giải thích được điều gì đã xảy ra.
+
+---
+
+#### 2. Tại sao cần một platform dùng chung?
+
+Nếu mỗi business service tự gọi email/SMS/push provider:
+
+- channel logic bị lặp lại;
+- templates và branding không nhất quán;
+- khó enforce user preferences/compliance;
+- credentials/provider APIs rải khắp hệ thống;
+- retries dễ gây gửi trùng;
+- provider outage có thể block business request;
+- không có delivery status/audit thống nhất;
+- thêm channel/provider mới phải sửa nhiều services.
+
+Notification Platform tạo abstraction:
+
+```text
+Order/Auth/Chat/Social services
+           │ business intent/event
+           ▼
+   Notification Platform
+           │ channel-neutral contract
+     ┌─────┼──────┬──────┐
+     ▼     ▼      ▼      ▼
+   Email  SMS    Push   In-app
+```
+
+Upstream service nên nói “Order 123 đã shipped cho user U”, không cần biết SMTP, APNs/FCM payload hay SMS provider API.
+
+---
+
+#### 3. Chốt các loại notification
+
+Không phải notification nào cũng có cùng priority hoặc policy.
+
+| Category | Ví dụ | Đặc tính |
+|---|---|---|
+| Security/critical | Password changed, suspicious login, MFA/OTP | Urgent, security-sensitive, thường không cho opt-out hoàn toàn |
+| Transactional | Payment receipt, order shipped, booking confirmed | Gắn business transaction, cần audit và reliability cao |
+| Communication | Chat message, mention, reply | Near real-time, volume lớn, dễ cần collapse/batch |
+| Product/activity | Like, follow, comment digest | Có thể delay/batch/dedup theo UX |
+| Marketing/promotional | Sale, campaign, recommendation | Consent/compliance/quiet hours nghiêm ngặt, có thể bulk scheduled |
+| System/broadcast | Maintenance, incident, policy update | Fan-out cực lớn, priority và audience segmentation rõ |
+
+Priority không chỉ ảnh hưởng queue order; nó còn quyết định:
+
+- latency SLO;
+- retry duration;
+- channel fallback;
+- quiet-hours behavior;
+- quota/reserved capacity;
+- retention/audit;
+- mức personalization và batching.
+
+Không nên để một campaign marketing khổng lồ làm trễ password-reset hoặc fraud alert.
+
+---
+
+#### 4. Delivery channels và semantics
+
+##### Email
+
+- payload tương đối lớn, HTML/text, attachments/links;
+- provider accepted không đồng nghĩa inbox placement;
+- bounce, complaint, unsubscribe và spam reputation quan trọng;
+- latency thường thấp hơn requirement của SMS/OTP nhưng không phải lúc nào cũng vậy.
+
+##### SMS
+
+- ngắn, đắt hơn, provider/carrier rate limits;
+- regional sender/consent/DND regulations;
+- delivery receipts không đồng nhất giữa quốc gia/provider;
+- phù hợp urgent/transactional use cases, không nên dùng bừa.
+
+##### Mobile push
+
+- qua APNs/FCM hoặc platform tương đương;
+- phụ thuộc device token, permission, app installation, OS/device connectivity;
+- provider acceptance không bảo đảm user đã nhìn thấy;
+- collapse keys/TTL/priority phải khớp use case;
+- invalid token cần cleanup.
+
+##### In-app notification
+
+- lưu trong hệ thống để user đọc khi mở app;
+- có unread/read state, pagination và retention;
+- có thể kết hợp real-time WebSocket/SSE nhưng canonical inbox vẫn durable;
+- dễ xác nhận “read” hơn external channels nếu client report đáng tin theo product semantics.
+
+Mỗi channel có giới hạn, receipt và failure taxonomy khác nhau. Cần adapter contract chung nhưng không che giấu những khác biệt quan trọng.
+
+---
+
+#### 5. Actors và upstream producers
+
+##### Producers
+
+- Order/Payment/Booking services.
+- Authentication/Security service.
+- Messaging/Social service.
+- Marketing/Campaign platform.
+- Admin/operations tools.
+- Scheduler/workflow engine.
+
+##### Recipients
+
+- một user;
+- một danh sách users;
+- một audience/segment;
+- account/organization members;
+- guest contact nếu policy cho phép.
+
+##### Operators
+
+- template/content managers;
+- support/on-call engineers;
+- compliance/security teams;
+- campaign operators;
+- provider/account administrators.
+
+Producer phải được authorize theo notification type, audience, volume và template. Không cho bất kỳ internal service nào tùy ý gửi mọi channel tới mọi user.
+
+---
+
+#### 6. Core domain model
+
+```text
+NotificationIntent
+  ├─ notification_id / idempotency_key
+  ├─ event/source/reference
+  ├─ recipient or audience
+  ├─ notification_type/category/priority
+  ├─ template_id + template_version
+  ├─ personalization data reference
+  ├─ requested channels/schedule/expiry
+  └─ policy/context metadata
+
+NotificationDelivery
+  ├─ delivery_id
+  ├─ notification_id + recipient_id + channel
+  ├─ destination/device endpoint reference
+  ├─ rendered content/version
+  ├─ provider + provider_message_id
+  ├─ attempt count/status/timestamps
+  └─ error/receipt metadata
+
+UserPreference
+  ├─ user_id
+  ├─ notification type/category
+  ├─ allowed channels
+  ├─ locale/timezone/quiet hours
+  └─ consent/version/source
+
+Template
+  ├─ template_id/version
+  ├─ channel + locale
+  ├─ subject/body/schema
+  └─ lifecycle/approval status
+
+Endpoint
+  ├─ email/phone/device token/in-app user
+  ├─ verification/consent status
+  └─ active/invalid/suppressed state
+```
+
+Phân biệt rõ:
+
+- **Business event:** sự thật domain như `OrderShipped`.
+- **Notification intent:** quyết định logical rằng cần thông báo.
+- **Delivery:** một lần gửi logical tới một recipient qua một channel.
+- **Delivery attempt:** một lần gọi cụ thể tới provider.
+
+Một event có thể tạo nhiều intents/deliveries; một delivery có thể có nhiều retry attempts.
+
+---
+
+#### 7. Functional requirements
+
+##### FR1 — Nhận events từ nhiều upstream services
+
+Hệ thống nhận:
+
+- durable domain events từ broker/log;
+- direct API requests cho use cases cần explicit response;
+- scheduled/bulk campaign jobs;
+- provider callbacks/receipts.
+
+Producer không phụ thuộc channel implementation. Event/API contract phải versioned, authenticated và có stable business/event ID.
+
+##### FR2 — Xác định notification cần tạo
+
+Từ event, hệ thống quyết định:
+
+- notification type/category/priority;
+- recipients/audience;
+- channels khả dụng;
+- template/version/locale;
+- gửi ngay, delay, batch, digest hay suppress;
+- expiry/time-to-live;
+- fallback/escalation policy nếu có.
+
+Một `OrderShipped` có thể tạo email, push và in-app delivery; một `LikeCreated` có thể chỉ tạo in-app hoặc được gộp thành digest.
+
+##### FR3 — Hỗ trợ nhiều channel
+
+Baseline:
+
+- email;
+- SMS;
+- mobile push;
+- in-app.
+
+Thêm channel/provider mới không buộc upstream business services thay đổi contract. Mỗi channel có adapter, worker pool, quota và failure handling riêng.
+
+##### FR4 — Quản lý và enforce user preferences
+
+User có thể cấu hình theo:
+
+- category/notification type;
+- channel;
+- quiet hours/timezone;
+- frequency/digest;
+- language/locale;
+- marketing consent.
+
+Preference evaluation phải xét hierarchy:
+
+```text
+legal/safety mandatory policy
+  → organization/account policy
+  → notification-type defaults
+  → explicit user consent/preferences
+  → channel availability/verified endpoint
+  → quiet hours/frequency caps
+```
+
+Security/transactional notifications có thể không cho opt-out theo policy/pháp lý; promotional notifications phải tôn trọng consent/unsubscribe/DND.
+
+##### FR5 — Templates, personalization và localization
+
+- reusable template cho từng type/channel/locale;
+- typed/validated variables;
+- fallback locale;
+- preview/test/approval/versioning;
+- consistent branding;
+- safe escaping cho HTML/text;
+- immutable version hoặc snapshot để audit nội dung đã gửi.
+
+Upstream nên truyền data/reference có schema, không tự viết raw provider-specific message tùy ý.
+
+##### FR6 — Retry và dead-letter handling
+
+- phân loại transient và permanent failures;
+- exponential backoff + jitter;
+- tôn trọng provider `Retry-After`/quota;
+- giới hạn attempts/time window;
+- expired notification không retry vô nghĩa;
+- permanent failure vào terminal state/suppression;
+- exhausted/poison cases vào DLQ để điều tra/replay có kiểm soát.
+
+##### FR7 — Direct-send và preference APIs
+
+Ví dụ capability:
+
+```http
+POST /v1/notification-intents
+GET  /v1/notifications/{notification_id}
+GET  /v1/users/me/notifications?cursor=...
+POST /v1/users/me/notifications/{id}/read
+GET  /v1/users/me/notification-preferences
+PUT  /v1/users/me/notification-preferences/{type}
+```
+
+Direct-send API cần idempotency key, producer authorization, rate/quota policy và async status contract. Không hứa message đã tới user chỉ vì API trả `202 Accepted`.
+
+##### FR8 — Delivery tracking và audit
+
+Cho phép truy vết:
+
+```text
+event received?
+→ intent generated?
+→ preference/policy result?
+→ delivery queued?
+→ provider called/accepted/rejected?
+→ receipt delivered/bounced/invalid?
+→ user opened/read/clicked? (nếu có và được phép đo)
+```
+
+Status history cần bảo vệ PII và có retention/access policy.
+
+---
+
+#### 8. Delivery state machine
+
+Một model khái niệm:
+
+```text
+CREATED
+  → SUPPRESSED              preference/compliance/dedup/frequency cap
+  → SCHEDULED
+  → QUEUED
+  → SENDING
+      → PROVIDER_ACCEPTED
+          → DELIVERED       nếu channel/provider có trustworthy receipt
+          → BOUNCED/FAILED
+      → RETRY_SCHEDULED
+      → FAILED_PERMANENT
+      → DEAD_LETTERED
+  → EXPIRED/CANCELLED
+
+In-app:
+  CREATED → AVAILABLE → SEEN/READ → ARCHIVED
+```
+
+Không dùng một boolean `sent=true` cho mọi nghĩa. `provider accepted`, `delivered`, `opened` và `read` là các facts khác nhau, độ tin cậy cũng khác nhau.
+
+Status transition cần monotonic/versioned hoặc rule rõ để callback đến muộn không ghi đè terminal state sai.
+
+---
+
+#### 9. Delivery guarantee và idempotency
+
+Transcript đặt mục tiêu **at-least-once delivery**, nhưng phải xác định boundary:
+
+- có thể bảo đảm durable acceptance/processing trong nội bộ;
+- có thể retry provider request ít nhất một lần;
+- không thể bảo đảm tuyệt đối user nhận/đọc external message vì provider, carrier, device, inbox và user nằm ngoài quyền kiểm soát;
+- at-least-once processing có thể tạo duplicate nếu không deduplicate.
+
+Idempotency keys có thể ở nhiều lớp:
+
+```text
+intent key   = producer + business_event_id + notification_type + recipient
+delivery key = notification_id + recipient + channel
+attempt key  = delivery_id + logical_attempt/provider contract
+```
+
+Controls:
+
+- unique constraint/conditional insert cho intent/delivery;
+- transactional outbox ở producer hoặc notification service;
+- inbox/dedup ở consumers;
+- provider idempotency key nếu hỗ trợ;
+- callback dedup theo provider event/message ID;
+- notification type-specific dedup/collapse window;
+- reconcile ambiguous timeouts trước khi retry non-idempotent external effect.
+
+“Exactly once tới user” thường không khả thi. Mục tiêu thực tế là **at-least-once durable processing + effectively-once logical delivery khi có thể + bounded duplicates**.
+
+---
+
+#### 10. Preference, consent và compliance correctness
+
+Preferences không chỉ là một bảng `email_enabled`.
+
+Các câu hỏi cần chốt:
+
+- preference được evaluate tại intent creation hay ngay trước delivery?
+- nếu user unsubscribe sau khi campaign đã queued thì pending deliveries có bị suppress không?
+- security alert có override quiet hours không?
+- fallback SMS có được consent riêng không?
+- contact endpoint đã verified chưa?
+- country/tenant/age/organization policy nào áp dụng?
+- audit được version policy/consent đã dùng lúc quyết định không?
+
+Hướng an toàn:
+
+- evaluate sớm để giảm work, nhưng re-check policy/consent ngay trước external send cho mutable high-risk rules;
+- lưu decision reason và relevant version;
+- maintain suppression lists cho bounce/complaint/unsubscribe/invalid tokens;
+- fail closed cho marketing khi consent không xác định;
+- mandatory security notification vẫn cần minimization, secure content và approved channels.
+
+---
+
+#### 11. Priority, timing, quiet hours và expiry
+
+Mỗi notification type cần policy:
+
+| Thuộc tính | Ví dụ |
+|---|---|
+| Priority | critical, high, normal, bulk |
+| Delivery deadline | OTP trong vài giây; campaign có thể trong vài giờ |
+| Expiry/TTL | OTP hết giá trị sau vài phút; old chat push có thể collapse |
+| Quiet-hours rule | delay marketing; bypass theo policy cho fraud alert |
+| Batch/digest | gộp nhiều likes/comments |
+| Frequency cap | tối đa N promotional pushes/ngày |
+| Fallback | push thất bại có chuyển SMS/email không? |
+
+Priority isolation cần separate queues/reserved capacity/provider quotas. Không chỉ gắn field `priority` rồi để mọi message dùng cùng consumer pool.
+
+“Đúng thời điểm” còn bao gồm timezone, scheduled sends, campaign cancellation và late-event handling.
+
+---
+
+#### 12. Non-functional requirements
+
+##### 12.1 Scalability và burst tolerance
+
+- hàng triệu notifications/ngày hoặc lớn hơn;
+- flash sale/viral/broadcast tạo burst rất cao;
+- fan-out theo recipient × channel tạo amplification;
+- queues phải hấp thụ bounded burst;
+- workers/providers/stores scale độc lập;
+- backpressure không lan ngược làm hỏng Order/Auth/Payment path.
+
+Sustained arrival rate lớn hơn service rate sẽ làm backlog tăng vô hạn. Cần quotas, segmentation, admission/scheduling và capacity plan—queue không “xóa” overload.
+
+##### 12.2 Reliability
+
+- accepted intent không bị mất theo durability/RPO contract;
+- transient failure được retry;
+- permanent failure được ghi nhận, không retry storm;
+- DLQ/replay/reconciliation;
+- provider/channel failure được cô lập;
+- critical delivery có policy/fallback rõ;
+- duplicate được hạn chế và đo lường.
+
+##### 12.3 Low latency
+
+SLO nên theo notification class/channel:
+
+```text
+event occurred
+→ event ingested
+→ intent created
+→ policy/render complete
+→ queued
+→ provider accepted
+→ delivered/read receipt nếu có
+```
+
+Near real-time có thể là vài giây ở p95/p99 cho chat/security; marketing/bulk có latency budget khác. Không dùng một average cho toàn platform.
+
+##### 12.4 Availability
+
+- ingestion/API có availability cao;
+- một provider lỗi không block providers/channels khác;
+- preference/template service lỗi có safe behavior;
+- in-app inbox có thể vẫn hoạt động khi SMS provider down;
+- bulk notifications không chiếm critical capacity.
+
+##### 12.5 Extensibility
+
+- channel adapter interface;
+- versioned event/API/template schemas;
+- routing/policy không hard-code trong upstream services;
+- provider abstraction nhưng vẫn expose channel-specific capabilities;
+- gradual rollout/canary và feature flags.
+
+##### 12.6 Observability và auditability
+
+- trace từng intent/delivery/attempt;
+- metrics theo type/channel/provider/priority/region;
+- queue lag/age, retry, DLQ, suppression và receipts;
+- template/policy/version correlation;
+- audit access được kiểm soát;
+- PII redaction/tokenization trong logs.
+
+##### 12.7 Security và privacy
+
+- authenticated/authorized producers và users;
+- encrypt contacts/payloads phù hợp at rest/in transit;
+- least-privilege access tới provider credentials;
+- secrets rotation;
+- template/payload injection protection;
+- no sensitive OTP/token in logs;
+- data minimization/retention/deletion;
+- signed provider webhooks và replay protection;
+- rate/abuse protection chống spam/phishing.
+
+##### 12.8 Idempotency
+
+Mọi mutation/retry path cần stable identity. “Item potency” trong transcript là **idempotency**: xử lý lại cùng logical request không tạo thêm logical notification ngoài contract.
+
+---
+
+#### 13. SLOs cần định nghĩa
+
+Không nên nói chung “nhanh và đáng tin cậy”. Ví dụ SLO framework:
+
+| Path/class | SLI/SLO cần chốt |
+|---|---|
+| Critical/security | event-to-provider-accepted p95/p99, expiry miss, loss/duplicate rate |
+| Transactional | durable acceptance, delivery-attempt latency, terminal outcome coverage |
+| Chat/activity | event-to-push/in-app-available latency, collapse/dedup behavior |
+| Marketing/bulk | campaign completion window, quota/compliance correctness |
+| Preferences | update latency và propagation trước pending delivery |
+| Provider callbacks | receipt ingest latency và reconciliation coverage |
+| In-app inbox | read latency, unread-count freshness, availability |
+
+Tách:
+
+- platform acceptance SLO;
+- dispatch/provider-acceptance SLO;
+- confirmed-delivery SLO khi provider có receipt;
+- user-read/open metrics nếu product thu thập hợp pháp.
+
+Không hứa SLO cho bước mà hệ thống không kiểm soát hoặc không quan sát đáng tin cậy.
+
+---
+
+#### 14. Constraints và challenges
+
+##### 14.1 External provider dependency
+
+- rate limits/quota và regional availability;
+- latency/throttling/outage;
+- API/auth/schema differences;
+- inconsistent receipts/error codes;
+- duplicate/ambiguous timeout;
+- sender reputation, bounce và carrier filtering;
+- pricing thay đổi theo channel/region.
+
+##### 14.2 Device và endpoint uncertainty
+
+- app uninstalled hoặc permission tắt;
+- token rotated/invalid/stale;
+- phone/email đổi hoặc chưa verify;
+- device offline;
+- nhiều devices trên một user;
+- same user cần collapse hoặc delivery per-device semantics.
+
+##### 14.3 Traffic spikes và amplification
+
+Một business event có thể tạo:
+
+```text
+recipients × selected channels × retry attempts
+```
+
+Broadcast tới 10 triệu users qua push + email đã tạo tối thiểu 20 triệu deliveries trước retries. Cần estimate logical intents khác physical provider requests.
+
+##### 14.4 Preference/compliance complexity
+
+- per-type/per-channel overrides;
+- quiet hours/timezones;
+- consent/unsubscribe/DND;
+- policy differences theo region/tenant;
+- preference update racing queued delivery;
+- mandatory vs optional categories.
+
+##### 14.5 Reliability vs latency
+
+- sync call provider cho cảm giác đơn giản nhưng kéo failure vào business request;
+- async queue tăng resilience nhưng tạo lag và status complexity;
+- retry nhanh có thể giảm latency nhưng gây duplicate/thundering herd;
+- retry quá chậm có thể làm OTP hết hạn.
+
+##### 14.6 Duplicate, ordering và stale notification
+
+- upstream event duplicate;
+- consumer redelivery;
+- provider timeout rồi thực ra đã accepted;
+- callback duplicate/out-of-order;
+- “order shipped” đến trước “order confirmed” do partitions;
+- notification đến sau khi sự kiện đã hết giá trị.
+
+Cần idempotency, scoped ordering/version, expiry/cancellation và current-state validation cho types nhạy cảm.
+
+##### 14.7 Security/PII và debugging
+
+Email, số điện thoại, device token và message content là nhạy cảm. Logs phải đủ correlation để debug nhưng không ghi raw secrets/OTP/PII không cần thiết. Support access phải audited và scoped.
+
+---
+
+#### 15. Provider success không bằng user delivery
+
+Các mức bằng chứng:
+
+```text
+ACCEPTED_BY_PLATFORM
+  → QUEUED_INTERNAL
+  → REQUEST_SENT_TO_PROVIDER
+  → PROVIDER_ACCEPTED
+  → DELIVERED_TO_CARRIER/DEVICE/MAILBOX  (chỉ khi receipt hỗ trợ)
+  → DISPLAYED/OPENED/READ               (chỉ khi đo được và semantics rõ)
+```
+
+Ví dụ:
+
+- APNs/FCM accepted: push service nhận request, không bảo đảm device hiển thị.
+- Email provider accepted: không bảo đảm inbox thay vì spam/bounce sau đó.
+- SMS provider accepted: carrier/device vẫn có thể thất bại.
+- In-app `read`: chỉ có nghĩa theo client/server read protocol đã định nghĩa.
+
+UI/support/audit không nên gắn nhãn “Delivered” nếu hệ thống chỉ biết “Provider Accepted”.
+
+---
+
+#### 16. Scope baseline của case study
+
+##### In scope
+
+- event-driven và direct API ingestion;
+- one-to-one và controlled fan-out/bulk intents;
+- email, SMS, push và in-app channels;
+- user preferences, consent, quiet hours và priority;
+- templates, personalization và localization;
+- scheduling/basic batching/dedup;
+- retries, DLQ, idempotency và delivery tracking;
+- provider adapters/failover policy;
+- observability, audit, security và compliance hooks.
+
+##### Out of scope ban đầu
+
+- xây SMTP carrier, SMS carrier hoặc mobile push network riêng;
+- full marketing journey/segmentation/experimentation suite;
+- sophisticated ML send-time optimization;
+- billing/contract settlement với providers;
+- rich two-way conversational messaging;
+- full customer-support UI;
+- legal analysis cho mọi jurisdiction;
+- content-generation AI.
+
+Nếu bulk campaigns nằm trong scope, phải tách workload/priority/quota khỏi transactional path ngay từ đầu.
+
+---
+
+#### 17. Core invariants
+
+1. Accepted durable notification intent không biến mất âm thầm.
+2. Cùng idempotency scope không tạo nhiều logical deliveries ngoài policy.
+3. Không gửi optional/marketing notification khi consent/preference hiện hành cấm.
+4. Chỉ authorized producer được dùng notification type/template/audience tương ứng.
+5. Template render phải dùng approved version và validated variables.
+6. Permanent failure không bị retry vô hạn.
+7. Expired/cancelled notification không tiếp tục gửi nếu policy không cho phép.
+8. Provider callback không được ghi đè state bằng event cũ hoặc giả mạo.
+9. Một provider/channel lỗi không làm block toàn bộ platform.
+10. Logs/audit không làm lộ secrets hoặc PII vượt policy.
+
+Các invariant này quan trọng hơn việc chọn Kafka, RabbitMQ, Redis hay vendor cụ thể.
+
+---
+
+#### 18. Các câu hỏi cần hỏi interviewer/stakeholder
+
+##### Product
+
+- Notification types/categories nào?
+- Kênh nào bắt buộc ở bản đầu?
+- Một event gửi một hay nhiều channels?
+- Có bulk/broadcast/campaign không?
+- Có scheduling, digest, quiet hours và fallback không?
+- In-app có unread/read, retention và realtime update không?
+
+##### Reliability/semantics
+
+- “Delivered” được định nghĩa ở boundary nào?
+- At-least-once áp dụng cho intent, provider request hay user receipt?
+- Duplicate tolerance theo type?
+- Critical notification có escalation/fallback channel không?
+- Notification hết hạn/cancel semantics?
+- Ordering cần theo user, entity hay conversation?
+
+##### Scale
+
+- notifications/day và peak events/s?
+- recipients/event distribution và largest broadcast?
+- channel mix và retries/provider request amplification?
+- payload/template size?
+- retention cho in-app, attempts và audit?
+
+##### Preferences/compliance
+
+- Mandatory vs opt-out categories?
+- Regions/tenants/regulations nào?
+- Preference propagation SLO?
+- Contact verification, unsubscribe, bounce/complaint và suppression?
+
+##### Operations
+
+- Provider quotas/SLA/cost và multi-provider requirement?
+- RPO/RTO và multi-region needs?
+- Audit/support/debug retention?
+- SLOs cho critical, transactional, social và marketing classes?
+
+---
+
+#### 19. Những lỗi thiết kế phổ biến từ Step 1
+
+- Gọi provider đồng bộ trong Order/Payment/Auth request path.
+- Dùng một queue/worker pool cho OTP và bulk marketing.
+- Nói “at-least-once delivery” mà không xác định delivery boundary.
+- Đồng nhất provider acceptance với user delivery/read.
+- Không có stable idempotency key hoặc dedup scope.
+- Retry mọi lỗi như nhau, kể cả invalid address/token.
+- Không có TTL nên OTP hoặc stale alert tới quá muộn.
+- Chỉ check preference lúc enqueue, bỏ unsubscribe trước send.
+- Cho upstream service tự truyền raw HTML/SMS text không kiểm soát.
+- Không version template/policy nên không audit được nội dung đã gửi.
+- Dùng fallback channel mà không kiểm tra consent/chi phí.
+- Một provider outage làm block toàn bộ channels.
+- Log raw email/phone/device token/OTP.
+- Không xử lý bounce, complaint, invalid device token và suppression.
+- Không tách intent, delivery và delivery attempt.
+- Queue để hấp thụ burst nhưng không capacity/backpressure plan.
+
+---
+
+#### 20. Checklist Step 1
+
+- [ ] Notification types/categories và priority classes?
+- [ ] Actors, producers, recipients và authorized scopes?
+- [ ] Channels cùng channel-specific semantics?
+- [ ] Event ingestion, direct API, scheduling và bulk scope?
+- [ ] Intent, delivery, attempt và endpoint model?
+- [ ] Templates, variables, localization, approval/versioning?
+- [ ] Preference/consent hierarchy, quiet hours và mandatory rules?
+- [ ] Dedup/collapse/batching/frequency caps?
+- [ ] Delivery statuses và evidence boundary?
+- [ ] At-least-once/idempotency semantics tại từng layer?
+- [ ] Retry taxonomy, expiry, cancellation, DLQ và replay?
+- [ ] Provider callbacks, signatures, dedup và reconciliation?
+- [ ] In-app inbox/read/unread/retention requirements?
+- [ ] Average/peak/broadcast/channel/retry amplification assumptions?
+- [ ] Latency/freshness SLO theo class/channel?
+- [ ] Availability, durability, RPO/RTO và regional requirements?
+- [ ] Provider quotas, failure isolation, fallback và cost?
+- [ ] PII, encryption, secrets, logs/audit và compliance?
+- [ ] Observability từ event tới provider receipt/read?
+- [ ] In-scope/out-of-scope và trade-offs được thống nhất?
+
+#### 21. Ý chính cần nhớ
+
+- Notification System biến business events thành channel-specific deliveries theo policy.
+- Upstream service biểu diễn business intent, không chứa provider/channel implementation.
+- Một event có thể tạo nhiều recipients × channels × attempts; phải tính amplification.
+- Email, SMS, push và in-app có delivery semantics/failure model khác nhau.
+- User preferences gồm category, channel, consent, quiet hours, locale và frequency—not một boolean.
+- Security/transactional và marketing notifications không dùng cùng priority/compliance policy.
+- Templates cần typed variables, localization, approval và immutable/versioned auditability.
+- Tách `NotificationIntent`, `Delivery` và `DeliveryAttempt` để retry/status rõ ràng.
+- At-least-once processing không đồng nghĩa user nhận đúng một lần.
+- Idempotency giảm duplicate do upstream retry, consumer redelivery và provider ambiguity.
+- Provider accepted không đồng nghĩa delivered, opened hoặc read.
+- Retry phải phân loại transient/permanent, tôn trọng TTL/quota và kết thúc ở terminal/DLQ state.
+- Queue hấp thụ bounded bursts nhưng sustained overload vẫn cần backpressure, quotas và capacity.
+- Provider/channel isolation bảo vệ critical notifications và toàn platform.
+- Observability phải trả lời từng bước từ event ingest tới provider receipt mà không làm lộ PII.
+- Kiến trúc được dẫn dắt bởi delivery semantics, preference correctness, provider uncertainty và burst scale.
+
+#### Công thức ghi nhớ
+
+> **Notification scope = business intent + recipient/channel policy + versioned rendering + durable idempotent delivery workflow + provider-aware status + preference/compliance correctness.**
+
+---
+
+### Bài 79. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Vì sao phải estimate trước khi vẽ kiến trúc?
+
+Scale estimation giúp xác định:
+
+- event ingestion throughput;
+- logical notification và channel delivery throughput;
+- queue/worker/provider capacity;
+- database, cache và audit storage;
+- retry/callback amplification;
+- largest broadcast và backlog recovery time;
+- third-party cost, đặc biệt SMS/email;
+- load tests, autoscaling signals và SLOs.
+
+Mục tiêu là tìm đúng **order of magnitude** và skew, không phải tạo ra một con số giả chính xác. Kiến trúc cho vài nghìn notifications/ngày khác hoàn toàn kiến trúc cho hàng trăm triệu deliveries/ngày.
+
+---
+
+#### 2. Các đơn vị phải phân biệt
+
+Không dùng từ “notification” cho mọi tầng vì dễ estimate thiếu.
+
+| Đơn vị | Ý nghĩa |
+|---|---|
+| Business event | Sự kiện upstream như `OrderShipped` hoặc `MessageReceived` |
+| Notification intent | Logical quyết định cần thông báo cho một recipient/type |
+| Channel delivery | Một intent được gửi qua một channel cụ thể |
+| Delivery attempt | Một lần gọi provider cho delivery; retry tạo thêm attempts |
+| Provider callback/receipt | Webhook/status event quay về từ provider |
+| In-app read | Query/page/unread-count traffic do client tạo |
+
+Quan hệ khái niệm:
+
+```text
+events
+  × recipients/event
+  × eligible notification intents/recipient
+  × enabled channels/intent
+  × attempts/delivery
+= physical provider requests
+```
+
+Một broadcast event duy nhất có thể fan-out tới hàng triệu recipients, nên average “events/user” không mô tả đủ tail workload.
+
+---
+
+#### 3. Giả định baseline từ transcript
+
+| Tham số | Giá trị minh họa |
+|---|---:|
+| Daily active users | 10 triệu |
+| Notification-triggering events/user/ngày | 5 |
+| Business events/ngày | 50 triệu |
+| Average channel deliveries/event | khoảng 2 |
+| Channel deliveries/ngày | khoảng 100 triệu |
+| Peak multiplier ban đầu | 3× average |
+
+Tính:
+
+```text
+Events/day
+= 10,000,000 users × 5 events/user/day
+= 50,000,000 events/day
+
+Deliveries/day
+= 50,000,000 events/day × 2 channels/event
+= 100,000,000 deliveries/day
+```
+
+“2 channels/event” là giả định gộp. Trong thực tế phải đo:
+
+- bao nhiêu event bị suppress vì preference/consent/dedup;
+- bao nhiêu event có nhiều recipients;
+- channel mix;
+- multi-device push fan-out;
+- fallback/escalation;
+- retries.
+
+---
+
+#### 4. Average throughput
+
+Một ngày có 86.400 giây:
+
+```text
+Average event rate
+= 50,000,000 / 86,400
+≈ 579 events/s
+
+Average channel-delivery rate
+= 100,000,000 / 86,400
+≈ 1,157 deliveries/s
+```
+
+Với peak multiplier 3×:
+
+```text
+Illustrative peak delivery rate
+≈ 1,157 × 3
+≈ 3,472 deliveries/s
+```
+
+`300 triệu deliveries/ngày tương đương` trong transcript chỉ là phép quy đổi tải. Capacity phải thiết kế theo **deliveries/second trong peak window**, không theo số “per day” nhân ba.
+
+Real burst có thể cao hơn 3× rất nhiều khi flash sale, incident hoặc broadcast. Cần input từ traffic history và largest campaign, không chỉ một multiplier chung.
+
+---
+
+#### 5. Channel mix và multi-device amplification
+
+Ví dụ minh họa trên 100 triệu deliveries/ngày:
+
+| Channel | Tỷ lệ giả định | Deliveries/ngày | Average/s |
+|---|---:|---:|---:|
+| Push | 50% | 50 triệu | 579 |
+| Email | 25% | 25 triệu | 289 |
+| In-app | 20% | 20 triệu | 231 |
+| SMS | 5% | 5 triệu | 58 |
+
+Đây chỉ là ví dụ; phải đo theo notification class và region.
+
+Push còn có device fan-out:
+
+```text
+push provider requests
+= push deliveries × active device tokens/recipient
+```
+
+Nếu một user trung bình có 1,4 active devices, 50 triệu logical push deliveries có thể tạo khoảng 70 triệu device requests trước retry. Ngược lại, provider hỗ trợ multicast/batch có thể thay đổi số API calls nhưng không loại bỏ quota/logical delivery cost.
+
+---
+
+#### 6. Preference và suppression làm thay đổi tải
+
+Không phải mọi candidate intent đều thành delivery:
+
+```text
+eligible deliveries
+= candidate intents
+× preference allow rate
+× consent/compliance allow rate
+× endpoint-valid rate
+× dedup/frequency-cap pass rate
+× enabled channels per intent
+```
+
+Cần ghi cả hai metrics:
+
+- **candidate intents:** work trước policy;
+- **deliveries dispatched:** work/provider cost sau policy.
+
+Preference check có thể giảm provider cost nhưng vẫn tiêu thụ event, policy, storage/cache và observability capacity. Suppression reason distribution là input quan trọng cho sizing và product decisions.
+
+---
+
+#### 7. Retry và provider-request amplification
+
+Giả sử:
+
+- 100 triệu channel deliveries/ngày;
+- 8% deliveries cần ít nhất một retry;
+- nhóm retry trung bình thêm 1,25 attempts.
+
+```text
+extra attempts
+= 100M × 8% × 1.25
+= 10M
+
+total attempts/day
+≈ 110M
+```
+
+Đây là ví dụ; phải tách theo channel/provider/error class.
+
+Retry amplification tăng mạnh khi provider outage. Nếu 30% traffic cùng retry sau timeout với cùng delay, thundering herd có thể làm outage kéo dài. Cần:
+
+- exponential backoff + jitter;
+- retry budget và maximum age/TTL;
+- `Retry-After`/quota awareness;
+- circuit breaker;
+- per-provider queues;
+- gradual recovery/ramp-up;
+- idempotency/reconciliation cho ambiguous timeout.
+
+---
+
+#### 8. Broadcast và fan-out estimation
+
+Average traffic che giấu worst case. Ví dụ một system announcement tới 10 triệu users qua push và in-app:
+
+```text
+logical deliveries
+= 10M recipients × 2 channels
+= 20M deliveries
+```
+
+Nếu phải hoàn thành trong 10 phút:
+
+```text
+required average dispatch rate
+= 20,000,000 / 600
+≈ 33,333 deliveries/s
+```
+
+Con số này lớn gần 29× average baseline 1.157 deliveries/s. Nếu push có 1,4 devices/user, provider requests còn cao hơn.
+
+Bulk design questions:
+
+- audience được snapshot hay thay đổi trong campaign?
+- recipient enumeration được partition thế nào?
+- completion deadline bao lâu?
+- campaign có thể pause/cancel không?
+- preference/consent re-check lúc send?
+- reserved capacity cho critical notifications?
+- per-region/provider quota và cost?
+
+Không cho broadcast fan-out materialize hàng chục triệu jobs trong một transaction hoặc một queue partition.
+
+---
+
+#### 9. Queue backlog và drain time
+
+Nếu arrival rate `λ` lớn hơn processing rate `μ`:
+
+```text
+backlog growth/second = λ - μ
+```
+
+Sau burst, nếu normal arrival vẫn là `λ_normal` và capacity là `μ`:
+
+```text
+drain rate = μ - λ_normal
+drain time = backlog / drain rate
+```
+
+Ví dụ:
+
+```text
+burst arrival      = 20,000 deliveries/s
+worker capacity    = 8,000 deliveries/s
+burst duration     = 10 minutes
+
+backlog created
+= (20,000 - 8,000) × 600
+= 7.2M deliveries
+
+normal arrival     = 1,200/s
+available drain    = 8,000 - 1,200 = 6,800/s
+drain time         ≈ 7.2M / 6,800 ≈ 17.6 minutes
+```
+
+Nhưng notification có TTL/priority. Một OTP hết hạn trong backlog không nên tiếp tục gửi; bulk backlog không được làm critical queue trễ.
+
+Theo dõi **oldest message age theo priority/channel**, không chỉ queue depth.
+
+---
+
+#### 10. Provider quota và concurrency budget
+
+Mỗi provider/channel cần capacity model riêng:
+
+```text
+safe dispatch rate
+= min(
+    provider quota,
+    contractual rate,
+    worker concurrency / average provider latency,
+    account/sender/IP limits,
+    internal database/queue capacity
+  )
+```
+
+Theo Little’s Law gần đúng:
+
+```text
+in-flight requests ≈ throughput × average latency
+```
+
+Ví dụ 5.000 requests/s với latency trung bình 200 ms cần khoảng 1.000 concurrent in-flight requests trước headroom. Tail latency/timeouts có thể làm concurrency tăng đột biến.
+
+Cần quota theo:
+
+- provider account/API key;
+- channel/sender/phone number/domain;
+- destination country/carrier;
+- priority/notification type;
+- tenant/campaign;
+- regional worker pool.
+
+Autoscale workers vượt provider quota chỉ tạo throttling/retries, không tăng throughput hữu ích.
+
+---
+
+#### 11. Storage estimation
+
+Giả sử một delivery record trung bình khoảng 1 KB gồm IDs, channel, status, timestamps và metadata đã tối giản:
+
+```text
+raw delivery metadata/day
+= 100M × 1 KB
+≈ 100 GB/day
+
+30-day raw retention
+≈ 3 TB
+```
+
+Với indexes, replicas, attempts, callbacks và storage overhead, physical footprint có thể gấp nhiều lần raw estimate. Không lưu full rendered HTML/large payload vô thời hạn nếu audit requirement chỉ cần template version + safe variables/reference.
+
+Cần estimate riêng:
+
+- notification intents;
+- per-channel deliveries;
+- attempt history;
+- provider callbacks/raw payload retention;
+- in-app notification content/indexes;
+- templates/preferences/endpoints;
+- idempotency/dedup keys;
+- audit logs;
+- DLQ/event-log retention.
+
+Lifecycle/tiering:
+
+- hot delivery status vài ngày/tuần;
+- in-app inbox theo product retention;
+- old attempts/audit đưa cold storage nếu cần;
+- PII/content deletion và legal retention có policy riêng;
+- metrics/traces/logs không mặc định giữ cùng thời gian.
+
+---
+
+#### 12. In-app read workload
+
+In-app notification không chỉ tạo writes. Nếu 10 triệu DAU mỗi user mở notification center trung bình 3 lần/ngày:
+
+```text
+in-app inbox reads/day
+= 10M × 3
+= 30M reads/day
+≈ 347 reads/s average trước peak/pagination
+```
+
+Thêm:
+
+- unread-count refresh trên app open;
+- pagination;
+- mark-read/mark-all-read writes;
+- WebSocket/SSE updates;
+- badge counts trên nhiều devices;
+- retention cleanup.
+
+Unread count là hot/derived state dễ drift. Cần semantics rõ: exact hay bounded-stale, mark-all-read theo watermark hay update từng row.
+
+---
+
+#### 13. Payload, bandwidth và template rendering
+
+Payload sizes khác nhau:
+
+- SMS rất nhỏ nhưng đắt;
+- push payload nhỏ và có platform limits;
+- email HTML lớn hơn;
+- in-app record có thể chứa structured metadata;
+- attachments/media nên dùng object storage/CDN links, không nhét bytes vào broker hoặc delivery DB.
+
+Ước lượng:
+
+```text
+broker ingress/egress
+= events × serialized event size × consumer/replication factor
+
+provider egress
+= Σ(channel attempts × average rendered payload size)
+```
+
+Template rendering cost phụ thuộc:
+
+- template lookup/cache hit;
+- locale fallback;
+- personalization complexity;
+- remote data dependencies;
+- HTML escaping/validation;
+- number of channel variants.
+
+Không pre-render vô điều kiện mọi recipient nếu nhiều notification sẽ bị suppressed/expired. Thường evaluate policy trước, render gần delivery và cache compiled template—not cache personalized sensitive output dùng chung.
+
+---
+
+#### 14. Bottleneck 1 — Event ingestion
+
+Rủi ro:
+
+- flash-sale/incident burst;
+- hot producer/partition key;
+- oversized event payload;
+- duplicate/out-of-order events;
+- broker partition saturation;
+- schema poison messages;
+- producer retry storm;
+- ingestion acknowledgement trước durability.
+
+Controls:
+
+- durable broker/log như Kafka/SQS-like service theo semantics;
+- partition key/cardinality phù hợp;
+- bounded event size và payload references;
+- producer outbox/idempotency/event IDs;
+- schema registry/version compatibility;
+- quotas/admission theo producer/tenant;
+- backpressure và separate priority streams;
+- lag/oldest-event/partition-skew metrics.
+
+Buffer chỉ làm phẳng bounded burst; không thay capacity plan.
+
+---
+
+#### 15. Bottleneck 2 — Recipient resolution và bulk fan-out
+
+Một audience segment lớn có thể yêu cầu scan/query hàng triệu recipients, evaluate preference và tạo nhiều channel deliveries.
+
+Rủi ro:
+
+- một campaign tạo millions jobs cùng lúc;
+- segment query chậm hoặc thay đổi giữa chừng;
+- hot partition theo campaign ID;
+- duplicate recipient qua nhiều segments;
+- cancel khó sau materialization;
+- critical traffic bị starve.
+
+Controls:
+
+- snapshot/version audience;
+- partitioned recipient pages/batches;
+- resumable checkpoints;
+- dedup key theo campaign-recipient-channel;
+- pacing/rate schedule theo provider quota;
+- pause/cancel state check trước batch/send;
+- workload isolation và weighted fairness;
+- pre-compute estimate/cost/consent checks.
+
+---
+
+#### 16. Bottleneck 3 — User preference lookup
+
+Với 100 triệu candidate deliveries/ngày, primary DB point-read cho từng channel có thể rất lớn. Ngoài preference còn endpoint, locale, timezone, consent và suppression data.
+
+Controls:
+
+- Redis/cache-aside hoặc distributed read cache;
+- compact preference document/version;
+- batch/multi-get theo recipient batch;
+- event-driven invalidation;
+- TTL + version safety net;
+- local bounded cache cho immutable/default policy;
+- avoid N+1 remote calls;
+- re-check mutable consent trước send khi compliance yêu cầu;
+- fail closed cho marketing khi state không xác định.
+
+Rủi ro lớn nhất không chỉ là latency mà là stale consent. Cache hit ratio không được đánh đổi compliance correctness.
+
+---
+
+#### 17. Bottleneck 4 — Template rendering/localization
+
+Rủi ro:
+
+- CPU intensive render ở peak;
+- remote lookup cho mỗi variable;
+- template/locale cache miss storm;
+- invalid/missing variables;
+- unsafe HTML/header injection;
+- oversized rendered payload;
+- template rollout lỗi ảnh hưởng hàng triệu sends;
+- storing personalized PII trong cache/log.
+
+Controls:
+
+- compile/cache template theo `(template_id, version, channel, locale)`;
+- typed schema và render validation;
+- pre-fetch/batch personalization data;
+- fallback locale/version;
+- canary/preview/approval/kill switch;
+- render deadlines và terminal error taxonomy;
+- no shared caching of personalized sensitive output;
+- avoid synchronous chains tới nhiều business services.
+
+Pre-render chỉ hợp lý cho static/common content hoặc campaign stage có lifecycle rõ; personalization thường render gần delivery.
+
+---
+
+#### 18. Bottleneck 5 — External provider APIs
+
+Providers gây:
+
+- network/tail latency;
+- throttling/quota;
+- transient outage;
+- permanent address/token rejection;
+- ambiguous timeout;
+- inconsistent errors/receipts;
+- regional/country routing limits;
+- cost spikes.
+
+Controls:
+
+- channel/provider-specific queues và worker pools;
+- token bucket/rate limiter theo quota;
+- bounded concurrency;
+- timeouts/circuit breakers;
+- error classification;
+- exponential backoff + jitter;
+- multi-provider routing/failover khi economics/compliance cho phép;
+- health score nhưng tránh oscillation;
+- provider idempotency keys/reconciliation;
+- cost/quality metrics như bounce, complaint, latency và delivery rate.
+
+Provider B không chắc thay thế Provider A ngay: sender identity, templates, country coverage, token/domain reputation và compliance có thể khác.
+
+---
+
+#### 19. Bottleneck 6 — Priority inversion và noisy neighbor
+
+Nếu OTP, password reset, order receipt và marketing campaign dùng cùng queue:
+
+- bulk traffic chiếm worker/provider quota;
+- critical latency tăng;
+- retry backlog làm starvation kéo dài;
+- một tenant lớn ảnh hưởng mọi tenant.
+
+Controls:
+
+- separate logical/physical queues theo priority/channel;
+- reserved capacity cho critical traffic;
+- per-tenant/campaign quotas;
+- weighted fair scheduling;
+- max queue age/TTL;
+- load shedding/suppress low-priority work;
+- preemption/cancellation semantics;
+- priority-specific SLO/alerts.
+
+Priority field không đủ nếu broker/consumer/provider concurrency không thực sự enforce nó.
+
+---
+
+#### 20. Bottleneck 7 — Retry storms, duplicates và idempotency store
+
+Rủi ro:
+
+- producer retries cùng event;
+- consumer redelivery;
+- provider timeout sau khi đã accepted;
+- callback duplicate;
+- dedup store hot key/TTL hết quá sớm;
+- replay sau khi dedup record đã expire;
+- retry storm vượt original traffic.
+
+Controls:
+
+- layered idempotency keys;
+- unique/conditional writes;
+- dedup retention >= maximum retry/replay horizon theo contract;
+- provider idempotency key nếu có;
+- ambiguous outcome reconciliation;
+- exponential backoff/jitter/retry budget;
+- attempt state machine/version;
+- duplicate rate và retry amplification metrics.
+
+Dedup mọi thứ mãi mãi không thực tế; scope và retention phải dựa trên business identity/lifetime.
+
+---
+
+#### 21. Bottleneck 8 — Scheduling, quiet hours và delayed delivery
+
+Hàng triệu notifications có thể được schedule ở cùng mốc giờ địa phương, tạo “top of the hour” burst.
+
+Rủi ro:
+
+- scan table để tìm due jobs;
+- timezone/DST mistakes;
+- schedule hot partitions;
+- reschedule/cancel race;
+- preference thay đổi trước due time;
+- notification đã stale/expired;
+- campaign cùng mở lúc 9:00 local time nhiều regions.
+
+Controls:
+
+- partitioned time buckets/delay queues/timing wheel;
+- jitter/pacing cho non-urgent bulk sends;
+- due-time index và bounded batch claim/lease;
+- version/conditional state transition;
+- re-check consent/expiry/cancellation trước send;
+- timezone stored as IANA zone, timestamps canonical UTC;
+- overdue/oldest-scheduled-age metrics.
+
+---
+
+#### 22. Bottleneck 9 — Delivery-status store và provider callbacks
+
+Mỗi delivery có nhiều state transitions/attempts/callbacks, tạo write amplification:
+
+```text
+CREATED → QUEUED → SENDING → PROVIDER_ACCEPTED
+        → DELIVERED/BOUNCED/FAILED
+```
+
+Rủi ro:
+
+- hot row/partition;
+- callback burst;
+- duplicate/out-of-order webhook;
+- provider IDs không unique/global;
+- raw payload retention lớn;
+- support query/analytics scan operational DB;
+- spoofed callback.
+
+Controls:
+
+- append attempts/status events + compact current-state projection;
+- partition theo delivery/recipient/time phù hợp queries;
+- signature/timestamp/replay validation;
+- callback dedup + monotonic/versioned state machine;
+- async analytics sink;
+- retention/tiering;
+- batch status updates khi semantics cho phép;
+- reconciliation jobs cho missing/ambiguous receipts.
+
+---
+
+#### 23. Bottleneck 10 — Endpoint/device-token management
+
+Push có thể có nhiều tokens/user và token churn cao. Email/phone cũng có verification/suppression lifecycle.
+
+Rủi ro:
+
+- stale/invalid device tokens;
+- multiple devices tạo duplicate UX;
+- token reassignment/security issue;
+- endpoint lookup N+1;
+- bounce/complaint tiếp tục bị gửi;
+- verification race;
+- endpoint PII leak.
+
+Controls:
+
+- Endpoint Store theo user/channel/device;
+- verified/active/invalid/suppressed states;
+- batch lookup/cache cẩn thận;
+- provider feedback-driven token cleanup;
+- last-seen/TTL policy;
+- encrypted/tokenized contacts;
+- uniqueness/ownership transitions;
+- collapse/dedup semantics theo notification type/device.
+
+---
+
+#### 24. Bottleneck 11 — In-app inbox và unread counts
+
+Rủi ro:
+
+- one user/tenant có inbox rất lớn;
+- unread counter hot/write contention;
+- mark-all-read update hàng nghìn rows;
+- multi-device read race;
+- pagination duplicate/missing;
+- delete/retention scans;
+- realtime connection fan-out.
+
+Controls:
+
+- partition/bucket theo recipient/time;
+- cursor pagination;
+- bounded retention/archive;
+- read watermark thay update từng notification cho mark-all-read khi model cho phép;
+- versioned/derived unread counts và reconciliation;
+- idempotent read commands;
+- WebSocket/SSE là delivery hint, inbox store là authority;
+- cap page size và batch writes.
+
+---
+
+#### 25. Bottleneck 12 — Observability pipeline
+
+100 triệu deliveries với nhiều attempts/status events có thể tạo hàng trăm triệu log/span records/ngày. High-cardinality labels như `user_id`, `notification_id` trong metrics sẽ phá monitoring cost/performance.
+
+Controls:
+
+- metrics aggregates theo channel/provider/type/priority/region/error class;
+- không đưa raw user/message IDs vào metric labels;
+- structured logs có redaction/tokenization;
+- trace sampling theo risk, tail/error/critical class;
+- audit/security evidence retention riêng;
+- correlation lookup theo indexed IDs trong bounded store;
+- log level/retention budgets;
+- provider raw payload chỉ lưu khi cần và được bảo vệ;
+- alert trên SLO, queue age, loss/duplicate/compliance symptoms.
+
+Good observability là thu đúng evidence để trả lời delivery journey, không phải ghi toàn bộ payload ở mọi bước.
+
+---
+
+#### 26. Bottleneck 13 — Multi-region và compliance locality
+
+Rủi ro:
+
+- duplicate intent do active-active ingestion;
+- ordering khác regions;
+- preference/consent update propagation chậm;
+- provider chỉ hỗ trợ một region/country;
+- cross-region PII movement;
+- failover gửi lại message đã accepted;
+- region-wide campaign/broadcast overload.
+
+Direction:
+
+- global business/event IDs và idempotency scope;
+- home region/ownership hoặc conflict policy cho recipient/delivery;
+- regional queues/workers/providers;
+- replicated preference/suppression với compliance-safe consistency;
+- data residency/minimization;
+- provider idempotency/reconciliation khi failover;
+- fenced ownership/epoch cho schedulers/campaigns;
+- per-region latency/lag/cost metrics;
+- không hứa total global ordering.
+
+---
+
+#### 27. Tổng hợp bottlenecks
+
+| Bottleneck | Amplification/skew | Control direction |
+|---|---|---|
+| Event ingestion | Burst, duplicates, hot producer | Durable buffer, partitions, quotas, schema/idempotency |
+| Bulk fan-out | Recipients × channels | Batches, pacing, checkpoints, workload isolation |
+| Preference lookup | Read per candidate/channel | Cache/batch/version/invalidation, consent-safe recheck |
+| Template render | Locale × channel × personalization | Compiled cache, typed schema, batch data, canary |
+| Provider APIs | Latency, quotas, outage | Per-provider pools, rate/concurrency limits, circuit breaker |
+| Priority inversion | Bulk vs critical traffic | Separate queues, reserved capacity, fair scheduling |
+| Retry/duplicates | Failure × attempts | Idempotency, jitter, retry budgets, reconciliation |
+| Scheduling | Time-bucket bursts, timezone | Delay/time buckets, pacing, due index, recheck |
+| Status/callback writes | Transitions × receipts | Append + projection, dedup/version, tiering |
+| Device endpoints | Multiple/stale tokens | Lifecycle store, cleanup, verification, collapse |
+| In-app inbox | Reads, unread updates, retention | Recipient buckets, cursor, watermark, bounded retention |
+| Observability | Attempts × signals/cardinality | Aggregation, sampling, redaction, retention budget |
+| Multi-region | Replication, duplicate failover | Ownership, idempotency, locality, fenced recovery |
+| Cost | SMS/email/retries/egress/storage | Policy, caps, provider routing, unit economics |
+
+---
+
+#### 28. Cost estimation
+
+Provider cost:
+
+```text
+daily provider cost
+= Σ(
+  attempts_by_channel_region
+  × unit_price_by_provider_channel_region
+)
+```
+
+Cần tính:
+
+- successful attempts và charged failures/retries;
+- SMS segments/Unicode/region/carrier;
+- email volume/dedicated IP/reputation services;
+- push thường rẻ nhưng compute/queue/observability vẫn có cost;
+- fallback chuyển từ push sang SMS;
+- provider callbacks và egress;
+- template/media/link hosting;
+- data retention/replication;
+- peak reserved capacity.
+
+Theo dõi unit metrics:
+
+- cost per accepted delivery;
+- cost per confirmed delivery khi có receipt;
+- cost per notification type/tenant/campaign;
+- wasted attempts do invalid endpoint/preference stale/retry;
+- SMS fallback conversion/value so với cost.
+
+Không giảm cost bằng cách bỏ audit, consent enforcement hoặc critical redundancy.
+
+---
+
+#### 29. Load-test scenarios
+
+1. Baseline 100 triệu deliveries/day với measured channel mix.
+2. Peak 3× trong normal daily traffic window.
+3. Broadcast 10 triệu recipients × push + in-app trong 10 phút.
+4. Flash sale đồng thời tạo transactional và marketing notifications.
+5. Email provider timeout/throttle 30 phút rồi phục hồi.
+6. SMS provider trả `429` và giảm quota đột ngột.
+7. Push token invalid burst sau app migration.
+8. Preference cache cold start hoặc primary preference store chậm.
+9. User unsubscribe khi campaign jobs đã queued.
+10. Template lỗi/missing variable sau rollout.
+11. Consumer crash sau provider accepted nhưng trước status commit.
+12. Duplicate/out-of-order provider callbacks.
+13. Retry storm và dedup store latency.
+14. Millions scheduled notifications cùng 9:00 local time/DST transition.
+15. In-app mark-all-read trên inbox lớn và nhiều devices.
+16. Observability backend degraded/high-cardinality protection.
+17. Region failover trong lúc campaign và critical messages đang chạy.
+18. DLQ replay sau khi idempotency horizon gần hết.
+
+Pass criteria phải gồm latency/queue age, no lost accepted intent, bounded duplicates, consent correctness, provider/cost limits và recovery—not chỉ HTTP success rate.
+
+---
+
+#### 30. Metrics và evolution triggers
+
+##### Ingestion/policy
+
+- events/intents/s và duplicate/suppression rates;
+- preference/cache latency/hit rate/version staleness;
+- template render latency/error/fallback;
+- audience expansion rate/checkpoint lag.
+
+##### Delivery
+
+- deliveries/attempts/s theo channel/provider/type/priority/region;
+- event-to-queued/provider-accepted/receipt latency;
+- queue depth và oldest age;
+- retry amplification, throttling, timeout và permanent failure;
+- provider acceptance/delivery/bounce/complaint/invalid-token rates;
+- duplicate logical delivery rate.
+
+##### Storage/operations
+
+- delivery/status write throughput;
+- partition hotness/size;
+- callback lag/dedup;
+- in-app inbox/read/unread latency;
+- DLQ age/volume/replay success;
+- retention/storage growth;
+- cost per type/channel/tenant.
+
+Triggers:
+
+- tách provider/channel worker pools;
+- tăng partitions/workers nhưng vẫn theo provider quota;
+- chuyển bulk sang paced scheduling;
+- tăng cache/batch preference reads;
+- shard/bucket recipient/status/inbox stores;
+- chuyển old data sang cold storage;
+- thêm provider/failover route;
+- reserve thêm critical capacity;
+- giảm/drop low-priority work khi queue age vượt SLO.
+
+---
+
+#### 31. Những lỗi estimate thường gặp
+
+- Lấy 10M × 5 = 50M rồi gọi đó là tổng provider requests.
+- Quên recipients/event, enabled channels, devices và retries.
+- Dùng daily average để sizing broadcast vài phút.
+- Nói peak “300M/day” nhưng không tính requests/s và burst duration.
+- Không tách provider quotas theo channel/region/sender.
+- Scale workers vượt quota rồi tạo retry storm.
+- Chỉ tính delivery records, bỏ attempts/callbacks/indexes/replication/audit.
+- Không tính in-app inbox reads, unread counts và realtime connections.
+- Render trước khi preference/dedup nên lãng phí CPU.
+- Cache preference nhưng không dimension stale-consent risk.
+- Một queue cho OTP và bulk campaigns.
+- Không tính backlog drain time và notification expiry.
+- Không load-test ambiguous timeout/duplicate callback.
+- Thu user_id/notification_id làm metric labels gây cardinality explosion.
+- Chỉ đo provider acceptance, không tách receipt/bounce/read evidence.
+- Không tính SMS Unicode segments, retry và fallback cost.
+- Over-engineer multi-region/broker/database khi actual scale/team chưa cần.
+
+---
+
+#### 32. Checklist Step 2
+
+- [ ] DAU, events/user/day và event types?
+- [ ] Events/s average/peak và burst duration?
+- [ ] Recipients/event distribution và largest broadcast?
+- [ ] Candidate intents, suppression rate và intents/recipient?
+- [ ] Enabled channels/intent và channel mix?
+- [ ] Active devices/user cho push?
+- [ ] Retry/error/attempt amplification theo provider?
+- [ ] Provider quotas, latency, concurrency và region/sender limits?
+- [ ] Broadcast completion window/pacing/cancel requirements?
+- [ ] Queue backlog growth, drain capacity và oldest-age SLO?
+- [ ] Notification priority/TTL và reserved capacity?
+- [ ] Preference/endpoint/template lookups, cache/batch rates?
+- [ ] Delivery/attempt/callback/in-app/audit storage và retention?
+- [ ] Broker/payload/provider bandwidth?
+- [ ] In-app reads, pagination, unread/read writes và connections?
+- [ ] Callback/reconciliation volume?
+- [ ] Observability event volume/cardinality/retention?
+- [ ] Multi-region replication/locality/failover effects?
+- [ ] Cost per channel/region/retry/fallback?
+- [ ] Load tests cho burst, outage, duplicates, stale consent và recovery?
+- [ ] Metrics/triggers nối bottleneck tới scaling/degraded policy?
+
+#### 33. Ý chính cần nhớ
+
+- 10M DAU × 5 events/ngày = 50M business events/ngày.
+- Với khoảng 2 channel deliveries/event, baseline là 100M deliveries/ngày.
+- 100M/ngày ≈ 1.157 deliveries/s average; peak 3× ≈ 3.472/s theo giả định đơn giản.
+- Capacity phải tính theo requests/s và burst duration, không chỉ daily equivalent.
+- Logical intent khác channel delivery, device request, retry attempt và provider callback.
+- Broadcast 10M users × 2 channels trong 10 phút cần khoảng 33k deliveries/s trước devices/retries.
+- Retry/provider outage có thể tạo traffic lớn hơn original workload; backoff/jitter/budget là bắt buộc.
+- Queue chỉ hấp thụ bounded burst; cần tính backlog growth và drain time.
+- Worker capacity bị chặn bởi provider quota, latency/concurrency và downstream stores.
+- Preference cache giảm reads nhưng stale consent là correctness/compliance risk.
+- Template rendering cần compiled cache, typed data và rollout safety.
+- Priority isolation ngăn marketing làm trễ OTP/security/transactional traffic.
+- Delivery state/callbacks tạo write amplification và phải xử lý duplicate/out-of-order.
+- In-app channel có read/unread/pagination workload riêng, không chỉ là delivery write.
+- Observability có thể trở thành bottleneck do volume và high cardinality.
+- SMS/provider/cross-region/storage costs phải nằm trong capacity model.
+- Estimate tốt nối **business events → recipients → policy → channels/devices → attempts/callbacks → storage/cost/SLO**.
+
+#### Công thức ghi nhớ
+
+> **Notification load = events × recipients × eligible intents × enabled channels × devices/fallbacks × retry attempts + callbacks + in-app reads.**
+
+---
+
+### Bài 80. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của Step 3
+
+High-level design phải trả lời:
+
+1. Event/direct request đi vào hệ thống bằng đường nào?
+2. Component nào quyết định recipient, policy, channel và template?
+3. Channel deliveries được cô lập và retry thế nào?
+4. Trạng thái từ internal acceptance tới provider receipt/read được lưu ở đâu?
+5. User, producer, administrator và provider callback dùng API/contract nào?
+
+Notification System phù hợp với pipeline bất đồng bộ vì provider latency/outage và traffic burst không nên kéo Order, Payment hoặc Auth request path xuống theo.
+
+---
+
+#### 2. Sơ đồ high-level
+
+```text
+Business Services                  Admin/Campaign Systems
+  ├─ domain events                       │ direct commands
+  └─ transactional outbox                ▼
+             │                    API Gateway / Command API
+             ▼                            │
+      Event Ingestor/API                  │
+             │ validate/auth/dedup        │
+             └────────────┬───────────────┘
+                          ▼
+                 Durable Ingestion Log/Queue
+                          │
+                          ▼
+                Notification Orchestrator
+                 ├─ Recipient Resolver
+                 ├─ Preference/Policy Service ── Preference Store/Cache
+                 ├─ Template Service ─────────── Template Store/Cache
+                 └─ Intent/Delivery Store + Outbox
+                          │
+            ┌─────────────┼──────────────┬──────────────┐
+            ▼             ▼              ▼              ▼
+        Email Queue    SMS Queue      Push Queue     In-app Queue
+            │             │              │              │
+        Email Workers  SMS Workers    Push Workers   In-app Workers
+            │             │              │              │
+       Email Adapter  SMS Adapter    Push Adapter    Inbox Store
+            │             │              │              │
+        Providers      Providers       APNs/FCM      WebSocket/SSE hint
+            └─────────────┴──────┬───────┘
+                                 │ webhooks/receipts
+                                 ▼
+                         Callback Ingestor
+                                 │
+                                 ▼
+                    Delivery Tracker/Attempt Store
+                     ├─ Current-status projection
+                     ├─ Retry scheduler
+                     ├─ DLQ/replay/reconciliation
+                     └─ Reports/audit/metrics
+```
+
+Ba boundaries:
+
+```text
+Ingestion: nhận durable business intent
+Decision:  recipient + policy + channel + content/version
+Delivery:  channel/provider-specific execution và tracking
+```
+
+---
+
+#### 3. Event Ingestor
+
+Event Ingestor là entry point cho domain events từ Order, Auth, Chat, Payment…
+
+Trách nhiệm:
+
+- authenticate/authorize producer;
+- validate envelope/schema/version/size;
+- assign/validate event ID, tenant và correlation ID;
+- enforce producer quotas/rate limits;
+- reject unsupported notification types early;
+- deduplicate theo contract hoặc chuyển dedup sang consumer;
+- ghi event vào durable broker/log trước acknowledgement;
+- expose ingestion latency/error metrics.
+
+Broker như Kafka/SQS-like service **buffer bounded bursts** và decouple producers; nó không tự “biến burst thành steady load” nếu downstream capacity thấp hơn sustained arrival. Consumers, pacing và backpressure mới kiểm soát drain rate.
+
+Upstream service nên dùng transactional outbox để tránh business transaction commit nhưng notification event bị mất.
+
+---
+
+#### 4. Direct Command API
+
+Không phải notification nào cũng bắt nguồn từ domain event. Admin/campaign/internal workflow có thể tạo explicit intent qua API.
+
+Direct API cần:
+
+- OAuth2/service identity và fine-grained authorization;
+- `Idempotency-Key`;
+- allowed notification type/template/channel/audience scope;
+- recipient/segment size quota;
+- dry-run/preview cho bulk campaign;
+- scheduled time, priority, TTL và cancellation reference;
+- audit actor/reason/change ticket;
+- trả `202 Accepted` + tracking ID sau durable acceptance.
+
+API không gọi provider đồng bộ. Nó ghi command/intent rồi đưa vào cùng pipeline để preferences, policy, templates, retries và tracking vẫn nhất quán.
+
+---
+
+#### 5. Notification Orchestrator
+
+Orchestrator là decision layer, không trực tiếp gửi email/SMS/push.
+
+Nó thực hiện:
+
+1. Validate event semantics và notification mapping.
+2. Resolve recipient hoặc tạo fan-out job cho audience lớn.
+3. Chọn notification type/category/priority/TTL.
+4. Kiểm tra user preference, consent, suppression, quiet hours và frequency cap.
+5. Chọn channels/endpoints và fallback policy.
+6. Chọn template ID/version/locale và validate variables.
+7. Tạo idempotent `NotificationIntent` cùng `ChannelDelivery` records.
+8. Ghi outbox messages tới channel-specific queues.
+9. Ghi decision/suppression reason và relevant policy/template versions.
+
+Để tránh “god service”, mapping/routing policy có thể là versioned configuration/rules; recipient resolution, preference và rendering là bounded supporting services. Orchestrator vẫn sở hữu workflow decision, không sở hữu mọi underlying data.
+
+---
+
+#### 6. Recipient Resolver
+
+Recipient Resolver chuyển business entity/audience thành recipient IDs/endpoints ở mức phù hợp:
+
+- một user theo `user_id`;
+- participants/member list;
+- followers/subscribers;
+- campaign segment snapshot;
+- organization/tenant broadcast.
+
+One-to-one có thể resolve inline/batch. Audience hàng triệu user phải:
+
+- snapshot/version segment;
+- paginate thành bounded batches;
+- checkpoint/resume;
+- deduplicate overlaps;
+- pace theo capacity/provider quota;
+- re-check campaign cancellation;
+- không materialize toàn bộ trong một transaction/memory buffer.
+
+Contact endpoint lookup có thể diễn ra gần channel delivery để dùng destination status mới nhất, nhưng recipient identity/audience version phải được cố định đủ cho idempotency/audit.
+
+---
+
+#### 7. Preference/Policy Service
+
+Service này sở hữu hoặc truy cập:
+
+- per-user type/category/channel preferences;
+- marketing consent/unsubscribe;
+- quiet hours/timezone;
+- organization/default/mandatory policies;
+- frequency caps/digest settings;
+- suppression lists;
+- verified/active endpoint policy.
+
+Vì lookup rất nhiều, dùng Redis/cache cho read acceleration; durable Preference Store mới là source of truth.
+
+```text
+Preference update
+  → authoritative commit + version
+  → invalidation/change event
+  → cache update/eviction
+```
+
+Nên evaluate khi planning để tránh work, đồng thời re-check mutable consent/suppression/expiry ngay trước external send khi policy yêu cầu. Nếu preference service lỗi:
+
+- marketing/optional: fail closed hoặc delay;
+- mandatory critical: dùng explicitly approved default path, không tự suy đoán;
+- ghi decision/fallback reason để audit.
+
+---
+
+#### 8. Template Service
+
+Template Service quản lý:
+
+- template theo notification type, channel và locale;
+- immutable/versioned subject/body/schema;
+- typed required/optional variables;
+- localization/fallback locale;
+- safe HTML/text escaping;
+- preview/test/approval/publish/rollback;
+- branding và content policy;
+- compiled-template cache.
+
+Hai chiến lược:
+
+##### Render ở orchestration time
+
+- delivery record có content snapshot ổn định;
+- audit/retry nhất quán;
+- nhưng render sớm có thể lãng phí khi quiet-hour delay/cancel/suppress.
+
+##### Render gần delivery time
+
+- data/content mới hơn và tránh work quá sớm;
+- nhưng phải pin `template_version`, variable snapshot/reference và policy rõ để retry không đổi message ngoài ý muốn.
+
+Production design thường kết hợp: pin template/version và validated data contract khi tạo delivery; render/snapshot ở stage phù hợp từng notification type. Không để retry tự động dùng “latest template”.
+
+---
+
+#### 9. Intent/Delivery Store và transactional handoff
+
+Logical state:
+
+```text
+NotificationIntent
+  └─ ChannelDelivery(email)
+       ├─ Attempt 1
+       └─ Attempt 2
+  └─ ChannelDelivery(push)
+       └─ Attempt 1
+```
+
+Một transaction khái niệm:
+
+```text
+INSERT intent/deliveries if idempotency keys absent
+INSERT outbox(channel_delivery_ready events)
+COMMIT
+```
+
+Outbox publisher route messages tới channel queues. Điều này tránh trạng thái “Delivery Store đã tạo nhưng queue message mất” hoặc ngược lại.
+
+Sources of truth:
+
+- Intent/Delivery Store: logical workflow/current desired/current status.
+- Attempt Store/event history: provider calls và outcomes.
+- Channel queue: work waiting to execute, không phải sole business authority.
+- DLQ: unresolved work/evidence để triage, không phải archive cuối cùng.
+
+---
+
+#### 10. Channel-specific queues
+
+Tách email, SMS, push và in-app queues vì mỗi channel có:
+
+- throughput/latency SLO khác;
+- provider quota/concurrency khác;
+- retry/error taxonomy khác;
+- payload/TTL khác;
+- cost/compliance khác;
+- worker scaling khác.
+
+Trong mỗi channel còn có thể tách:
+
+```text
+critical / transactional / normal / bulk
+```
+
+Hoặc dùng fair scheduling + reserved capacity. Priority phải được enforce ở broker, consumers và provider quota—not chỉ lưu trong message field.
+
+Message chứa reference/IDs và bounded necessary metadata; không nhét large attachments/raw PII nếu worker có thể lấy an toàn từ stores.
+
+---
+
+#### 11. Channel Workers và Provider Adapters
+
+Worker lifecycle:
+
+```text
+claim delivery
+  → verify state/version/not cancelled/not expired
+  → re-check required preference/suppression/endpoint
+  → render/load pinned content
+  → acquire provider quota/concurrency permit
+  → call adapter/provider with idempotency key
+  → persist attempt/outcome
+  → ack, retry schedule hoặc terminal/DLQ
+```
+
+Channel Worker chứa common channel workflow; Provider Adapter cô lập vendor-specific:
+
+- API/payload/auth;
+- error-code normalization;
+- idempotency capability;
+- message/provider IDs;
+- retry-after/throttling;
+- webhook verification/mapping;
+- sender/region routing.
+
+Provider switching/failover là policy riêng. Không retry sang provider khác nếu có nguy cơ provider đầu đã accepted mà outcome unknown, trừ khi dedup/reconciliation và business tolerance cho phép.
+
+---
+
+#### 12. Email Worker
+
+Email-specific tasks:
+
+- render subject, text và HTML variants;
+- validate/suppress recipient;
+- select sender/domain/provider/region;
+- attach tracking/unsubscribe links theo policy;
+- handle provider acceptance, bounce, complaint và unsubscribe;
+- protect sender reputation;
+- retry transient errors, terminalize invalid address/policy errors.
+
+Attachments lớn nên qua secure object links; không đẩy bytes lớn qua broker. Marketing và transactional sending domains/IP pools có thể cần cô lập.
+
+---
+
+#### 13. SMS Worker
+
+SMS-specific tasks:
+
+- verified E.164 destination và consent/DND;
+- sender/short code/alphanumeric identity theo country;
+- message encoding/segment count;
+- provider/carrier routing và cost limits;
+- TTL/priority cho OTP;
+- delivery receipts và STOP/unsubscribe workflows;
+- per-country/provider quotas.
+
+SMS đắt và regulated; fallback sang SMS phải là explicit policy có consent, value và cost cap—not default cho mọi push/email failure.
+
+---
+
+#### 14. Push Worker
+
+Push-specific tasks:
+
+- resolve active device tokens/platform;
+- APNs/FCM payload mapping;
+- TTL, urgency, collapse key và topic/category;
+- multiple-device fan-out/dedup policy;
+- invalid-token cleanup;
+- provider acceptance và limited receipt semantics;
+- payload-size and sensitive-lock-screen rules.
+
+APNs/FCM acceptance không đồng nghĩa device hiển thị hoặc user đọc. Deep links phải validate và không đưa sensitive content lên lock screen nếu product/security policy không cho phép.
+
+---
+
+#### 15. In-app Worker và Inbox Service
+
+In-app delivery nằm trong hệ thống:
+
+```text
+delivery job
+  → idempotent insert InboxItem
+  → update/derive unread state
+  → optional WebSocket/SSE/push hint
+```
+
+Inbox Store là source of truth cho available/read/archive state. WebSocket/SSE chỉ là realtime hint; mất connection không được làm mất notification.
+
+Thiết kế:
+
+- partition/bucket theo recipient/time;
+- cursor pagination;
+- batch mark-read;
+- mark-all-read bằng watermark khi semantics cho phép;
+- retention/archive;
+- multi-device consistency;
+- authorization: user chỉ đọc/sửa inbox của mình.
+
+---
+
+#### 16. Delivery Tracker
+
+Delivery Tracker ghi nhận:
+
+- intent/delivery current state;
+- every provider attempt;
+- provider message/reference ID;
+- timestamps và normalized error category;
+- retry schedule/terminal reason;
+- callbacks/receipts;
+- policy/template/provider versions;
+- correlation to business event.
+
+Nên tách:
+
+```text
+append-only attempt/status history
+            ↓
+compact current-status projection
+            ↓
+reporting/support API
+```
+
+Không update một boolean `sent`. State machine phân biệt `QUEUED`, `SENDING`, `PROVIDER_ACCEPTED`, `DELIVERED`, `BOUNCED`, `FAILED`, `SUPPRESSED`, `EXPIRED`, `DEAD_LETTERED`…
+
+Analytics dashboards không nên scan operational status store trực tiếp; dùng asynchronous analytical projection.
+
+---
+
+#### 17. Provider Callback Ingestor
+
+Email/SMS providers gửi bounce, complaint, delivery receipt; push provider có feedback hạn chế.
+
+Callback path:
+
+```text
+Provider
+  → public callback endpoint/API Gateway
+  → verify signature/timestamp/source + rate/size limits
+  → durable callback queue/log
+  → dedup by provider event ID
+  → map provider message ID to delivery
+  → versioned/monotonic status transition
+  → update suppression/endpoint state if needed
+```
+
+Callback có thể duplicate, delay và out-of-order. Không tin callback payload chỉ vì request tới đúng URL. Raw payload retention phải bounded/encrypted/redacted.
+
+Nếu receipt mất, reconciliation job có thể query provider hoặc đánh dấu outcome `UNKNOWN` theo contract; không tự gắn `DELIVERED`.
+
+---
+
+#### 18. Retry Scheduler và DLQ
+
+Retry decision dựa trên:
+
+- normalized transient/permanent/unknown error;
+- notification priority và expiry;
+- provider `Retry-After`/quota;
+- number/age of attempts;
+- idempotency/ambiguous outcome;
+- circuit state và alternate-provider policy.
+
+```text
+transient → exponential backoff + jitter → retry queue/time bucket
+permanent → terminal failure/suppression
+unknown   → reconcile or carefully retry under idempotency contract
+expired   → EXPIRED, do not send
+exhausted/poison → DLQ + alert/triage
+```
+
+DLQ process phải có:
+
+- owner/runbook/alert;
+- searchable reason and safe context;
+- fix-and-replay tooling;
+- replay authorization/rate controls;
+- idempotency after long delay;
+- retention and terminal disposition.
+
+Blindly replay toàn DLQ có thể spam users hoặc vượt provider quota.
+
+---
+
+#### 19. End-to-end event flow
+
+Ví dụ `OrderShipped`:
+
+```text
+1. Order Service commits shipment + outbox event.
+2. Event Ingestor/broker durably receives OrderShipped(event_id).
+3. Orchestrator maps event → ORDER_SHIPPED intent for user U.
+4. Recipient/preference/policy resolution allows email + push + in-app.
+5. Template version/locale/variables are pinned and validated.
+6. Intent + three Delivery records + outbox are committed idempotently.
+7. Outbox routes jobs to Email, Push and In-app queues.
+8. Each worker independently sends/inserts and records attempts.
+9. Email/push provider acceptance updates each delivery separately.
+10. Provider callbacks later record delivery/bounce where observable.
+11. In-app item remains queryable and can be marked read.
+12. Reporting aggregates lifecycle without blocking any delivery.
+```
+
+Một channel lỗi không rollback hoặc block các channel đã thành công, trừ khi business policy định nghĩa orchestration/fallback khác.
+
+---
+
+#### 20. Direct/manual notification flow
+
+```text
+Admin/Internal System
+  → POST /notification-intents + Idempotency-Key
+  → Gateway: AuthN, RBAC/ABAC, quota, audit
+  → Command API: validate type/template/audience/schedule
+  → durable intent/campaign command
+  → async recipient fan-out/policy/template/channel pipeline
+  ← 202 Accepted + tracking_id
+```
+
+System-wide announcement cần dry run, audience estimate, cost/quota approval, schedule, pause/cancel và rollout batches. Admin UI không được bypass preference/compliance hoặc ghi trực tiếp channel queue.
+
+---
+
+#### 21. User-facing APIs
+
+##### Lấy in-app notifications
+
+```http
+GET /v1/me/notifications?status=unread&limit=20&cursor=<opaque>
+Authorization: Bearer <user-token>
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "notification_id": "ntf_123",
+      "type": "ORDER_SHIPPED",
+      "created_at": "...",
+      "read_at": null,
+      "content": {},
+      "deep_link": "..."
+    }
+  ],
+  "next_cursor": "opaque-token",
+  "unread_count": 42
+}
+```
+
+Dùng cursor thay offset cho history đang tăng. Filter/sort chỉ expose combinations có index/contract; không cho client tùy ý scan/sort lớn.
+
+##### Mark read theo batch
+
+```http
+POST /v1/me/notifications/read
+Idempotency-Key: <key>
+
+{
+  "notification_ids": ["ntf_123", "ntf_124"]
+}
+```
+
+Hoặc idempotent resource semantics:
+
+```http
+PUT /v1/me/notifications/{notification_id}/read
+```
+
+Server xác minh ownership; retry không tăng/giảm unread count sai. Mark-all-read có thể dùng `read_before`/watermark contract.
+
+##### Preferences
+
+```http
+GET /v1/me/notification-preferences
+PUT /v1/me/notification-preferences/{notification_type}
+```
+
+Preference update trả version/effective state và phát invalidation event. API phải phân biệt mandatory và optional settings.
+
+---
+
+#### 22. Producer/admin APIs
+
+##### Tạo intent trực tiếp
+
+```http
+POST /v1/notification-intents
+Authorization: Bearer <service-or-admin-token>
+Idempotency-Key: <key>
+
+{
+  "notification_type": "MAINTENANCE_NOTICE",
+  "recipient": {"user_id": "usr_..."},
+  "template_id": "tpl_...",
+  "template_data": {},
+  "requested_channels": ["EMAIL", "IN_APP"],
+  "priority": "NORMAL",
+  "schedule_at": null,
+  "expires_at": "..."
+}
+```
+
+Response:
+
+```http
+202 Accepted
+Location: /v1/notification-intents/ntf_...
+```
+
+Upstream không nên được tự chọn arbitrary sender/template/channel nếu permission scope không cho phép.
+
+##### Delivery report
+
+```http
+GET /v1/notification-intents/{notification_id}
+GET /v1/notification-intents/{notification_id}/deliveries
+GET /v1/deliveries/{delivery_id}/attempts
+```
+
+Report phải phân biệt platform accepted, provider accepted, delivered/bounced và read. PII/raw content được mask theo role; analytics bulk export dùng async job thay synchronous unbounded query.
+
+---
+
+#### 23. API semantics và security
+
+- OAuth2/OIDC/JWT hoặc workload identity cho AuthN.
+- RBAC/ABAC/scopes cho user, producer, operator, support và admin.
+- Object-level authorization: user chỉ đọc/sửa notification/preference của mình.
+- Tenant isolation và quotas.
+- `Idempotency-Key` cho mutations/direct send.
+- Cursor pagination và bounded batch sizes.
+- `202 Accepted` nghĩa durable acceptance, không phải delivered.
+- Request/schema versioning và validation.
+- Rate limits, audience caps và abuse controls.
+- Audit actor/action/reason cho admin/template/campaign/replay.
+- PII redaction, encrypted sensitive data và secrets management.
+- Provider webhook signature, timestamp và replay protection.
+
+Gateway enforce coarse policy; domain services vẫn enforce ownership/business authorization.
+
+---
+
+#### 24. Communication matrix
+
+| From → To | Kiểu | Contract/semantics |
+|---|---|---|
+| Business Service → Ingestor | Async event | Durable, versioned, stable event ID |
+| Internal/Admin → Command API | Sync accept | AuthZ + idempotency; returns tracking ID |
+| Ingestor → Broker | Async durable | Ack only after accepted durability boundary |
+| Broker → Orchestrator | Async at-least-once | Inbox/dedup/versioned processing |
+| Orchestrator → Preference/Template | Sync/batch/cache | Deadlines, safe fallback, pinned versions |
+| Orchestrator → Intent Store/Outbox | Local transaction | Atomic logical state + channel handoff |
+| Outbox → Channel Queues | Async | Delivery ID, priority, schedule/expiry/version |
+| Worker → Provider | Sync external request | Timeout, rate limit, idempotency, error taxonomy |
+| Provider → Callback Ingestor | Async webhook | Signature, dedup, durable ingest, out-of-order aware |
+| Worker/Callback → Tracker | Versioned write/event | Attempt history + current-state projection |
+| Client → Inbox API | Sync | Cursor, AuthZ, bounded reads/mutations |
+| Inbox Service → Client | Optional push stream | WebSocket/SSE hint, reconnectable |
+
+Không biến mọi internal call thành synchronous chain. Quyết định/lookup cần response trực tiếp có thể sync; delivery và supporting side effects chạy async.
+
+---
+
+#### 25. Event/message contracts
+
+Envelope tối thiểu:
+
+```json
+{
+  "event_id": "evt_...",
+  "event_type": "OrderShipped",
+  "producer": "order-service",
+  "tenant_id": "...",
+  "aggregate_id": "order_...",
+  "aggregate_version": 12,
+  "occurred_at": "...",
+  "schema_version": 3,
+  "trace_id": "...",
+  "payload": {}
+}
+```
+
+Channel job:
+
+```json
+{
+  "delivery_id": "dlv_...",
+  "notification_id": "ntf_...",
+  "recipient_id": "usr_...",
+  "channel": "EMAIL",
+  "priority": "TRANSACTIONAL",
+  "template_id": "order_shipped",
+  "template_version": 7,
+  "policy_version": 11,
+  "scheduled_at": "...",
+  "expires_at": "...",
+  "attempt_generation": 0
+}
+```
+
+Message không nên chứa raw contact/personalized content nếu ID/reference lookup giảm exposure và vẫn đáp ứng availability/latency. Nếu snapshot là bắt buộc, encrypt và áp retention/access policy.
+
+---
+
+#### 26. Ordering và cancellation
+
+Không cần total ordering toàn hệ thống. Có thể cần ordering theo:
+
+- conversation/user;
+- business aggregate như `order_id`;
+- notification/campaign;
+- endpoint/channel.
+
+Event mang aggregate version; consumer bỏ/hold stale transition khi cần. Tuy nhiên, provider delivery order vẫn không bảo đảm tuyệt đối.
+
+Cancellation:
+
+```text
+cancel command
+  → authoritative delivery/campaign state = CANCELLED/version N
+  → high-priority invalidation/event
+  → worker re-check state before provider call
+  → queued jobs become no-op
+```
+
+Nếu provider đã accepted thì cancellation có thể không thu hồi được external message. API/status phải nói rõ boundary.
+
+---
+
+#### 27. Caching strategy
+
+Cache candidates:
+
+- preference documents/versions;
+- suppression/endpoint status;
+- compiled templates theo version/channel/locale;
+- notification-type policy/config;
+- provider routing/quota configuration;
+- in-app unread count/current page.
+
+Controls:
+
+- source of truth rõ;
+- versioned keys/invalidation events;
+- TTL + jitter;
+- batch/multi-get;
+- single-flight chống stampede;
+- no shared personalized rendered-content cache;
+- compliance-sensitive re-check;
+- fail behavior theo notification class;
+- origin capacity/load shedding.
+
+Redis giúp read latency nhưng không thay durable Preference/Template/Delivery Stores.
+
+---
+
+#### 28. Failure và degraded behavior
+
+| Failure | Hành vi an toàn |
+|---|---|
+| Ingestion broker chậm | Backpressure/quota; không ack trước durability |
+| Orchestrator crash sau commit | Outbox/consumer replay, idempotent intent creation |
+| Preference cache lỗi | Read authority/bounded fallback; marketing fail closed/delay |
+| Preference authority lỗi | Delay optional; explicit safe policy cho critical |
+| Template service/cache lỗi | Pinned cached version hoặc delay; không gửi malformed content |
+| Email provider outage | Circuit open, queue/backoff; SMS/push unaffected |
+| SMS quota exhausted | Pace/alternate approved provider; preserve critical capacity |
+| Provider timeout unknown | Reconcile/idempotent retry; không blind multi-provider duplicate |
+| Callback duplicate/out-of-order | Verify, dedup và versioned state transition |
+| Delivery Store unavailable | Không mất state; worker không ack unsafe handoff |
+| DLQ tăng | Alert/triage; không blind replay |
+| In-app realtime disconnect | Inbox vẫn durable; client poll/resync |
+| Observability backend lỗi | Delivery tiếp tục với bounded buffering; critical audit không bỏ âm thầm |
+
+Failure isolation cần channel/priority/provider pools, circuit breakers, quotas và bulkheads. Chỉ tách service trên diagram không tự tạo resilience.
+
+---
+
+#### 29. Multi-region direction
+
+- regional ingress/brokers/workers giảm latency và tôn trọng provider/data locality;
+- notification/delivery có global stable IDs;
+- một intent/campaign/recipient partition có owner/home region hoặc conflict rule rõ;
+- preference/suppression replication đáp ứng compliance propagation SLO;
+- channel provider route theo country/region;
+- callbacks route/map được tới authoritative delivery owner;
+- failover dùng epoch/fencing và provider reconciliation;
+- duplicate cross-region processing vẫn an toàn nhờ idempotency;
+- audit/PII không replication trái residency policy;
+- per-region queues/lag/provider health/cost metrics.
+
+Active-active ingestion không đồng nghĩa cùng delivery được phép gửi từ hai regions.
+
+---
+
+#### 30. Observability
+
+Một notification cần traceable journey:
+
+```text
+business_event_id
+ → notification_id
+ → delivery_id per channel
+ → attempt_id
+ → provider_message_id
+ → callback_event_id
+```
+
+Metrics:
+
+- ingestion/intents/deliveries/attempts/s;
+- suppression/dedup/preference/cache rates;
+- queue lag/oldest age theo priority/channel/provider;
+- render latency/error/template version;
+- provider latency/throttle/timeout/acceptance/bounce/receipt;
+- retry amplification/DLQ/replay;
+- event-to-provider-accepted/delivered/read latency;
+- duplicate/loss/reconciliation mismatch;
+- in-app inbox/read/unread latency;
+- cost theo type/channel/provider/tenant.
+
+Metrics labels không chứa user/notification IDs. Logs/traces dùng correlation IDs, redaction và bounded retention. Alerts ưu tiên critical delivery SLO, consent violation, lost intent và queue age hơn CPU đơn thuần.
+
+---
+
+#### 31. Những điểm hiệu chỉnh so với transcript
+
+| Transcript đơn giản hóa | Thiết kế production-oriented |
+|---|---|
+| Ingestor buffer/rate control làm downstream nhận steady flow | Broker hấp thụ bounded burst; consumers/pacing/backpressure quyết định drain rate |
+| Orchestrator check preference rồi render message | Tạo versioned intent/deliveries; re-check mutable policy và render theo timing contract |
+| Preference cache bằng Redis | Redis là cache; durable store/version/invalidation và compliance-safe behavior vẫn cần |
+| Cache/pre-render templates | Cache compiled version; không cache personalized PII dùng chung; pin version cho retry/audit |
+| Một worker cho mỗi channel | Còn cần priority/provider isolation, quotas, adapters và endpoint semantics |
+| Worker tự retry | Retry scheduler phải phân loại error, TTL, quota và ambiguous outcome |
+| Delivery Tracker ghi success/failure | Cần intent/delivery/attempt state machine và provider callback evidence |
+| Fail nhiều lần thì đưa DLQ | DLQ cần owner, triage, safe replay, idempotency và terminal disposition |
+| Pipeline gần như hoàn toàn async | User/admin APIs và provider calls có sync boundaries; business delivery workflow chủ yếu async |
+| GET notifications hỗ trợ mọi filter/sort | Chỉ expose indexed, bounded cursor queries |
+| POST mark-read list | Batch phải bounded, ownership-checked và idempotent; mark-all có watermark option |
+| POST notification cho admins | Dùng typed intent API, scopes, quotas, preview/audit; không arbitrary raw provider send |
+| Delivery report cho biết “thực sự xảy ra” | Chỉ report evidence boundary: accepted ≠ delivered ≠ read |
+| JWT/OAuth2 là security | Còn cần object AuthZ, producer scopes, tenant isolation, webhook verification và PII controls |
+
+---
+
+#### 32. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Upstream services phát durable domain events hoặc gọi idempotent Command API; không gọi providers trực tiếp.
+2. Event Ingestor validate/auth/quota rồi ghi durable broker để decouple và absorb bounded bursts.
+3. Orchestrator resolve recipients, evaluate preference/compliance, pin template/policy và tạo Intent + per-channel Deliveries.
+4. Intent/Delivery + Outbox commit atomically; messages route tới isolated email/SMS/push/in-app queues.
+5. Workers re-check state/expiry/policy, render pinned content, enforce provider quota rồi gọi channel adapters.
+6. Attempts và current status được Delivery Tracker lưu riêng; provider callbacks được verify/dedup/version.
+7. Transient lỗi dùng backoff/jitter; permanent lỗi terminal/suppress; unknown outcome reconcile; exhausted work vào managed DLQ.
+8. In-app Inbox là durable và cursor-paginated; WebSocket/SSE chỉ là realtime hint.
+9. User APIs cho inbox/read/preferences; producer/admin APIs trả `202 + tracking ID` và enforce scopes/audit.
+10. Outbox/inbox/idempotency, priority isolation, multi-region ownership và end-to-end observability bảo vệ reliability.
+
+---
+
+#### 33. Checklist Step 3
+
+- [ ] Event và direct-command ingress boundaries?
+- [ ] Producer AuthZ/schema/quota/idempotency/durable ack?
+- [ ] Orchestrator responsibilities không trở thành god service?
+- [ ] Recipient resolution/bulk batching/checkpoint/cancel?
+- [ ] Preference source, cache/version/invalidation/re-check/fail policy?
+- [ ] Template schema, localization, version pinning/render timing?
+- [ ] Intent, Delivery và Attempt data/state ownership?
+- [ ] Atomic outbox handoff tới channel queues?
+- [ ] Channel/priority/provider queue isolation và reserved capacity?
+- [ ] Worker state/expiry/policy re-check trước external send?
+- [ ] Provider adapter, quota, timeout, idempotency và failover semantics?
+- [ ] Callback verification/dedup/out-of-order/reconciliation?
+- [ ] Retry classification/backoff/jitter/TTL/unknown outcome?
+- [ ] DLQ owner/runbook/safe replay/retention?
+- [ ] In-app inbox, cursor, read/unread/watermark/realtime hint?
+- [ ] User APIs với object AuthZ và bounded batches?
+- [ ] Admin/producer APIs với scopes, quotas, preview/audit và `202` semantics?
+- [ ] Event/channel job schemas, versions và PII minimization?
+- [ ] Cancellation/ordering boundaries?
+- [ ] Failure/degraded behavior theo component/channel/class?
+- [ ] Multi-region ownership/fencing/locality/provider routing?
+- [ ] IDs nối event → intent → delivery → attempt → callback?
+- [ ] Metrics/SLOs cho latency, queue age, duplicate, consent và cost?
+
+#### 34. Ý chính cần nhớ
+
+- Notification HLD là pipeline ingestion → decision → channel delivery → tracking.
+- Business producers phát intent/event, không biết provider implementation.
+- Broker decouple và buffer bounded bursts; không thay downstream capacity/backpressure.
+- Orchestrator quyết định, không trực tiếp gửi notification.
+- Preferences/consent có durable source, Redis cache và versioned invalidation.
+- Template phải versioned/pinned; retry không tự dùng latest content.
+- Intent, channel Delivery và provider Attempt là ba entities khác nhau.
+- Delivery + channel outbox cần atomic commit để không mất handoff.
+- Channel-specific queues/workers cô lập throughput, retry, quota, cost và failures.
+- Worker re-check cancellation, expiry và required consent trước provider call.
+- Provider adapter chuẩn hóa vendor API/error nhưng không xóa channel-specific semantics.
+- Delivery Tracker lưu attempt history và current-state projection, không chỉ boolean sent.
+- Provider callbacks phải verify, dedup và xử lý out-of-order.
+- At-least-once workflow cần idempotency/outbox/inbox/reconciliation để bounded duplicates.
+- DLQ là operational workflow có owner và safe replay, không phải thùng rác.
+- `202 Accepted` chỉ xác nhận durable acceptance, không phải provider/user delivery.
+- User/admin APIs cần object-level AuthZ, quotas, cursor và audit.
+- In-app Inbox là durable authority; WebSocket/SSE chỉ giúp realtime.
+- Failure isolation cần queues/pools/quotas/bulkheads thực sự—not chỉ microservice boxes.
+- Thiết kế tốt nối **event → decision evidence → delivery state → provider evidence → user-visible status**.
+
+#### Công thức ghi nhớ
+
+> **Notification HLD = durable ingress + policy-driven idempotent orchestration + versioned content + isolated channel queues/workers + provider-aware attempt tracking + secure APIs and callbacks.**
+
+---
+
+### Bài 81. Making Tech & Infra Decisions Strategically
+
+#### 1. Mục tiêu của Step 4
+
+Chỉ chọn công nghệ sau khi đã xác định:
+
+- event/delivery throughput và burst shape;
+- priority/channel isolation;
+- delivery/idempotency/ordering semantics;
+- provider quotas và failure behavior;
+- data authority, access patterns và retention;
+- latency, durability, RPO/RTO;
+- team capability, operational overhead và cost.
+
+Không có một stack duy nhất đúng. Kafka, SQS, Kubernetes, Lambda, PostgreSQL hay Redis chỉ có ý nghĩa khi giải quyết một requirement cụ thể.
+
+---
+
+#### 2. Technology map đại diện
+
+| Capability | Lựa chọn đại diện | Requirement được giải quyết | Cảnh báo |
+|---|---|---|---|
+| Durable event stream | Kafka/MSK hoặc managed equivalent | Throughput, partitions, retention/replay, nhiều consumers | Operations, partitioning, lag, ordering scope |
+| Work queue | Amazon SQS hoặc RabbitMQ-like queue | Managed task delivery, retry/visibility/DLQ | Semantics/ordering/replay khác event log |
+| Preference authority | PostgreSQL/distributed SQL/KV phù hợp | Constraints, updates, audit/version | Cache vẫn cần ở read-heavy scale |
+| Preference/cache | Redis | Low-latency lookups, caps/suppression acceleration | Không là sole source of truth |
+| Intent/delivery store | PostgreSQL/sharded SQL hoặc DynamoDB/Cassandra-like | Idempotent writes, status lookup, high throughput | Chọn theo transactions/query/partition model |
+| Attempt/status history | Append/event store + current-state projection | Audit, retries, callbacks, support | Retention/indexing/write amplification |
+| In-app inbox | DynamoDB/Cassandra/sharded relational | Range-by-recipient, pagination, retention | Bucket large inboxes, read watermark |
+| Templates | DB metadata/content hoặc S3 + metadata DB | Versioning, publishing, localization | S3 đơn độc không giải quyết workflow/query/approval |
+| Template engine | Handlebars/Liquid hoặc safe equivalent | Separation, personalization, localization | Sandbox, escaping, variable schema |
+| Cache | Redis/Memcached | Templates, policy, hot status/read paths | Stampede/staleness/invalidation |
+| Email provider | SendGrid/SES/Mailgun-like | Deliverability infrastructure | Reputation, bounce, quotas, lock-in |
+| SMS provider | Twilio/SNS/region-specific provider | Carrier integration/regulatory routing | Cost, country coverage, DND/sender rules |
+| Push provider | FCM + APNs | Mobile platform delivery | Acceptance ≠ display/read; token churn |
+| Compute | Kubernetes/ECS/managed containers | Long-running APIs/workers, control/isolation | Cluster/operations and downstream capacity |
+| Event compute | AWS Lambda/serverless | Burst/event-driven tasks, low ops | Concurrency, duration, cold starts, cost, quotas |
+| Metrics/dashboard | Prometheus + Grafana hoặc managed service | SLOs, health, queue/provider signals | Cardinality/retention |
+| Logs/traces | CloudWatch/OpenTelemetry + backend | Debug/audit/correlation | PII, cost, sampling |
+
+Product names chỉ là ví dụ; cloud/provider alternatives có thể đáp ứng cùng architectural contract.
+
+---
+
+#### 3. Kafka khi nào phù hợp?
+
+Kafka phù hợp cho retained domain-event streams khi:
+
+- throughput lớn và ổn định;
+- nhiều consumers độc lập: orchestration, analytics, audit, fraud…;
+- cần replay/rebuild;
+- ordering theo partition key;
+- muốn control partition/retention/consumer offsets;
+- platform team đủ năng lực vận hành hoặc dùng managed Kafka.
+
+Design decisions:
+
+- topic theo domain/lifecycle, không nhất thiết topic cho từng notification type;
+- partition key giữ ordering cần thiết nhưng tránh hot tenant/campaign;
+- replication/min-ISR/acks theo durability contract;
+- bounded payload, schema registry và compatibility policy;
+- retention đủ replay horizon;
+- DLQ/retry topics không thay business state machine;
+- lag/oldest-event/partition-skew monitoring.
+
+Kafka có at-least-once redelivery trong nhiều practical workflows. Nó không tạo exactly-once provider delivery; consumer idempotency và Delivery Store vẫn cần.
+
+---
+
+#### 4. Amazon SQS khi nào phù hợp?
+
+SQS phù hợp cho managed work queues khi:
+
+- muốn giảm broker operations;
+- work được dispatch tới competing consumers;
+- retry/visibility timeout/DLQ là nhu cầu chính;
+- throughput và API limits phù hợp;
+- không cần retained event history cho nhiều consumers theo cách Kafka cung cấp.
+
+Standard queue:
+
+- high throughput;
+- at-least-once và có thể duplicate/out-of-order;
+- consumer phải idempotent.
+
+FIFO queue:
+
+- ordering/dedup trong scope/message group;
+- throughput/partition considerations;
+- không nên dùng global message group làm bottleneck.
+
+Cần cấu hình:
+
+- visibility timeout > bounded processing time hoặc heartbeat/extension;
+- long polling/batch send-receive-delete;
+- redrive policy/DLQ;
+- maximum receive count;
+- message retention;
+- queue age/depth alerts;
+- IAM/KMS/VPC endpoint phù hợp.
+
+SQS “managed” không loại bỏ idempotency, poison-message handling, backlog drain hoặc provider quota control.
+
+---
+
+#### 5. Event log và work queue có thể cùng tồn tại
+
+Một mapping hợp lý:
+
+```text
+Kafka/event log
+  ├─ OrderShipped/Auth events
+  ├─ NotificationIntent/Status events
+  ├─ analytics/audit projections
+  └─ replay/rebuild
+
+SQS/RabbitMQ-like work queues
+  ├─ email-delivery-critical
+  ├─ email-delivery-bulk
+  ├─ sms-delivery
+  ├─ push-delivery
+  ├─ scheduled-retry
+  └─ template/media/report jobs
+```
+
+Có thể dùng một managed primitive cho nhiều vai trò nếu semantics đáp ứng; không thêm cả Kafka lẫn SQS chỉ để “đủ công nghệ”. Mỗi extra system tăng incident surface, data movement và on-call burden.
+
+---
+
+#### 6. Broker choice matrix
+
+| Dimension | Kafka/event log | SQS/work queue |
+|---|---|---|
+| Operation | Self/managed cluster complexity | Fully managed, ít broker operations |
+| Consumption | Mỗi consumer group đọc stream riêng | Competing consumers xử lý work |
+| Replay | Mạnh, offsets + retention | Hạn chế hơn sau delete/retention |
+| Ordering | Theo partition | Standard không bảo đảm; FIFO theo group |
+| Backpressure signal | Consumer lag/oldest offset age | Queue depth/oldest message age |
+| Scaling | Partitions + consumers | Consumers/API quota |
+| Best fit | Domain events, multi-consumer projections | Channel jobs, retries, delayed work |
+| Main risk | Bad partitions/ops/lag | Duplicate/visibility/DLQ misuse, limited event history |
+
+Chọn theo semantics trước, operational preference sau.
+
+---
+
+#### 7. Template engine: Handlebars/Liquid
+
+Template engine tách presentation khỏi application logic:
+
+```text
+template(version, channel, locale)
++ validated variables
+→ rendered subject/body/payload
+```
+
+Yêu cầu:
+
+- deterministic, sandboxed execution;
+- không chạy arbitrary code/network/file access;
+- strict variable schema và missing-variable behavior;
+- HTML/header/URL escaping theo context;
+- output-size limits;
+- compile/render timeout;
+- locale fallback;
+- preview/snapshot/golden tests;
+- immutable published version và rollback;
+- audit ai publish gì.
+
+Handlebars/Liquid là ví dụ. Chọn engine còn phụ thuộc language/runtime, security model, tooling cho content team và channel-specific output.
+
+---
+
+#### 8. Template storage: S3 hay database?
+
+Transcript đề xuất S3 vì dễ version độc lập. Production thường cần tách blob/content khỏi metadata workflow.
+
+##### Database-only
+
+Phù hợp khi templates nhỏ và cần:
+
+- query theo ID/channel/locale/status;
+- transactional draft→publish;
+- uniqueness/approval metadata;
+- audit/version relationships.
+
+##### S3/object storage + metadata DB
+
+Phù hợp khi:
+
+- content/artifacts lớn hoặc nhiều assets;
+- immutable versioned objects;
+- lifecycle/replication/distribution;
+- metadata DB giữ template ID, locale, schema, status, checksum và object key.
+
+```text
+Template Metadata Store
+  template_id/version/channel/locale/status/checksum/object_key
+                │
+                ▼
+       Object Storage immutable content
+```
+
+Publish flow phải atomic về logical version: chỉ expose version sau khi object/checksum/validation sẵn sàng. Workers pin version và cache compiled template. Không đọc “latest file” mỗi retry.
+
+---
+
+#### 9. Preference Store: PostgreSQL + Redis
+
+PostgreSQL phù hợp khi preferences cần:
+
+- user/type/channel rows/documents;
+- constraints và versioned updates;
+- consent/audit history;
+- transaction với endpoint/default state nơi phù hợp;
+- operational familiarity.
+
+Ví dụ:
+
+```text
+notification_preferences(
+  user_id,
+  notification_type,
+  channels,
+  quiet_hours,
+  locale,
+  consent_state,
+  version,
+  updated_at,
+  PRIMARY KEY(user_id, notification_type)
+)
+```
+
+Scale hướng:
+
+- indexes theo actual APIs;
+- read replicas chỉ khi staleness contract cho phép;
+- partition/shard theo user/tenant khi cần;
+- Redis cache compact versioned preference documents;
+- outbox/change events cho invalidation;
+- cache miss batching và stampede protection;
+- consent-sensitive re-check/fail-closed policy.
+
+Redis tăng tốc nhưng không được trở thành nguồn duy nhất của consent/preferences.
+
+---
+
+#### 10. Intent và Delivery Store
+
+Access patterns:
+
+- conditional create theo idempotency key;
+- get current state theo notification/delivery ID;
+- list channel deliveries của intent;
+- update versioned state;
+- scan due retries/schedules qua index/buckets;
+- support/report query với bounded filters;
+- append/retrieve attempts.
+
+PostgreSQL/sharded SQL phù hợp khi transactions/outbox/constraints quan trọng và throughput trong khả năng scale. DynamoDB/Cassandra-like store phù hợp khi key-based throughput/partition scale lớn và workflow được model theo conditional writes.
+
+Không dùng status table như analytics warehouse. Một pattern:
+
+```text
+Operational current state
++ append-only attempts/status events
+→ async analytics/audit projection/data lake
+```
+
+Partition keys phải tránh một campaign/provider/tenant thành hot partition. TTL/tiering chỉ áp khi retention/audit/replay contract cho phép.
+
+---
+
+#### 11. In-app Inbox Store
+
+Access pattern:
+
+```text
+write item by recipient
+read recent items by recipient + cursor
+mark one/batch/read-before watermark
+read/derive unread count
+expire/archive old items
+```
+
+Options:
+
+- DynamoDB/Cassandra: partition/bucket theo recipient và range theo time/sequence;
+- sharded PostgreSQL: transactions/richer queries ở scale phù hợp;
+- Redis: cache recent page/count, không nên là sole durable inbox.
+
+Model cần:
+
+- stable tie-breaker/cursor;
+- bucket large users;
+- conditional idempotent insert;
+- read watermark/version;
+- multi-device semantics;
+- retention/archival;
+- authorization và tenant isolation.
+
+---
+
+#### 12. Redis usage boundaries
+
+Redis phù hợp cho:
+
+- preference/template/policy cache;
+- compiled templates;
+- endpoint/status hot cache;
+- rate limits/frequency caps;
+- short dedup windows;
+- in-app first page/unread count cache;
+- provider health/routing cache.
+
+Không nên mặc định dùng Redis làm:
+
+- sole consent source;
+- permanent idempotency record khi replay horizon dài;
+- authoritative delivery history;
+- only in-app inbox;
+- distributed lock giữ suốt external provider call.
+
+Thiết kế cluster/sharding, eviction, max-memory policy, TTL jitter, hot keys, failover, cache-warm/origin protection và key cardinality. Redis outage phải có degraded behavior theo notification class.
+
+---
+
+#### 13. Email providers
+
+SendGrid, Amazon SES, Mailgun hoặc provider tương đương cung cấp:
+
+- SMTP/API delivery infrastructure;
+- sender/domain authentication;
+- bounce/complaint events;
+- quotas/reputation tooling;
+- templates/analytics tùy provider.
+
+Decision criteria:
+
+- regions/data residency;
+- throughput/ramp-up limits;
+- deliverability/reputation controls;
+- webhook quality/idempotency;
+- dedicated IP/domain support;
+- template ownership strategy;
+- unit cost/support/SLA;
+- failover portability.
+
+Transactional và marketing traffic nên được cô lập sender pools/domain/config nếu reputation/compliance yêu cầu. SPF/DKIM/DMARC và unsubscribe/complaint processing là phần của production delivery, không chỉ gọi API.
+
+---
+
+#### 14. SMS providers
+
+Twilio, Amazon SNS hoặc regional provider được chọn theo:
+
+- country/carrier coverage;
+- sender ID/short code/long code rules;
+- OTP/transactional/marketing support;
+- consent/DND/STOP workflow;
+- delivery receipt quality;
+- throughput và per-number limits;
+- Unicode/segment pricing;
+- data locality/SLA/support;
+- fraud controls và cost caps.
+
+Multi-provider routing có thể tăng resilience/coverage nhưng thêm normalization, sender registration, ambiguous failover, cost và compliance complexity. Không automatic failover nếu provider A outcome unknown mà duplicate SMS nguy hiểm/đắt.
+
+---
+
+#### 15. Push delivery: FCM và APNs
+
+- FCM hỗ trợ Android và có thể làm integration layer cho một số platforms.
+- APNs là provider gốc cho Apple devices.
+
+System cần:
+
+- platform-specific credentials/rotation;
+- device-token lifecycle;
+- TTL/priority/collapse semantics;
+- batch/multicast strategy;
+- invalid/unregistered token cleanup;
+- payload-size/sensitive-data controls;
+- provider quota/response normalization;
+- acceptance vs display/read status distinction.
+
+Push thường không có “delivered/read” evidence mạnh như in-app. Client events có thể bổ sung displayed/opened telemetry nhưng phải có consent/privacy và vẫn không tạo exactly-once guarantee.
+
+---
+
+#### 16. Kubernetes/ECS cho long-running services
+
+Container orchestration phù hợp với:
+
+- Event Ingestor/Command API/Orchestrator;
+- long-running channel workers;
+- persistent broker connections/consumer groups;
+- predictable high utilization;
+- custom networking/security/sidecars;
+- CPU/memory-specific render jobs;
+- gradual rollouts và detailed autoscaling controls.
+
+Kubernetes cho control lớn nhưng đòi hỏi:
+
+- cluster/node upgrades và autoscaling;
+- resource requests/limits;
+- probes/PDB/topology spread;
+- secret/config management;
+- ingress/network policies;
+- workload identity;
+- observability và on-call maturity.
+
+ECS/managed containers giảm một phần control-plane toil. Team capability và total cost quan trọng không kém feature list.
+
+---
+
+#### 17. AWS Lambda/serverless cho event-driven workloads
+
+Serverless phù hợp khi:
+
+- traffic bursty/low duty cycle;
+- task ngắn, stateless và retry-safe;
+- event source integration tốt;
+- muốn giảm server/cluster operations;
+- concurrency/cost model phù hợp.
+
+Risks/constraints:
+
+- cold start nếu latency-sensitive;
+- concurrency burst làm ngập Postgres/provider;
+- execution duration/payload/tmp limits;
+- connection pooling và database exhaustion;
+- event batch partial failure semantics;
+- observability/debug local complexity;
+- cost tăng ở sustained high throughput;
+- reserved concurrency/provider quota coordination.
+
+Lambda scaling nhanh không có nghĩa provider cho phép gửi nhanh. Đặt maximum/reserved concurrency từ downstream-safe capacity; dùng RDS Proxy/connection management khi cần.
+
+---
+
+#### 18. Hybrid compute strategy
+
+Không nhất thiết chọn toàn bộ Kubernetes hoặc toàn bộ serverless:
+
+```text
+Long-running high-throughput APIs/orchestrators
+  → managed containers/Kubernetes
+
+Bursty webhook transforms, scheduled cleanup, low-volume adapters
+  → serverless nếu phù hợp
+
+GPU/heavy rendering hoặc specialized processing
+  → dedicated worker pools
+```
+
+Chuẩn hóa contracts, deployment/security/observability đủ để tránh hai operating models trở thành hỗn loạn. Chỉ hybrid khi benefit cụ thể vượt complexity.
+
+---
+
+#### 19. Autoscaling strategy
+
+Transcript nhắc CPU và queue depth; notification workers nên ưu tiên work/user-facing signals:
+
+| Workload | Scale signals |
+|---|---|
+| Ingestor/API | RPS, concurrency, p95/p99 latency, saturation |
+| Orchestrator | consumer lag/oldest event, processing rate, dependency latency |
+| Channel workers | queue age/depth, delivery duration, provider quota/headroom |
+| Template renderer | render queue age, CPU, render p95/errors |
+| Callback workers | webhook queue age/rate |
+| Inbox API | read/write RPS, latency, store throttling |
+
+Safe replica bound:
+
+```text
+max useful workers
+≤ min(
+    provider quota / per-worker rate,
+    DB/broker safe concurrency,
+    network/account/sender limits,
+    budgeted cost
+  )
+```
+
+HPA scale-up theo queue age/depth nhưng:
+
+- cooldown/stabilization chống oscillation;
+- pre-scale known campaigns;
+- node capacity/startup readiness;
+- max replicas theo downstream quota;
+- scale-down không giết in-flight jobs unsafe;
+- separate critical/bulk policies.
+
+CPU thấp trong khi queue tăng có thể do provider throttling; thêm workers sẽ làm tình hình tệ hơn.
+
+---
+
+#### 20. Retry, rate limiting và provider resilience
+
+Mỗi provider route cần:
+
+- token-bucket/leaky-bucket quota;
+- bounded concurrency;
+- connection pooling;
+- connect/request deadlines;
+- normalized transient/permanent/unknown errors;
+- exponential backoff + jitter;
+- retry budget và notification TTL;
+- circuit breaker;
+- gradual recovery ramp;
+- provider health/routing policy;
+- idempotency key/reconciliation;
+- DLQ/alert/runbook.
+
+Retries không chạy trực tiếp trong tight loop của worker. Dùng retry queue/time bucket với scheduled next-attempt. Provider outage phải cô lập theo channel/provider/priority.
+
+---
+
+#### 21. Security architecture
+
+JWT-based authentication + RBAC trong transcript là baseline, chưa đủ.
+
+##### External/user/admin APIs
+
+- OAuth2/OIDC, JWT validation với issuer/audience/expiry/key rotation;
+- RBAC + ABAC/scopes + object/tenant authorization;
+- MFA/step-up và approval cho broadcast/replay/template publish;
+- WAF/rate limits/audit;
+- idempotency và audience/cost caps.
+
+##### Workloads
+
+- service/workload identity và least-privilege IAM;
+- mTLS/private networking theo threat model;
+- separate roles cho queue, DB, object, KMS và provider secrets;
+- secrets manager + rotation;
+- no long-lived credentials trong images/config maps.
+
+##### Data/callbacks
+
+- encryption at rest/in transit;
+- contact/token encryption hoặc tokenization;
+- PII minimization/redaction;
+- template input/output sanitization;
+- signed provider webhooks + timestamp/replay check;
+- immutable/protected audit;
+- retention/deletion/data residency.
+
+Admin quyền “send notification” có blast radius lớn, nên cần fine-grained scope, review/approval và kill switch.
+
+---
+
+#### 22. Observability architecture
+
+Prometheus + Grafana cung cấp metrics/dashboard; CloudWatch/ELK-like backend lưu logs; OpenTelemetry hỗ trợ traces và correlation.
+
+```text
+Metrics
+  rate/errors/duration/saturation
+  queue age/lag/retry/provider/receipt/cost
+
+Structured logs
+  event/notification/delivery/attempt/provider IDs
+  redacted decision/error evidence
+
+Distributed traces
+  ingestion → orchestration → channel → provider/callback
+```
+
+Controls:
+
+- không dùng user/notification ID làm metric labels;
+- trace sampling theo critical/error/tail cases;
+- critical audit riêng khỏi debug logs;
+- PII/OTP/token redaction;
+- retention/cardinality/cost budgets;
+- SLO alerts theo priority/channel/provider/region;
+- correlation/query tooling cho support;
+- provider acceptance ≠ delivered metrics.
+
+Monitoring backend lỗi không được block delivery; critical audit evidence cần bounded durable buffer/fail policy rõ.
+
+---
+
+#### 23. HA, backup và disaster recovery
+
+##### Multi-AZ
+
+- stateless services/workers trải nhiều AZ;
+- broker/DB/cache replicated theo failure domain;
+- health checks/load balancing;
+- provider/channel isolation;
+- no single scheduler/consumer ownership without lease/fencing.
+
+##### Backup/recovery
+
+- PostgreSQL PITR/backups + restore tests;
+- template/object versioning và replicated metadata;
+- Intent/Delivery/Preference authority RPO/RTO;
+- event-log/queue retention đủ replay window;
+- inbox retention/backup theo product contract;
+- cache rebuild procedures;
+- DLQ/export/audit recovery.
+
+##### Multi-region
+
+- global IDs/idempotency;
+- home-region/owner epoch cho delivery;
+- regional provider routes/data residency;
+- failover reconciliation tránh double send;
+- replicated preference/suppression trong compliance SLO;
+- DR exercises và runbooks.
+
+Do external side effect khó thu hồi, notification DR quan tâm duplicate send ngang data loss.
+
+---
+
+#### 24. Deployment và schema evolution
+
+- immutable artifacts/images và signed supply chain;
+- canary/blue-green rollout;
+- backward-compatible API/event schemas;
+- expand-migrate-contract database changes;
+- old/new consumers cùng xử lý safely;
+- template/version canary/approval/rollback;
+- provider adapter feature flags;
+- kill switch theo type/channel/provider/campaign;
+- config-as-code và audited changes;
+- DLQ/replay compatibility qua schema versions.
+
+Không deploy template/provider/schema breaking change ngay trước bulk campaign mà không test/canary/recovery plan.
+
+---
+
+#### 25. Cost model
+
+```text
+Total cost
+= broker requests/retention/replication
++ compute duration/idle capacity
++ DB read/write/storage/index/backup
++ Redis memory
++ provider attempts by channel/region
++ logs/traces/metrics
++ cross-region/network egress
++ operational staffing/toil
+```
+
+Trade-offs:
+
+- Kafka control/economics ở scale vs managed-queue simplicity;
+- Kubernetes sustained utilization vs Lambda per-invocation cost;
+- reserved/provisioned vs on-demand capacity;
+- provider volume discount vs lock-in/failover;
+- SMS fallback value vs unit cost;
+- retention/audit vs storage;
+- Redis hit ratio vs memory cost;
+- tracing depth vs observability cost.
+
+Theo dõi cost per intent, delivery attempt, provider acceptance và confirmed delivery khi observable. Retry/invalid endpoint/suppressed-after-render là wasted-work signals.
+
+---
+
+#### 26. Managed vs self-managed decision
+
+| Managed phù hợp khi | Self-managed/control-heavy phù hợp khi |
+|---|---|
+| Team muốn giảm broker/cluster toil | Cần tuning/topology/control rất đặc thù |
+| Time-to-market và HA primitives quan trọng | Scale/economics justify platform team |
+| Workload nằm trong service limits | Managed limits/residency/compliance không đáp ứng |
+| Provider tích hợp/IAM/backup tạo lợi ích | Cần portability/custom networking hoặc operational control |
+
+“Managed” vẫn cần schema/partition/quota/cost/security/backups/alerts/runbooks. “Self-managed” chỉ đáng chọn khi benefit đo được vượt staffing/incident burden.
+
+---
+
+#### 27. ADR minh họa — chọn SQS cho channel queues
+
+```text
+Context
+- delivery jobs là competing-consumer work
+- team nhỏ, muốn managed HA/DLQ/visibility timeout
+- không cần replay nhiều consumer groups cho channel job
+
+Decision
+- SQS Standard per channel + priority class
+- idempotent worker theo delivery_id
+- DLQ, long polling, batching, KMS/IAM
+
+Trade-offs
+- duplicate/out-of-order có thể xảy ra
+- delayed/replay semantics hạn chế hơn event log
+- cần queue inventory và observability tốt
+
+Rejected for now
+- self-managed Kafka cho mọi task: operational cost cao hơn benefit
+- one shared queue: không cô lập provider/priority
+
+Revisit triggers
+- multi-consumer replay requirement
+- queue/message quota hoặc cost không còn phù hợp
+- ordering scope thay đổi
+```
+
+Mỗi quyết định lớn nên lưu context, choice, consequences, alternatives, owner và evolution triggers.
+
+---
+
+#### 28. Những điểm hiệu chỉnh so với transcript
+
+| Transcript đơn giản hóa | Cách hiểu production-oriented |
+|---|---|
+| Kafka nếu volume cao, SQS nếu muốn managed | Còn phải chọn theo event-log vs work-queue semantics, ordering, replay, quotas và operations |
+| Kafka = control, SQS = simplicity | Managed Kafka tồn tại; SQS vẫn cần idempotency, visibility, DLQ và capacity design |
+| Handlebars/Liquid tách presentation | Phải sandbox, escape, validate schema, pin version và limit output/runtime |
+| Templates lưu S3 | S3 phù hợp immutable objects; metadata/query/publish/approval thường cần DB/control plane |
+| SendGrid/Twilio/FCM reliable delivery | Provider acceptance không bảo đảm user delivery; còn quota, callback, reputation, compliance |
+| Kubernetes hoặc Lambda | Chọn theo workload duration/concurrency/utilization/team/downstream limits; có thể hybrid |
+| HPA scale theo CPU/queue depth | Queue age, provider quota và DB safe concurrency quan trọng hơn; thêm workers có thể tăng throttling |
+| PostgreSQL cho preferences | Hợp lý nhưng cần version/cache/invalidation/sharding/consent-safe reads theo scale |
+| JWT + RBAC bảo vệ API | Cần object/tenant AuthZ, service identity, IAM, secrets, callback signatures, audit và PII controls |
+| Prometheus/Grafana/CloudWatch đủ observability | Cần metrics + logs + traces, cardinality/retention/redaction và business SLOs |
+| Microservices/cloud services tạo HA | HA cần multi-AZ stores, ownership/fencing, backup/restore, failover và drills |
+
+---
+
+#### 29. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Tôi chọn Kafka cho retained domain events/replay và SQS-like queues cho channel work nếu cần managed task semantics.
+2. Preference authority dùng PostgreSQL với Redis versioned cache; Redis không giữ sole consent truth.
+3. Intent/Delivery store chọn SQL hoặc distributed KV theo transaction/query/throughput; attempt history tách current projection.
+4. Templates có metadata/version/approval store, optional immutable S3 content và sandboxed Handlebars/Liquid rendering.
+5. Email/SMS/push đi qua provider adapters như SendGrid/SES, Twilio và FCM/APNs, với quotas/callbacks/reconciliation.
+6. Long-running APIs/workers chạy containers/Kubernetes/ECS; bursty bounded jobs có thể dùng Lambda với concurrency cap.
+7. Autoscale theo queue age/lag và user latency nhưng giới hạn bởi provider/DB safe capacity.
+8. Redis cache policy/templates/hot reads, có TTL/invalidation/stampede/failure controls.
+9. OAuth/JWT + domain AuthZ, workload IAM, secrets, encryption, signed callbacks và PII redaction bảo vệ platform.
+10. Prometheus/Grafana, structured logs và OpenTelemetry traces đo end-to-end SLO, retries, receipts, duplicates và cost.
+
+---
+
+#### 30. Checklist Step 4
+
+- [ ] Event log hay work queue, tại sao?
+- [ ] Kafka/SQS partition/order/replay/retention/visibility/DLQ settings?
+- [ ] Topic/queue separation theo channel/priority/provider?
+- [ ] Schema registry/versioning và message-size/PII controls?
+- [ ] Preference authority, constraints, cache/version/invalidation/fail policy?
+- [ ] Intent/Delivery/Attempt store queries, transactions, partitions và retention?
+- [ ] In-app inbox/cursor/read-watermark/storage model?
+- [ ] Template engine sandbox/escaping/schema/version/publish/rollback?
+- [ ] S3 vs metadata DB responsibilities?
+- [ ] Provider selection theo region/quota/SLA/callback/reputation/cost?
+- [ ] Multi-provider unknown-outcome/failover semantics?
+- [ ] Kubernetes/ECS vs Lambda dựa trên workload/team/cost?
+- [ ] Autoscaling theo queue age/provider quota/downstream capacity?
+- [ ] Bounded concurrency, rate limit, retry budget, circuit breaker?
+- [ ] Multi-AZ/backup/PITR/restore/cache rebuild?
+- [ ] Multi-region ownership/fencing/reconciliation/data locality?
+- [ ] JWT/OAuth + object/tenant AuthZ + workload IAM/secrets?
+- [ ] Signed callbacks, encryption, PII redaction và audit?
+- [ ] Metrics/logs/traces/cardinality/retention/SLO alerts?
+- [ ] Cost per channel/attempt/delivery và operational staffing?
+- [ ] ADRs ghi alternatives, trade-offs và revisit triggers?
+
+#### 31. Ý chính cần nhớ
+
+- Chọn technology theo semantics, failure model và operations—not popularity.
+- Kafka mạnh ở retained streams/replay/multi-consumer; SQS mạnh ở managed work delivery.
+- Có thể dùng event log và channel work queues cùng nhau, nhưng chỉ khi mỗi cái có vai trò rõ.
+- Broker vẫn cần idempotency, schema, lag, backlog và poison-message design.
+- Handlebars/Liquid phải sandbox, escape, validate variables và pin template version.
+- S3 phù hợp immutable template artifacts; metadata/workflow thường cần database/control plane.
+- PostgreSQL + Redis là pattern tốt cho preferences nếu authority/cache/consent staleness rõ.
+- Intent/Delivery/Attempt stores được chọn theo access pattern, không gom tất cả vào một table/cache.
+- Providers cung cấp delivery infrastructure nhưng không loại bỏ quota, outage, callback, compliance và reputation.
+- Kubernetes phù hợp control/long-running workloads; Lambda phù hợp bounded bursty jobs nhưng phải cap concurrency.
+- Autoscaling không được vượt provider quota hoặc làm cạn database connections.
+- Redis tăng tốc nhưng không là canonical consent/delivery/inbox authority mặc định.
+- JWT/RBAC chỉ là một phần; service AuthZ, IAM, secrets, callback verification và PII controls vẫn bắt buộc.
+- Observability gồm metrics, logs, traces và business evidence từ event tới receipt.
+- Notification DR phải chống cả data loss lẫn duplicate external send.
+- Managed service giảm toil nhưng không bỏ workload design và incident ownership.
+- Mỗi choice cần context, consequences, cost và evolution trigger trong ADR.
+
+#### Công thức ghi nhớ
+
+> **Notification tech strategy = broker semantics + query-shaped durable stores + safe versioned rendering + quota-aware provider adapters + workload-fit compute + security/observability/DR by design.**
+
+---
+
+### Bài 82. The Final Design — Notification System
+
+#### 1. Bài toán cuối cùng
+
+Notification Platform phải biến business events/direct commands thành các deliveries:
+
+- đúng recipient và notification type;
+- đúng channel, priority, locale và thời điểm;
+- tôn trọng preference, consent, quiet hours và suppression;
+- chịu được traffic burst và broadcast lớn;
+- cô lập provider/channel failures;
+- retry an toàn, hạn chế duplicate;
+- theo dõi được từ event tới provider receipt/read trong giới hạn quan sát;
+- scale tới hàng trăm triệu channel deliveries/ngày.
+
+Final design được xây quanh một durable asynchronous workflow:
+
+```text
+Business fact/command
+  → durable acceptance
+  → policy-driven intent planning
+  → isolated per-channel execution
+  → provider-aware outcome tracking
+  → retry/reconciliation/audit
+```
+
+---
+
+#### 2. Kiến trúc hoàn chỉnh
+
+```text
+ Business Services                      Admin/Campaign Tools
+  Order · Auth · Chat · Payment             │
+       │ domain events/outbox                │ command/schedule
+       ▼                                     ▼
+ Event Ingestor                         API Gateway/Command API
+       └────────────────┬────────────────────┘
+                        ▼
+               Durable Event Log/Queue
+                        │
+                        ▼
+              Notification Orchestrator
+               ├─ Recipient Resolver
+               ├─ Preference/Policy Service ── DB + Redis cache
+               ├─ Template Service ─────────── Metadata DB + cache/S3
+               └─ Intent/Delivery Store + transactional outbox
+                        │
+             ┌──────────┼───────────┬────────────┐
+             ▼          ▼           ▼            ▼
+        Email Queues  SMS Queues  Push Queues  In-app Queues
+             │          │           │            │
+        Email Worker SMS Worker Push Worker   Inbox Worker
+             │          │           │            │
+        Provider     Provider     APNs/FCM    Inbox Store
+             │          │           │            │
+             └──────────┴─────┬─────┘       WebSocket/SSE hint
+                              ▼
+                     Callback Ingestor
+                              │
+                              ▼
+                  Delivery/Attempt Tracker
+                   ├─ Current status projection
+                   ├─ Retry scheduler/time buckets
+                   ├─ DLQ + replay/reconciliation
+                   └─ Reports/audit/analytics events
+
+ User Client
+   └─ Inbox/Read/Preference APIs through API Gateway
+
+ Cross-cutting: IAM/AuthZ · encryption · quotas · metrics/logs/traces
+                multi-AZ · backups/DR · config/schema/version control
+```
+
+Mỗi stage có durable handoff hoặc explicit synchronous boundary; không dựa vào fire-and-forget calls.
+
+---
+
+#### 3. Source of truth và derived state
+
+| Data | Source of truth | Derived/cache |
+|---|---|---|
+| Business event | Upstream domain store/event log | Notification ingestion copy |
+| Notification intent/current workflow | Intent/Delivery Store | Reporting/search projection |
+| User preferences/consent | Preference Store | Redis/read cache |
+| Template metadata/version | Template Metadata Store | Compiled-template cache |
+| Template artifact | DB content hoặc immutable object storage | Worker/local cache |
+| Contact/device endpoints | Endpoint Store | Endpoint cache |
+| Provider attempts | Attempt/Status history | Current-state projection |
+| In-app notification/read state | Inbox Store | First-page/unread cache |
+| Queue message | Work waiting for execution | Không phải canonical business record |
+| DLQ item | Failed/unresolved work evidence | Không phải long-term archive |
+
+Redis, broker và provider dashboard không thay authoritative stores hoặc audit trail.
+
+---
+
+#### 4. Luồng business event end-to-end
+
+Ví dụ `OrderShipped`:
+
+```text
+1. Order Service commit shipment + transactional outbox.
+2. Event được publish với stable event_id và schema/version.
+3. Event Ingestor authenticate/validate/quota rồi ghi durable broker.
+4. Orchestrator consume idempotently và map sang ORDER_SHIPPED intent.
+5. Resolve user; evaluate preference/consent/quiet-hours/suppression.
+6. Pin template/policy/locale và chọn email + push + in-app.
+7. Atomic commit Intent + Deliveries + channel outbox.
+8. Outbox publisher đưa jobs vào isolated channel queues.
+9. Workers xử lý độc lập, re-check state/expiry/policy rồi gọi providers.
+10. Mỗi attempt được ghi với normalized outcome/provider ID.
+11. Provider callbacks được verify/dedup và update state theo version.
+12. Reporting/analytics nhận events bất đồng bộ.
+```
+
+Order Service hoàn tất nghiệp vụ mà không chờ email/push provider. Notification lag hoặc provider outage không rollback shipment.
+
+---
+
+#### 5. Luồng direct/admin notification
+
+```text
+Admin/Internal System
+  → API Gateway: AuthN, scope, quota, audit
+  → Command API: schema/template/audience/schedule validation
+  → durable command/intent
+  ← 202 Accepted + tracking ID
+  → async fan-out/policy/channel pipeline
+```
+
+System-wide campaign cần:
+
+- audience snapshot/version;
+- preview/dry run và cost estimate;
+- approval/segregation of duties;
+- priority, pacing, schedule và completion window;
+- pause/cancel/kill switch;
+- per-tenant/provider quotas;
+- preference/consent re-check trước send;
+- reserved capacity cho critical traffic.
+
+Admin API không bypass orchestration hoặc ghi raw message trực tiếp vào provider queue.
+
+---
+
+#### 6. Orchestration decision
+
+Orchestrator quyết định:
+
+```text
+Should send?
+  → Who?
+  → What notification type/category/priority?
+  → Which channels/endpoints?
+  → Which template/version/locale/data?
+  → Send now, delay, digest, collapse or suppress?
+  → Expiry, retry and fallback policy?
+```
+
+Decision evidence cần lưu:
+
+- notification/business/event IDs;
+- recipient/audience version;
+- preference/consent/policy version và decision reason;
+- template/version/locale;
+- selected/suppressed channels;
+- priority, schedule, TTL, dedup/frequency-cap result;
+- actor/tenant/correlation ID.
+
+Nhờ vậy support/audit có thể giải thích vì sao notification được gửi hoặc không gửi.
+
+---
+
+#### 7. Preference và compliance flow
+
+```text
+User updates preference
+  → Preference API/AuthZ
+  → authoritative DB commit + version + audit/outbox
+  → invalidation/change event
+  → Redis cache refresh/eviction
+```
+
+Khi tạo delivery:
+
+- check category/type/channel;
+- consent/unsubscribe/DND/suppression;
+- quiet hours/timezone;
+- organization/tenant/legal policy;
+- endpoint verified/active;
+- frequency cap/digest;
+- mandatory/critical override chỉ theo explicit policy.
+
+Với mutable consent, optional/marketing workers re-check ngay trước external send. Preference service/cache không xác định thì fail closed/delay cho marketing, không tự mặc định “allowed”.
+
+---
+
+#### 8. Template/rendering flow
+
+```text
+Template draft
+  → schema/safety/locale validation
+  → preview/test/approval
+  → immutable published version
+  → metadata + content/checksum
+  → compiled cache
+```
+
+Delivery pin:
+
+- `template_id`, `template_version`, channel, locale;
+- typed variable schema;
+- variable snapshot hoặc versioned reference;
+- optional rendered-content snapshot theo audit/retry contract.
+
+Worker render bằng sandboxed Handlebars/Liquid-like engine với context-aware escaping, size/time limits và fallback locale. Retry không tự dùng template mới nhất.
+
+---
+
+#### 9. Channel queue isolation
+
+```text
+email-critical / email-transactional / email-bulk
+sms-critical   / sms-normal
+push-high      / push-normal / push-bulk
+in-app-high    / in-app-normal
+```
+
+Tách queues hoặc enforce weighted fairness/reserved capacity giúp:
+
+- email campaign không làm chậm OTP;
+- SMS provider outage không block push/in-app;
+- retry backlog của một provider không chiếm mọi worker;
+- scale và quota theo channel/provider;
+- áp TTL/error policy riêng.
+
+Queue có at-least-once semantics nên message chứa stable `delivery_id`; worker dùng conditional/versioned claim/update. Queue depth phải đi cùng oldest-message age và delivery SLO.
+
+---
+
+#### 10. Worker delivery protocol
+
+```text
+1. Consumer nhận delivery job.
+2. Load Delivery current state/version.
+3. No-op nếu completed/cancelled/suppressed/expired.
+4. Re-check required consent, endpoint và policy.
+5. Load/render pinned template safely.
+6. Acquire provider quota + concurrency permit.
+7. Persist attempt-start/idempotency context theo design.
+8. Call provider với deadline và provider idempotency key nếu có.
+9. Persist normalized outcome/provider_message_id.
+10. Ack queue, schedule retry, reconcile unknown hoặc terminalize.
+```
+
+Nếu worker crash sau provider accepted nhưng trước local commit, outcome là ambiguous. Không thể giải bằng retry mù; dùng provider idempotency/status query/webhook/reconciliation và tolerate bounded duplicate theo business contract.
+
+---
+
+#### 11. Channel-specific execution
+
+##### Email
+
+- sender/domain/pool/reputation;
+- HTML/text render, links/unsubscribe;
+- SendGrid/SES-like provider;
+- bounce/complaint/suppression;
+- transactional vs marketing isolation.
+
+##### SMS
+
+- E.164/verified endpoint/consent/DND;
+- sender/country/carrier routing;
+- Unicode segment count, strict cost/quota;
+- Twilio/SNS/regional provider;
+- STOP/unsubscribe và delivery receipts.
+
+##### Push
+
+- APNs/FCM adapter;
+- device-token fan-out/lifecycle;
+- TTL/priority/collapse key;
+- invalid-token cleanup;
+- acceptance không đồng nghĩa displayed/read.
+
+##### In-app
+
+- idempotent InboxItem insert;
+- cursor pagination và retention;
+- unread/read watermark;
+- optional WebSocket/SSE hint;
+- durable inbox bảo đảm user xem lại khi offline.
+
+Mỗi channel độc lập về worker pool, quota, retry, cost và observability nhưng dùng cùng intent/status identity.
+
+---
+
+#### 12. Provider callback và reconciliation
+
+```text
+External Provider
+  → Callback API
+  → verify signature/timestamp/source + rate/size limits
+  → durable callback queue
+  → dedup provider_event_id
+  → lookup provider_message_id → delivery_id
+  → versioned/monotonic state update
+  → suppression/endpoint cleanup if bounce/complaint/invalid
+```
+
+Callback có thể duplicate, out-of-order hoặc không đến. Reconciliation jobs xử lý:
+
+- provider accepted nhưng local state unknown;
+- missing terminal receipt;
+- mismatched provider/local states;
+- callbacks chưa map được;
+- DLQ/replay outcomes;
+- invalid endpoint/suppression propagation.
+
+Không gọi `DELIVERED` nếu evidence chỉ là `PROVIDER_ACCEPTED`.
+
+---
+
+#### 13. Delivery state machine
+
+```text
+CREATED
+  ├─ SUPPRESSED
+  ├─ SCHEDULED
+  └─ QUEUED
+       → SENDING
+          ├─ PROVIDER_ACCEPTED
+          │    ├─ DELIVERED   if trustworthy receipt exists
+          │    ├─ BOUNCED/FAILED
+          │    └─ outcome remains accepted/unknown
+          ├─ RETRY_SCHEDULED
+          ├─ FAILED_PERMANENT
+          ├─ DEAD_LETTERED
+          └─ UNKNOWN/RECONCILING
+
+Any pre-send state
+  → CANCELLED or EXPIRED under versioned rules
+
+In-app
+  AVAILABLE → SEEN/READ → ARCHIVED
+```
+
+State update phải conditional/versioned; callback cũ không ghi đè terminal state mới. Attempt history append-only giúp audit trong khi current-state projection phục vụ query nhanh.
+
+---
+
+#### 14. Delivery guarantees thực tế
+
+Hệ thống có thể cam kết:
+
+- accepted intent được lưu durable;
+- internal jobs được xử lý/retry theo at-least-once;
+- logical deliveries được deduplicate/idempotent trong defined horizon;
+- attempts/status không mất âm thầm theo RPO;
+- terminal/unknown outcomes được track và reconcile;
+- critical traffic có reserved capacity/fallback policy.
+
+Hệ thống không thể cam kết tuyệt đối:
+
+- email vào inbox thay vì spam;
+- carrier/device luôn nhận SMS/push;
+- app còn cài hoặc notification permission bật;
+- provider không tạo duplicate ngoài contract;
+- user đã nhìn/đọc external message.
+
+Mục tiêu:
+
+> Durable at-least-once internal processing + effectively-once logical delivery khi có thể + honest provider/user evidence boundaries.
+
+---
+
+#### 15. Idempotency và atomic handoffs
+
+```text
+intent key
+= producer + business_event_id + type + recipient
+
+delivery key
+= notification_id + recipient + channel [+ endpoint/collapse scope]
+
+attempt/callback key
+= delivery_id + provider + provider request/event ID
+```
+
+Patterns:
+
+- upstream transactional outbox;
+- ingestor/orchestrator inbox/dedup;
+- Intent/Deliveries + channel outbox atomic commit;
+- channel consumer conditional state transition;
+- provider idempotency key/status lookup nếu hỗ trợ;
+- callback dedup/version;
+- retry horizon phù hợp dedup retention;
+- replay/reconciliation tools.
+
+Exactly-once transaction không thể bao trùm database, broker, provider và user device. Thiết kế dựa trên durable state machine cùng idempotent effects.
+
+---
+
+#### 16. Retry, expiry và DLQ
+
+| Outcome | Hành vi |
+|---|---|
+| Transient network/5xx/throttle | Backoff + jitter + provider quota awareness |
+| Permanent invalid address/token/content | Terminalize + endpoint/suppression update |
+| Unknown timeout | Reconcile/idempotent retry, tránh blind failover |
+| Expired OTP/stale notification | `EXPIRED`, không tiếp tục gửi |
+| Cancelled campaign/delivery | Worker state re-check → no-op |
+| Exhausted/poison | DLQ + alert/owner/triage |
+
+DLQ replay:
+
+- chỉ sau khi hiểu/fix nguyên nhân;
+- enforce current consent, cancellation và TTL;
+- dùng idempotency;
+- pace theo provider/downstream capacity;
+- audit actor/reason;
+- có terminal disposition.
+
+DLQ không bảo đảm reliability nếu không ai theo dõi và xử lý nó.
+
+---
+
+#### 17. User-facing flow
+
+```text
+Client
+  → GET /v1/me/notifications?cursor=...
+  → Inbox API/AuthZ
+  → Inbox Store/cache
+  ← items + next_cursor + unread_count
+
+Client
+  → batch mark-read or read watermark
+  → idempotent conditional update
+  → unread projection/cache invalidation
+```
+
+WebSocket/SSE có thể báo có item mới, nhưng client reconnect/poll/resync từ durable inbox. User chỉ truy cập own notifications/preferences; batch size và filters bị giới hạn theo indexed query contracts.
+
+Preference update trả version/effective policy và phát invalidation event để pending work re-check theo contract.
+
+---
+
+#### 18. Scaling model
+
+Từ bài 79:
+
+```text
+10M DAU × 5 events/day = 50M events/day
+× approximately 2 channels = 100M deliveries/day
+≈ 1,157 deliveries/s average
+3× baseline peak ≈ 3,472 deliveries/s
+```
+
+Nhưng broadcast 10M users × 2 channels trong 10 phút cần khoảng 33k deliveries/s trước devices/retries.
+
+Scaling:
+
+- Ingestor/API theo RPS/concurrency/latency;
+- Orchestrator theo event lag/oldest age;
+- channel workers theo queue age, service rate và provider headroom;
+- recipient fan-out theo partitioned batches/checkpoints;
+- database/cache/broker theo hot partitions và write/read capacity;
+- callback workers theo receipt burst;
+- pre-scale/pacing known campaigns;
+- cap workers theo provider/DB safe concurrency;
+- isolate tenants, priorities và providers.
+
+Load balancer phân phối HTTP requests tới APIs. Queue/consumer group mới thường phân phối channel jobs giữa worker instances; không cần đặt load balancer trước competing consumers.
+
+---
+
+#### 19. Data/storage design
+
+| Store | Representative implementation | Access pattern |
+|---|---|---|
+| Preference Store | PostgreSQL/distributed store | point read/update by user/type, audit/version |
+| Preference cache | Redis | high-volume read acceleration |
+| Intent/Delivery Store | PostgreSQL/sharded SQL or distributed KV | idempotent create, state/version query/update |
+| Attempt History | Append records/events + projection | write-heavy audit/reconciliation |
+| Template Metadata | PostgreSQL-like DB | version/locale/channel/status queries |
+| Template Content | DB or immutable S3 objects | versioned load/cache |
+| Endpoint Store | SQL/KV | user-channel-device lookup/lifecycle |
+| Inbox Store | DynamoDB/Cassandra/sharded SQL | recipient range query + cursor/write/read |
+| Event/work infrastructure | Kafka/SQS-like queues | retained events/channel tasks/retries |
+| Analytics/audit archive | Stream sink/object/data warehouse | aggregates, reports, cold retention |
+
+Mỗi schema được tạo từ access patterns. Reporting không scan live delivery store; Redis không giữ sole consent/inbox/delivery truth.
+
+---
+
+#### 20. Infrastructure và autoscaling
+
+- Kubernetes/ECS/managed containers cho long-running APIs, orchestrators và high-throughput workers.
+- Lambda/serverless cho bounded bursty jobs/webhook transforms khi duration/concurrency/cost phù hợp.
+- HPA/custom autoscaling theo queue age/lag, RPS, p95 latency và provider headroom.
+- Reserved/max concurrency ngăn serverless hoặc workers làm ngập DB/provider.
+- Multi-AZ topology, health checks, resource limits, graceful shutdown/lease handling.
+- Canary/blue-green, backward-compatible APIs/events/schema, feature flags/kill switches.
+- Workload identity, secrets manager, private networking và least-privilege IAM.
+
+Thêm replicas không giải quyết provider quota, hot partition, database connection exhaustion hoặc malformed template.
+
+---
+
+#### 21. Failure isolation và degraded modes
+
+| Failure | Final behavior |
+|---|---|
+| Event burst | Durable queue, backpressure/quotas, controlled drain |
+| Orchestrator crash/redelivery | Inbox/dedup + idempotent Intent creation |
+| Preference cache miss/outage | Authority/bounded fallback; optional traffic delay/fail closed |
+| Preference Store outage | Delay optional; explicit safe policy for critical |
+| Template rollout/render failure | Pinned last-good version/fallback or delay; kill switch |
+| Email provider outage | Email circuit opens/queues; SMS/push/in-app continue |
+| SMS quota exhausted | Preserve critical pool, pace, approved alternate route |
+| Push invalid token wave | Terminalize/cleanup without retry storm |
+| Provider timeout unknown | Reconcile/provider idempotency; no blind duplicate failover |
+| Callback loss/duplicate/order | Durable ingest, dedup/version, reconciliation |
+| Delivery Store failure | Do not ack unsafe work; recover/retry from durable queue/state |
+| Inbox realtime failure | Durable inbox + client resync |
+| Bulk overload | Rate/pause/load-shed bulk; reserved critical capacity |
+| Region outage | Fenced owner failover + reconciliation before resend |
+
+Resilience đến từ durable boundaries, idempotency, quotas, bulkheads, deadlines, circuit breakers, degraded policies và operations—not chỉ microservice separation.
+
+---
+
+#### 22. Multi-AZ, multi-region và DR
+
+##### Multi-AZ baseline
+
+- stateless components spread across AZs;
+- replicated authorities/broker/cache topology;
+- health-based routing;
+- no singleton scheduler without lease/fencing;
+- PITR/backups và tested restores;
+- projection/cache rebuild playbooks.
+
+##### Multi-region nếu requirement cần
+
+- global stable IDs và idempotency;
+- delivery/campaign home region hoặc owner epoch;
+- regional queues/workers/provider routes;
+- preference/suppression replication trong compliance SLO;
+- callbacks route về authoritative owner;
+- data residency/PII boundaries;
+- failover reconciliation và fencing tránh double send;
+- region-specific lag/SLO/cost observability.
+
+Notification DR cân bằng hai rủi ro: **mất critical notification** và **gửi trùng external side effect**.
+
+---
+
+#### 23. Security và abuse controls
+
+- OAuth2/OIDC/JWT validation cho user/admin APIs.
+- RBAC/ABAC/scopes + object/tenant AuthZ.
+- Service/workload identity và least-privilege IAM.
+- MFA/approval/segregation cho campaign, template publish, DLQ replay.
+- Rate limits, audience caps, frequency caps và spam/phishing controls.
+- Encryption at rest/in transit, KMS và secrets rotation.
+- Endpoint/PII tokenization/redaction và bounded retention.
+- Sandboxed template engine, typed variables và output validation.
+- Signed provider callbacks + timestamp/replay protection.
+- Protected audit for admin/policy/template/provider changes.
+- Data residency, consent, unsubscribe, DND và deletion workflows.
+
+Notification platform có thể trở thành spam/phishing amplifier nếu internal producers hoặc admins bị lạm quyền; producer scopes và blast-radius controls là bắt buộc.
+
+---
+
+#### 24. Observability end-to-end
+
+Correlation chain:
+
+```text
+business_event_id
+ → notification_id
+ → delivery_id(channel)
+ → attempt_id
+ → provider_message_id
+ → callback_event_id
+```
+
+##### Platform SLIs
+
+- event/intents/deliveries/attempts rates;
+- durable acceptance/error;
+- event-to-queued/provider-accepted latency;
+- queue lag/oldest age by class/channel/provider;
+- render/preference/cache latency/error;
+- retry amplification/DLQ age/replay;
+- duplicate/lost/reconciliation mismatch.
+
+##### Provider/channel SLIs
+
+- provider latency/throttle/timeout/acceptance;
+- bounce/complaint/invalid-token/delivery receipt;
+- SMS segments/cost;
+- push endpoint health;
+- in-app read/unread latency.
+
+##### Correctness/compliance
+
+- optional send despite opt-out phải bằng 0 theo control boundary;
+- stale preference decisions;
+- wrong template/locale/audience incidents;
+- expired/cancelled sends;
+- unauthorized admin/producer attempts;
+- callback signature failures.
+
+Metrics không dùng high-cardinality user IDs; logs/traces redacted và sampled; critical audit evidence có protected retention.
+
+---
+
+#### 25. Bottleneck → control
+
+| Bottleneck | Final control |
+|---|---|
+| Event burst | Durable broker, quotas, backpressure và controlled drain |
+| Broadcast fan-out | Audience snapshot, batches, checkpoints, pacing/cancel |
+| Preference reads/staleness | Redis cache + version/invalidation + compliance re-check |
+| Template rendering | Compiled version cache, typed data, sandbox, canary |
+| Provider rate limits/outage | Per-provider queues/pools, limiter, circuit breaker |
+| Priority inversion | Separate/fair queues, reserved capacity, TTL/load shedding |
+| Retry/duplicates | Outbox/inbox, stable IDs, jitter/budget/reconciliation |
+| Scheduling/quiet hours | Time buckets/delay queues, timezone, expiry/re-check |
+| Status/callback writes | Append attempts + compact projection, dedup/version |
+| Device-token churn | Endpoint lifecycle/invalid-token cleanup |
+| In-app inbox/unread | Recipient buckets, cursor, watermark, bounded retention |
+| Observability scale | Aggregation, sampling, redaction, cardinality budget |
+| Region failure | Ownership/fencing, regional routes, reconciliation |
+| Provider/SMS cost | Channel policy, caps, pacing, unit-economics metrics |
+
+---
+
+#### 26. Requirement → design decision
+
+| Requirement | Final decision |
+|---|---|
+| Multiple upstream producers | Authenticated/versioned Event Ingestor + direct Command API |
+| Burst scalability | Durable broker, queues, partitioned consumers và backpressure |
+| User preferences | Central Preference Service, DB authority + Redis cache/version |
+| Multi-channel extensibility | Channel queues/workers + provider adapter interface |
+| Consistent/localized content | Versioned Template Service + safe rendering |
+| Critical latency | Priority isolation, reserved capacity, pre-scale và TTL-aware retry |
+| At-least-once processing | Outbox/inbox, idempotency, conditional states và replay |
+| Minimize duplicates | Logical delivery keys, provider idempotency/reconciliation |
+| Provider failures | Per-channel isolation, circuit breaker, retry/DLQ/fallback policy |
+| Delivery visibility | Attempt history + current status + verified callbacks |
+| In-app history | Durable Inbox Store + cursor/read watermark |
+| Secure operations | Fine-grained AuthZ/IAM, approval/audit, signed callbacks |
+| Availability/recovery | Multi-AZ, backup/PITR, rebuild/replay, fenced DR |
+| Operational manageability | Metrics/logs/traces/SLOs/runbooks/kill switches |
+| Cost efficiency | Channel policy, provider quotas/routing, autoscale và unit cost |
+
+---
+
+#### 27. Những điểm hiệu chỉnh so với final diagram đơn giản
+
+| Transcript/sơ đồ đơn giản hóa | Final design production-oriented |
+|---|---|
+| Ingestor đặt event vào Kafka/SQS để absorb spike | Buffer chỉ bounded; cần pacing, backpressure, capacity và backlog-drain plan |
+| Orchestrator chọn user/channel rồi render | Cần versioned intent/delivery, consent evidence, TTL, dedup và atomic outbox |
+| Preferences được check một lần | Mutable consent/suppression có thể cần re-check ngay trước external send |
+| Template Service “generate message” | Pin template/version/data; render timing và retry/audit semantics rõ |
+| Channel queues cô lập failures | Cần priority/provider pools, quotas, circuit breakers và reserved capacity |
+| Load balancer chia jobs cho workers | Queue/consumer group phân phối jobs; LB chủ yếu cho HTTP/gRPC APIs |
+| Worker gọi SendGrid/Twilio/FCM | Còn provider adapters, idempotency, unknown outcome, receipts và token/reputation lifecycle |
+| Delivery Tracker ghi success/failure | Cần full state machine, attempt history, callback evidence và reconciliation |
+| Retry nhiều lần rồi DLQ | Phân loại transient/permanent/unknown/expired; DLQ có owner và safe replay |
+| In-app message được lưu để xem lại | Cần cursor, read watermark, retention, AuthZ và realtime resync |
+| Scale workers độc lập | Vẫn bị giới hạn bởi provider quotas, DB/broker partitions và cost |
+| Asynchronous = reliable | Reliability cần durable handoffs, idempotency, recovery tests và observability |
+
+---
+
+#### 28. Trade-offs quan trọng
+
+| Decision | Lợi ích | Chi phí/giới hạn |
+|---|---|---|
+| Async pipeline | Decoupling, burst tolerance | Lag, duplicate, ordering, operational complexity |
+| Central orchestration | Policy nhất quán | Hot/god-service risk, dependency latency |
+| Channel isolation | Failure/scale độc lập | Nhiều queues/workers/config cần vận hành |
+| Preference caching | Low-latency reads | Stale consent/invalidation complexity |
+| Pre-render content | Retry/audit stable | Wasted work, stale personalized data/storage |
+| Render at send time | Fresh data, delay-friendly | Dependency/runtime risk; phải pin version |
+| Multi-provider | Resilience/coverage | Duplicate ambiguity, normalization, cost/compliance |
+| At-least-once | Giảm message loss | Bounded duplicate và idempotency complexity |
+| Multi-region | Availability/locality | Ownership, replication, data residency, double-send risk |
+| Managed infrastructure | Lower toil/time-to-market | Quotas, vendor dependency và request cost |
+
+Không có “perfect delivery”; phải nói rõ boundary và đánh đổi theo notification class.
+
+---
+
+#### 29. Cách trình bày final design trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Business services commit domain state rồi phát event qua outbox; direct/admin requests dùng authenticated idempotent Command API.
+2. Event Ingestor validate/quota và ghi durable broker để decouple producers và absorb bounded bursts.
+3. Orchestrator resolve recipients, evaluate preferences/consent, pin template/policy và tạo Intent + per-channel Deliveries.
+4. Delivery records và channel outbox commit atomically, rồi route tới isolated email/SMS/push/in-app queues.
+5. Workers re-check state/expiry/consent, render pinned content, enforce provider quota và gọi adapters idempotently.
+6. Attempts và current status được track; verified callbacks/reconciliation phân biệt provider accepted, delivered, bounced và read.
+7. Transient errors retry với backoff/jitter; permanent/expired terminalize; unknown reconcile; DLQ có managed replay.
+8. In-app notifications lưu durable Inbox Store, cursor pagination/read watermark; WebSocket chỉ là hint.
+9. Kafka/SQS, Postgres/Redis, template store, containers/serverless và providers được chọn theo semantics/access patterns.
+10. Priority/provider isolation, multi-AZ/DR, fine-grained security và end-to-end SLOs bảo vệ scale/reliability.
+
+Deep dives nên chuẩn bị:
+
+- at-least-once/idempotency/ambiguous provider timeout;
+- preference/cache/consent race;
+- broadcast fan-out và critical priority isolation;
+- Kafka vs SQS;
+- delivery state/callback reconciliation;
+- provider failover và quotas;
+- template version/render timing;
+- in-app inbox/unread model;
+- multi-region duplicate prevention/DR;
+- cost/observability at 100M deliveries/day.
+
+---
+
+#### 30. Final checklist
+
+- [ ] Event/direct command ingestion, schemas, AuthZ và durable ack?
+- [ ] Business outbox và notification inbox/idempotency?
+- [ ] Recipient/audience snapshot, batching, pacing, cancel?
+- [ ] Preference/consent authority, cache, version, re-check/fail behavior?
+- [ ] Mandatory vs optional notification policies?
+- [ ] Template schema, localization, approval, pin/render timing?
+- [ ] Intent/Delivery/Attempt models và state machine?
+- [ ] Atomic Delivery + channel outbox handoff?
+- [ ] Channel/priority/provider isolation và reserved capacity?
+- [ ] Worker state/expiry/policy check và graceful claim/ack?
+- [ ] Provider adapters, quota, timeout, idempotency, receipts?
+- [ ] Unknown outcome và multi-provider failover semantics?
+- [ ] Callback signature/dedup/order/mapping/reconciliation?
+- [ ] Retry taxonomy, backoff/jitter/budget/TTL?
+- [ ] DLQ owner, alert, triage, replay, retention/disposition?
+- [ ] In-app store, cursor, unread/read watermark, retention/realtime resync?
+- [ ] User/admin/report APIs với object/tenant AuthZ và bounded queries?
+- [ ] Broker/store/cache partitioning và 100M/day capacity model?
+- [ ] Autoscaling capped by provider/DB safe capacity?
+- [ ] Multi-AZ, backups/PITR/restore/rebuild/replay?
+- [ ] Multi-region ownership/fencing/locality/double-send prevention?
+- [ ] IAM, secrets, encryption, PII redaction, audit/abuse controls?
+- [ ] Event→intent→delivery→attempt→callback correlation?
+- [ ] Latency, queue age, duplicates, consent, receipts và cost SLOs?
+- [ ] Load/chaos/provider-outage/DR/reconciliation drills?
+- [ ] ADRs ghi requirements, trade-offs và evolution triggers?
+
+#### 31. Ý chính cần nhớ
+
+- Final Notification System là durable asynchronous workflow, không phải wrapper gọi provider.
+- Business service phát event/intent; notification platform sở hữu policy, channel và delivery lifecycle.
+- Event Ingestor + broker decouple và buffer bounded bursts, nhưng vẫn cần backpressure/capacity.
+- Orchestrator tạo versioned Intent và per-channel Deliveries; nó không trực tiếp gửi message.
+- Preferences/consent có DB authority, Redis cache và re-check theo compliance risk.
+- Templates phải immutable/versioned, schema-safe và retry-consistent.
+- Delivery + outbox commit atomically trước khi channel workers nhận việc.
+- Queues/workers được cô lập theo channel, provider và priority để tránh cascading failure/starvation.
+- Queue/consumer group phân phối worker jobs; load balancer chủ yếu phân phối API requests.
+- Worker luôn re-check cancelled/expired/suppressed state trước provider call.
+- Provider acceptance khác delivered, displayed, opened và read.
+- Attempt history, verified callbacks và reconciliation tạo honest delivery evidence.
+- At-least-once internal processing cần idempotency để đạt effectively-once logical behavior.
+- Retry phải phân loại error/TTL/unknown outcome; DLQ cần owner và safe replay.
+- In-app inbox là durable; realtime connection chỉ là hint.
+- Autoscaling bị giới hạn bởi provider quota, DB/broker capacity và cost.
+- Notification DR phải tránh cả message loss lẫn duplicate external sends.
+- Security bao gồm producer/admin blast-radius controls, AuthZ, IAM, callbacks và PII—not chỉ JWT.
+- Observability nối event tới callback và đo latency, queue age, duplicates, consent cùng unit cost.
+- Kiến trúc tốt giải thích được component nào bảo vệ requirement/failure mode nào và trade-off ra sao.
+
+#### Công thức ghi nhớ
+
+> **Final Notification System = durable event/command intake + preference-aware versioned orchestration + isolated quota-aware channel execution + idempotent attempt tracking + verified receipts/reconciliation + secure observable recovery.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -24999,3 +39723,175 @@ Không cần liệt kê mọi security product. Câu trả lời tốt liên k�
 | **SBOM** | Software Bill of Materials, danh mục components và dependencies tạo nên một software artifact. |
 | **SSRF** | Server-Side Request Forgery; attacker khiến server gửi request tới destination ngoài ý định, thường nhắm internal services hoặc metadata. |
 | **CSP** | Content Security Policy, browser policy hạn chế nguồn và kiểu nội dung/script được phép tải hoặc thực thi. |
+| **Functional requirement** | Hành vi hoặc capability mà hệ thống phải cung cấp cho actor/use case. |
+| **Non-functional requirement (NFR)** | Thuộc tính chất lượng hoặc constraint như latency, availability, security, scalability và cost. |
+| **Constraint** | Giới hạn bắt buộc mà thiết kế phải tuân theo, ví dụ budget, deadline, regulation hoặc existing platform. |
+| **Assumption** | Điều tạm coi là đúng để tiếp tục thiết kế và cần được nêu rõ, kiểm chứng hoặc cập nhật. |
+| **Back-of-the-envelope estimation** | Ước lượng nhanh theo order of magnitude để định hướng capacity và quyết định kiến trúc. |
+| **Order of magnitude** | Bậc quy mô gần đúng, thường dùng để phân biệt chênh lệch lớn như hàng nghìn, triệu hoặc tỷ. |
+| **Peak factor** | Tỷ lệ peak load so với average load được dùng trong capacity estimation. |
+| **High-level design (HLD)** | Thiết kế mô tả major components, responsibilities, interfaces và data/request flows mà chưa đi sâu implementation. |
+| **Traceability** | Khả năng truy ngược một quyết định/component về requirement, evidence, risk hoặc constraint đã tạo ra nó. |
+| **Evolution path** | Chuỗi bước và trigger dự kiến để kiến trúc chuyển sang trạng thái tiếp theo khi scale hoặc requirements thay đổi. |
+| **Architecture Decision Record (ADR)** | Bản ghi ngắn lưu context, quyết định kiến trúc, alternatives và consequences. |
+| **URL shortener** | Dịch vụ tạo short URL và redirect short key tới destination URL đã lưu. |
+| **Short key** | Identifier ngắn trong URL namespace dùng để tra mapping tới destination. |
+| **Base62** | Cách biểu diễn số bằng 62 ký tự `0-9`, `a-z`, `A-Z`; là encoding chứ không phải encryption hay ID generator. |
+| **Custom alias** | Short key do user/tenant chọn, cần uniqueness, ownership và lifecycle policy trong namespace. |
+| **URL canonicalization** | Chuẩn hóa biểu diễn URL theo quy tắc xác định; phải tránh làm thay đổi destination semantics. |
+| **Conditional write** | Write chỉ thành công khi điều kiện atomic như key chưa tồn tại hoặc version còn khớp được thỏa mãn. |
+| **Birthday paradox** | Hiện tượng collision có xác suất đáng kể sau khoảng căn bậc hai của số phần tử trong keyspace. |
+| **Snowflake-style ID** | ID phân tán thường ghép timestamp, worker identifier và sequence để tạo uniqueness mà không cần counter toàn cục mỗi lần. |
+| **Hot link** | Short link nhận traffic vượt trội và có thể tạo hot cache key, partition hoặc analytics stream. |
+| **Branded short link** | Short URL dùng custom domain của tổ chức để tăng nhận diện và kiểm soát namespace. |
+| **Traffic skew** | Phân bố traffic không đều, trong đó một phần nhỏ key/tenant/resource nhận phần lớn request. |
+| **Viral link** | Link đột ngột nhận traffic rất lớn trong thời gian ngắn và tạo burst/hot-key behavior. |
+| **Origin protection** | Controls như cache, single-flight, admission control và load shedding bảo vệ backend/source khỏi overload. |
+| **Working set** | Phần dữ liệu được truy cập tích cực trong một khoảng thời gian và thường là mục tiêu của cache/memory sizing. |
+| **Bot traffic** | Requests do crawler, previewer, automation hoặc malicious bot tạo ra thay vì thao tác trực tiếp của con người. |
+| **Soft delete** | Đánh dấu resource đã xóa/vô hiệu hóa nhưng giữ record trong một thời gian cho audit, recovery hoặc propagation. |
+| **Hard delete** | Xóa vật lý resource khỏi store theo retention/privacy workflow. |
+| **Resource-oriented API** | API tổ chức quanh resources và dùng HTTP methods/status semantics để thao tác chúng. |
+| **Hi/Lo ID allocation** | Coordinator cấp một dải/high value để node tạo nhiều low IDs cục bộ mà không coordination mỗi request. |
+| **Read-after-create consistency** | Guarantee cho phép caller đọc thấy resource vừa tạo trong phạm vi/session/thời gian đã định. |
+| **Link Store** | Source of truth lưu mapping short key, destination, owner, lifecycle status và version. |
+| **CDN purge** | Yêu cầu edge cache loại hoặc invalidation một cached object trước khi TTL tự hết hạn. |
+| **Database sequence** | Database object cấp dãy numeric values riêng biệt; có thể có gaps nhưng phù hợp tạo unique IDs trong database scope. |
+| **Identity column** | Column được database tự sinh giá trị định danh, thường dựa trên sequence/engine mechanism. |
+| **DynamoDB** | Managed distributed key-value/document database của AWS, model theo partition key và access patterns. |
+| **Managed service** | Dịch vụ do provider vận hành một phần hạ tầng, patching, backup hoặc HA nhưng customer vẫn chịu trách nhiệm cấu hình và workload design. |
+| **Multi-AZ** | Topology triển khai qua nhiều availability zones để giảm ảnh hưởng của zone failure. |
+| **Point-in-time recovery (PITR)** | Khả năng khôi phục data store tới một thời điểm trong retention window bằng backup cùng logs/change history. |
+| **Standby replica** | Replica được duy trì để promotion/failover khi primary không còn phục vụ. |
+| **Connection-pool budget** | Giới hạn tổng connections xuống dependency được phân bổ qua mọi application instances/pools. |
+| **Sequence gap** | Khoảng thiếu trong dãy sequence do rollback, caching, failover hoặc allocation không được dùng; không đồng nghĩa uniqueness bị hỏng. |
+| **Takedown** | Quy trình vô hiệu hóa hoặc chặn nội dung/link do abuse, policy, legal hoặc security decision. |
+| **Takedown propagation** | Thời gian và cơ chế để quyết định chặn lan tới CDN, caches và mọi serving paths. |
+| **Interstitial** | Trang cảnh báo/trung gian hiển thị trước destination để thông báo risk hoặc yêu cầu user xác nhận. |
+| **Lifecycle-aware TTL** | TTL được giới hạn theo expiration, editability, takedown SLO và trạng thái vòng đời của resource. |
+| **Multi-writer region** | Kiến trúc cho phép nhiều region cùng nhận writes và cần xử lý uniqueness, conflict, ordering cùng replication semantics. |
+| **Cache coherence** | Mức các cache copies phản ánh cùng logical state và cơ chế xử lý invalidation/version/staleness giữa chúng. |
+| **Ticketing system** | Hệ thống quản lý discovery, inventory, hold, payment, booking và ticket lifecycle cho event/show. |
+| **Show** | Một suất cụ thể của event tại venue và thời gian xác định, sở hữu inventory riêng. |
+| **ShowSeat** | Inventory của một physical seat trong một show cụ thể, có state và price riêng. |
+| **Inventory unit** | Đơn vị hữu hạn có thể được hold/book, ví dụ show-seat hoặc một vé general-admission trong quota. |
+| **Seat hold** | Lease tạm thời trao quyền checkout trên một hoặc nhiều show-seats tới khi hết hạn hoặc được commit/release. |
+| **Double booking** | Hai booking cùng được xác nhận cho một inventory unit vốn chỉ được bán một lần. |
+| **Assigned seating** | Mô hình mỗi ticket gắn với một ghế/vị trí cụ thể. |
+| **General admission** | Mô hình bán theo tổng quota/capacity mà không gán ghế cụ thể lúc mua. |
+| **Virtual waiting room** | Lớp admission trước booking path, xếp/điều tiết users vào hệ thống theo capacity và fairness policy. |
+| **Admission token** | Credential có phạm vi/thời hạn chứng minh client đã được waiting-room/admission service cho phép tiến vào protected path. |
+| **Price snapshot** | Bản giá, phí, thuế và currency được cố định/versioned cho hold hoặc checkout theo policy. |
+| **Payment attempt** | Một lần thử giao dịch với provider, có identity/state riêng và liên kết tới booking/order. |
+| **Payment reconciliation** | Đối soát internal booking/payment state với provider records để phát hiện và sửa mismatch/unknown outcomes. |
+| **Home region** | Region có authoritative ownership cho writes của một entity/partition như inventory của một show. |
+| **Flash sale** | Đợt mở bán tạo arrival burst cực lớn trong khoảng thời gian rất ngắn cho inventory hữu hạn. |
+| **Hot show** | Show nhận phần lớn browse/hold/booking traffic và tạo contention trên cùng inventory partition. |
+| **Write amplification** | Một business operation tạo nhiều physical/logical writes, indexes, logs hoặc events ở downstream systems. |
+| **Compare-and-swap (CAS)** | Atomic operation chỉ cập nhật value/state khi current version/value còn khớp expected condition. |
+| **Inventory authority** | Store/process có quyền quyết định state transition cuối cùng của inventory và enforce invariant. |
+| **Hold expiry** | Thời điểm/quy trình lease giữ chỗ hết hiệu lực và inventory có thể được cấp lại theo authoritative rule. |
+| **Expiry lag** | Độ trễ giữa lúc resource hết hạn theo rule và lúc cleanup/projection phản ánh trạng thái đó. |
+| **Payment in-flight** | Payment attempt đã bắt đầu nhưng chưa đạt terminal/known state. |
+| **Retry amplification** | Tải tăng thêm do clients/services retry khi latency, timeout hoặc failure xảy ra. |
+| **Projection lag** | Khoảng chậm giữa authoritative state và read model/cache/projection đã áp dụng thay đổi. |
+| **Admission rate** | Tốc độ waiting room/gateway cho phép requests/users tiến vào protected booking path. |
+| **Business action** | Hành động logic như xem event hoặc đặt vé, có thể tạo nhiều API calls và downstream operations. |
+| **Anti-corruption layer** | Adapter/domain boundary cô lập internal model khỏi API, trạng thái và semantics riêng của external system/provider. |
+| **Booking intent** | Durable resource biểu diễn ý định checkout/booking trước khi payment và inventory commit đạt terminal state. |
+| **Owner epoch** | Version tăng khi quyền sở hữu partition/region chuyển, dùng để fence commands từ owner cũ. |
+| **Transactional inbox** | Bảng/store ghi message IDs và processing state cùng local transaction để consumer xử lý redelivery idempotently. |
+| **Inventory projection** | Read model/cache được dẫn xuất từ authoritative inventory events để phục vụ seat-map queries nhanh. |
+| **Payment authorization** | Provider chấp thuận giữ/đảm bảo một khoản tiền trong khi chưa nhất thiết chuyển/capture hoàn tất. |
+| **Payment capture** | Bước hoàn tất thu tiền từ authorization hoặc payment method theo provider contract. |
+| **Provider webhook** | HTTP callback do external provider gửi để thông báo event/trạng thái và cần signature, replay cùng dedup controls. |
+| **Horizontal Pod Autoscaler (HPA)** | Kubernetes controller điều chỉnh số replicas của workload dựa trên resource, custom hoặc external metrics. |
+| **Node autoscaler** | Thành phần tự động thêm/bớt cluster nodes để cung cấp capacity chạy Pods/workloads. |
+| **Pre-scaling** | Chủ động provision/tăng capacity trước một đợt tải đã biết thay vì chờ reactive autoscaling. |
+| **JWKS** | JSON Web Key Set, tập public keys thường dùng để resource server xác minh chữ ký JWT. |
+| **Provider adapter** | Implementation cô lập API/semantics của một external provider sau internal interface thống nhất. |
+| **Payment tokenization** | Thay thông tin payment nhạy cảm bằng token do trusted provider/vault quản lý để giảm exposure và compliance scope. |
+| **Search projection** | Search index/read model được dẫn xuất từ canonical data và có thể rebuild khi cần. |
+| **OpenTelemetry** | Bộ chuẩn và công cụ vendor-neutral để instrument, thu và truyền metrics, logs và traces. |
+| **Amazon SES** | Amazon Simple Email Service, managed service dùng để gửi/nhận email theo capability của AWS. |
+| **Unknown payment outcome** | Trạng thái không biết provider đã xử lý giao dịch hay chưa sau timeout/network failure và cần webhook/reconciliation. |
+| **Read plane** | Các services/stores/projections phục vụ queries và có thể scale/cache/replicate tách khỏi authoritative writes. |
+| **Write authority** | Owner/store/process duy nhất có quyền chấp nhận state-changing commands cho một entity/partition trong epoch hiện tại. |
+| **Lazy expiry** | Xử lý resource đã hết hạn khi nó được đọc/cập nhật thay vì phụ thuộc hoàn toàn vào cleanup chạy đúng thời điểm. |
+| **Adaptive admission** | Tự điều chỉnh tốc độ cho requests/users vào protected path theo latency, errors và safe downstream capacity. |
+| **Fenced failover** | Failover chỉ cho owner mới nhận writes sau khi owner cũ bị vô hiệu hóa bằng epoch/token/lease hoặc control tương đương. |
+| **Authoritative clock** | Nguồn thời gian/logic được inventory authority dùng để quyết định lease/expiration, thay vì tin client clock. |
+| **Business correctness metric** | Metric theo dõi invariant và business outcome như double booking, duplicate charge hoặc reconciliation mismatch. |
+| **News feed** | Dòng nội dung cá nhân hóa được tạo từ candidates, eligibility rules và ordering/ranking cho một viewer. |
+| **Home timeline** | Feed chính của user, thường chứa post từ accounts/sources họ theo dõi cùng optional recommendations/modules. |
+| **Social graph** | Đồ thị users/entities và relationships như follow, block, mute hoặc membership. |
+| **Follow edge** | Directed relationship từ follower tới followee, có state/version và là authority cho quyền theo dõi. |
+| **Timeline entry** | Derived record tham chiếu post trong feed của user cùng ordering/ranking/generation metadata. |
+| **Fan-out on write** | Phân phối/materialize post vào timelines của followers khi post được tạo. |
+| **Fan-out on read** | Tổng hợp posts từ followed sources khi reader yêu cầu feed. |
+| **Hybrid fan-out** | Kết hợp push cho một số authors/readers và pull/merge cho cases như celebrity accounts. |
+| **Celebrity problem** | Write amplification/hotspot khi một author có lượng followers cực lớn publish content. |
+| **Feed generation** | Version/snapshot context giúp giữ ordering và pagination tương đối ổn định trong một browsing session. |
+| **Feed cursor** | Opaque pagination state chỉ vị trí/generation tiếp theo trong ordered feed mà không dùng offset đơn giản. |
+| **Candidate generation** | Bước thu thập tập posts có khả năng xuất hiện trước khi eligibility, ranking và dedup. |
+| **Eligibility filtering** | Loại candidates viewer không được hoặc không nên thấy theo follow, privacy, block, moderation và lifecycle policy. |
+| **Reverse chronological feed** | Feed sắp post mới hơn trước theo event/create time và stable tie-breaker. |
+| **Ranked feed** | Feed sắp candidates theo relevance score cùng product, diversity, safety và freshness rules. |
+| **Post-weighted follower distribution** | Phân bố follower count được weighting theo số post của authors, phản ánh fan-out cost tốt hơn average user đơn giản. |
+| **Read amplification** | Một logical read tạo nhiều backend lookups, merges, enrichments hoặc network calls. |
+| **Fan-out backlog** | Các post/timeline delivery tasks chưa xử lý tích lũy và làm tăng post-to-feed freshness lag. |
+| **Hot user** | User/author tạo traffic hoặc fan-out không cân xứng do follower count, post rate hay activity cao. |
+| **Hot post** | Post nhận lượng views/engagement cực lớn và tạo hot cache keys, counters hoặc partitions. |
+| **Sharded counter** | Counter được chia thành nhiều shards/deltas để phân tán concurrent updates rồi aggregate khi đọc/xử lý. |
+| **Feed assembly** | Quá trình merge candidates, dedup, eligibility filter, enrich, rank/order và paginate thành feed response. |
+| **Media ingest** | Luồng nhận uploads, validate, lưu originals và đưa media vào processing pipeline. |
+| **CDN egress** | Dữ liệu CDN truyền ra tới clients, thường là cost/capacity driver lớn của media platform. |
+| **Active follower ratio** | Tỷ lệ followers còn hoạt động trong window mục tiêu và đáng để materialize timeline entry. |
+| **Timeline window** | Số lượng hoặc khoảng thời gian entries được giữ/materialize trong feed của user. |
+| **K-way merge** | Hợp nhất K sorted input streams/lists thành một sorted output, thường dùng khi kéo recent posts từ nhiều sources. |
+| **Feed Service** | Dịch vụ assemble feed từ candidates/read models, áp eligibility, hydrate, order/rank và pagination cho viewer. |
+| **Fan-out Worker** | Background worker phân phối post references tới timelines hoặc cập nhật pull indexes theo fan-out policy. |
+| **Feed hydration** | Bước batch-fetch và ghép post, profile, media, counts cùng viewer state vào candidate references. |
+| **Recent-post index** | Read model giữ các post gần đây theo author, đặc biệt hữu ích cho celebrity pull-on-read. |
+| **Eligibility cache** | Cache hỗ trợ kiểm tra follow/block/privacy nhanh nhưng không thay authoritative relationship/status rules. |
+| **Feed tombstone** | Dấu hiệu deny/delete/version dùng để ngừng serve một post dù references cũ còn trong timelines/caches. |
+| **Viewer state** | Trạng thái riêng của viewer trên một item, ví dụ đã like, follow, mute hoặc có quyền xem. |
+| **Author class** | Phân loại author theo workload/cost như normal hoặc hot để chọn fan-out và isolation policy. |
+| **Authoritative write plane** | Nhóm domain services/stores nhận mutations, enforce invariants và giữ canonical durable state. |
+| **Feed read plane** | Nhóm timelines, indexes, caches và assembly services được tối ưu cho feed queries, thường là derived/rebuildable. |
+| **Post-to-feed freshness** | Độ trễ từ lúc post được commit tới lúc nó có thể xuất hiện trong feed của viewer mục tiêu. |
+| **Workload isolation** | Tách resource pools, quotas hoặc queues để workload/hot tenant này không làm cạn capacity của workload khác. |
+| **Notification intent** | Logical yêu cầu thông báo được dẫn xuất từ business event/direct request trước khi tách thành channel deliveries. |
+| **Channel delivery** | Một logical notification gửi tới một recipient qua một channel cụ thể như email, SMS, push hoặc in-app. |
+| **Provider acceptance** | External provider đã nhận/chấp nhận request xử lý, nhưng chưa nhất thiết giao tới thiết bị, carrier hoặc inbox. |
+| **Delivery receipt** | Callback/status evidence từ provider hoặc client về kết quả giao, bounce, display hay read tùy channel semantics. |
+| **Suppression list** | Danh sách endpoints/recipients bị chặn gửi do unsubscribe, complaint, bounce, invalid token hoặc compliance policy. |
+| **Quiet hours** | Khoảng thời gian user/policy yêu cầu trì hoãn các notification không khẩn cấp. |
+| **Collapse key** | Khóa cho phép provider/client thay thế hoặc gộp các push notifications cũ cùng chủ đề thay vì hiển thị tất cả. |
+| **Frequency cap** | Giới hạn số notification thuộc một category/channel được gửi tới user trong một khoảng thời gian. |
+| **Notification amplification** | Một business event nhân thành nhiều recipient × channel × retry/provider requests. |
+| **Backlog drain time** | Thời gian cần để xử lý hết backlog bằng phần capacity còn lại sau khi phục vụ traffic mới. |
+| **Provider quota** | Giới hạn request/throughput do external delivery provider áp theo account, sender, region hoặc channel. |
+| **Priority inversion** | Low-priority workload chiếm resource khiến high-priority notification bị chậm hoặc starve. |
+| **Audience snapshot** | Phiên bản cố định của tập recipients dùng cho một campaign/broadcast để fan-out có thể resume và audit nhất quán. |
+| **Timing wheel** | Cấu trúc lập lịch chia delayed tasks theo các time buckets để tìm công việc đến hạn hiệu quả. |
+| **Oldest message age** | Tuổi của message cũ nhất chưa xử lý trong queue, phản ánh user-visible lag tốt hơn queue depth đơn thuần. |
+| **Event Ingestor** | Entry component xác thực, validate, quota và ghi business events vào durable notification pipeline. |
+| **Notification Orchestrator** | Decision component resolve recipients, áp preferences/policy, chọn channels/templates và tạo logical deliveries. |
+| **Channel Worker** | Worker thực thi delivery workflow riêng cho email, SMS, push hoặc in-app và giao tiếp qua provider adapter. |
+| **Callback Ingestor** | Component nhận, xác minh, deduplicate và ghi durable provider webhooks/delivery receipts. |
+| **Compiled template** | Template đã được parse/compile sẵn theo version, channel và locale để render nhanh với validated variables. |
+| **Read watermark** | Mốc thời gian/sequence biểu diễn mọi in-app notification trước mốc đó đã được user đánh dấu đọc. |
+| **Provider message ID** | Identifier do external provider trả về để liên kết request, receipt, reconciliation và support investigation. |
+| **SQS Standard queue** | Managed work queue có throughput cao và at-least-once semantics; message có thể duplicate hoặc out-of-order. |
+| **SQS FIFO queue** | Queue hỗ trợ ordering/dedup trong message-group scope với throughput và partition considerations riêng. |
+| **Message group** | Nhóm message trong FIFO queue được xử lý theo thứ tự; một group quá lớn có thể trở thành bottleneck. |
+| **Sender reputation** | Uy tín của email/SMS sender theo provider, mailbox hoặc carrier, ảnh hưởng khả năng message được chấp nhận và giao. |
+| **Reserved concurrency** | Giới hạn/dung lượng concurrency được dành hoặc khóa cho serverless function để bảo vệ workload và downstream. |
+| **Template metadata store** | Store quản lý template ID, version, locale, channel, schema, approval status, checksum và content reference. |
+| **Current-status projection** | Compact read model biểu diễn trạng thái hiện tại được dẫn xuất từ attempt/status history để query nhanh. |
+| **Provider headroom** | Phần quota/concurrency provider còn khả dụng sau current traffic, dùng để giới hạn dispatch và autoscaling. |
+| **Unknown delivery outcome** | Trạng thái không biết provider đã chấp nhận/giao message hay chưa sau timeout hoặc mất callback và cần reconciliation. |
+| **Channel isolation** | Tách queues, workers, quotas và failure domains giữa email, SMS, push và in-app. |
+| **Delivery evidence** | Bằng chứng quan sát được về các mốc accepted, provider accepted, delivered, bounced, displayed hoặc read. |
+| **Effectively-once logical delivery** | Hành vi hạn chế một logical delivery dù processing có thể lặp, nhờ idempotency, dedup và reconciliation. |
