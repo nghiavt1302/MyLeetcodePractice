@@ -38765,6 +38765,23194 @@ Deep dives nên chuẩn bị:
 
 ---
 
+## Phần 16 — Design a Chat Application (WhatsApp)
+
+### Bài 83. Understanding the Problem & Defining the Scope
+
+#### 1. Chat application là bài toán gì?
+
+Mục tiêu là xây một hệ thống chat production-scale giống WhatsApp, nơi user có thể trao đổi gần real time dù:
+
+- có hàng triệu kết nối đồng thời;
+- client dùng mạng di động không ổn định;
+- một user có nhiều thiết bị;
+- recipient đang offline;
+- group có nhiều thành viên;
+- message có text hoặc media;
+- server/region/provider có thể lỗi;
+- nội dung cần end-to-end encryption (E2EE).
+
+Core journey:
+
+```text
+Sender composes message locally
+  → client assigns stable client_message_id
+  → encrypted message reaches server durably
+  → server acknowledges acceptance
+  → message is routed to recipient devices
+  → devices acknowledge delivery
+  → recipient reads and optionally sends read receipt
+  → all authorized devices converge on conversation state
+```
+
+Hệ thống không chỉ “mở WebSocket rồi gửi JSON”. Nó phải giải quyết identity, conversation membership, durability, ordering, retries, offline sync, multi-device state và cryptographic key lifecycle.
+
+---
+
+#### 2. Chốt terminology trước khi thiết kế
+
+| Khái niệm | Nghĩa |
+|---|---|
+| User | Logical account/person |
+| Device | Một installation/device session có identity/key riêng |
+| Conversation | Container cho 1:1 hoặc group messages |
+| Participant/member | User được phép tham gia conversation trong membership interval |
+| Message | Logical immutable send operation/content envelope |
+| Message event | Message, edit/delete/reaction/system event nếu nằm trong scope |
+| Connection/session | Kết nối online tạm thời của một device tới realtime gateway |
+| Inbox/mailbox | Pending/ordered work hoặc sync state cho user/device |
+| Delivery receipt | Bằng chứng một device/server đã nhận message theo contract |
+| Read receipt | Bằng chứng client/user report đã đọc tới một message/sequence |
+| Presence | Trạng thái online/last seen mang tính gần đúng |
+| Typing indicator | Ephemeral signal, không phải durable message |
+
+Một user có nhiều devices; “delivered to user” cần định nghĩa là tới ít nhất một device, tất cả active devices hay primary device.
+
+---
+
+#### 3. Conversation types
+
+##### One-to-one chat
+
+- hai logical users;
+- mỗi user có thể có nhiều devices;
+- membership đơn giản hơn nhưng block/delete/account state vẫn ảnh hưởng;
+- E2EE cần fan-out tới recipient devices và sender’s other devices.
+
+##### Group chat
+
+- từ vài người tới hàng trăm thành viên theo baseline transcript;
+- membership/role/version;
+- join/leave/remove semantics;
+- history visibility trước lúc join;
+- group metadata và system messages;
+- receipt aggregation;
+- key rotation khi membership đổi;
+- fan-out cost lớn hơn 1:1.
+
+Cần chốt maximum group size. Group vài trăm người khác broadcast channel hàng triệu subscribers; latter nên là scope/pattern riêng.
+
+---
+
+#### 4. Functional requirements
+
+##### FR1 — One-to-one messaging
+
+User gửi/nhận text messages trong conversation 1:1:
+
+- local optimistic UI;
+- idempotent retry;
+- server acceptance acknowledgement;
+- online realtime delivery;
+- offline storage/synchronization;
+- conversation history pagination;
+- per-conversation ordering contract.
+
+##### FR2 — Group messaging
+
+- create/update group;
+- add/remove/leave members theo role/policy;
+- send message tới current authorized members;
+- group membership version gắn với send/decrypt authorization;
+- group events và message history;
+- bounded receipt/read aggregation.
+
+##### FR3 — Typing indicators
+
+- sender báo `typing=true/false` hoặc heartbeat có TTL;
+- chỉ gửi tới active authorized participants;
+- best-effort, droppable và không cần durable history;
+- coalesce/throttle để tránh spam traffic;
+- tự hết hạn nếu disconnect/mất stop event.
+
+##### FR4 — Online status/presence
+
+- online, offline, last-seen hoặc approximate availability;
+- tổng hợp từ nhiều connections/devices;
+- privacy setting ai được thấy;
+- heartbeat/lease TTL;
+- eventual/best-effort semantics;
+- không dùng presence để quyết định message durability.
+
+##### FR5 — Rich media
+
+User gửi image, video và document:
+
+```text
+client encrypts media
+  → direct multipart upload to object storage
+  → receive media reference + encrypted metadata/key envelope
+  → send small chat message referencing media
+  → recipient downloads through CDN/object endpoint
+  → decrypts on device
+```
+
+Chat gateway không nên proxy large media bytes. Cần upload resume, size/type/quota, integrity hash, thumbnails/variants theo E2EE model, expiration và access control.
+
+##### FR6 — Delivery và read receipts
+
+Phân biệt:
+
+```text
+LOCAL_PENDING      client đã lưu vào outbox cục bộ
+SERVER_ACCEPTED    server đã nhận durable theo contract
+DELIVERED          recipient device(s) đã acknowledge
+READ               recipient client/user đã report đọc
+FAILED             terminal failure theo policy
+```
+
+Receipt policy có thể tắt vì privacy. Trong group, không nên trả raw per-member receipts vô hạn; có thể dùng counts, sampled list hoặc read watermark theo product requirement.
+
+##### FR7 — Multi-device synchronization
+
+- message sent từ device A xuất hiện ở sender devices B/C;
+- recipient nhận trên các authorized devices;
+- read/delivery state hội tụ;
+- device mới có history/key bootstrap policy;
+- reconnect dùng cursor/checkpoint để lấy missed events;
+- revoke/lost device ngừng nhận future messages;
+- không tạo duplicate logical message do nhiều connection/retry.
+
+##### FR8 — Offline operation
+
+- client outbox giữ pending sends;
+- stable IDs và retry khi reconnect;
+- server mailbox/history giữ messages chưa sync;
+- delta sync từ last acknowledged cursor;
+- attachments upload có resume/retry;
+- conflicts/edits/deletes theo version;
+- UX nói rõ pending/sent/failed.
+
+---
+
+#### 5. Những feature cần hỏi thêm
+
+Transcript chưa chốt các feature sau; interviewer/stakeholder phải quyết định:
+
+- edit/delete-for-me/delete-for-everyone;
+- reactions, replies/threads, mentions;
+- message search;
+- disappearing messages/retention;
+- contact discovery/block/report;
+- voice notes/location/contact sharing;
+- link previews;
+- message backup/restore;
+- push notifications;
+- voice/video calls;
+- broadcast channels/communities;
+- bots/business integrations;
+- moderation/reporting/legal requests.
+
+Không âm thầm đưa tất cả vào scope vì mỗi feature tác động data model, encryption, fan-out và retention.
+
+---
+
+#### 6. Scope baseline của case study
+
+##### In scope
+
+- authenticated users và registered devices;
+- one-to-one chat;
+- groups tối đa vài trăm members;
+- text, image, video, document messages;
+- realtime delivery khi online;
+- offline buffering/history synchronization;
+- sent/server-accepted/delivered/read states;
+- typing và approximate presence;
+- multi-device sync;
+- content E2EE ở mức architectural requirements;
+- push notification hint cho offline devices;
+- pagination, retry, idempotency và observability.
+
+##### Out of scope ban đầu
+
+- voice/video calls và media conferencing;
+- public broadcast channels hàng triệu followers;
+- stories/status feed;
+- full-text server-side search trên plaintext;
+- bot/plugin ecosystem;
+- payments/commerce;
+- full spam/moderation ML pipeline;
+- cryptographic protocol implementation chi tiết;
+- cross-platform cloud backup/key-recovery product chi tiết;
+- global contact discovery design.
+
+Ta vẫn phải ghi E2EE/search/moderation/backup trade-offs vì chúng ảnh hưởng boundary từ đầu.
+
+---
+
+#### 7. Core domain model
+
+```text
+User
+  └─ Device(device_id, identity key, status, push token, last_sync_cursor)
+
+Conversation
+  ├─ conversation_id
+  ├─ type: DIRECT | GROUP
+  ├─ metadata/version
+  └─ Membership(user_id, role, joined_at, left_at, membership_version)
+
+Message
+  ├─ message_id / client_message_id
+  ├─ conversation_id
+  ├─ sender_user_id + sender_device_id
+  ├─ conversation_sequence/order metadata
+  ├─ encrypted payload/media reference
+  ├─ created/accepted timestamp
+  ├─ content/event type
+  └─ version/tombstone/expiry metadata
+
+DeviceDelivery
+  ├─ message_id + recipient_device_id
+  ├─ delivery state/version
+  └─ delivered/read timestamps if reported
+
+PresenceLease
+  └─ device/user connection, region/gateway, expiry
+```
+
+Message content/ciphertext khác message metadata. E2EE bảo vệ content nhưng server vẫn có thể thấy một số metadata cần routing—phải tối thiểu hóa và bảo vệ nó.
+
+---
+
+#### 8. Message identity và idempotency
+
+Client tạo stable ID trước khi gửi:
+
+```text
+client_message_id
+= sender_user_id + sender_device_id + locally unique nonce/sequence
+```
+
+Server có thể dùng cùng ID hoặc trả canonical `message_id`. Retry cùng logical send phải trả lại kết quả cũ thay vì tạo message mới.
+
+Idempotency scope:
+
+- unique `(sender_device_id, client_message_id)`;
+- server append/sequence assignment conditional;
+- delivery fan-out key `(message_id, recipient_device_id)`;
+- receipt key/version `(message_id, device_id, receipt_type)`;
+- push notification dedup/collapse key.
+
+Dedup retention phải dài hơn client retry/offline/replay horizon. UI có thể hiển thị effectively-once dù backend processing/delivery dùng at-least-once.
+
+---
+
+#### 9. Ordering semantics
+
+“Đúng thứ tự” phải xác định scope:
+
+- không cần global order cho mọi chats;
+- thường cần stable order trong một conversation;
+- một sender device có local send order;
+- concurrent messages từ nhiều senders không có natural absolute order nếu chưa qua sequencer/owner;
+- delivery arrival có thể out-of-order nhưng client reorder theo server sequence/order key;
+- receipts có thể đến trước/sau trên các devices.
+
+Một contract thực tế:
+
+> Server gán monotonic sequence trong mỗi conversation hoặc deterministic total-order key tại authoritative conversation partition; client render theo sequence và dùng cursor để phát hiện gaps.
+
+Trade-off:
+
+- strict per-conversation sequence đơn giản hóa UX/sync;
+- nhưng hot large groups có thể tạo sequencer/partition bottleneck;
+- cross-region active-active writes làm ordering/failover phức tạp.
+
+Không đồng nhất timestamp client với authoritative order vì clock skew và malicious clients.
+
+---
+
+#### 10. Delivery semantics
+
+Transcript nói users mong message “exactly once”. Distributed reality:
+
+- client request có thể timeout sau server commit;
+- network retry/consumer redelivery gây duplicate processing;
+- một user có nhiều devices;
+- acknowledgement có thể mất;
+- push hint có thể duplicate hoặc không tới.
+
+Practical goal:
+
+```text
+durable at-least-once processing/delivery attempts
++ idempotent message creation/fan-out/receipts
++ client/server dedup
+= effectively-once conversation experience
+```
+
+`Delivered` cần product definition:
+
+- server accepted durable;
+- delivered tới ít nhất một recipient device;
+- delivered tới tất cả active recipient devices;
+- available in recipient mailbox nhưng chưa sync.
+
+Không dùng một tick/boolean nếu semantics chưa rõ. Trong group và multi-device, receipts là aggregation problem.
+
+---
+
+#### 11. Read-receipt semantics
+
+Read receipt thường dùng watermark thay record cho từng message:
+
+```text
+ReadState(
+  conversation_id,
+  reader_user_id or device_id,
+  highest_contiguous_read_sequence,
+  updated_at,
+  version
+)
+```
+
+Benefits:
+
+- một update biểu diễn nhiều messages đã đọc;
+- giảm write/storage amplification;
+- sync nhiều devices dễ hơn;
+- query “đã đọc tới đâu?” hiệu quả.
+
+Questions:
+
+- per-user hay per-device read state?
+- read receipt privacy toggle?
+- group hiển thị all/read-by/count thế nào?
+- out-of-order gaps có cho watermark nhảy qua không?
+- mark read khi message visible, conversation focused hay user action?
+
+Read receipt là client-reported product event, không phải bằng chứng tuyệt đối con người đã hiểu nội dung.
+
+---
+
+#### 12. Presence semantics
+
+Presence là soft state:
+
+```text
+device connects/authenticates
+  → acquire/refresh presence lease
+  → periodic heartbeat
+  → lease expires on disconnect/network loss
+  → aggregate user online if policy permits
+```
+
+Properties:
+
+- eventual và approximate;
+- có TTL để tránh “online mãi” khi disconnect đột ngột;
+- multi-device aggregation;
+- privacy/block rules;
+- high fan-out subscriptions;
+- không ghi mọi heartbeat vào relational durable history;
+- degraded presence được, message durability vẫn phải hoạt động.
+
+“Online” không có nghĩa recipient chắc chắn đang nhìn app hoặc sẽ đọc ngay.
+
+---
+
+#### 13. Typing indicator semantics
+
+Typing indicators:
+
+- ephemeral/best effort;
+- chỉ gửi khi recipient đang online/subscribed;
+- throttled/debounced/coalesced;
+- TTL vài giây theo product;
+- không retry sau khi stale;
+- không lưu trong conversation history;
+- privacy/membership check;
+- drop trước critical message traffic khi overload.
+
+```text
+typing-start/heartbeat
+  → realtime pub/sub
+  → active recipient connections
+  → auto-expire if typing-stop is lost
+```
+
+Đây là ví dụ tốt về data không cần durability/ordering như chat messages.
+
+---
+
+#### 14. Multi-device semantics
+
+Mỗi user có device set động:
+
+- device registration/revocation;
+- identity/prekeys/session keys theo E2EE protocol;
+- active connection/push token;
+- sync cursor/ack state;
+- history bootstrap policy;
+- per-device delivery và sender-device echo.
+
+Khi Alice gửi từ phone:
+
+```text
+message fan-out
+  → Bob's authorized devices
+  → Alice's other authorized devices
+```
+
+Questions:
+
+- offline device được giữ message bao lâu?
+- device mới nhận old history bằng secure transfer/backup hay chỉ future messages?
+- “delivered/read” aggregate qua devices thế nào?
+- revoke device có rotate group/session keys không?
+- duplicate connection của cùng device xử lý thế nào?
+
+Multi-device không chỉ là sync database; nó là identity, key distribution, fan-out và state convergence problem.
+
+---
+
+#### 15. Rich-media semantics
+
+Message service chỉ lưu encrypted media descriptor/reference:
+
+```text
+EncryptedMediaDescriptor
+  object_id/url reference
+  content type/size
+  integrity hash
+  encryption algorithm/key envelope
+  thumbnail/variant metadata
+  expiry/access token metadata
+```
+
+Requirements:
+
+- direct/resumable multipart upload;
+- client-side encryption trước upload nếu E2EE;
+- object storage durability và CDN delivery;
+- authorization/signed URLs;
+- malware/abuse scanning trade-off khi content encrypted;
+- orphan upload cleanup;
+- download resume/range;
+- storage/retention/deletion;
+- do not auto-download huge media on unreliable/expensive network;
+- media message can remain `UPLOADING/PROCESSING/FAILED` locally before send.
+
+Server-side thumbnails/transcoding khó hơn dưới true E2EE; có thể tạo/encrypt variants trên client hoặc dùng trusted/privacy-preserving design đã chốt.
+
+---
+
+#### 16. End-to-end encryption scope
+
+E2EE requirement nghĩa server route/store ciphertext nhưng không có content decryption keys. Tuy nhiên cần chốt:
+
+- protocol đã được review/chứng minh, không tự phát minh crypto;
+- identity verification và device keys;
+- session establishment/prekeys;
+- group key distribution/rotation;
+- member/device add/remove;
+- forward secrecy/post-compromise security goals;
+- encrypted attachments;
+- sender’s other devices;
+- offline key availability;
+- backup/key recovery;
+- safety-number/device-change UX;
+- metadata leakage/minimization;
+- abuse reporting/moderation;
+- legal/compliance requirements.
+
+E2EE tạo trade-offs:
+
+| Capability | Tác động |
+|---|---|
+| Server-side full-text search | Không đọc plaintext; cần client-side index/search hoặc specialized encrypted design |
+| Server moderation | Không thể scan arbitrary plaintext; dựa reports/metadata/rate/abuse signals theo policy |
+| Link previews | Client-side fetch/generate hoặc privacy proxy có trade-offs |
+| Backups | Phải E2EE/key recovery rõ, nếu không backup có thể phá promise |
+| Multi-device | Key distribution và device revocation phức tạp |
+| Media processing | Server không thể transcode plaintext nếu không thay trust model |
+
+TLS vẫn cần dù payload E2EE, vì nó bảo vệ transport metadata/integrity/authentication và APIs.
+
+---
+
+#### 17. Functional consistency boundaries
+
+| Data/feature | Consistency target |
+|---|---|
+| Message acceptance | Durable + idempotent trước server ACK |
+| Conversation order | Stable per-conversation sequence/order key |
+| Message delivery | At-least-once attempts, device dedup |
+| Read/delivery receipts | Eventual, monotonic/versioned |
+| Membership authorization | Strong/authoritative at send/fan-out/decrypt-key boundaries |
+| Block/revoke | Bounded high-priority propagation, future sends denied |
+| Presence | Eventual/best effort/TTL |
+| Typing | Best effort, droppable, very short TTL |
+| Push notification | Best-effort hint; not message authority |
+| Media reference | Message durable; object availability/integrity contract explicit |
+| Multi-device sync | Eventual convergence with cursors/gap recovery |
+
+Không mọi feature cần strong consistency. Membership/security/message durability quan trọng hơn typing/presence freshness.
+
+---
+
+#### 18. Non-functional requirements
+
+##### 18.1 Low latency
+
+Transcript yêu cầu sub-second delivery. Phải tách SLO stages:
+
+```text
+client send
+→ server accepted
+→ recipient gateway enqueue
+→ online recipient device receives
+→ device acknowledgement
+```
+
+Target theo p50/p95/p99, region/network và online/offline state. Không hứa sub-second tới device offline hoặc mạng mất kết nối.
+
+##### 18.2 High availability
+
+- send/receive/sync path availability cao;
+- gateway instance failure không mất message;
+- reconnect route tới instance khác;
+- region/provider failure có degraded/failover policy;
+- presence/typing có thể degrade trước messaging;
+- push provider outage không làm mất durable inbox/message.
+
+##### 18.3 Durability
+
+- server ACK chỉ sau message nằm trong durable authority/log theo contract;
+- replicated storage/backup/RPO;
+- media object durability;
+- pending deliveries/sync cursors phục hồi được;
+- cache/presence rebuildable;
+- deletion/retention contract rõ.
+
+##### 18.4 Scalability
+
+- hàng triệu concurrent persistent connections;
+- high messages/s và group/device fan-out;
+- long conversation histories;
+- media storage/bandwidth lớn;
+- hot groups/users;
+- horizontal partitioning, stateless/gateway connection ownership và backpressure.
+
+##### 18.5 Fault tolerance
+
+- client retries/idempotency;
+- broker/storage/gateway redelivery/reconnect;
+- no single point of failure;
+- duplicate/out-of-order/gap recovery;
+- bounded retry/backoff;
+- poison/malformed client isolation;
+- failover fencing cho conversation ownership nếu dùng.
+
+##### 18.6 Security/privacy
+
+- E2EE content;
+- TLS transport;
+- strong user/device authentication;
+- membership/block authorization;
+- secure device/key lifecycle;
+- metadata minimization;
+- encrypted at rest for server-visible metadata;
+- abuse/spam/rate controls;
+- secure push previews;
+- audit admin/system access.
+
+##### 18.7 Unreliable-network UX
+
+- local-first pending outbox;
+- optimistic UI với honest state;
+- resumable connection/upload;
+- exponential reconnect backoff + jitter;
+- delta sync/cursors/gap detection;
+- data/battery-efficient heartbeats;
+- adaptive media quality/download;
+- no duplicate message on retry;
+- explicit permanent failure/retry UI.
+
+##### 18.8 Maintainability/observability
+
+- trace message by safe IDs without plaintext;
+- per-stage latency/queue/gap/duplicate metrics;
+- protocol/schema backward compatibility;
+- mobile-version rollout lag;
+- runbooks, load/chaos/DR testing;
+- privacy-preserving diagnostics.
+
+---
+
+#### 19. Availability vs consistency priorities
+
+| Path | Priority/degraded behavior |
+|---|---|
+| Send message | Durability/idempotency before ACK; may accept with later delivery |
+| Receive online | Low latency; reconnect/sync fallback |
+| History sync | Complete ordered delta; can be slower than live path |
+| Membership/block | Correct authorization; fail closed for unauthorized send/read |
+| Receipt | Can lag or be omitted temporarily |
+| Presence | Stale/unknown acceptable |
+| Typing | Drop entirely under overload |
+| Media | Text/metadata can arrive before media download; placeholder/retry |
+| Push hint | Best effort; durable message sync remains authority |
+
+Chat availability không có nghĩa gửi message không authorize hoặc acknowledge dữ liệu chưa durable.
+
+---
+
+#### 20. Core invariants
+
+1. Cùng `(sender_device_id, client_message_id)` tạo tối đa một logical message.
+2. Server ACK không được gửi trước durable acceptance boundary.
+3. Một message chỉ được append vào conversation khi sender là authorized member tại rule/version áp dụng.
+4. Message có stable order key/sequence trong conversation theo contract.
+5. Retry/redelivery không tạo duplicate message hoặc device-delivery effect ngoài semantics.
+6. Client có thể phát hiện gap và resync từ authoritative history.
+7. Device/user bị revoke/block không nhận future messages/keys ngoài bounded policy window.
+8. Receipt/read watermark không lùi ngược do event đến muộn.
+9. Presence/typing failure không ảnh hưởng message correctness.
+10. Server không có plaintext/decryption keys nếu đã cam kết true E2EE.
+11. Media reference không được dẫn tới object ngoài authorization/integrity contract.
+12. Multi-device sync cuối cùng hội tụ hoặc báo rõ gap/failure.
+
+---
+
+#### 21. Constraints và challenges
+
+##### 21.1 Persistent connection scale
+
+- millions WebSocket/TCP connections;
+- connection memory/file descriptors;
+- heartbeats/battery/network overhead;
+- load balancer idle timeouts;
+- reconnect storms;
+- gateway-to-user/device routing;
+- rolling deploy/connection draining;
+- NAT/mobile network changes.
+
+##### 21.2 Ordering và hot conversation
+
+- concurrent senders;
+- cross-region clock skew;
+- sequence allocator/partition leader;
+- huge active group hot partition;
+- failover split-brain/fencing;
+- client gap/reorder buffer.
+
+##### 21.3 Fan-out
+
+Một message tạo deliveries cho:
+
+```text
+group members × active devices/member
++ sender's other devices
++ optional push hints
+```
+
+Large groups và multi-device tạo write/network amplification.
+
+##### 21.4 Unreliable network
+
+- send timeout after commit;
+- duplicate retry;
+- connection drops during delivery;
+- ACK loss;
+- long offline gaps;
+- stale auth/session/key state;
+- media partial upload/download.
+
+##### 21.5 Presence/typing fan-out
+
+- celebrity/high-degree user presence updates;
+- subscription explosion;
+- heartbeat write load;
+- privacy filtering;
+- stale presence;
+- typing event storms.
+
+##### 21.6 E2EE và multi-device
+
+- key distribution/rotation;
+- offline recipients;
+- new/revoked device;
+- group membership change;
+- backup/recovery;
+- lost key/device;
+- metadata/abuse trade-offs.
+
+##### 21.7 Media
+
+- upload/download bandwidth;
+- object/storage/CDN cost;
+- viral group media;
+- encrypted scanning/transcoding tension;
+- expiry/deletion/forwarding;
+- slow networks and resumability.
+
+##### 21.8 Abuse/security
+
+- spam, unsolicited messages, account takeover;
+- enumeration/contact discovery abuse;
+- malicious attachments/links;
+- oversized payload/decompression bombs;
+- group invite/member abuse;
+- key/device impersonation;
+- reporting/moderation under E2EE.
+
+---
+
+#### 22. Message lifecycle
+
+```text
+Client state:
+  LOCAL_PENDING
+    → UPLOADING_MEDIA
+    → SENDING
+    → SERVER_ACCEPTED
+    → DELIVERED
+    → READ
+    → FAILED/RETRYING
+
+Server canonical state/history:
+  ACCEPTED(sequence assigned, ciphertext durable)
+    → FANOUT_PENDING
+    → AVAILABLE_TO_RECIPIENT_DEVICE(S)
+    → device receipt/read projections
+```
+
+Không nhất thiết persist một mutable row qua mọi UX state. Message immutable + append receipts/read watermarks/current projections thường dễ reason/replay hơn.
+
+Client phải phân biệt local pending với server accepted để không nói “sent” khi request chưa đạt durability boundary.
+
+---
+
+#### 23. APIs/protocol capabilities cần có
+
+Không chốt transport ở Step 1, nhưng cần capability:
+
+```text
+Authenticate/register/revoke device
+Create/get conversation
+Add/remove/list group members
+Send message with client_message_id
+Receive realtime message/event stream
+ACK delivered/read watermark
+Sync conversation events from cursor
+Paginate history before cursor
+Send typing/presence heartbeat
+Initiate/complete encrypted media upload
+Block/report user/message
+```
+
+Mutations idempotent/versioned; reads cursor-based; realtime protocol có heartbeat, resume token, backpressure và protocol version. REST có thể dùng cho control/history/media-init; WebSocket/gRPC-stream-like channel cho realtime—technology choice ở bước sau.
+
+---
+
+#### 24. Security threat model cần hỏi
+
+- Server/operator có được đọc message content không?
+- Metadata nào server thấy và giữ bao lâu?
+- Attacker chiếm account nhưng chưa có trusted device?
+- Device bị mất/revoke thì future/history access thế nào?
+- Key verification và device-change warning?
+- Spam sender có thể tạo group/gửi message hàng loạt?
+- Push notification có lộ plaintext trên lock screen/provider không?
+- Encrypted backup/key recovery threat model?
+- Report abuse có gửi selected plaintext/context tự nguyện không?
+- Message deletion có nghĩa xóa ở server, recipients, backups hay cryptographic erasure?
+- Legal/data-residency/retention obligations?
+
+“Có E2EE” không đủ nếu identity, backup, push preview hoặc key recovery phá trust boundary.
+
+---
+
+#### 25. SLOs cần chốt
+
+| Path | SLI/SLO cần định nghĩa |
+|---|---|
+| Send | client-send → durable server ACK p95/p99 |
+| Online delivery | server accepted → recipient device receives p95/p99 |
+| Offline sync | reconnect → gap-free sync completion theo backlog size |
+| History | page latency/availability/cursor error |
+| Ordering | duplicate/gap/out-of-order-after-reorder rates |
+| Receipts | device ACK/read propagation latency |
+| Presence | freshness/false-online/unknown rate |
+| Typing | best-effort latency/drop, không cần durability SLO |
+| Media | upload success, time-to-first-byte, resume success |
+| Availability | send/receive/sync success theo region |
+| Durability | acknowledged message loss rate/RPO |
+| Security | unauthorized membership delivery phải bằng 0 theo control boundary |
+| Multi-device | convergence lag và revoked-device propagation |
+
+Sub-second chỉ áp cho online path trong điều kiện network/region đã định nghĩa, không cho user offline.
+
+---
+
+#### 26. Questions cho interviewer/stakeholder
+
+##### Product/scope
+
+- One-to-one, group size tối đa và broadcast channels?
+- Text/media/document limits?
+- Edit/delete/reaction/reply/disappearing messages?
+- History retention và offline duration?
+- Presence/last-seen/read-receipt privacy?
+- Push notification preview policy?
+- Voice/video calls có nằm trong scope?
+
+##### Semantics
+
+- `sent`, `delivered`, `read` định nghĩa thế nào?
+- Ordering cần per sender hay per conversation?
+- Duplicate tolerance/visibility?
+- Group membership history visibility?
+- Delete-for-everyone và late/offline devices?
+- Multiple-device receipt aggregation?
+- New device history bootstrap?
+
+##### Scale
+
+- DAU/MAU, peak concurrent connections?
+- Messages/user/day và message peak/s?
+- 1:1/group mix, group size/activity distribution?
+- Devices/user?
+- Media attachment ratio/sizes/views?
+- Offline backlog distribution?
+- Regions/network profile?
+
+##### Security
+
+- True E2EE scope và approved protocol?
+- Backup/key recovery?
+- Group key/device lifecycle?
+- Metadata retention?
+- Abuse reporting/moderation?
+- Compliance/data residency?
+
+##### Reliability
+
+- Durability/RPO/RTO?
+- Multi-region writes/failover?
+- Message expiry?
+- Push provider role?
+- SLOs cho online/offline delivery/sync?
+
+---
+
+#### 27. Những lỗi thiết kế phổ biến từ Step 1
+
+- Hứa exactly-once end-to-end mà không định nghĩa idempotency/dedup boundary.
+- Hứa “correct order” nhưng không nói per conversation hay global.
+- Dùng client timestamp làm authoritative order.
+- Đồng nhất server ACK với recipient delivered/read.
+- Gọi user online nếu một stale connection chưa hết TTL.
+- Lưu typing indicators như durable messages.
+- Dùng push notification làm message-delivery authority.
+- Không tính sender’s other devices trong multi-device fan-out.
+- Một user ID được coi là một connection/device.
+- Group membership thay đổi nhưng không version/key rotation.
+- Gửi media bytes qua chat gateway/database.
+- Nói E2EE nhưng server tạo plaintext thumbnails/search/backups không giải thích.
+- Không có local outbox/resume/gap sync cho unreliable networks.
+- Không chốt history/retention/new-device bootstrap.
+- Một global sequence cho toàn platform.
+- Presence/receipt overload làm ảnh hưởng core messaging.
+- Bỏ block/spam/abuse/rate limits khỏi scope.
+- Chỉ đo average latency, bỏ reconnect storm/hot groups/tail latency.
+
+---
+
+#### 28. Checklist Step 1
+
+- [ ] One-to-one/group/broadcast scope và max group size?
+- [ ] Text/media/document types và limits?
+- [ ] Edit/delete/reaction/reply/disappearing/history retention?
+- [ ] User vs device vs connection model?
+- [ ] Message/client ID và idempotency semantics?
+- [ ] Server ACK durability boundary?
+- [ ] Ordering scope/sequence/gap behavior?
+- [ ] Delivered/read semantics per user/device/group?
+- [ ] Online/offline sync, cursor và backlog retention?
+- [ ] Multi-device fan-out/convergence/new-device/revocation?
+- [ ] Presence/typing TTL/privacy/best-effort policy?
+- [ ] Media direct upload/encryption/CDN/resume/deletion?
+- [ ] E2EE identity/session/group/device/backup scope?
+- [ ] Server-visible metadata và retention?
+- [ ] Push notification role và preview privacy?
+- [ ] Membership/block authorization consistency?
+- [ ] DAU/connections/messages/group/devices/media assumptions?
+- [ ] Online/offline latency, availability, durability SLOs?
+- [ ] Multi-region/RPO/RTO/data-residency?
+- [ ] Spam/abuse/reporting/rate limits?
+- [ ] Explicit in-scope/out-of-scope/trade-offs?
+
+#### 29. Ý chính cần nhớ
+
+- Chat system là durable ordered event delivery + realtime connection + offline/multi-device sync problem.
+- One-to-one và group messaging có fan-out, membership và receipt semantics khác nhau.
+- User, device và connection là ba identities/lifecycles khác nhau.
+- Client tạo stable `client_message_id`; retries phải idempotent.
+- Exactly-once end-to-end không thực tế; mục tiêu là effectively-once UX trên at-least-once processing.
+- Ordering thường chỉ được bảo đảm per conversation, không global.
+- Server accepted, delivered-to-device và read là các trạng thái khác nhau.
+- Read watermarks giảm write amplification so với receipt row cho mọi message.
+- Presence và typing là ephemeral/best effort; không được ảnh hưởng core messaging.
+- Multi-device gồm fan-out, cursors, identity/key lifecycle và state convergence—not chỉ database sync.
+- Offline UX cần local outbox, reconnect/resume, gap detection và delta sync.
+- Rich media đi object storage/CDN và được tham chiếu từ message; E2EE ảnh hưởng processing.
+- True E2EE đòi hỏi approved protocol, device/group key lifecycle, backup và metadata threat model.
+- Membership/block/revoke/message durability cần correctness cao hơn presence/receipt freshness.
+- Push là wake-up/delivery hint, không phải canonical message channel.
+- Sub-second SLO chỉ có nghĩa khi xác định online/device/network/region boundary.
+- Scope tốt chốt semantics và trust boundaries trước khi chọn WebSocket, Kafka hoặc database.
+
+#### Công thức ghi nhớ
+
+> **Chat scope = idempotent per-conversation messaging + realtime online delivery + durable offline/device sync + ephemeral presence signals + encrypted media/content + explicit receipt/order semantics.**
+
+---
+
+### Bài 84. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của Step 2
+
+Scale estimation cho chat cần trả lời:
+
+- có bao nhiêu logical messages/giây;
+- fan-out thành bao nhiêu recipient/device deliveries;
+- có bao nhiêu persistent connections và reconnects;
+- message/receipt/history/presence write throughput;
+- offline backlog và sync read amplification;
+- media storage, CDN bandwidth và egress;
+- partition/hot-conversation distribution;
+- latency, reliability và capacity headroom;
+- crypto, push, observability và multi-region overhead.
+
+Mục tiêu là tìm đúng order of magnitude và skew. Average alone không đủ để dimension connection gateways, hot groups hoặc reconnect storms.
+
+---
+
+#### 2. Baseline assumptions từ transcript
+
+| Tham số | Giá trị minh họa |
+|---|---:|
+| Daily active users | 100 triệu |
+| Messages/user/ngày | 50 |
+| Logical messages/ngày | 5 tỷ |
+| Peak multiplier | 3× average |
+| Peak online users | 20–30 triệu |
+
+```text
+Messages/day
+= 100,000,000 DAU × 50 messages/user/day
+= 5,000,000,000 messages/day
+```
+
+Các con số chưa có trong transcript nhưng phải hỏi/đo:
+
+- 1:1/group mix và group-size/activity distribution;
+- devices/user và simultaneous online devices;
+- message text/ciphertext envelope size;
+- media attachment ratio/size/views;
+- receipts/message và push-hint rate;
+- offline duration/backlog distribution;
+- regional/time-zone skew;
+- retention, edit/delete/reaction event rate.
+
+---
+
+#### 3. Average và peak message throughput
+
+Một ngày có 86.400 giây:
+
+```text
+Average logical message rate
+= 5,000,000,000 / 86,400
+≈ 57,870 messages/s
+
+Illustrative 3× peak
+≈ 173,611 messages/s
+```
+
+Đây là logical sends, chưa gồm:
+
+- recipient/device fan-out;
+- sender’s other-device sync;
+- broker replicas/consumers;
+- delivery/read receipts;
+- push notifications;
+- retry/redelivery;
+- history/index writes;
+- media objects/downloads.
+
+“3× normal load” cần được hiểu là peak rate trong một time window, không phải 15 tỷ messages rải đều trong ngày.
+
+---
+
+#### 4. Logical messages khác physical deliveries
+
+Một logical message có amplification:
+
+```text
+device deliveries/message
+= eligible recipient users
+× active/registered recipient devices per user
++ sender's other devices
+```
+
+Với group:
+
+```text
+group fan-out
+≈ current eligible members excluding sender
+× devices/member
+```
+
+Ngoài ra có:
+
+```text
+physical work
+= message persistence
++ delivery jobs
++ broker replication/reads
++ device acknowledgements
++ read-state updates
++ push hints
++ search/analytics/abuse metadata events
+```
+
+Đừng gọi 5B messages/ngày là 5B total writes hoặc network sends.
+
+---
+
+#### 5. Fan-out sensitivity example
+
+Giả sử minh họa:
+
+- 90% messages là 1:1;
+- 10% là group messages;
+- group message trung bình có 10 eligible recipients ngoài sender;
+- mỗi recipient có trung bình 1,5 target devices;
+- tạm bỏ sender’s other-device echo.
+
+```text
+1:1 device deliveries/day
+= 5B × 90% × 1 recipient × 1.5 devices
+= 6.75B
+
+Group device deliveries/day
+= 5B × 10% × 10 recipients × 1.5 devices
+= 7.5B
+
+Total
+≈ 14.25B device deliveries/day
+≈ 164,931 deliveries/s average
+≈ 494,792 deliveries/s at 3× peak
+```
+
+Chỉ 10% group messages đã đóng góp hơn nửa delivery work trong ví dụ. Phải dùng **message-weighted group-size distribution**, không dùng average group size của mọi groups; nhiều group lớn có thể gần như không hoạt động, một số hot groups phát sinh phần lớn messages.
+
+---
+
+#### 6. Multi-device amplification
+
+Phân biệt:
+
+- registered devices/user;
+- active devices/user;
+- simultaneously connected devices/user;
+- devices cần nhận historical/future message theo E2EE policy.
+
+Ví dụ một 1:1 message từ Alice phone tới Bob:
+
+```text
+Bob phone + desktop          = 2 recipient deliveries
+Alice desktop/tablet echo    = 2 sender-device sync deliveries
+Total                        = 4 device deliveries
+```
+
+Thiết bị offline vẫn có thể cần mailbox/history sync, nên “không connected” không đồng nghĩa không tạo future delivery state. Device revoke và history bootstrap policy ảnh hưởng storage/fan-out đáng kể.
+
+---
+
+#### 7. Delivery và read receipt load
+
+Naive per-message/per-device receipts:
+
+```text
+delivery ACK writes
+≈ delivered device messages
+
+read ACK writes
+≈ messages read per device/user
+```
+
+Với 14.25B device deliveries/ngày, một ACK cho mỗi delivery có thể tạo cùng order of magnitude writes.
+
+Giảm amplification:
+
+- cumulative ACK tới highest contiguous delivery sequence;
+- per-conversation read watermark;
+- batch/coalesce ACKs;
+- per-user aggregation thay per-device nếu product cho phép;
+- group read counts/projections thay raw fan-out cho UI;
+- asynchronous receipt propagation;
+- monotonic conditional update.
+
+Receipt optimization không được làm mất gap detection hoặc hiển thị state sai theo contract.
+
+---
+
+#### 8. Concurrent connections
+
+Transcript giả định 20–30 triệu online users tại peak. Connections có thể lớn hơn users:
+
+```text
+connections
+= online users × simultaneously connected devices/user
+```
+
+Nếu 30M online users có trung bình 1,2 connected devices:
+
+```text
+≈ 36M concurrent connections
+```
+
+Capacity gateway:
+
+```text
+gateway instances
+≥ concurrent connections
+  / safe connections per instance
+  × headroom/failure factor
+```
+
+“Safe connections per instance” phải load-test theo:
+
+- runtime/kernel/file descriptors;
+- TLS/mTLS state;
+- socket/read/write buffers;
+- per-connection subscriptions/session metadata;
+- heartbeat/message rate;
+- GC/event-loop behavior;
+- network bandwidth/packets per second;
+- rolling deploy/one-AZ failure headroom.
+
+Không chọn một con số WebSocket/server từ benchmark marketing rồi nhân thẳng.
+
+---
+
+#### 9. Connection memory sensitivity
+
+Nếu effective memory/socket/session overhead là `M` bytes/connection:
+
+```text
+fleet connection memory
+= concurrent connections × M
+```
+
+Ví dụ minh họa cho 30M connections:
+
+| Effective overhead/connection | Fleet memory trước headroom |
+|---:|---:|
+| 10 KB | khoảng 300 GB |
+| 25 KB | khoảng 750 GB |
+| 50 KB | khoảng 1,5 TB |
+
+Đây là aggregate fleet memory, không phải capacity của một node. TLS buffers, framework objects và backpressure queues dễ làm thực tế cao hơn. Cần tránh unbounded per-connection outbound buffers khi client chậm.
+
+---
+
+#### 10. Heartbeat và presence traffic
+
+Nếu 30M connections heartbeat mỗi 60 giây:
+
+```text
+heartbeat ingress
+= 30M / 60
+≈ 500,000 heartbeats/s
+```
+
+Mỗi 30 giây:
+
+```text
+≈ 1,000,000 heartbeats/s
+```
+
+Chưa tính heartbeat responses, presence aggregation và subscriber fan-out. Vì vậy:
+
+- dùng transport keepalive hợp lý;
+- adaptive intervals theo foreground/background/network;
+- local gateway lease renewal/batching;
+- TTL/soft state store;
+- không persist từng heartbeat vào primary relational DB;
+- publish presence transition thay vì mọi heartbeat;
+- privacy/subscription filtering;
+- degrade/drop presence trước messages.
+
+Heartbeat interval là trade-off giữa detection latency, fleet load, mobile battery và radio/data usage.
+
+---
+
+#### 11. Connection churn và reconnect storms
+
+Mobile clients đổi Wi-Fi/cellular, background/foreground và mất mạng. Nếu 10% của 30M connections reconnect trong một phút:
+
+```text
+reconnect attempts
+= 3M / 60
+≈ 50,000 reconnects/s
+```
+
+Mỗi reconnect có thể tạo:
+
+- TLS handshake/auth/token validation;
+- connection/session registration;
+- presence transition;
+- route-map update;
+- missed-message delta sync;
+- key/prekey/device-state fetch;
+- push-token refresh;
+- duplicate old-connection cleanup.
+
+Controls:
+
+- exponential reconnect backoff + jitter;
+- resume tokens/session resumption;
+- gateway admission/rate limits;
+- randomized client reconnect;
+- connection draining/rolling deploy controls;
+- stale-session epoch/fencing;
+- sync pagination/budgets;
+- avoid broadcasting presence flaps immediately.
+
+Reconnect storm sau region/network outage có thể nặng hơn normal message peak.
+
+---
+
+#### 12. Text-message storage
+
+Giả sử encrypted message envelope + metadata trung bình 1 KB:
+
+```text
+raw message data/day
+= 5B × 1 KB
+≈ 5 TB/day
+
+30-day raw
+≈ 150 TB
+
+1-year raw
+≈ 1.825 PB
+```
+
+Nếu 2 KB/message, các con số gấp đôi. Physical storage còn có:
+
+- replication;
+- database overhead/indexes;
+- conversation membership/system events;
+- dedup/idempotency records;
+- delivery state/receipts;
+- edit/delete/tombstone;
+- backups/snapshots;
+- broker retention;
+- regional copies.
+
+Không nên lưu full message copy cho từng recipient nếu canonical conversation log + delivery cursors giải quyết được; nhưng offline/device fan-out/read model có trade-offs riêng.
+
+---
+
+#### 13. Retention và lifecycle
+
+Storage estimate phụ thuộc:
+
+- indefinite history hay bounded retention;
+- disappearing messages;
+- delete-for-everyone window;
+- offline device backlog retention;
+- account deletion;
+- backup/legal hold;
+- attachments retention;
+- tombstone duration để late devices không resurrect content;
+- dedup key retention;
+- cold archive accessibility dưới E2EE.
+
+Tiering direction:
+
+- hot recent messages gần active conversations;
+- warm/cold older history;
+- object lifecycle cho media;
+- compact old receipt/attempt metadata;
+- retention policy versioned/auditable;
+- deletion propagation tới indexes/caches/backups theo contract.
+
+E2EE không tự giải quyết deletion; ciphertext copies và keys/backup vẫn có lifecycle.
+
+---
+
+#### 14. Media storage và bandwidth
+
+Giả sử 5% của 5B messages có media, average upload 1 MB:
+
+```text
+media uploads/day
+= 250M objects/messages
+
+raw media ingest/day
+= 250M × 1 MB
+≈ 250 TB/day
+```
+
+Đây chỉ là illustrative; video size distribution có long tail. Variants/thumbnails/replication có thể tăng storage, còn compression/lifecycle giảm nó.
+
+Delivery bandwidth:
+
+```text
+media egress/day
+= media messages
+× eligible recipients/devices/views
+× average bytes actually downloaded
+```
+
+Group media và forwarding có thể đẩy egress lên PB/day. CDN hit ratio, client caching, preview/full-download policy, adaptive bitrate, autoplay và mobile network quyết định cost/latency.
+
+E2EE có thể làm content dedup/transcode/cache semantics khó hơn; cần object IDs/versioning/integrity và client-side encrypted variants.
+
+---
+
+#### 15. Network throughput
+
+Text/ciphertext traffic:
+
+```text
+ingress bytes/s
+≈ logical messages/s × average envelope bytes
+
+delivery bytes/s
+≈ device deliveries/s × average wire bytes
+```
+
+Với peak khoảng 495k device deliveries/s và 1 KB payload:
+
+```text
+payload-only delivery throughput
+≈ 495 MB/s
+≈ 4 Gbps
+```
+
+Thực tế cao hơn do TLS/WebSocket/frame/protocol headers, ACKs, replication và cross-region hops; media đi riêng có thể lớn hơn nhiều bậc. Packets/second và many small writes có thể bottleneck trước raw bandwidth.
+
+Batching/coalescing giúp ACK/presence, nhưng message delivery latency phải giữ SLO.
+
+---
+
+#### 16. Broker/event amplification
+
+Một message có thể đi qua:
+
+```text
+ingestion log
+→ persistence/sequencing consumer
+→ fan-out jobs
+→ recipient/device queues/mailboxes
+→ delivery gateway
+→ receipts/read events
+→ push/analytics/abuse/audit consumers
+```
+
+Broker capacity:
+
+```text
+broker bytes
+≈ event count × serialized size × replication × consumer reads
+```
+
+Risks:
+
+- bad partition key/hot conversation;
+- too many tiny topics/partitions;
+- large media payload in broker;
+- lag and retention disk pressure;
+- consumer redelivery/duplicates;
+- cross-region replication;
+- one hot group monopolizes partition.
+
+Use references for media, stable IDs, bounded envelopes và partition strategy tied to ordering scope.
+
+---
+
+#### 17. Bottleneck 1 — Persistent connection gateways
+
+Rủi ro:
+
+- memory/file-descriptor exhaustion;
+- event-loop/GC pauses;
+- TLS handshake CPU;
+- slow-client outbound buffer growth;
+- load-balancer idle timeout;
+- connection imbalance/sticky routing;
+- rolling deploy disconnect storm;
+- one AZ failure transfers millions connections;
+- heartbeat/packet load.
+
+Controls:
+
+- lightweight event-driven gateways;
+- per-connection memory/buffer caps;
+- backpressure and slow-client disconnect policy;
+- connection count/bytes/pps-based load balancing;
+- registry with gateway/device route and TTL/epoch;
+- graceful drain/go-away + reconnect jitter;
+- TLS session resumption;
+- multi-AZ headroom;
+- connection admission and overload shedding;
+- separate connection plane from message authority.
+
+Gateway failure làm connection rớt, không được làm mất accepted message.
+
+---
+
+#### 18. Bottleneck 2 — Connection routing registry
+
+Realtime delivery cần biết:
+
+```text
+user/device → gateway instance/region/connection epoch
+```
+
+Rủi ro:
+
+- high-frequency connect/disconnect writes;
+- stale route sau gateway crash;
+- multi-device/multiple connections;
+- lookup per device delivery;
+- registry hot user/key;
+- cross-region lookup latency;
+- split sessions khi reconnect.
+
+Controls:
+
+- ephemeral distributed registry/cache with TTL/leases;
+- gateway-local session map;
+- batched route lookup/fan-out;
+- connection epoch/fencing;
+- gateway membership/health integration;
+- shard by user/device;
+- offline fallback to durable mailbox/history;
+- registry rebuild from active gateways;
+- do not make registry sole message authority.
+
+---
+
+#### 19. Bottleneck 3 — Message ingestion, sequencing và dedup
+
+Rủi ro:
+
+- 174k+ logical sends/s peak baseline;
+- client retry after timeout;
+- hot conversation sequence owner;
+- cross-region concurrent writes;
+- dedup index hotness/retention;
+- database+broker dual write;
+- oversized/malformed/encryption-envelope abuse;
+- ACK before durability.
+
+Controls:
+
+- stable client IDs + conditional idempotent insert;
+- conversation partition/home owner/sequencer;
+- atomic message + outbox or append-log authority;
+- bounded payload/validation/rate limits;
+- per-conversation monotonic sequence/version;
+- batching while respecting latency;
+- hot-partition isolation/migration policy;
+- backpressure/admission;
+- ACK only after defined durable commit.
+
+Strict sequence for huge hot groups may require single logical authority; scale across conversations, not arbitrary concurrent writers within one ordered stream.
+
+---
+
+#### 20. Bottleneck 4 — Message fan-out
+
+Rủi ro:
+
+- group members × devices amplification;
+- membership lookup per send;
+- fan-out synchronous on sender path;
+- hot group burst;
+- duplicate delivery jobs;
+- offline devices/backlog growth;
+- sender-other-device echo;
+- recipient gateway unavailable;
+- one group starves 1:1 chats.
+
+Controls:
+
+- durable message commit before async fan-out;
+- versioned membership snapshot/authorization;
+- batch/bucket recipients/devices;
+- idempotent delivery key;
+- separate hot-group/normal workloads and fairness;
+- online direct route + offline durable cursor/mailbox;
+- bounded per-device queues and backpressure;
+- push hints asynchronous;
+- fan-out lag/oldest-message metrics;
+- optionally pull/history sync for very large/broadcast-like groups.
+
+Không phải mọi recipient copy cần chứa full ciphertext nếu group encryption/history model cho phép shared canonical message reference.
+
+---
+
+#### 21. Bottleneck 5 — Hot conversations/groups
+
+Một group rất active gây:
+
+- sequence-owner saturation;
+- same partition write hotspot;
+- membership reads;
+- burst fan-out;
+- receipt/read aggregation;
+- presence/typing storms;
+- media CDN surge;
+- subscriber gateway network load.
+
+Controls:
+
+- conversation ownership/partition isolation;
+- bounded group size/rate quotas;
+- batch fan-out and worker fairness;
+- separate ephemeral signal rate limits;
+- receipt/read watermark aggregation;
+- pull/recent-log sync cho broadcast-scale use case;
+- media CDN/origin protection;
+- hot-key detection and dedicated capacity;
+- degrade typing/presence/read-by lists first.
+
+Sharding một ordered conversation across arbitrary writers có thể phá sequence; parallelize downstream fan-out, không nhất thiết sequencing authority.
+
+---
+
+#### 22. Bottleneck 6 — Message storage và history reads
+
+Rủi ro:
+
+- continuous 5B writes/day;
+- large/hot conversation partitions;
+- unbounded history;
+- reverse pagination/index costs;
+- late device reads/cold storage;
+- delete/tombstone/version propagation;
+- replicas/compaction/repair;
+- cross-region read/write latency;
+- N+1 decrypt/media metadata requests on client/backend.
+
+Controls:
+
+- partition by conversation + time/size bucket;
+- sort by conversation sequence;
+- append-oriented immutable events;
+- bounded page/cursor;
+- hot/warm/cold lifecycle;
+- separate media bytes;
+- replicas/backups/PITR as supported;
+- tombstone/retention compaction strategy;
+- cache recent pages carefully;
+- archiving/rebuild/index policies;
+- load-test skew, not uniform conversation IDs.
+
+Partition key must support primary query “history for conversation ordered by sequence” without one lifetime partition growing forever.
+
+---
+
+#### 23. Bottleneck 7 — Offline sync và catch-up
+
+Reconnect sau nhiều giờ/ngày có thể yêu cầu thousands messages across many conversations.
+
+Rủi ro:
+
+- reconnect storm × large delta sync;
+- one client requests unbounded backlog;
+- gaps/out-of-order across live and sync streams;
+- duplicate message between push/live/history;
+- old device beyond retention;
+- key material missing;
+- sync starves live traffic;
+- huge media auto-download.
+
+Controls:
+
+- global/per-conversation sync cursors;
+- paginated deltas and checkpoints;
+- merge/dedup live + catch-up by message ID/sequence;
+- sync bandwidth/concurrency quotas;
+- prioritize metadata/text before media;
+- client lazy media download;
+- retention/bootstrap policy;
+- snapshot + delta for large state;
+- resume tokens and backoff;
+- separate sync worker/capacity pools;
+- gap-detection and repair metrics.
+
+Client ACK/cursor is state, nhưng canonical history mới là source để repair nếu cursor drift/mất.
+
+---
+
+#### 24. Bottleneck 8 — Receipts và read-state writes
+
+Rủi ro:
+
+- ACK per message/device creates billions writes;
+- read receipts broadcast lại tới all participants/devices;
+- group read-by list cardinality;
+- out-of-order/stale receipt;
+- multi-device read state conflict;
+- hot watermark row for active conversation;
+- UI update storms.
+
+Controls:
+
+- cumulative delivery ACKs/read watermarks;
+- batch/coalesce/debounce;
+- monotonic conditional max update;
+- per-user aggregate from devices;
+- async receipt propagation;
+- group counts/summary instead of full list at scale;
+- optional privacy disable;
+- separate receipt store/partitions;
+- lower priority than messages;
+- drop intermediate states, retain latest watermark.
+
+---
+
+#### 25. Bottleneck 9 — Presence và typing fan-out
+
+Presence changes can fan out to contacts/group members; typing can spike in hot groups.
+
+Rủi ro:
+
+- heartbeat flood;
+- connection flapping;
+- large subscription graph;
+- privacy/block checks;
+- stale online state;
+- presence store hot keys;
+- typing events crowd message path.
+
+Controls:
+
+- gateway leases/TTL and transition-only publish;
+- debounce/hysteresis for flaps;
+- subscribe only active conversations/visible users;
+- batch/coalesce presence updates;
+- privacy-filtered fan-out;
+- ephemeral pub/sub, no durable history;
+- strict rate limits/short TTL;
+- separate priority/capacity path;
+- degrade/drop entirely under overload.
+
+---
+
+#### 26. Bottleneck 10 — E2EE key management
+
+Crypto compute thường không phải bottleneck duy nhất; lifecycle/availability/consistency mới khó:
+
+- identity/prekey registration/lookups;
+- multi-device session fan-out;
+- group key distribution;
+- membership/device-change rotation;
+- offline recipient prekeys;
+- key-server hot users/groups;
+- replay/prekey exhaustion;
+- device verification/revocation;
+- backup/recovery;
+- protocol version migration.
+
+Controls:
+
+- reviewed protocol/libraries;
+- signed device/prekey records;
+- one-time prekey inventory/low-watermark refill;
+- cached public key material with version/expiry;
+- key-service HA and abuse limits;
+- membership/device epochs;
+- no private content keys on server under E2EE contract;
+- secure client storage;
+- cryptographic/compatibility telemetry without leaking secrets;
+- chaos/offline/new-device/revocation tests.
+
+Key service outage có thể block new sessions/devices nhưng existing sessions có thể continue; degraded behavior phải rõ.
+
+---
+
+#### 27. Bottleneck 11 — Media pipeline/CDN
+
+Rủi ro:
+
+- slow/partial uploads;
+- giant/malicious files;
+- object hot spots;
+- viral group download burst;
+- CDN miss/origin overload;
+- encrypted thumbnails/transcode limitation;
+- orphan objects;
+- expired/deleted object access;
+- cross-region egress;
+- mobile data/battery.
+
+Controls:
+
+- direct resumable multipart upload;
+- client-side size/type/integrity/encryption;
+- signed scoped URLs;
+- versioned immutable objects;
+- CDN with origin shielding/range requests;
+- lazy download/adaptive media policy;
+- per-user/group quotas;
+- object lifecycle/orphan cleanup;
+- encrypted variant strategy;
+- client cache;
+- media availability/egress/takedown metrics.
+
+Do not put media bytes in chat broker/message database.
+
+---
+
+#### 28. Bottleneck 12 — Push notification hints
+
+Offline/background devices có thể cần APNs/FCM hint.
+
+Rủi ro:
+
+- one push per message tạo provider/cost/battery spam;
+- token churn;
+- provider quota/outage;
+- duplicate/out-of-order hints;
+- plaintext preview leak;
+- group burst;
+- push arrives after realtime sync.
+
+Controls:
+
+- collapse/batch hints by conversation;
+- TTL/priority;
+- generic privacy-safe payload;
+- token lifecycle cleanup;
+- provider rate limits/retries;
+- push not canonical—client syncs from server;
+- suppress if device already active where feasible;
+- notification preferences/OS settings;
+- separate push backlog from core message fan-out.
+
+---
+
+#### 29. Bottleneck 13 — Multi-region routing và ordering
+
+Global chat needs low latency but strict per-conversation order complicates active-active writes.
+
+Risks:
+
+- sender/recipient in different regions;
+- two senders write same conversation in different regions;
+- cross-region sequence conflict;
+- duplicate event replication;
+- region outage and stale owner;
+- connection route changes;
+- E2EE key/preference/membership lag;
+- egress and data residency.
+
+Direction:
+
+- conversation home region/partition owner;
+- nearest gateway forwards send to owner;
+- global stable message IDs;
+- owner assigns sequence/commits durably;
+- cross-region async recipient fan-out;
+- regional connection registries/mailboxes;
+- idempotent consumers;
+- owner epoch/fencing on failover;
+- explicit failover latency/availability trade-off;
+- no global total order;
+- priority propagation for membership/block/device revoke.
+
+Active-active may be possible with different ordering model/CRDT-like semantics, nhưng không miễn phí và phải nói rõ UX contract.
+
+---
+
+#### 30. Bottleneck 14 — Abuse và denial of service
+
+At scale, attackers can amplify work through:
+
+- spam sends/groups/invites;
+- many fake accounts/devices/connections;
+- reconnect/heartbeat floods;
+- huge encrypted payload/media;
+- hot-group fan-out;
+- receipt/typing spam;
+- prekey exhaustion;
+- contact enumeration;
+- reporting abuse.
+
+Controls:
+
+- per-user/device/IP/tenant rate limits;
+- trust/reputation/risk scoring;
+- group/member/message/media quotas;
+- request/payload/frame limits;
+- connection admission and proof/challenges where appropriate;
+- block/report/sender controls;
+- abuse metadata/audit compatible with E2EE promise;
+- workload isolation and cost budgets;
+- anomaly detection/kill switches.
+
+E2EE bảo vệ content privacy nhưng không ngăn metadata-level spam/DoS controls.
+
+---
+
+#### 31. Bottleneck 15 — Observability
+
+5B messages + 14B illustrative device deliveries có thể tạo enormous logs/traces. Không log plaintext/ciphertext payloads hoặc user/message IDs làm metric labels.
+
+Controls:
+
+- metrics aggregate theo region/gateway/conversation class/path/error;
+- sampled/tail/error traces;
+- safe message/correlation IDs trong protected indexed diagnostics;
+- structured logs với metadata minimization/redaction;
+- connection/message/delivery/sync stage metrics;
+- separate security/audit evidence;
+- bounded retention/cardinality budgets;
+- client telemetry sampling/privacy;
+- detect silent gaps/duplicates, not just server errors.
+
+Observability backend outage không được block core message delivery; buffer/drop non-critical telemetry theo policy.
+
+---
+
+#### 32. Tổng hợp bottlenecks
+
+| Bottleneck | Amplification/skew | Control direction |
+|---|---|---|
+| Persistent connections | Users × devices, memory/FD/pps | Lightweight gateways, caps, headroom, graceful drain |
+| Reconnect storms | Outage/users × auth/sync | Backoff/jitter, resume, admission, separate sync capacity |
+| Routing registry | Connection churn/lookups | TTL leases, epochs, sharding, offline fallback |
+| Message ingestion | 58k avg/174k peak + retries | Idempotent durable append, partition owner, backpressure |
+| Group/device fan-out | Members × devices | Async batches, fairness, idempotent deliveries |
+| Hot conversation | Single ordered stream + fan-out | Owner isolation, quotas, downstream parallelism |
+| Message history | 5B writes/day + retention | Conversation/time buckets, append, tiering, cursor |
+| Offline sync | Backlog × reconnecting devices | Delta cursor, pages, gap repair, sync quotas |
+| Receipts | Deliveries × devices | Cumulative ACK/read watermark, batching/aggregation |
+| Presence/typing | Heartbeats × subscribers | TTL soft state, coalesce, scoped subscriptions, drop |
+| E2EE keys | Users × devices/groups/change | Reviewed protocol, prekeys, version/rotation/HA |
+| Media | Attachments × recipients/views | Object storage, encrypted direct upload, CDN/lifecycle |
+| Push hints | Offline devices × messages | Collapse/TTL/token cleanup; hint only |
+| Multi-region | Owner/replication/routing | Home region, IDs, idempotency, fenced failover |
+| Abuse | Attacker-controlled amplification | Quotas, admission, isolation, reputation/limits |
+| Observability | Events × stages/cardinality | Aggregation, sampling, redaction, retention budget |
+
+---
+
+#### 33. Load-test scenarios
+
+1. Baseline 58k logical messages/s with measured 1:1/group/device mix.
+2. Peak 174k messages/s và corresponding device fan-out.
+3. 30M+ connections with realistic heartbeat/message distribution.
+4. One AZ/gateway pool lost; millions clients reconnect with jitter.
+5. Mobile network flap causes 50k reconnects/s and delta sync.
+6. Hot group with hundreds members, multiple messages/s and media.
+7. Duplicate send after ACK loss; verify one logical message.
+8. Out-of-order broker/fan-out/receipt events; client gap repair.
+9. Conversation owner failover while concurrent users send.
+10. Multi-day offline device syncs large history while live traffic continues.
+11. Receipt/read storm and mark-read across multiple devices.
+12. Presence heartbeat surge/flapping; core messaging unaffected.
+13. Typing spam/hot group; signals dropped without message loss.
+14. E2EE prekey depletion/key service outage/new device/revocation.
+15. 250TB/day illustrative media ingest and viral CDN cold object.
+16. APNs/FCM outage/token invalidation wave.
+17. Storage/broker partition hotness/compaction/lag.
+18. Cross-region latency/replication duplicate/region outage.
+19. Malicious oversized frames/media/reconnect/account spam.
+20. Observability backend unavailable/high-cardinality safeguards.
+
+Pass criteria gồm latency, no acknowledged message loss, bounded duplicates, correct ordering/gap recovery, membership/E2EE correctness, controlled backlog/resources và graceful feature degradation.
+
+---
+
+#### 34. Metrics và evolution triggers
+
+##### Connections
+
+- active connections/users/devices by gateway/region/AZ;
+- connect/reconnect/auth rate và latency;
+- heartbeat/timeout/flap;
+- memory/FD/pps/bandwidth;
+- outbound buffer/slow-client disconnect;
+- route-registry stale/miss;
+- drain/rebalance behavior.
+
+##### Messages/fan-out
+
+- sends/s, accepted/error/idempotency-hit;
+- send→durable ACK latency;
+- message→online-device latency;
+- recipients/devices/message distribution;
+- fan-out queue lag/oldest age;
+- hot conversation/partition;
+- duplicate/gap/out-of-order-after-reorder rate;
+- push hint and offline backlog.
+
+##### Sync/receipts
+
+- delivery/read ACK rate and batch size;
+- watermark propagation lag/conflicts;
+- reconnect sync pages/bytes/duration;
+- gap detect/repair success;
+- multi-device convergence/revoke lag.
+
+##### Storage/media/crypto
+
+- message bytes/writes/reads/partition size;
+- retention/tombstone/compaction;
+- media upload/download/CDN hit/origin/egress;
+- key/prekey availability/latency/exhaustion;
+- backup/restore/rebuild checks.
+
+Triggers:
+
+- add/split gateways/partitions;
+- isolate/migrate hot conversations;
+- adjust heartbeat/admission/reconnect controls;
+- change push vs pull fan-out for large groups;
+- bucket/archive histories;
+- increase sync/receipt batching;
+- add regional routing/owner capacity;
+- pre-warm/protect media origin;
+- degrade presence/typing/read-by detail under pressure.
+
+---
+
+#### 35. Những lỗi estimate thường gặp
+
+- 5B messages/day được coi là 58k total operations/s.
+- Không tính group recipients, devices, sender-device echo và receipts.
+- Dùng average group size thay message-weighted distribution.
+- 30M online users được coi là 30M connections dù multi-device.
+- Chỉ tính connection count, bỏ heartbeat, reconnect, memory, FD và pps.
+- Không load-test one-AZ failure/reconnect storm.
+- Một ACK row cho mọi message/device mà không tính billions writes.
+- Không tách presence/typing ephemeral traffic khỏi messages.
+- Dùng WebSocket benchmark connections/server mà không đo realistic buffers/TLS/events.
+- Lưu một lifetime partition cho conversation history.
+- Dùng timestamp client làm order/partition key.
+- Không tính offline sync reads/gap repair.
+- Tính 1KB text storage nhưng bỏ replication/index/backups/dedup/receipts.
+- Không tính media views/CDN egress hoặc group amplification.
+- Đẩy media bytes qua message broker.
+- Bỏ key/prekey/group/device lifecycle capacity vì “crypto nhanh”.
+- Không dimension push hints/token churn/provider outage.
+- Uniform load test bỏ hot groups/hot users.
+- Log/trace mọi message gây cost/cardinality/privacy bottleneck.
+- Over-engineer global active-active ordering khi requirements/team chưa cần.
+
+---
+
+#### 36. Checklist Step 2
+
+- [ ] DAU/MAU, messages/user/day và average/peak messages/s?
+- [ ] Peak duration/time zones/festival or incident multiplier?
+- [ ] 1:1/group mix và message-weighted recipient distribution?
+- [ ] Devices/user, simultaneously connected và fan-out policy?
+- [ ] Logical messages → device deliveries → receipts/push amplification?
+- [ ] Concurrent connections/gateway safe capacity/headroom?
+- [ ] Per-connection memory/FD/buffer/TLS/pps/bandwidth?
+- [ ] Heartbeat interval/traffic/battery trade-off?
+- [ ] Connect/reconnect rates và outage storm?
+- [ ] Route registry lookup/write/staleness capacity?
+- [ ] Message envelope size, storage/day/retention/replication/index?
+- [ ] Conversation partition/bucket/hot-group distribution?
+- [ ] Fan-out workers/queues/backlog/freshness/drain capacity?
+- [ ] Offline duration/backlog/sync pages/bytes/concurrency?
+- [ ] Receipt/read watermark rate/storage/aggregation?
+- [ ] Presence/typing updates/subscribers/fan-out/drop policy?
+- [ ] Media rate/size/variants/uploads/views/CDN/egress?
+- [ ] Push hints, token churn/provider quota?
+- [ ] E2EE prekeys/devices/groups/rotation/service capacity?
+- [ ] Multi-region routing/owner/replication/egress/failover?
+- [ ] Abuse-amplification controls?
+- [ ] Observability volume/cardinality/retention/privacy?
+- [ ] Load tests include hot group, retry, gap, reconnect và AZ/region failure?
+- [ ] Metrics/triggers connect bottleneck to scaling/degraded behavior?
+
+#### 37. Ý chính cần nhớ
+
+- 100M DAU × 50 messages/ngày = 5B logical messages/ngày.
+- 5B/ngày ≈ 57.9k messages/s average và ≈173.6k/s ở peak 3×.
+- Logical sends khác recipient/device deliveries, receipts, push hints và broker operations.
+- Với illustrative 90% 1:1, 10% groups, 10 recipients/group và 1,5 devices, workload đạt 14.25B device deliveries/ngày.
+- Peak device delivery trong ví dụ gần 495k/s trước retries/sender-device echo.
+- 20–30M online users có thể thành nhiều hơn 30M connections do multi-device.
+- Heartbeat mỗi 60 giây cho 30M connections đã khoảng 500k/s.
+- Reconnect 10% fleet trong một phút có thể tạo khoảng 50k reconnects/s cùng sync load.
+- 1KB × 5B messages ≈ 5TB raw text/envelope data/ngày trước replication/indexes.
+- 5% media × 1MB trên 5B messages ≈ 250TB uploads/ngày trong ví dụ; delivery có thể PB/day.
+- Group/device fan-out và receipts thường lớn hơn logical message write workload.
+- Persistent gateway capacity phụ thuộc memory, FDs, TLS, pps, buffers và churn—not chỉ socket count.
+- Ordering/hot conversation cần conversation authority; downstream fan-out mới scale song song.
+- Offline sync cần cursors, pagination, gap repair và capacity tách khỏi live path.
+- Presence/typing là soft/ephemeral traffic và phải degrade trước core messages.
+- E2EE bottleneck gồm key/device/group lifecycle, không chỉ encryption CPU.
+- Multi-region latency phải cân bằng per-conversation order/ownership và failover fencing.
+- Estimate tốt nối **logical messages → conversation/member/device fan-out → connections/receipts/sync/media → storage/network/cost/SLO**.
+
+#### Công thức ghi nhớ
+
+> **Chat load = logical messages × recipients × devices + receipts + offline sync + persistent-connection churn/heartbeats + presence/typing + media delivery + crypto/routing overhead.**
+
+---
+
+### Bài 85. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của Step 3
+
+High-level design phải xác định:
+
+1. Thiết bị thiết lập và duy trì realtime connection thế nào?
+2. Message được authorize, order, lưu durable và ACK ra sao?
+3. Online delivery và offline synchronization dùng cùng authoritative history thế nào?
+4. Group/multi-device fan-out được tạo và retry ra sao?
+5. Receipts, presence, typing, media và push hints nằm ở đâu?
+6. REST và WebSocket contracts nào phục vụ từng workload?
+
+Nên nhìn hệ thống thành ba planes:
+
+```text
+Connection plane → long-lived sessions, realtime routing, ephemeral signals
+Message plane    → authorization, ordering, durability, fan-out, sync, receipts
+Media plane      → encrypted object upload/download và CDN delivery
+```
+
+Connection bị mất có thể reconnect; accepted message thì không được mất.
+
+---
+
+#### 2. Sơ đồ high-level
+
+```text
+ Mobile/Desktop/Web Clients
+   │          │ REST/control/history/media
+   │ WS       └───────────────────────────────────────────────┐
+   ▼                                                          ▼
+ Edge/WAF/WebSocket-aware Load Balancer                 API Gateway/BFF
+   │                                                          │
+   ▼                                                          │
+ Realtime Connection Gateways ◄──► Connection Registry        │
+   │        │                      (device→gateway/epoch)       │
+   │        ├── Presence/Typing Service ── Ephemeral Store     │
+   │        └── Realtime Delivery Router ◄───────────────┐     │
+   │                                                     │     │
+   └── inbound commands ──► Chat/Message Service ◄───────┼─────┘
+                              │                           │
+                   ┌──────────┼───────────┐               │
+                   ▼          ▼           ▼               │
+              Auth/Device  Conversation  Group/Membership │
+                Service       Service       Service        │
+                   │          │              │             │
+                   └──────────┴──────┬───────┘             │
+                                    ▼                     │
+                         Message Store + Outbox            │
+                                    │                     │
+                                    ▼                     │
+                         Durable Event Log/Queues          │
+                          ├─ Fan-out/Delivery Workers ─────┘
+                          ├─ Receipt/Sync projections
+                          ├─ Push Notification Service → APNs/FCM
+                          └─ Abuse/Audit/Analytics metadata
+
+ Media Service ──► Object Storage ──► CDN
+      ▲                 ▲
+      └── upload init ──┘ direct encrypted upload/download
+
+ Key/Device Directory
+   └─ identity/public prekeys/device epochs
+```
+
+Message Store/conversation log là authority. Connection registry, presence, caches và push đều là supporting/ephemeral/derived state.
+
+---
+
+#### 3. Component responsibilities
+
+| Component | Trách nhiệm | Không nên làm |
+|---|---|---|
+| Edge/LB | TLS, DDoS/WAF, route WebSocket/REST, connection admission | Message business logic |
+| Connection Gateway | Maintain sockets, authenticate session, frame/protocol, backpressure | Canonical message storage/order |
+| Connection Registry | Device→gateway/region/epoch soft mapping | Durable offline inbox authority |
+| Chat/Message Service | Validate, AuthZ, idempotency, order/commit, ACK | Manage millions raw sockets |
+| Conversation Service | Conversation metadata/type/history policies | Device connection routing |
+| Group/Membership Service | Group lifecycle, members/roles/version | Message bytes/media storage |
+| Delivery/Fan-out Workers | Expand recipients/devices, create/route idempotent deliveries | Reorder canonical conversation log |
+| Presence/Typing Service | Ephemeral leases/subscriptions/events | Decide message durability |
+| Receipt/Sync Service | Delivery/read watermarks, cursors, gap repair | Treat receipt as message authority |
+| Media Service | Upload authorization, metadata, encrypted object lifecycle | Proxy large bytes through chat path |
+| Notification Service | Push hint cho offline/background devices | Canonical message delivery |
+| Auth/Device/Key Directory | Identity, devices, public keys/prekeys/revocation | Hold content decryption keys under E2EE |
+
+Service boundaries có thể deploy chung ở quy mô nhỏ; ownership/invariants vẫn phải rõ.
+
+---
+
+#### 4. Realtime Connection Gateway
+
+Gateway duy trì long-lived WebSocket connections cho mỗi authenticated device.
+
+Lifecycle:
+
+```text
+connect
+  → TLS/WebSocket upgrade
+  → validate access token/device/session/protocol version
+  → establish connection_id + epoch
+  → register device route with TTL
+  → resume from cursor if supplied
+  → heartbeat/flow control
+  → drain/disconnect/expire route
+```
+
+Trách nhiệm:
+
+- parse bounded frames và reject malformed/oversized input;
+- connection/session authentication;
+- per-device/user/IP rate limits;
+- forward commands tới Message/Presence services;
+- deliver outbound frames tới socket;
+- heartbeat, backpressure và slow-client handling;
+- graceful drain/reconnect hints;
+- connection-level ACK khác message durable ACK.
+
+Gateway không tự quyết định membership, gán authoritative message order hoặc giữ sole copy của pending messages.
+
+---
+
+#### 5. Connection Registry và routing
+
+Registry soft state:
+
+```text
+key: user_id/device_id
+value: region, gateway_id, connection_id, connection_epoch, expires_at
+```
+
+Gateway renew lease/TTL; route hết hạn khi crash hoặc disconnect. Reconnect tạo epoch mới để delivery cũ không ghi vào stale socket.
+
+Lookup flow:
+
+```text
+Delivery Worker/Router
+  → batch lookup recipient devices
+  → registry returns active gateway routes
+  → publish/route delivery to target gateway shard
+  → gateway validates current connection epoch and sends
+```
+
+Redis/ephemeral KV/pub-sub có thể hỗ trợ registry/routing, nhưng Redis Pub/Sub không durable: subscriber offline hoặc node failure có thể mất event. Canonical message/history/mailbox phải cho phép retry/sync.
+
+Sticky session không giải quyết cross-gateway routing. Persistent socket tự gắn với một instance trong lifetime; registry và connection-aware load balancing mới giúp toàn cluster tìm đúng instance.
+
+---
+
+#### 6. Chat/Message Service
+
+Đây là core write authority cho messaging workflow:
+
+1. Xác thực sender user/device context.
+2. Validate envelope, type, size, client message ID.
+3. Authorize conversation membership/block/account/device state.
+4. Deduplicate retry theo `(sender_device_id, client_message_id)`.
+5. Gán server `message_id` và per-conversation sequence/order key.
+6. Commit encrypted message envelope + outbox durably.
+7. Trả `SERVER_ACCEPTED` ACK với IDs/sequence.
+8. Publish event cho fan-out/delivery/sync/notification.
+
+```text
+DB/log transaction:
+  append Message(conversation, sequence, ciphertext, metadata)
+  insert Idempotency result
+  insert Outbox(MessageAccepted)
+COMMIT
+```
+
+Nếu commit thành công nhưng ACK mất, client retry cùng ID và nhận lại canonical result. Không ACK success trước durable boundary.
+
+---
+
+#### 7. Conversation và Group/Membership Services
+
+Conversation Service sở hữu:
+
+- conversation ID/type/metadata/version;
+- 1:1 pair uniqueness nếu product yêu cầu;
+- history/retention/disappearing policy;
+- last activity/summary projections;
+- conversation home-region/partition ownership metadata.
+
+Group Service sở hữu:
+
+- create/update group;
+- membership, roles và invitation/join/leave/remove;
+- membership version/epochs;
+- group-size/rate constraints;
+- history visibility rules;
+- key-rotation trigger metadata;
+- system events.
+
+Send phải authorize against appropriate membership version/current rule. Fan-out dùng versioned membership snapshot hoặc membership event/cursor để tránh recipient list không xác định.
+
+Group Service không cần lưu một separate message table nếu unified conversation/message log hỗ trợ cả 1:1 và groups.
+
+---
+
+#### 8. Unified data model thay vì direct/group tables tách cứng
+
+Transcript mô tả `direct_messages`, `group_chat`, `group_members`, `group_messages`. Production-oriented model có thể thống nhất:
+
+```text
+Conversation(
+  conversation_id,
+  type DIRECT|GROUP,
+  home_partition/region,
+  metadata_version,
+  created_at,
+  ...
+)
+
+ConversationMember(
+  conversation_id,
+  user_id,
+  role,
+  joined_sequence,
+  left_sequence,
+  membership_version,
+  ...
+)
+
+MessageEvent(
+  conversation_id,
+  bucket,
+  sequence,
+  message_id,
+  client_message_id,
+  sender_user_id,
+  sender_device_id,
+  encrypted_payload_or_media_ref,
+  event_type,
+  server_accepted_at,
+  version/tombstone/expiry,
+  ...
+)
+```
+
+Lợi ích:
+
+- shared send/history/sync/ordering pipeline;
+- group/direct khác ở membership/fan-out policy;
+- dễ thêm system/edit/delete/reaction events;
+- query chính là conversation history by sequence.
+
+Timestamp không “bảo đảm order”; server sequence/order key mới làm việc đó. `status` không nằm duy nhất trên message vì nhiều recipients/devices có trạng thái khác nhau.
+
+---
+
+#### 9. Receipt và Sync data model
+
+```text
+DeviceDeliveryState(
+  message_id,
+  recipient_device_id,
+  state/version,
+  delivered_at,
+  ...
+)
+
+ConversationDeliveryWatermark(
+  conversation_id,
+  recipient_user_or_device_id,
+  highest_contiguous_delivered_sequence,
+  version
+)
+
+ConversationReadWatermark(
+  conversation_id,
+  reader_user_or_device_id,
+  highest_contiguous_read_sequence,
+  version
+)
+
+DeviceSyncCursor(
+  device_id,
+  stream/conversation scope,
+  last_acknowledged_sequence/cursor,
+  version
+)
+```
+
+Watermarks giảm receipt writes; per-message/device state chỉ dùng nơi product cần. Updates phải monotonic/conditional max để receipt cũ không làm state lùi.
+
+---
+
+#### 10. Direct-message send flow
+
+```text
+Alice Device A
+  → WebSocket SEND_MESSAGE(
+       conversation_id,
+       client_message_id,
+       encrypted_payload,
+       media_refs,
+       client metadata
+     )
+  → Connection Gateway
+  → Chat Service
+       ├─ AuthZ/dedup/validate
+       ├─ conversation owner assigns sequence
+       └─ durable Message + Outbox commit
+  ← SERVER_ACCEPTED(message_id, sequence)
+
+MessageAccepted event
+  → Delivery/Fan-out Worker
+       ├─ Bob authorized devices
+       └─ Alice other authorized devices
+  → online route through Connection Registry/Gateway
+  → offline devices recover through mailbox/history sync
+  → optional push hint for background/offline devices
+```
+
+Presence lookup chỉ chọn fast delivery route/hint policy. Message vẫn được durable commit và trở thành sync-able dù Bob được đánh dấu online nhưng socket đã chết.
+
+---
+
+#### 11. Group-message send flow
+
+```text
+Sender
+  → SEND_MESSAGE(group_conversation_id, client_message_id, ciphertext...)
+  → Chat Service
+       ├─ authorize sender against membership/version
+       ├─ assign conversation sequence
+       └─ durable commit + outbox
+  ← SERVER_ACCEPTED
+
+Fan-out Worker
+  → read/version group membership
+  → bucket eligible recipients
+  → resolve authorized devices
+  → idempotent delivery jobs
+  → online gateways + offline sync/mailbox + push hints
+```
+
+Không fan-out hàng trăm recipients đồng bộ trước sender ACK. Canonical group message lưu một lần nếu cryptographic/data model cho phép; deliveries/references được materialize theo device/sync strategy.
+
+Controls:
+
+- membership snapshot/version;
+- group size/rate limits;
+- batched fan-out;
+- hot-group isolation/fairness;
+- delivery key `(message_id, device_id)`;
+- group receipt aggregation;
+- key rotation/distribution coordinated with membership changes.
+
+---
+
+#### 12. Online delivery flow
+
+```text
+Delivery job
+  → batch route lookup
+  → target gateway channel/partition
+  → gateway checks device + connection epoch
+  → enqueue bounded outbound frame
+  → device receives/decrypts/persists locally
+  → device sends cumulative DELIVERY_ACK(sequence)
+  → Receipt Service monotonic update
+  → optional receipt event to sender devices
+```
+
+Nếu connection mất giữa lookup và send:
+
+- gateway rejects/does not ACK job;
+- delivery retry hoặc device sync retrieves message;
+- push hint có thể đánh thức client;
+- no message loss because realtime path không là authority.
+
+Slow client có bounded buffer; khi vượt limit, disconnect/resync tốt hơn giữ unbounded memory.
+
+---
+
+#### 13. Offline và reconnect sync flow
+
+```text
+Device reconnects with resume token/cursor
+  → authenticate device/session/epoch
+  → register route
+  → Sync Service compares cursors/high-watermarks
+  → return paginated missing conversation/events
+  → client merges by message_id/sequence
+  → detect/request gaps
+  → ACK cumulative sync cursor
+  → switch/merge with live stream
+```
+
+Requirements:
+
+- snapshot/delta or per-conversation cursor contract;
+- cursor opaque/versioned/authorized;
+- page/byte/time budgets;
+- no duplicate UX between live and sync;
+- metadata/text trước, media lazy download;
+- old-device/retention/bootstrap behavior;
+- reconnect backoff/jitter;
+- separate sync capacity so catch-up không starve live delivery.
+
+Push notification chỉ là hint; device luôn sync authoritative history after reconnect.
+
+---
+
+#### 14. Delivery/read receipt flow
+
+```text
+Recipient Device
+  → DELIVERY_ACK(conversation_id, highest_contiguous_sequence)
+  → READ_UP_TO(conversation_id, sequence)
+  → Gateway → Receipt Service
+  → authorize member/device + conditional monotonic max update
+  → ReceiptChanged event
+  → sender's active devices / other authorized participants
+```
+
+Receipt events:
+
+- batch/coalesce/debounce;
+- lower priority than messages;
+- duplicate/out-of-order safe;
+- privacy preference applied;
+- group summaries/counts instead of unlimited read-by list;
+- user-vs-device aggregation specified;
+- no durable retry after receipt becomes irrelevant according policy.
+
+---
+
+#### 15. Presence flow
+
+```text
+Device connection established
+  → Presence Service acquires lease(device, connection_epoch, TTL)
+  → heartbeats renew locally/batched
+  → meaningful transition published after debounce/hysteresis
+  → privacy-filtered subscribers receive update
+  → disconnect/crash causes lease expiry
+```
+
+Presence Store là ephemeral Redis-like/distributed soft-state store; không update profile DB mỗi heartbeat. User presence aggregate từ device leases và privacy policy.
+
+Presence unavailable:
+
+- UI hiển thị unknown/stale-safe;
+- delivery vẫn route qua registry/history;
+- no message loss;
+- typing/presence fan-out có thể drop.
+
+---
+
+#### 16. Typing-indicator flow
+
+```text
+Client → TYPING(conversation_id, state/heartbeat)
+  → Gateway validates membership + rate limit
+  → ephemeral pub/sub to active conversation subscribers
+  → receiver auto-expires indicator by TTL
+```
+
+Không vào Message Store, không retry durable, không đẩy tới offline mailbox. Coalesce/debounce và drop under pressure. Với group lớn, chỉ gửi khi conversation visible hoặc giới hạn số active typers.
+
+---
+
+#### 17. Media flow
+
+```text
+1. Client asks Media Service for upload session.
+2. AuthZ validates user/conversation/quota/content metadata.
+3. Service returns media_id + scoped signed multipart URL.
+4. Client encrypts media and uploads directly to Object Storage.
+5. Upload completes with encrypted object hash/size/metadata.
+6. Client sends normal chat message containing encrypted media descriptor.
+7. Recipient obtains scoped download/CDN URL/reference.
+8. Client downloads, verifies integrity and decrypts locally.
+```
+
+Media Service manages metadata/lifecycle, not plaintext under true E2EE. CDN/object storage deliver ciphertext. Orphan uploads expire; media message send validates uploader/ownership/completion.
+
+Server-side scan/transcode/thumbnail requires explicit trust-model decision. Client-created encrypted variants are one direction; do not silently decrypt on server while claiming E2EE.
+
+---
+
+#### 18. Notification/push fallback
+
+When recipient device is offline/background or realtime delivery is not confirmed:
+
+```text
+MessageAccepted/DeliveryPending
+  → Notification Service
+  → preference/privacy/collapse/rate policy
+  → APNs/FCM push hint
+  → client wakes/reconnects/syncs authoritative messages
+```
+
+Push payload nên generic hoặc E2EE-safe according policy. Use collapse key per conversation, TTL và token cleanup. Push provider accepted không phải message delivered; duplicate/missing hint không ảnh hưởng canonical chat state.
+
+Notification fan-out không nằm trên sender ACK path.
+
+---
+
+#### 19. Auth, User, Device và Key Directory
+
+Auth/User Service:
+
+- account authentication/session/token;
+- profile/account/block status;
+- rate/risk state;
+- device registration/revocation authorization.
+
+Device/Key Directory:
+
+- device identity/public keys;
+- signed prekeys/one-time prekeys;
+- device epoch/status;
+- push token/reference;
+- protocol capabilities/version;
+- no content private keys on server under E2EE.
+
+Flow:
+
+```text
+new device registration
+  → strong account auth/approval
+  → publish device identity/prekeys
+  → notify existing devices/user
+  → establish sessions/history bootstrap policy
+
+revoke device
+  → authoritative device epoch/status update
+  → disconnect/fence sessions
+  → stop future fan-out/push
+  → rotate affected sessions/group keys per protocol
+```
+
+JWT authentication không thay membership/block/device authorization cho từng command/resource.
+
+---
+
+#### 20. Data ownership
+
+| Data | Authority | Derived/ephemeral |
+|---|---|---|
+| Account/profile/block state | User/Auth Store | Profile cache |
+| Device identity/revocation/public keys | Device/Key Directory | Key/route cache |
+| Conversation metadata | Conversation Store | Conversation-list projection |
+| Group membership/roles/version | Membership Store | Member cache/snapshot |
+| Message ciphertext/order | Message Store/conversation log | Recipient delivery projections/cache |
+| Delivery/read state | Receipt/Sync Store | UI/count cache |
+| Connection route | Active gateway + registry lease | Rebuildable soft state |
+| Presence/typing | Ephemeral lease/pub-sub | No durable authority required |
+| Media ciphertext | Object Storage | CDN edge cache |
+| Media metadata/access state | Media Metadata Store | Manifest/cache |
+| Push hint | External provider/request log | Not message authority |
+
+Không để Connection Manager hoặc Redis Pub/Sub trở thành sole copy của accepted message.
+
+---
+
+#### 21. WebSocket protocol
+
+Connection handshake:
+
+```http
+GET /v1/realtime
+Upgrade: websocket
+Authorization: Bearer <access-token>
+Sec-WebSocket-Protocol: chat.v1
+```
+
+Trong browser có thể cần token/cookie/subprotocol strategy phù hợp thay vì giả định custom `Authorization` luôn khả dụng ở mọi client API. Token phải short-lived/refreshable; long connection re-auth/expiry semantics cần rõ.
+
+Frame envelope:
+
+```json
+{
+  "frame_id": "frm_...",
+  "type": "SEND_MESSAGE",
+  "protocol_version": 1,
+  "device_id": "dev_...",
+  "client_message_id": "cmsg_...",
+  "conversation_id": "conv_...",
+  "payload": {},
+  "trace_id": "..."
+}
+```
+
+Server frames:
+
+```text
+SERVER_ACCEPTED
+MESSAGE_AVAILABLE
+DELIVERY_RECEIPT
+READ_RECEIPT
+MEMBERSHIP_CHANGED
+DEVICE_CHANGED
+TYPING
+PRESENCE
+SYNC_REQUIRED
+ERROR/THROTTLED/GO_AWAY
+```
+
+Protocol needs:
+
+- frame/field size limits;
+- schema/version compatibility;
+- IDs and sequence, not client timestamp as order;
+- heartbeat/ping-pong;
+- flow control/backpressure;
+- resume cursor/token;
+- error/retry classification;
+- compression safety;
+- rate limits and abuse handling.
+
+---
+
+#### 22. REST APIs
+
+REST phù hợp cho control plane, history, sync initiation và media.
+
+##### Conversations/history
+
+```http
+POST /v1/conversations
+GET  /v1/conversations?cursor=...
+GET  /v1/conversations/{conversation_id}/messages?before=<cursor>&limit=50
+```
+
+##### Groups
+
+```http
+POST   /v1/groups
+GET    /v1/groups/{group_id}/members?cursor=...
+PUT    /v1/groups/{group_id}/members/{user_id}
+DELETE /v1/groups/{group_id}/members/{user_id}
+```
+
+Membership mutation cần idempotency/version/precondition và role AuthZ.
+
+##### Sync
+
+```http
+POST /v1/devices/{device_id}/sync
+{
+  "cursor": "opaque-resume-token",
+  "max_items": 500
+}
+```
+
+##### Media
+
+```http
+POST /v1/media/uploads
+POST /v1/media/{media_id}/complete
+GET  /v1/media/{media_id}/download-authorization
+```
+
+##### Device/key directory
+
+```http
+POST   /v1/devices
+DELETE /v1/devices/{device_id}
+GET    /v1/users/{user_id}/devices/keys
+POST   /v1/devices/{device_id}/prekeys
+```
+
+##### Presence
+
+Point presence query có thể dùng REST nếu product cần, nhưng subscription/realtime updates đi WebSocket và phải enforce privacy.
+
+---
+
+#### 23. API semantics và security
+
+- AuthN via OAuth/OIDC/JWT/session/device proof as appropriate.
+- AuthZ per conversation/member/role/block/device/media object.
+- `client_message_id`/`Idempotency-Key` cho mutations.
+- optimistic concurrency/membership version cho group changes.
+- cursor pagination, bounded page/batch size.
+- `SERVER_ACCEPTED` chỉ sau durable commit.
+- message content là ciphertext; metadata minimized.
+- WebSocket and REST request quotas/frame limits.
+- replay/nonce/session protections.
+- TLS everywhere dù content E2EE.
+- signed scoped media URLs và integrity checks.
+- no plaintext/key/PII in logs.
+- admin/support access audited and least privilege.
+
+RBAC alone không đủ: Alice có role `USER` nhưng vẫn không được đọc conversation của Bob.
+
+---
+
+#### 24. Communication matrix
+
+| From → To | Kiểu | Semantics |
+|---|---|---|
+| Client → Gateway | WebSocket | Long-lived, authenticated device session, flow-controlled |
+| Gateway → Chat Service | Sync internal RPC/command | Deadline, AuthZ context, idempotent send |
+| Chat Service → Message Store/Outbox | Atomic/local transaction or durable append | ACK only after commit |
+| Outbox/log → Fan-out Workers | Async at-least-once | Idempotent/versioned recipient deliveries |
+| Worker → Connection Registry | Batch lookup | Soft route, TTL/epoch; miss means offline path |
+| Router → Gateway | Internal stream/pub-sub/queue | Bounded, retriable or sync-recoverable |
+| Gateway → Client | WebSocket push | Device dedup/ACK, reconnect sync fallback |
+| Client → Receipt Service | WebSocket/REST | Cumulative monotonic ACK/read watermark |
+| Client → Presence Service | WS heartbeat/typing | Ephemeral, throttled, droppable |
+| Client → Media/Object | REST + direct upload/download | Signed, resumable, encrypted bytes |
+| Message event → Notification | Async | Push hint, collapse/TTL; not authority |
+| Client → History/Sync | REST/stream | Cursor pages, gap-free convergence |
+
+Synchronous calls trên sender path cần bounded deadlines. Fan-out, push, receipts propagation và analytics không kéo dài durable sender ACK.
+
+---
+
+#### 25. Ordering, ownership và partitioning direction
+
+```text
+conversation_id
+  → hash/lookup owner partition/home region
+  → single logical sequence authority per epoch
+  → append message sequence N
+  → fan-out in parallel downstream
+```
+
+Benefits:
+
+- per-conversation stable order;
+- local membership/message transaction where feasible;
+- clear failover/fencing;
+- horizontal scale across conversations.
+
+Risks:
+
+- hot conversation owner;
+- cross-region forwarding latency;
+- owner migration/failover;
+- partition imbalance.
+
+Controls:
+
+- virtual partitions/consistent mapping;
+- owner epoch/fencing;
+- hot-conversation detection/dedicated capacity;
+- rate/group-size limits;
+- batch downstream fan-out;
+- failover state recovery before accepting new sequence;
+- no total global order.
+
+Timestamp may remain metadata/tie information but not authoritative sequence.
+
+---
+
+#### 26. Idempotency, outbox và delivery guarantees
+
+```text
+send idempotency:
+  UNIQUE(sender_device_id, client_message_id)
+
+fan-out idempotency:
+  UNIQUE(message_id, recipient_device_id, delivery_generation)
+
+receipt monotonicity:
+  new_watermark = max(current, incoming)
+```
+
+Atomic handoff options:
+
+- transactional DB outbox;
+- durable append log as message authority;
+- change-data-capture with explicit semantics.
+
+Client/server workflow:
+
+- client retries until `SERVER_ACCEPTED` or terminal error;
+- server returns same message ID/sequence on duplicate;
+- online delivery may repeat; device dedups;
+- gap detection causes history sync;
+- receipts/read updates can repeat/out-of-order;
+- push may duplicate/miss;
+- user experience converges effectively once.
+
+Không hứa exactly-once across store, broker, gateways và devices.
+
+---
+
+#### 27. Failure và degraded behavior
+
+| Failure | Hành vi an toàn |
+|---|---|
+| Gateway instance dies | Sockets reconnect; accepted messages recovered by sync |
+| Registry stale/miss | Treat route unavailable; durable offline/sync path, optional push |
+| Chat Service crashes before commit | No success ACK; client idempotent retry |
+| Commit succeeds, ACK lost | Retry returns same message ID/sequence |
+| Outbox publisher fails | Message remains durable; publish/replay later |
+| Fan-out worker duplicate | Conditional delivery key/device dedup |
+| Recipient socket drops during send | No durable loss; retry/sync on reconnect |
+| Presence unavailable | Show unknown/stale; core messaging unaffected |
+| Typing pipeline overload | Drop typing events |
+| Receipt Service delayed | Message visible; receipts stale/eventual |
+| Push provider outage | No hint; durable message retrieved when app reconnects |
+| Media upload/CDN failure | Placeholder/retry; text messaging remains available |
+| Membership service uncertain | Fail closed for unauthorized send/fan-out/key distribution |
+| Conversation owner failure | Fenced failover/recovery; may increase send latency |
+| Key service unavailable | Existing sessions may continue; new session/device operations degrade per protocol |
+| Sync overload | Paginate/rate limit/cap; protect live send/delivery capacity |
+
+Degradation order thường là typing/presence → detailed receipts → push/media convenience; message durability/authorization/E2EE không fail-open.
+
+---
+
+#### 28. Multi-region direction
+
+Một design dễ reason:
+
+- clients connect to nearest healthy regional gateways;
+- connections/routes/presence are regional soft state;
+- each conversation has home-region/owner partition;
+- sends are forwarded to owner for AuthZ/order/durable commit;
+- MessageAccepted events replicate/fan-out to recipient regions;
+- regional delivery workers route to local gateways;
+- offline devices sync from replicated/owner-backed history;
+- stable event/message IDs and idempotent consumers;
+- owner epoch/fencing during failover;
+- membership/device revocation changes propagate high priority;
+- media uses regional object/CDN delivery;
+- no global total order.
+
+Trade-off: extra cross-region hop có thể tăng sender ACK latency nhưng giữ per-conversation ordering simple. Alternative active-active model cần conflict/order semantics khác và phải chứng minh UX/correctness.
+
+---
+
+#### 29. Security và E2EE boundary
+
+- use reviewed E2EE protocol/libraries; không tự phát minh crypto;
+- per-device identity and signed prekeys;
+- membership/device epoch/key rotation;
+- TLS + authenticated realtime/control APIs;
+- server stores/routes ciphertext and minimal metadata;
+- conversation/member/block/media AuthZ vẫn ở server;
+- private content keys remain on authorized devices;
+- push previews privacy-safe/encrypted according model;
+- signed upload/download and content integrity;
+- endpoint/metadata encryption at rest;
+- rate limits/spam/group-invite/media abuse controls;
+- no plaintext/keys in metrics/logs/traces;
+- device change/revoke notification/audit;
+- backup/recovery/reporting/search trade-offs explicitly documented.
+
+E2EE không thay server-side authorization: server vẫn phải ngăn non-member lấy ciphertext, metadata hoặc media reference.
+
+---
+
+#### 30. Observability
+
+Safe correlation:
+
+```text
+client_message_id
+ → message_id + conversation sequence
+ → fan-out job/delivery ID
+ → gateway/device route + connection epoch
+ → delivery/read watermark
+```
+
+Metrics:
+
+- active connections/reconnects/heartbeats by region/gateway;
+- connection auth/drain/stale route/slow client;
+- send RPS, duplicate hit, durable ACK latency/error;
+- message→device delivery latency;
+- fan-out recipients/devices/lag/oldest age;
+- hot conversation/partition;
+- gaps/resync pages/bytes/duration/failure;
+- receipts/read watermark lag/conflict;
+- presence/typing publish/drop/fan-out;
+- push hint/token/provider outcomes;
+- media upload/download/CDN/egress;
+- key/prekey availability/rotation/revoke lag;
+- unauthorized send/read attempts;
+- acknowledged-message loss phải bằng 0 theo defined boundary.
+
+Không log ciphertext/plaintext/key material. IDs trong diagnostics phải protected, retained có giới hạn và không dùng làm high-cardinality metric labels.
+
+---
+
+#### 31. Những điểm hiệu chỉnh so với transcript
+
+| Transcript đơn giản hóa | Thiết kế production-oriented |
+|---|---|
+| Connection Manager tracks users/devices và delivery status | Gateway/registry quản lý sockets/routes; Receipt/Sync service giữ durable delivery/read state |
+| Connection Manager retry message delivery | Durable message/fan-out workflow retry; gateway socket send chỉ là fast path |
+| Sticky sessions + Redis Pub/Sub route cluster | Socket tự bound tới gateway; registry/epoch routes; Redis Pub/Sub không durable/offline authority |
+| Presence tells system online/offline delivery path | Presence là hint; message luôn durable và sync-able, registry decides current route |
+| Chat Service validates, stores, manages status và delivery | Split Message authority, async fan-out và receipt state để tránh god service |
+| Direct messages table has sender, receiver, content, status, timestamp | Unified conversation log; ciphertext, server sequence; status per recipient/device/watermark |
+| Timestamp preserves order | Client/server timestamps không bảo đảm order; per-conversation sequence/owner does |
+| Direct/group message tables separate | Unified Conversation/Membership/MessageEvent model thường đơn giản hơn |
+| Group Service gets members rồi Connection Manager fans out synchronously | Commit once, async versioned/batched recipient-device fan-out |
+| API Gateway handles WebSocket connection | Need WebSocket-aware edge/LB and long-connection semantics; product gateway capabilities vary |
+| SEND_MESSAGE includes recipient/content/timestamp | Use conversation ID, client_message_id, encrypted payload; server assigns order |
+| ACK/typing share WebSocket | Đúng, nhưng ACK durable/monotonic; typing ephemeral/droppable |
+| REST presence query whenever needed | Presence is privacy-sensitive soft state; realtime subscriptions/scoped query/cache preferred |
+| JWT + role-based authorization | Need device proof, object membership/block AuthZ, epochs, rate/abuse and E2EE identity |
+
+---
+
+#### 32. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Clients connect qua WebSocket-aware edge tới lightweight Connection Gateways; registry maps device→gateway with TTL/epoch.
+2. Gateway forwards SEND_MESSAGE tới Chat Service; service authenticates, authorizes membership, dedups client ID và routes tới conversation owner.
+3. Owner assigns per-conversation sequence and commits encrypted message + outbox before `SERVER_ACCEPTED` ACK.
+4. Async fan-out resolves versioned group membership and recipient devices, then routes online devices through gateways; offline devices sync from durable history.
+5. Push notifications are best-effort wake-up hints, not message authority.
+6. Delivery/read state uses cumulative watermarks/conditional max updates; typing/presence use ephemeral TTL/pub-sub paths.
+7. Multi-device fan-out includes recipient devices and sender’s other devices; reconnect uses cursor/gap sync.
+8. Media is encrypted client-side, direct-uploaded to object storage and delivered as ciphertext through CDN.
+9. Unified Conversation/Membership/MessageEvent model stores server sequence, not a single status/timestamp-based order.
+10. Outbox/idempotency, hot-group isolation, multi-region ownership/fencing, E2EE device keys and observability protect correctness/scale.
+
+---
+
+#### 33. Checklist Step 3
+
+- [ ] Connection, message và media planes separated?
+- [ ] WebSocket Gateway lifecycle/auth/version/heartbeat/backpressure/drain?
+- [ ] Device→gateway registry TTL/epoch/stale-route handling?
+- [ ] Registry/pub-sub not message authority?
+- [ ] Chat Service AuthZ/idempotency/order/durable ACK boundary?
+- [ ] Conversation owner/partition/sequence/fencing?
+- [ ] Unified Conversation/Membership/MessageEvent model?
+- [ ] Ciphertext/media refs, no plaintext server assumption?
+- [ ] Message + outbox atomic handoff?
+- [ ] Async direct/group recipient-device fan-out and fairness?
+- [ ] Versioned membership snapshot and block/revoke correctness?
+- [ ] Sender’s other-device sync?
+- [ ] Online route failure → offline sync fallback?
+- [ ] Device reconnect cursor/delta/gap/live-merge semantics?
+- [ ] Delivery/read cumulative watermark and privacy/group aggregation?
+- [ ] Presence leases and typing TTL/droppable path?
+- [ ] Media direct encrypted upload, object/CDN, integrity/lifecycle?
+- [ ] Push collapse/TTL/privacy/token cleanup and hint-only semantics?
+- [ ] Auth/User/Device/Key Directory ownership and revocation?
+- [ ] WebSocket frame types, IDs, sequence, flow control and versioning?
+- [ ] REST history/group/sync/media/device APIs with cursor/AuthZ?
+- [ ] At-least-once + idempotency effectively-once behavior?
+- [ ] Failure/degradation order protects message/security paths?
+- [ ] Multi-region home-owner/replication/fenced failover?
+- [ ] Metrics connect client ID→message→delivery→receipt without leaking content?
+
+#### 34. Ý chính cần nhớ
+
+- Chat HLD separates persistent connection, durable message and encrypted media planes.
+- Connection Gateway owns sockets/flow control; Chat Service owns message validation/order/durability.
+- Device route registry and presence are soft state; accepted messages remain in durable history.
+- Stable client message IDs make send retries idempotent.
+- Server ACK only after message + outbox/durable log commit.
+- Per-conversation owner/sequence gives meaningful order; timestamps do not.
+- A unified conversation/membership/message-event model supports direct and group chats cleanly.
+- Delivery status cannot be one field on message because recipients/devices differ.
+- Async fan-out occurs after commit and uses membership version + device-delivery idempotency.
+- Online WebSocket delivery is fast path; reconnect cursor/gap sync is correctness fallback.
+- Push is a wake-up hint, not canonical delivery.
+- Cumulative delivery/read watermarks reduce billions of receipt writes.
+- Presence/typing are ephemeral TTL events and degrade before core messaging.
+- Multi-device includes sender echo, recipient fan-out, cursors, device epochs and keys.
+- Media bytes bypass message pipeline via encrypted direct upload/object storage/CDN.
+- Redis Pub/Sub can route live events but cannot guarantee offline/durable delivery.
+- E2EE requires device/key/membership lifecycle plus server-side ciphertext AuthZ.
+- Multi-region design balances nearest connection gateway with conversation home-owner order.
+- Exactly-once is replaced by at-least-once processing + layered idempotency + gap repair.
+- Thiết kế tốt nối **client command → durable ordered message → recipient-device fan-out → realtime/sync delivery → monotonic receipt**.
+
+#### Công thức ghi nhớ
+
+> **Chat HLD = connection-aware realtime edge + idempotent ordered durable conversation log + asynchronous recipient-device fan-out + cursor-based offline sync + ephemeral presence + encrypted object media.**
+
+---
+
+### Bài 86. Making Tech & Infra Decisions Strategically
+
+#### 1. Mục tiêu của Step 4
+
+Chọn công nghệ sau khi biết:
+
+- peak logical messages và device deliveries/s;
+- 20–30M online users cùng multi-device connection count;
+- per-conversation ordering và partition ownership;
+- message durability/idempotency/offline sync semantics;
+- group fan-out, receipt và presence workloads;
+- E2EE/device-key boundary;
+- media storage/egress;
+- multi-region SLO/RPO/RTO;
+- team maturity, operational overhead và cost.
+
+Không có một stack duy nhất đúng. Technology choice tốt phải nói được **requirement nào được giải quyết, failure mode nào còn lại và khi nào cần xem xét lại**.
+
+---
+
+#### 2. Technology map đại diện
+
+| Capability | Representative choice | Lý do | Lưu ý |
+|---|---|---|---|
+| Realtime protocol | WebSocket | Full-duplex, long-lived, low latency | Connection lifecycle/backpressure/churn |
+| .NET realtime framework | ASP.NET Core SignalR | Hubs, connection abstraction, client support | Không tự giải quyết durable messaging/order/E2EE |
+| Edge/LB | WebSocket-aware global/regional LB/WAF | Upgrade, TLS, admission, regional route | Idle timeout/drain/connection imbalance |
+| Domain event stream | Kafka/managed Kafka | High throughput, partition order, retention/replay | Operations, hot partitions, idempotency |
+| Delivery/work queues | SQS/RabbitMQ-like | Managed task delivery/retry/DLQ | Ordering/replay semantics riêng |
+| Message/history store | Cassandra/ScyllaDB/DynamoDB-like hoặc sharded/distributed SQL | Append/range by conversation, high writes | Query-shaped schema, buckets, hot conversations |
+| Relational authority | PostgreSQL/distributed SQL | User/device/conversation/membership transactions | Scale/shard/replication theo workload |
+| Ephemeral state/cache | Redis | Connection routes, presence leases, hot metadata | Không là sole message/consent/key authority |
+| Media | Object storage + CDN | Durable blobs, direct upload, global delivery | E2EE variants, lifecycle, egress |
+| Offline push | FCM/APNs | Wake/background device | Hint only; acceptance ≠ message delivery |
+| Containers | Kubernetes/ECS/managed platform | Independent services/worker/gateway scale | Persistent connections cần drain/pre-scale |
+| Event autoscaling | KEDA/HPA/custom scaler | Queue lag/depth/event signals | Downstream-safe caps, not magic scaling |
+| Identity | OIDC/OAuth2 + short-lived tokens/device proof | User/client/service authorization context | OAuth2 alone không phải authentication protocol |
+| Metrics/traces/logs | Prometheus, Grafana, OpenTelemetry, log backend | End-to-end SLO/diagnostics | Cardinality/privacy/cost |
+
+Tên sản phẩm chỉ minh họa; chọn theo workload và operating model thực tế.
+
+---
+
+#### 3. Kafka cho domain/message events
+
+Kafka phù hợp khi cần:
+
+- high-throughput durable streaming;
+- partitioned order;
+- retained events và replay;
+- nhiều consumers: fan-out, receipts, push, analytics, abuse metadata;
+- scale consumers độc lập;
+- rebuild projections.
+
+Potential topics:
+
+```text
+message-accepted
+membership-events
+device-events
+delivery-events
+receipt-events
+push-hints
+```
+
+Partitioning:
+
+- `conversation_id` giữ message event order trong conversation;
+- hot conversation có thể làm một partition nóng;
+- không dùng random key nếu downstream cần per-conversation order;
+- fan-out jobs có thể re-partition/bucket theo recipients/devices để parallelize sau canonical sequence;
+- key/version/epoch trong event để consumer bỏ stale changes.
+
+Kafka guarantees không tạo exactly-once user experience tự động. Producer outbox, consumer idempotency, delivery keys và client dedup vẫn bắt buộc.
+
+---
+
+#### 4. SQS/work queue cho delivery jobs
+
+SQS hoặc managed work queue phù hợp khi:
+
+- jobs được chia cho competing consumers;
+- managed retry/visibility/DLQ là trọng tâm;
+- không cần mọi consumer replay cùng stream;
+- muốn giảm broker operational overhead;
+- fan-out/device delivery/push/media task semantics phù hợp.
+
+Configuration concerns:
+
+- Standard queue có duplicate/out-of-order; worker idempotent;
+- FIFO ordering chỉ trong message group và có throughput considerations;
+- visibility timeout > bounded work time hoặc được extend;
+- batch send/receive/delete;
+- message retention và DLQ redrive;
+- oldest-message age alerts;
+- payload size, encryption/IAM;
+- queue separation theo workload/priority/region.
+
+Kafka và SQS có thể cùng tồn tại: Kafka làm durable domain stream, SQS làm bounded work dispatch. Không thêm cả hai nếu một primitive đã đáp ứng đầy đủ semantics/team requirements.
+
+---
+
+#### 5. WebSocket là realtime transport, không phải message system
+
+WebSocket phù hợp vì:
+
+- persistent full-duplex channel;
+- server push không cần polling;
+- low per-message framing overhead;
+- hỗ trợ messages, ACKs, receipts, presence và typing.
+
+Nhưng WebSocket không cung cấp sẵn:
+
+- durable storage;
+- exactly-once delivery;
+- per-conversation ordering;
+- offline mailbox/history;
+- authentication/authorization policy;
+- reconnect resume/gap repair;
+- multi-device fan-out;
+- backpressure semantics cho app;
+- E2EE protocol.
+
+Phải thiết kế frame schema/version, stable IDs, flow control, bounded buffers, heartbeat, token refresh, resume cursor, error/retry codes và client compatibility.
+
+---
+
+#### 6. ASP.NET Core SignalR
+
+SignalR hữu ích trong .NET ecosystem vì cung cấp:
+
+- Hub abstraction;
+- connection lifecycle/client libraries;
+- groups và server-to-client calls;
+- WebSocket transport cùng fallback khi configured;
+- integration với ASP.NET Core auth/DI/observability;
+- scale-out options/backplanes/managed SignalR services.
+
+SignalR không thay thế:
+
+- Message Store/outbox;
+- connection registry semantics theo device/epoch;
+- durable fan-out/offline sync;
+- per-conversation sequencing;
+- idempotency/dedup;
+- E2EE key protocol;
+- hot-group/provider/region capacity design.
+
+SignalR group membership thường gắn với active connections, khác authoritative chat group membership. Không dùng SignalR group như source of truth cho quyền xem/gửi message.
+
+Ở 20–30M users online, cần benchmark realistic hub/frame/serialization/auth/buffer workload và cân nhắc managed Azure SignalR-like service, custom gateways hoặc alternative runtime based on operations/cost.
+
+---
+
+#### 7. Connection-gateway infrastructure
+
+Requirements:
+
+- event-driven/non-blocking networking;
+- millions connections across fleet;
+- low per-connection memory;
+- TLS session resumption;
+- connection/user/device quotas;
+- per-socket outbound buffer limit;
+- graceful drain and reconnect hints;
+- region/AZ headroom;
+- connection-aware load balancing;
+- route registry/epoch integration;
+- protocol version/canary compatibility.
+
+Kubernetes Service/load balancer settings phải hỗ trợ:
+
+- WebSocket upgrade;
+- idle timeout > heartbeat interval;
+- source/connection draining;
+- no disruptive pod eviction without grace;
+- topology spread/PDB;
+- readiness trước nhận connections;
+- preStop/go-away and sufficient termination grace;
+- node/network/file-descriptor limits.
+
+HPA thêm gateway pods không tự chuyển existing sockets. Capacity planning phải xét new-connection distribution, drain time và one-AZ failure.
+
+---
+
+#### 8. Message store: NoSQL vì access pattern, không chỉ “flexible schema”
+
+Core query:
+
+```text
+append message to conversation order
+get recent/history events by conversation + sequence cursor
+get exact message by ID/reference
+```
+
+Wide-column/KV options như Cassandra, ScyllaDB hoặc DynamoDB phù hợp khi:
+
+- sustained high write throughput;
+- horizontal partitions;
+- append/range access;
+- denormalized query-shaped schema;
+- predictable bounded queries.
+
+Data model direction:
+
+```text
+partition key = conversation_id + time/size_bucket
+sort key      = conversation_sequence
+value         = message_id, sender, ciphertext/media refs,
+                accepted_at, event type, version/tombstone
+```
+
+Need:
+
+- conversation owner/sequence authority;
+- bucket rollover/index;
+- idempotent/conditional append;
+- hot partition detection;
+- compaction/tombstone/TTL understanding;
+- replication/consistency configuration;
+- backups/export/recovery;
+- schema migration/versioning.
+
+NoSQL label không giải quyết ordering, durability hoặc hot group automatically.
+
+---
+
+#### 9. Cassandra/ScyllaDB vs DynamoDB vs relational
+
+| Dimension | Cassandra/Scylla-like | DynamoDB-like | Sharded/distributed SQL |
+|---|---|---|---|
+| Operations | More topology/tuning/repair control | Managed service/quotas/request pricing | Transaction/index familiarity but shard/distribution complexity |
+| Access model | Wide-column partitions/ranges | Partition + sort key/secondary indexes | SQL/transactions/constraints |
+| Scale | High write/horizontal | Managed horizontal scale, on-demand/provisioned | Varies by product/sharding |
+| Hot key risk | Yes | Yes | Yes; leader/row/partition contention |
+| Transactions | Limited/scoped, design-dependent | Conditional/transaction APIs with limits | Stronger relational transactions |
+| Best fit | Predictable high-throughput conversation logs | Managed key/range message/inbox stores | Membership/metadata or message scale where transactions dominate |
+
+Choose based on query patterns, team capability, consistency, latency, region topology and cost—not interview fashion.
+
+---
+
+#### 10. PostgreSQL cho strongly consistent metadata
+
+PostgreSQL phù hợp cho:
+
+- user/account/device registration metadata;
+- conversation metadata;
+- group membership/roles/invites;
+- block/privacy settings;
+- idempotency/outbox ở scale phù hợp;
+- administrative/audit configuration.
+
+Schema/invariants:
+
+- unique 1:1 conversation pair if required;
+- membership interval/version/role;
+- device epoch/revocation;
+- conditional optimistic version updates;
+- transactional outbox for membership/device changes.
+
+Scale path:
+
+- indexes from APIs;
+- read replicas only for staleness-safe reads;
+- partition/shard by user/conversation/tenant;
+- distributed SQL or KV if global/write requirements demand;
+- caches/projections for conversation lists/member reads.
+
+Membership AuthZ và revocation freshness không được tùy tiện đọc stale replica/cache nếu gây unauthorized delivery/key distribution.
+
+---
+
+#### 11. Redis: đúng vai trò và giới hạn
+
+Redis phù hợp cho:
+
+- device→gateway route leases/epochs;
+- presence leases/last-known soft state;
+- typing/realtime ephemeral pub/sub;
+- hot conversation/user/device metadata cache;
+- rate limits/connection admission;
+- short dedup/session state;
+- recent conversation/list cache;
+- distributed counters with careful semantics.
+
+Redis không nên là:
+
+- sole accepted-message store;
+- durable offline mailbox;
+- authoritative chat-group membership;
+- permanent device-key authority;
+- exactly-once delivery mechanism;
+- unbounded per-device queue;
+- global lock held across provider/network calls.
+
+Redis Pub/Sub drops messages when subscriber unavailable; use durable stream/queue/history for correctness. Configure cluster/sharding, memory/eviction, TTL jitter, hot keys, multi-AZ failover và rebuild/degraded behavior.
+
+---
+
+#### 12. Conversation list/read models
+
+Primary message log optimized cho history không nhất thiết phục vụ “list recent conversations” hiệu quả. Maintain derived read model:
+
+```text
+ConversationSummaryByUser(
+  user_id,
+  conversation_id,
+  last_message_id/sequence/time,
+  unread_count/read watermark,
+  pinned/muted/archive metadata,
+  summary_version
+)
+```
+
+Updated asynchronously/idempotently from message/receipt/membership events. Redis can cache first page. Canonical messages/membership remain authority; projection can lag/rebuild.
+
+Unread count may be derived from last sequence minus read watermark only if sequence visibility/membership/deletes semantics support it.
+
+---
+
+#### 13. Object storage và CDN cho rich media
+
+Use S3/GCS/object storage for encrypted attachments:
+
+- signed multipart upload/download;
+- durable large objects;
+- lifecycle/versioning;
+- regional replication according policy;
+- CDN edge caching/range requests;
+- origin protection;
+- client lazy/resumable download.
+
+E2EE-oriented flow:
+
+```text
+client encrypts original/variants
+→ upload ciphertext
+→ send encrypted descriptor/hash/key envelope in message
+→ CDN serves ciphertext
+→ recipient verifies/decrypts locally
+```
+
+Decisions:
+
+- client-generated thumbnails/transcodes;
+- object/key naming to prevent enumeration;
+- signed URL scope/TTL;
+- CDN cache key/private access;
+- orphan cleanup;
+- delete/expiry/forward semantics;
+- malware/reporting trade-off;
+- egress and storage-tier cost.
+
+Do not store large binary media in Kafka, Redis or message table.
+
+---
+
+#### 14. FCM và APNs cho offline/background hints
+
+Firebase Cloud Messaging supports Android/web and integrates with Apple delivery through APNs-related platform path; Apple devices ultimately depend on APNs semantics.
+
+Push architecture:
+
+- Notification Service consumes `DeliveryPending/MessageAvailable` events;
+- checks push preference/device/background state;
+- collapse/coalesce by conversation;
+- sends privacy-safe payload with TTL/priority;
+- handles invalid tokens/provider quotas;
+- records provider acceptance separately;
+- client reconnects/syncs canonical message history.
+
+Push guarantee:
+
+- best-effort wake-up/hint;
+- duplicate/missing/out-of-order possible;
+- provider accepted ≠ device received/read;
+- no plaintext content on provider/lock screen unless trust/privacy contract permits;
+- provider outage không làm mất message.
+
+---
+
+#### 15. AuthN: OIDC; delegated authorization: OAuth 2.0
+
+Transcript nói OAuth 2.0 là authentication mechanism. Chính xác hơn:
+
+- OAuth 2.0 là authorization framework cho delegated access/tokens;
+- OpenID Connect (OIDC) xây identity/authentication layer trên OAuth 2.0;
+- access token/JWT là credential format/representation, không tự tạo authorization correctness.
+
+Chat needs:
+
+- user login/session/token issuance/refresh/revocation;
+- device registration/proof and epoch;
+- token issuer/audience/expiry/signature validation;
+- WebSocket long-session re-auth/expiry behavior;
+- conversation membership/block/media object AuthZ;
+- service/workload identities;
+- rate/risk/abuse controls;
+- E2EE identity keys verified separately from account access token.
+
+RBAC `USER/ADMIN` không đủ cho object-level chat authorization.
+
+---
+
+#### 16. E2EE key/device infrastructure
+
+Server directory may store:
+
+- device identity public keys;
+- signed prekeys/one-time prekeys;
+- protocol/device capabilities;
+- device epoch/revocation/status;
+- public group-key distribution metadata depending protocol.
+
+It must not store content private keys under true E2EE.
+
+Operational needs:
+
+- HA/low-latency public key/prekey lookup;
+- prekey stock/refill thresholds;
+- signed/versioned records;
+- device add/change/revoke alerts;
+- membership/device key rotation events;
+- replay/rate/abuse protection;
+- protocol migration/backward compatibility;
+- encrypted backup/recovery policy;
+- no key material in logs/traces.
+
+Use reviewed protocols/libraries; custom cryptography is not a technology choice shortcut.
+
+---
+
+#### 17. Kubernetes cho services và connection gateways
+
+Kubernetes supports:
+
+- separate deployments for gateways, chat, fan-out, sync, presence, media, push;
+- service discovery/config/secrets/workload identity;
+- horizontal scaling and resource isolation;
+- topology spread/PDB;
+- canary/rollout;
+- custom metrics autoscaling.
+
+Persistent connection caveats:
+
+- readiness before LB registration;
+- long termination grace and connection draining;
+- rolling update surge capacity;
+- no sudden scale-down of pods holding many sockets;
+- PDB/node drain/AZ loss planning;
+- existing sockets don't migrate to new pods;
+- kernel/network/FD tuning;
+- pod/node bandwidth/pps;
+- gateway state remains ephemeral/rebuildable.
+
+Managed containers/VMs/custom gateway fleet may be simpler or more efficient depending team/runtime/scale. Kubernetes is not required for good architecture.
+
+---
+
+#### 18. KEDA và event-driven autoscaling
+
+KEDA can scale workloads from Kafka lag, SQS queue depth and external/custom signals.
+
+Good targets:
+
+| Workload | Signals |
+|---|---|
+| Fan-out workers | lag/oldest message age, delivery rate, store throttling |
+| Push workers | queue age, provider quota/headroom |
+| Sync workers | backlog bytes/pages/age, live-path protection |
+| Receipt workers | lag, watermark updates/s |
+| Media jobs | queue age, CPU/GPU/memory/duration |
+
+Connection gateways need different scaling:
+
+- active connections/pod;
+- new connections/s;
+- per-pod memory/FD/pps/bandwidth;
+- outbound buffer pressure;
+- AZ headroom/drain schedule.
+
+KEDA/HPA pitfalls:
+
+- queue depth alone ignores message age/cost;
+- more workers can overload Message Store/provider/registry;
+- partition count caps Kafka consumer parallelism;
+- scale-from-zero cold start may violate latency;
+- scale-down can interrupt in-flight jobs/connections;
+- sustained backlog may need admission/fan-out policy, not infinite replicas.
+
+Set min/pre-scaled capacity and maximum from downstream-safe limits.
+
+---
+
+#### 19. Serialization/compression protocol
+
+Options:
+
+- JSON: easy debug/evolution, larger payload/parse cost;
+- Protocol Buffers/MessagePack-like binary: compact/faster, schema/tooling required.
+
+At hundreds of thousands frames/s and millions connections, wire size/CPU matter. Requirements:
+
+- explicit envelope/type/version;
+- backward/forward compatibility;
+- unknown-field behavior;
+- stable IDs/sequence;
+- bounded frame/payload;
+- no compression of attacker-controlled plus secret data without threat review;
+- compression bomb limits;
+- deterministic canonical fields where cryptographic signing requires;
+- client version rollout support.
+
+Do not optimize binary protocol before measuring, nhưng mobile bandwidth/battery and fleet CPU can justify it.
+
+---
+
+#### 20. Multi-region infrastructure
+
+“Deploy nhiều regions + load balancing” chưa đủ. A reasonable model:
+
+```text
+Global traffic manager
+  → nearest healthy regional WebSocket/REST edge
+  → regional connection gateways/registry/presence
+
+conversation_id
+  → directory/home-region owner
+  → owner assigns sequence + durable commit
+  → events replicate/fan-out to recipient regions
+  → local gateway delivery
+```
+
+Needs:
+
+- global stable IDs;
+- conversation ownership directory/cache;
+- owner epoch/fencing;
+- cross-region durable event replication;
+- regional message replicas/history access;
+- membership/device-revoke priority propagation;
+- data residency/metadata boundaries;
+- reconnect/reroute on region failure;
+- recovery/reconciliation before accepting new owner writes;
+- no global total order;
+- cross-region egress/cost model.
+
+Global LB routes clients; it cannot ensure two regions don't assign conflicting sequences to the same conversation.
+
+---
+
+#### 21. High availability và disaster recovery
+
+##### Multi-AZ baseline
+
+- gateways/workers/services spread across AZs;
+- replicated message/metadata/broker/cache stores;
+- health-aware load balancing;
+- one-AZ connection/fan-out capacity headroom;
+- graceful connection reconnect;
+- no singleton owner without consensus/lease/fencing.
+
+##### Recovery
+
+- PostgreSQL PITR/backups/restore tests;
+- message-store backup/export/replication validation;
+- event retention/replay;
+- rebuild conversation summaries/caches/routes;
+- object storage version/lifecycle/replication;
+- key/device directory recovery preserving trust;
+- region failover drills;
+- acknowledged-message loss/duplicate/gap reconciliation.
+
+RPO/RTO differ:
+
+- route/presence cache can rebuild with relaxed RPO;
+- acknowledged messages/membership/device revocations need stronger durability;
+- push/typing need no recovery history.
+
+---
+
+#### 22. Security infrastructure
+
+- TLS 1.2+/modern configuration and certificate automation.
+- OIDC/OAuth2/token lifecycle and WebSocket re-auth.
+- Device identity/proof, session epoch and revocation.
+- Object-level conversation/member/block/media AuthZ.
+- Reviewed E2EE protocol and secure client key storage.
+- Workload identity/mTLS/private networks as needed.
+- Least-privilege IAM for broker/DB/cache/object/KMS.
+- Secrets manager/rotation; no credentials in images.
+- Signed media URLs, integrity and anti-enumeration.
+- Frame/request/media size/rate limits.
+- Spam/group invite/reconnect/prekey exhaustion controls.
+- Encryption of server-visible metadata at rest.
+- PII/content/key redaction in telemetry.
+- Protected admin/audit and supply-chain/image scanning.
+
+OAuth2, TLS và E2EE solve different layers; none replaces the others.
+
+---
+
+#### 23. Observability stack
+
+Use Prometheus/Grafana or managed metrics, OpenTelemetry traces and centralized structured logs.
+
+##### Gateway metrics
+
+- active/new/reconnected connections;
+- memory/FD/pps/bandwidth;
+- heartbeat timeout/stale route;
+- outbound queue/slow-client disconnect;
+- drain/rebalance/AZ skew.
+
+##### Message metrics
+
+- send rate/durable ACK p50/p95/p99/error;
+- idempotency hit/conflict;
+- owner/partition latency/hotness;
+- fan-out recipients/devices/lag/oldest age;
+- message→device latency;
+- duplicate/gap/resync rates.
+
+##### Supporting metrics
+
+- receipt/read watermark lag;
+- presence/typing drop/fan-out;
+- push token/provider outcomes;
+- media/CDN/object/egress;
+- prekey stock/key lookup/revoke lag;
+- DB/broker/cache saturation;
+- cross-region replication/owner failover.
+
+Logs/traces must not contain plaintext/ciphertext/key material. Avoid IDs as metric labels; use protected indexed diagnostics, sampling and bounded retention.
+
+---
+
+#### 24. Deployment và protocol evolution
+
+- canary/blue-green for services/gateways;
+- connection-aware draining and version negotiation;
+- mobile clients lag months behind server rollout;
+- backward-compatible WebSocket frames/events;
+- expand-migrate-contract DB/schema changes;
+- old/new Kafka consumers coexist safely;
+- feature flags/kill switches for presence, receipts, media previews, hot groups;
+- staged E2EE protocol/device-key migration;
+- dual-read/write only with explicit reconciliation;
+- load tests before gateway/runtime changes;
+- client minimum-version/deprecation policy.
+
+Rolling upgrade cannot assume all clients reconnect immediately or understand new frame types.
+
+---
+
+#### 25. Cost model
+
+```text
+Total chat cost
+= gateway compute/memory/network for connections
++ message DB writes/storage/replication/backups
++ broker requests/retention/replication
++ Redis memory/operations
++ fan-out/sync/receipt compute
++ media object storage/CDN egress
++ push provider/notification processing
++ cross-region traffic
++ logs/metrics/traces
++ operational staffing/toil
+```
+
+Major levers:
+
+- per-connection memory/heartbeat interval;
+- recipient/device fan-out;
+- receipt batching/watermarks;
+- message retention/tiering;
+- media compression/variants/lazy download/CDN hit;
+- regional placement/egress;
+- managed vs self-managed Kafka/SignalR/database;
+- reserved vs on-demand capacity;
+- observability sampling/retention;
+- hot-group/presence/typing limits.
+
+Track cost per connected device-hour, logical message, device delivery, sync GB and media GB—not only server count.
+
+---
+
+#### 26. ADR minh họa — chọn message store
+
+```text
+Context
+- 5B logical messages/day
+- primary query: append/read ordered history by conversation
+- per-conversation order, long retention, high write throughput
+- media stored separately
+
+Decision
+- wide-column managed store
+- partition by conversation_id + time/size bucket
+- sort by server sequence
+- Message Service/owner assigns sequence and idempotent append
+
+Trade-offs
+- denormalized query-specific schema
+- hot conversation remains hot within sequence authority
+- secondary/report queries need projections
+- TTL/tombstone/bucket lifecycle complexity
+
+Rejected for now
+- Redis-only: durability/memory/recovery
+- one unsharded relational instance: scale/hot history concern
+
+Revisit triggers
+- store throttling/p99/cost exceeds SLO
+- retention/access pattern changes
+- distributed SQL transaction benefit outweighs migration/operations
+```
+
+ADR phải ghi assumptions/benchmark, consistency/durability, alternatives, failure/recovery, cost và evolution trigger.
+
+---
+
+#### 27. Những điểm hiệu chỉnh so với transcript
+
+| Transcript đơn giản hóa | Cách hiểu production-oriented |
+|---|---|
+| Kafka hoặc SQS cho reliable async messaging | Kafka event log và SQS work queue có replay/order/consumer semantics khác nhau |
+| WebSocket là natural choice | Đúng cho transport; vẫn cần durable log, resume, backpressure, IDs/order/AuthZ |
+| SignalR quản lý nhiều implementation details | Framework không thay message authority, offline sync, scale benchmark, E2EE hoặc multi-region ownership |
+| FCM đảm bảo users không bỏ lỡ chat | FCM/APNs là best-effort hint; durable history/sync mới ngăn mất message |
+| NoSQL vì flexible schema/high writes | Chọn vì append/range access, partitioning, consistency, hot-key và operations—not flexibility alone |
+| PostgreSQL cho settings/metadata | Hợp lý, nhưng membership/device revocation consistency và scale/sharding vẫn cần design |
+| Redis cache active sessions | Use TTL/epoch route/presence cache; Redis không là message/offline authority |
+| Kubernetes giúp services scale độc lập | Existing sockets không rebalance; DB/broker/hot conversation/downstream remain constraints |
+| KEDA scale workers theo queue depth | Cần oldest age/cost, partitions và safe downstream/provider maximum |
+| OAuth 2.0 là authentication | OIDC handles authentication layer; OAuth2 delegates authorization; resource AuthZ vẫn cần |
+| Multi-region + load balancing tạo HA | Cần conversation owner, replication, epochs/fencing, data locality, restore/reconciliation |
+| Prometheus/Grafana/logs đủ operations | Cần traces, client/gap/duplicate/SLO signals, privacy/cardinality/cost controls |
+
+---
+
+#### 28. Cách trình bày trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. WebSocket/SignalR-like gateways handle long connections; Redis-like registry stores device routes/presence leases with TTL/epoch.
+2. WebSocket chỉ là transport; Chat Service commits encrypted message to query-shaped durable store before ACK.
+3. Conversation owner assigns per-conversation sequence; Kafka-like retained stream publishes accepted events.
+4. SQS/queue-like jobs can distribute recipient-device fan-out, push and retries idempotently.
+5. Cassandra/DynamoDB-like store fits append/range history; PostgreSQL owns transactional user/device/membership metadata where appropriate.
+6. Redis caches/rate limits/routes, but never sole message/membership/key authority.
+7. Media is encrypted and direct-uploaded to object storage, then served as ciphertext through CDN.
+8. APNs/FCM push wakes offline devices; client reconnects and syncs canonical history.
+9. Kubernetes/KEDA scale services/workers by connection/queue-age signals with downstream-safe caps and graceful drain.
+10. OIDC/OAuth2 + object AuthZ, E2EE device keys, multi-region owner fencing and privacy-safe observability complete the design.
+
+---
+
+#### 29. Checklist Step 4
+
+- [ ] Kafka/event log vs SQS/work queue semantics and roles?
+- [ ] Topic/queue partitions, order keys, retention, DLQ/replay?
+- [ ] WebSocket/SignalR protocol/version/resume/backpressure/AuthN?
+- [ ] Gateway per-connection capacity, LB idle/drain/AZ headroom?
+- [ ] SignalR/backplane/managed service limitations and benchmarks?
+- [ ] Message-store access patterns, partition+bucket+sequence model?
+- [ ] Cassandra/Scylla/DynamoDB/SQL trade-off and team capability?
+- [ ] PostgreSQL ownership for user/device/membership/outbox?
+- [ ] Redis route/presence/cache TTL/epoch/eviction/failure boundaries?
+- [ ] Conversation list/receipt projections and rebuild path?
+- [ ] Object storage/CDN encrypted upload/access/lifecycle/egress?
+- [ ] APNs/FCM hint-only, token/TTL/collapse/privacy semantics?
+- [ ] OIDC vs OAuth2, token/device identity and object AuthZ?
+- [ ] E2EE prekey/device/group/revocation/backup infrastructure?
+- [ ] Kubernetes connection drain/topology/PDB/node/network config?
+- [ ] KEDA/HPA signals, min/max capacity and downstream caps?
+- [ ] Protocol serialization/security/backward compatibility?
+- [ ] Multi-AZ replication, backups/PITR/restore/rebuild?
+- [ ] Multi-region conversation ownership/fencing/replication/locality?
+- [ ] Security IAM/secrets/TLS/rate/abuse/telemetry redaction?
+- [ ] Metrics/logs/traces/client/gap/duplicate SLOs?
+- [ ] Deployment/client-version/schema/event/E2EE migration plan?
+- [ ] Cost per connection-hour/message/delivery/sync/media GB?
+- [ ] ADRs with alternatives, benchmarks and revisit triggers?
+
+#### 30. Ý chính cần nhớ
+
+- Technology follows chat semantics and scale—not the reverse.
+- WebSocket provides full-duplex transport but not durability, ordering, offline sync or exactly-once.
+- SignalR accelerates .NET realtime development but does not replace message architecture or capacity testing.
+- Kafka fits retained high-throughput event streams; SQS-like queues fit managed competing-consumer work.
+- Message storage is query-shaped by conversation bucket + server sequence.
+- NoSQL is chosen for access/partition/throughput fit, not merely flexible schema.
+- PostgreSQL remains strong for transactional user/device/membership data at appropriate scale.
+- Redis holds route/presence/cache soft state; Redis Pub/Sub cannot guarantee durable delivery.
+- Object storage/CDN handle encrypted media bytes; message records contain references.
+- FCM/APNs are best-effort offline hints; canonical message sync prevents loss.
+- OIDC addresses authentication; OAuth2 delegated authorization; service still enforces conversation/device AuthZ.
+- E2EE needs reviewed protocols, device/prekey/group lifecycle and secure client keys.
+- Kubernetes helps deploy/scale, but persistent connections require drain/pre-scale and don't rebalance automatically.
+- KEDA/HPA must use queue age/lag and be capped by store/provider/network capacity.
+- Multi-region requires conversation home-owner and fenced failover; global LB alone is insufficient.
+- Observability must measure connections, durable ACK, fan-out, gap/sync, receipts and keys without leaking content.
+- Chat cost is often driven by persistent connections, recipient-device fan-out, media egress and cross-region traffic.
+- Mỗi quyết định cần ADR với requirement, trade-off, failure model, cost và trigger để thay đổi.
+
+#### Công thức ghi nhớ
+
+> **Chat tech strategy = WebSocket connection runtime + partitioned durable event/work infrastructure + conversation-shaped message storage + ephemeral Redis routing + encrypted object media + ownership-aware multi-region operations.**
+
+---
+
+### Bài 87. The Final Design — Chat Application
+
+#### 1. Bài toán cuối cùng cần giải
+
+Final Chat System phải cung cấp:
+
+- 1:1 và group messaging gần real time;
+- per-conversation ordering contract;
+- durable, idempotent message acceptance;
+- online WebSocket delivery và offline catch-up;
+- multi-device synchronization;
+- delivery/read receipts;
+- approximate presence và typing indicators;
+- encrypted rich media;
+- E2EE/device-key lifecycle;
+- horizontal scale cho hàng tỷ messages và hàng chục triệu connections;
+- resilience trước gateway, storage, network và region failures.
+
+Design principle:
+
+```text
+Connection is temporary.
+Message history is durable.
+Realtime delivery is the fast path.
+Cursor-based synchronization is the correctness path.
+```
+
+---
+
+#### 2. Kiến trúc hoàn chỉnh
+
+```text
+ Mobile · Desktop · Web Clients
+   │ WebSocket                         │ REST/control/history/media
+   ▼                                   ▼
+ WAF/DDoS + WebSocket-aware       API Gateway/BFF
+ Global/Regional Load Balancer         │
+   │                                   │
+   ▼                                   │
+ Connection Gateway Fleet ◄────────────┘
+   │  ├─ Connection Registry (device→gateway/epoch, Redis-like)
+   │  ├─ Presence/Typing Service (TTL soft state/pub-sub)
+   │  └─ Realtime Delivery Router ◄──────────────────────┐
+   │                                                      │
+   └─ commands ──► Chat/Message Service                  │
+                    ├─ Auth/User/Device Service           │
+                    ├─ Conversation Service               │
+                    ├─ Group/Membership Service           │
+                    └─ Conversation Owner/Sequencer       │
+                                   │                      │
+                                   ▼                      │
+                         Message Store + Outbox           │
+                                   │                      │
+                                   ▼                      │
+                       Durable Event Log / Queues         │
+                         ├─ Fan-out/Delivery Workers ─────┘
+                         ├─ Receipt/Sync Service
+                         ├─ Conversation Summary projection
+                         ├─ Notification Service → APNs/FCM
+                         └─ Audit/abuse/analytics metadata
+
+ Media Service ──► Object Storage ──► CDN
+       ▲                 ▲
+       └── signed direct encrypted upload/download
+
+ Device/Key Directory
+   └─ identity public keys, signed/one-time prekeys, device epochs
+
+ Cross-cutting:
+   OIDC/OAuth2 · object AuthZ · E2EE · quotas/backpressure
+   metrics/logs/traces · multi-AZ · backups/DR · schema/versioning
+```
+
+---
+
+#### 3. Ba planes và authority boundaries
+
+##### Connection plane
+
+- WebSocket sessions;
+- connection registry/routes;
+- presence leases;
+- typing events;
+- bounded realtime buffers.
+
+State phần lớn ephemeral/rebuildable. Gateway chết làm disconnect, không làm mất accepted message.
+
+##### Message plane
+
+- AuthZ, idempotency;
+- per-conversation sequencing;
+- durable encrypted history;
+- fan-out/device deliveries;
+- receipts/read state;
+- offline sync và push events.
+
+Đây là correctness/durability plane.
+
+##### Media plane
+
+- encrypted direct uploads;
+- media metadata/integrity;
+- object storage/CDN;
+- lifecycle/access/deletion.
+
+Large bytes không đi qua message/gateway/broker path.
+
+---
+
+#### 4. Data ownership
+
+| Data | Authority | Derived/ephemeral state |
+|---|---|---|
+| User/account/block/profile | User/Auth Store | Profile cache |
+| Registered devices/revocation/public keys | Device/Key Directory | Key/route cache |
+| Conversation metadata | Conversation Store | User conversation-list projection |
+| Group membership/roles/version | Membership Store | Member snapshot/cache |
+| Message ciphertext + sequence | Message Store/conversation log | Recent-page cache/delivery refs |
+| Delivery/read watermark | Receipt/Sync Store | UI/read-count cache |
+| Connection location | Active gateway + TTL registry | Rebuilt on reconnect |
+| Presence/typing | TTL lease/ephemeral pub-sub | No durable history required |
+| Media ciphertext | Object Storage | CDN copies |
+| Media ownership/state | Media Metadata Store | Manifest/cache |
+| Push request | Notification attempt/status | Không phải message authority |
+
+Message Store mới quyết định message đã được server chấp nhận; Redis, WebSocket buffer và APNs/FCM không giữ truth này.
+
+---
+
+#### 5. Connection establishment
+
+```text
+1. Device resolves nearest healthy region.
+2. Edge applies TLS, WAF/DDoS and connection admission.
+3. WebSocket upgrade reaches a ready Connection Gateway.
+4. Gateway validates token, device, protocol and session epoch.
+5. It creates connection_id and registers route with TTL/epoch.
+6. Device sends resume cursor if reconnecting.
+7. Gateway starts heartbeat, flow control and token-refresh policy.
+8. Sync Service streams missed events, then merges into live delivery.
+```
+
+The gateway:
+
+- limits frames/rates/outbound buffers;
+- tracks one connection instance, not user truth;
+- drains gracefully during deployment;
+- can issue `GO_AWAY`/retry-after hint;
+- updates route lease;
+- drops stale connection by epoch.
+
+Sticky sessions may help handshake/reconnect affinity but cannot replace route registry or durable sync.
+
+---
+
+#### 6. Send-message end-to-end flow
+
+```text
+Client
+  → SEND_MESSAGE(
+       conversation_id,
+       client_message_id,
+       encrypted_payload/media_refs
+     )
+  → Connection Gateway
+  → Chat Service
+       1. validate envelope/size/type/device
+       2. authorize member/block/device state
+       3. dedup by sender_device + client_message_id
+       4. route to conversation home-owner
+       5. assign monotonic conversation sequence
+       6. commit ciphertext message + idempotency result + outbox
+  ← SERVER_ACCEPTED(message_id, sequence, accepted_at)
+
+Outbox/Event
+  → async recipient-device fan-out
+  → online gateways / offline sync state / push hints
+```
+
+If ACK is lost after commit, retry returns the same `message_id` and sequence. The user should never wait for every group member/device delivery before receiving `SERVER_ACCEPTED`.
+
+---
+
+#### 7. Direct-chat delivery
+
+For 1:1 message:
+
+```text
+Fan-out recipients
+  = recipient's authorized devices
+  + sender's other authorized devices
+```
+
+Delivery Worker:
+
+1. Reads device set/version.
+2. Creates idempotent delivery keys.
+3. Batch-checks active routes.
+4. Routes online devices to their gateways.
+5. Leaves offline devices recoverable through canonical history/mailbox cursor.
+6. Emits privacy-safe push hint if policy allows.
+
+Sender-device echo ensures the sender’s desktop/tablet sees the message even when it originated on phone.
+
+---
+
+#### 8. Group-chat delivery
+
+Group send differs mainly in authorization/fan-out:
+
+```text
+message committed once in ordered group conversation log
+  → versioned membership snapshot/current rule
+  → eligible member buckets
+  → authorized devices/member
+  → idempotent batched delivery jobs
+  → regional online routes + offline sync + push hints
+```
+
+Controls:
+
+- member/role/version checked before commit;
+- join/leave history visibility contract;
+- group/device key epoch coordinated with membership change;
+- hot-group queue/worker isolation and fairness;
+- bounded group/message rate;
+- downstream parallel fan-out while sequencing remains single logical authority;
+- aggregate receipts/read-by data at scale;
+- pull/history-sync strategy for broadcast-like groups outside baseline.
+
+SignalR/realtime “group” membership is only connection routing state, not authoritative chat membership.
+
+---
+
+#### 9. Online realtime delivery
+
+```text
+Delivery job
+  → lookup device route(gateway, connection_epoch)
+  → target gateway internal route
+  → verify current device/session/epoch
+  → enqueue bounded WebSocket frame
+  → client receives, verifies/decrypts/persists locally
+  → cumulative delivery ACK
+```
+
+If route is stale/socket disappears:
+
+- realtime attempt may fail;
+- message remains durable;
+- push may wake device;
+- reconnect sync recovers it;
+- device dedup prevents repeated UI message.
+
+Do not keep unbounded outbound buffers for slow clients. Disconnect + cursor resync is safer than fleet memory exhaustion.
+
+---
+
+#### 10. Offline/reconnect synchronization
+
+```text
+Device reconnects with opaque resume cursor
+  → route/session established
+  → Sync Service calculates missed ranges
+  → paginated conversation/events streamed
+  → client dedups/orders by ID + sequence
+  → gaps requested/repaired
+  → cumulative sync cursor ACKed
+  → live stream and catch-up converge
+```
+
+Properties:
+
+- cursors versioned, opaque and authorized;
+- bounded items/bytes/time per page;
+- snapshot+delta option for large state;
+- metadata/text before lazy media;
+- separate sync quotas/workers so reconnect storms do not starve live sends;
+- old device beyond retention gets explicit bootstrap behavior;
+- reconnect uses exponential backoff + jitter;
+- duplicate between live/push/history is expected and deduped.
+
+---
+
+#### 11. Delivery/read receipts
+
+```text
+Device
+  → DELIVERY_ACK(up_to_sequence)
+  → READ_UP_TO(sequence)
+  → Receipt Service
+  → authorize + conditional max(current, incoming)
+  → ReceiptChanged event
+  → sender's devices / allowed group participants
+```
+
+Use cumulative watermarks where possible to reduce writes:
+
+- per-device delivery watermark;
+- per-user or per-device read watermark according product;
+- batch/debounce/coalesce;
+- lower priority than core messages;
+- eventual propagation;
+- privacy setting;
+- group counts/summary rather than unbounded full list.
+
+`READ` is client-reported behavior, not proof that a human understood content.
+
+---
+
+#### 12. Presence và typing
+
+##### Presence
+
+```text
+connection/device heartbeat
+  → renew TTL lease
+  → aggregate user state
+  → debounce meaningful transition
+  → privacy-filtered subscribers
+```
+
+- Redis-like soft state;
+- approximate/eventual;
+- no primary DB write per heartbeat;
+- multi-device aggregation;
+- unknown/stale acceptable;
+- delivery does not depend on it.
+
+##### Typing
+
+```text
+typing heartbeat
+  → membership/rate validation
+  → ephemeral pub/sub to active viewers
+  → client TTL auto-expiry
+```
+
+- no durable history;
+- no offline delivery;
+- short TTL;
+- throttled/coalesced;
+- dropped under overload before messages.
+
+---
+
+#### 13. Rich-media flow
+
+```text
+1. Client requests an upload session from Media Service.
+2. Server checks account/conversation/quota and returns media_id + signed URL.
+3. Client creates/encrypts original and variants where E2EE design requires.
+4. Client uploads ciphertext directly to object storage, resumably.
+5. Client completes upload with hash/size/descriptor.
+6. Chat message references encrypted media descriptor.
+7. Recipient gets scoped CDN/object authorization.
+8. Client downloads, verifies integrity and decrypts.
+```
+
+Object storage is canonical for media bytes; CDN accelerates frequently accessed content and also handles cold objects through origin fetch—không chỉ “infrequently accessed media”.
+
+Need lifecycle/orphan cleanup, range requests, private cache policy, quota, expiry/delete and E2EE-compatible thumbnail/transcoding strategy.
+
+---
+
+#### 14. Push notification flow
+
+```text
+MessageAccepted/DeliveryPending
+  → Notification Service
+  → device/background/preference/privacy checks
+  → collapse by conversation + TTL/priority
+  → APNs/FCM
+  → device wakes/reconnects/syncs canonical messages
+```
+
+Push is:
+
+- best-effort;
+- may duplicate/drop/reorder;
+- provider-accepted is not message delivered;
+- privacy-sensitive on lock screen/provider;
+- asynchronously triggered after durable message commit;
+- isolated from core message delivery failures.
+
+Token cleanup and provider outage handling must not affect durable chat history.
+
+---
+
+#### 15. Message/order data model
+
+```text
+Conversation(
+  conversation_id,
+  type,
+  home_region/owner_partition,
+  metadata_version,
+  retention_policy,
+  ...
+)
+
+ConversationMember(
+  conversation_id,
+  user_id,
+  role,
+  joined_sequence,
+  left_sequence,
+  membership_version,
+  ...
+)
+
+MessageEvent(
+  conversation_id,
+  time_or_size_bucket,
+  sequence,
+  message_id,
+  sender_user_id,
+  sender_device_id,
+  client_message_id,
+  encrypted_payload_or_media_ref,
+  event_type,
+  server_accepted_at,
+  version/tombstone/expiry
+)
+```
+
+One unified conversation log serves direct and group chats. Server sequence, not client timestamp, determines order. Message stores ciphertext/reference; delivery/read status remains in separate per-user/device watermark/projection.
+
+---
+
+#### 16. Storage choices
+
+| Data/workload | Representative choice | Reason |
+|---|---|---|
+| Message history | Cassandra/Scylla/DynamoDB-like or sharded/distributed SQL | High write, append/range by conversation+sequence |
+| Conversation/group/device metadata | PostgreSQL/distributed SQL/KV as needed | Constraints, transactions, versioned membership/device state |
+| Routes/presence/cache | Redis-like cluster | TTL soft state and low-latency lookup |
+| Durable streams/jobs | Kafka + optional SQS-like queues | Retained events/replay + competing-consumer delivery tasks |
+| Receipt/sync state | Partitioned SQL/KV/wide-column | Conditional monotonic watermark updates |
+| Conversation summaries | Derived per-user store/cache | List recent chats/unread state |
+| Media bytes | Object storage | Durable large ciphertext blobs |
+| Media delivery | CDN | Edge latency/origin protection/egress efficiency |
+| Key directory | HA durable metadata/KV/SQL | Device public-key/prekey/version lookup |
+
+Stores are chosen by query, consistency, lifecycle and operations—not by one universal database preference.
+
+---
+
+#### 17. Messaging infrastructure
+
+Kafka/managed stream can carry durable domain events with partition key `conversation_id`, retention and replay. SQS/RabbitMQ-like queues can distribute bounded recipient/device/push/sync jobs.
+
+Required patterns:
+
+- producer transactional outbox or durable append authority;
+- at-least-once consumer assumptions;
+- idempotent recipient/device delivery keys;
+- event/message schema versions;
+- ordering scope/aggregate versions;
+- retries with backoff/jitter;
+- DLQ with owner and replay controls;
+- queue lag/oldest-message alerts;
+- media references, not bytes;
+- workload/priority/hot-group isolation;
+- reconciliation/rebuild.
+
+Broker is transport/history for events, not substitute for message business authority and client sync protocol.
+
+---
+
+#### 18. Horizontal scaling
+
+##### Connection gateways
+
+Scale by:
+
+- active/new connections;
+- memory/file descriptors;
+- packets/bandwidth;
+- outbound buffer pressure;
+- AZ/node headroom.
+
+Existing sockets do not migrate to new replicas; pre-scale and graceful draining matter.
+
+##### Chat/owner partitions
+
+Scale across conversations; one ordered conversation has a logical owner per epoch. Detect/isolate hot conversations rather than randomizing away order.
+
+##### Workers
+
+Scale fan-out/sync/receipt/push workers by queue lag/oldest age, bounded by store/provider/network capacity. KEDA/HPA can automate this with min/max and stabilization.
+
+##### Storage
+
+Partition/bucket message history; shard metadata/read models; monitor hot keys, compaction, replica lag and cost.
+
+---
+
+#### 19. Multi-AZ và failure of instances
+
+- Gateways/services/workers spread across AZs.
+- Message/metadata/broker/cache stores replicated according durability needs.
+- PDB/topology spread and one-AZ capacity headroom.
+- Health checks stop new traffic to failed instances.
+- Connection routes expire by TTL/epoch.
+- Clients reconnect with jitter and resume cursor.
+- Outbox/events replay pending fan-out.
+- Cache/presence/routes rebuild.
+
+Important correction:
+
+> Load balancer cannot transparently move an already-open WebSocket from a dead gateway to another instance. The connection closes; the client reconnects, receives a new epoch and synchronizes missing messages.
+
+This is why connection failure must be independent from message durability.
+
+---
+
+#### 20. Multi-region design
+
+```text
+Client → nearest healthy regional edge/gateway
+Send   → conversation home-region owner
+Owner  → sequence + durable commit
+Event  → regional recipient fan-out
+Route  → local recipient gateway
+Offline→ regional/owner-backed history sync
+```
+
+Requirements:
+
+- global stable IDs;
+- owner directory/cache;
+- conversation owner epoch/fencing;
+- cross-region durable replication;
+- idempotent regional consumers;
+- regional connection registry/presence;
+- high-priority membership/block/device revoke propagation;
+- data-residency/metadata policy;
+- failover recovery/reconciliation before new owner writes;
+- media CDN/object regional strategy;
+- no global total order.
+
+Global load balancing improves connection latency/availability but cannot resolve per-conversation sequencing conflict by itself.
+
+---
+
+#### 21. End-to-end encryption architecture
+
+- approved/reviewed E2EE protocol and libraries;
+- per-device identity keys;
+- signed and one-time prekeys for offline session establishment;
+- device add/change/revoke lifecycle;
+- 1:1 and group key distribution/rotation;
+- sender’s other-device encryption/fan-out;
+- encrypted attachments and key envelopes;
+- safety-number/device-change UX;
+- encrypted backup/recovery policy;
+- forward secrecy/post-compromise goals as defined;
+- server stores/routes ciphertext and public key material, not content private keys;
+- metadata minimization and server-side AuthZ still required.
+
+Trade-offs for search, link previews, server moderation, backups and media processing must be explicit. TLS, OIDC and E2EE protect different boundaries.
+
+---
+
+#### 22. Authentication, authorization và abuse protection
+
+- OIDC/user authentication and short-lived access tokens.
+- OAuth2 scopes/service authorization where relevant.
+- Token issuer/audience/expiry/key rotation validation.
+- WebSocket re-auth/session expiry behavior.
+- Device identity/proof/epoch/revocation.
+- Conversation membership/role/block object AuthZ per command/read.
+- Signed media access and ownership.
+- Per-user/device/IP/conversation/group rate limits.
+- Connection admission/reconnect controls.
+- Message/frame/media size quotas.
+- Spam/group-invite/prekey/contact-enumeration abuse controls.
+- Least-privilege workload IAM/secrets/private networks.
+- Audit admin/support access without plaintext leakage.
+
+Role `USER` never implies access to every conversation; object-level authorization is mandatory.
+
+---
+
+#### 23. Reliability và degraded modes
+
+| Failure/overload | Safe behavior |
+|---|---|
+| Gateway dies | Reconnect + cursor sync; accepted message unaffected |
+| Route registry stale/down | Realtime miss; offline/sync path, optional push |
+| Chat service fails before commit | No success ACK; idempotent client retry |
+| ACK lost after commit | Same ID retry returns same canonical result |
+| Conversation owner unavailable | Failover/fencing or bounded send delay; no split sequence |
+| Fan-out lag | Message remains in history; online freshness drops, sync catches up |
+| Presence failure | Show unknown/stale; core chat available |
+| Typing overload | Drop all typing events |
+| Receipt delay | Messages remain usable; receipt UI stale |
+| Push outage | No wake hint; reconnect/history still works |
+| Media/CDN failure | Placeholder/retry; text path available |
+| Membership/key service uncertainty | Fail closed for unauthorized send/key distribution |
+| Sync overload | Paginate/rate limit; reserve live traffic capacity |
+| Redis failure | Rebuild routes/presence/cache; do not lose messages |
+| Region failure | Fenced owner recovery + reconnect/reroute/reconciliation |
+
+Degrade presence, typing, detailed receipts and media convenience before durability, ordering, membership authorization or E2EE.
+
+---
+
+#### 24. Observability và SLOs
+
+Correlation:
+
+```text
+client_message_id
+ → message_id/conversation sequence
+ → fan-out/device delivery ID
+ → gateway/connection epoch
+ → delivery/read watermark
+```
+
+##### User SLOs
+
+- send→durable ACK p50/p95/p99;
+- accepted→online-device delivery p95/p99;
+- reconnect→gap-free sync duration;
+- history page latency/error;
+- multi-device convergence lag;
+- media upload/download success/start time.
+
+##### Correctness
+
+- acknowledged-message loss rate;
+- duplicate logical-message rate;
+- missing/gap repair and out-of-order-after-buffer rates;
+- sequence/idempotency conflicts;
+- unauthorized send/read/delivery incidents;
+- revoked-device propagation;
+- receipt watermark regression must be zero.
+
+##### Capacity
+
+- active connections, reconnect/heartbeat, per-gateway memory/FD/pps/bandwidth;
+- route registry stale/miss;
+- message/fan-out/receipt/sync lag;
+- hot conversation/partition;
+- DB/broker/cache/media/key saturation;
+- cross-region replication/failover;
+- cost per connection-hour/message/device delivery/media GB.
+
+No plaintext/ciphertext/key material in logs/traces. Avoid high-cardinality IDs in metric labels; use protected indexed diagnostics and sampling.
+
+---
+
+#### 25. Bottleneck → final control
+
+| Bottleneck | Final control |
+|---|---|
+| Millions connections | Lightweight gateways, bounded buffers, connection-aware LB, headroom/drain |
+| Reconnect storm | Backoff/jitter, resume tokens, admission, separate sync capacity |
+| Route lookup/churn | TTL registry, epochs, batch lookup, offline fallback |
+| Duplicate send/ACK loss | Client IDs, conditional append, idempotent response |
+| Per-conversation order | Home owner/sequencer + sequence + fencing |
+| Group/device fan-out | Post-commit async batches, membership version, delivery dedup/fairness |
+| Hot group | Owner isolation, quotas, fan-out parallelism, feature degradation |
+| Billions message history | Conversation+bucket partitions, append/range cursor, tiering |
+| Offline backlog | Delta cursors, pages, gap repair, sync quotas |
+| Billions receipts | Cumulative ACK/read watermarks, batching/aggregation |
+| Presence/typing load | TTL soft state, scoped pub/sub, debounce/drop |
+| Rich media | Encrypted direct upload, object storage/CDN/lifecycle |
+| Offline wake-up | Collapsed privacy-safe APNs/FCM hints |
+| E2EE key lifecycle | Device/prekey directory, rotation/revocation, reviewed protocol |
+| Multi-region order/failure | Home region, global IDs, replication, owner epoch/fencing |
+| Abuse | Rate/size/group/device quotas, admission and isolation |
+
+---
+
+#### 26. Requirement → final decision
+
+| Requirement | Final decision |
+|---|---|
+| Sub-second online delivery | Persistent WebSocket gateways + regional realtime router |
+| Durable send | Message + idempotency + outbox commit before ACK |
+| Correct order | Per-conversation owner and monotonic server sequence |
+| Retry without duplicate | Stable client message ID + conditional dedup |
+| Group chat | Versioned membership + async recipient-device fan-out |
+| Offline reliability | Canonical history + cursor/gap sync; push hint only |
+| Multi-device | Device directory, sender echo, per-device delivery/cursors/keys |
+| Delivery/read feedback | Cumulative monotonic watermarks and async receipt events |
+| Presence/typing | Ephemeral TTL/pub-sub paths, safely droppable |
+| Rich media | Client encryption, direct object upload and CDN ciphertext delivery |
+| E2EE | Reviewed device/session/group-key protocol; server has no content private keys |
+| Horizontal scale | Partition by conversation, separate gateway/worker/read models |
+| High availability | Multi-AZ replicated authorities + reconnect/replay/rebuild |
+| Global users | Nearest gateway + conversation home-owner + regional fan-out |
+| Security | OIDC/device proof + object AuthZ + TLS/E2EE + abuse controls |
+| Operability | End-to-end IDs, SLO metrics, privacy-safe logs/traces, runbooks |
+
+---
+
+#### 27. Những điểm hiệu chỉnh so với final diagram đơn giản
+
+| Transcript/sơ đồ đơn giản hóa | Final design production-oriented |
+|---|---|
+| API Gateway is front door for all requests | WebSocket-aware edge/LB handles long connections; REST gateway handles control APIs according capability |
+| Gateway authentication/rate-limit/load-balance is enough | Device proof and per-conversation/member/block/media AuthZ still required |
+| Connection Manager tracks every user/device | Gateway owns sockets; TTL/epoch registry supports cross-gateway route and rebuild |
+| Chat Service validates, “parses”/stores, manages all delivery state | It **persists** ordered message; fan-out/receipts/sync are separate workflows/stores |
+| Group Service determines recipients, then direct real-time fan-out | Commit first; async versioned/batched membership-device fan-out afterward |
+| Presence tells whether to deliver realtime | Registry gives current route; presence is UX hint and never decides durability |
+| Redis stores active sessions/presence | Correct for soft/cache state; not durable message/offline/group authority |
+| Notification handles offline delivery | Push only wakes/notifies; history/sync delivers canonical message |
+| Infrequent media served via CDN | CDN benefits popular content most; cold objects fetch from origin; use for global delivery/origin protection |
+| Relational/Redis/object stores cover data | Still need query-shaped message store, receipt/sync and key/device authorities |
+| Load balancer redirects traffic if instance fails | New requests/connections reroute; existing WebSocket closes and client reconnects/syncs |
+| Horizontal microservices guarantee resilience | Need durable handoffs, idempotency, fencing, backpressure, replicas and tested recovery |
+
+---
+
+#### 28. Trade-offs quan trọng
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Persistent WebSockets | Low-latency server push | Connection memory/churn/drain complexity |
+| Per-conversation owner | Stable order/simple reasoning | Cross-region hop/hot conversation/failover complexity |
+| Async fan-out | Sender latency and independent scale | Eventual delivery lag, duplicates, operations |
+| Unified conversation log | Shared direct/group history pipeline | Membership/fan-out policies still differ |
+| Watermark receipts | Far fewer writes | Less per-message/device detail, gap semantics |
+| Redis route/presence | Very low-latency soft state | Staleness/eviction/rebuild, no durability |
+| E2EE | Strong content privacy | Search/moderation/backup/media/key complexity |
+| Object storage/CDN | Scalable media delivery | Egress, lifecycle, private-cache/E2EE concerns |
+| Multi-region | Connection latency/availability | Ownership, replication, data residency and cost |
+| Microservices/Kubernetes | Independent scale/deploy | Network and operational complexity |
+
+Không có perfect design; chọn trade-off phù hợp product semantics, scale, trust model và team.
+
+---
+
+#### 29. Cách trình bày final design trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Clients connect to nearest regional WebSocket Gateway; Redis-like registry maps each device to gateway with TTL/epoch.
+2. SEND_MESSAGE reaches Chat Service, which authenticates, checks membership/block, dedups client ID and routes to conversation owner.
+3. Owner assigns per-conversation sequence and commits encrypted message + outbox before returning `SERVER_ACCEPTED`.
+4. Durable event drives async fan-out to recipient devices and sender’s other devices using membership/device versions and idempotent delivery keys.
+5. Online devices receive through local gateways; offline devices recover through cursor-based history sync; APNs/FCM is only a wake hint.
+6. Delivery/read receipts use monotonic cumulative watermarks; presence/typing use separate ephemeral TTL paths.
+7. Direct and group chats share Conversation/Membership/MessageEvent model; status is not one field on message.
+8. Media is encrypted client-side, direct-uploaded to object storage and delivered via CDN as ciphertext.
+9. Kafka/SQS-like infrastructure, message-shaped storage, Postgres metadata and Redis soft state are selected by semantics.
+10. Multi-AZ replication, conversation-owner fencing, E2EE device keys, abuse controls and privacy-safe SLOs provide resilience/security.
+
+Deep dives nên chuẩn bị:
+
+- WebSocket gateway capacity/reconnect storm;
+- idempotent send and ACK-loss scenario;
+- per-conversation ordering/owner failover;
+- group/device fan-out and hot groups;
+- offline cursor/gap sync;
+- delivery/read watermark model;
+- presence/typing degradation;
+- E2EE multi-device/group keys;
+- encrypted media/CDN;
+- multi-region ownership and DR.
+
+---
+
+#### 30. Final checklist
+
+- [ ] Scope, group limits, devices/user, delivery/order semantics and SLOs?
+- [ ] Connection/message/media planes and authorities separated?
+- [ ] WebSocket gateway auth/frame/version/backpressure/heartbeat/drain?
+- [ ] Device route TTL/epoch and stale-route recovery?
+- [ ] Stable client message ID and conditional idempotency?
+- [ ] Per-conversation owner/sequence/home region/fencing?
+- [ ] Durable message + outbox before ACK?
+- [ ] Unified conversation/membership/message model and buckets?
+- [ ] Membership/block/device version AuthZ at send/fan-out/key boundaries?
+- [ ] Async batched direct/group/device fan-out and hot-group fairness?
+- [ ] Sender’s other-device echo and recipient multi-device policy?
+- [ ] Online route failure falls back to durable sync?
+- [ ] Offline cursor/pagination/gap/live-merge/bootstrap/retention?
+- [ ] Delivery/read cumulative monotonic watermarks and privacy/group aggregation?
+- [ ] Presence leases and typing short-TTL/drop behavior?
+- [ ] Encrypted direct media upload/object/CDN/integrity/lifecycle?
+- [ ] APNs/FCM collapse/TTL/privacy/token cleanup, hint-only semantics?
+- [ ] Device/prekey/group-key/revocation/backup E2EE lifecycle?
+- [ ] Kafka/SQS/message/metadata/Redis store roles and recovery?
+- [ ] Kubernetes/KEDA capacity, drain, downstream caps and AZ headroom?
+- [ ] Multi-AZ backups/PITR/replay/rebuild/restore drills?
+- [ ] Multi-region owner, replication, failover reconciliation/data residency?
+- [ ] OIDC/device proof/object AuthZ/IAM/secrets/abuse controls?
+- [ ] Correlation/metrics cover ACK, fan-out, gaps, receipts, keys without content leakage?
+- [ ] Cost model and ADR/evolution triggers?
+
+#### 31. Ý chính cần nhớ
+
+- Final Chat System separates ephemeral connections from durable ordered messages.
+- Realtime WebSocket is fast path; cursor/gap synchronization is correctness fallback.
+- Load balancer cannot migrate a dead WebSocket; client reconnects and resyncs.
+- Chat Service commits encrypted message and outbox before server acceptance ACK.
+- Stable client IDs turn retries after timeout into one logical message.
+- Per-conversation owner/sequence gives useful order without global ordering.
+- Group messages commit once, then fan out asynchronously to versioned member devices.
+- Sender’s other devices are part of multi-device fan-out.
+- Connection registry/presence/Redis Pub/Sub are soft state, never sole message truth.
+- Delivery/read states belong to recipient/device watermarks, not one message status column.
+- Presence and typing are approximate/droppable and isolated from core messaging.
+- Push is a best-effort wake hint; canonical history ensures eventual retrieval.
+- Rich media is encrypted and sent through object storage/CDN, not chat servers.
+- E2EE requires device/prekey/group/revocation/backup lifecycle, not only ciphertext storage.
+- NoSQL/Postgres/Redis/Kafka/SQS are selected by access and delivery semantics.
+- Multi-region routing uses nearest gateway but conversation home-owner for ordered writes.
+- Availability needs reconnect, replay, rebuild and fencing—not only replicated instances.
+- Security requires device/object authorization, abuse controls and metadata protection in addition to OIDC/TLS/E2EE.
+- Observability measures durable ACK, delivery lag, gaps, duplicates and revocation without logging content.
+- Kiến trúc tốt nối **authenticated device → idempotent ordered commit → recipient-device fan-out → realtime/offline convergence → monotonic receipt**.
+
+#### Công thức ghi nhớ
+
+> **Final Chat System = ephemeral regional connection plane + authoritative ordered encrypted conversation log + idempotent asynchronous device fan-out + durable cursor sync + E2EE media/key lifecycle + fenced observable recovery.**
+
+---
+
+## Phần 17 — Design an Auction Platform (eBay)
+
+### Bài 88. Understanding the Problem & Defining the Scope
+
+#### 1. Auction platform thực sự giải quyết bài toán gì?
+
+Auction platform không chỉ là màn hình hiển thị một mức giá đang tăng. Nó quản lý toàn bộ vòng đời kinh doanh của một phiên đấu giá:
+
+```text
+Seller tạo listing
+        ↓
+Auction được kiểm duyệt/lên lịch
+        ↓
+Scheduled ──start time──> Active
+                              ↓
+                    nhận và phân xử bids
+                              ↓
+                         end time
+                              ↓
+                           Closed
+                    ┌─────────┴─────────┐
+                    │                   │
+             Có winner hợp lệ     Không bán được
+                    │          (không bid/reserve chưa đạt)
+                    ↓
+              Payment pending
+                    ↓
+          Paid → Fulfillment → Complete
+                    │
+                    └── failure/dispute/refund path
+```
+
+Trách nhiệm end-to-end gồm:
+
+- cho seller đăng mặt hàng và cấu hình luật đấu giá;
+- giúp buyer khám phá, theo dõi và tham gia auction;
+- tiếp nhận, xác thực và sắp thứ tự các bid cạnh tranh;
+- duy trì mức giá/winner hiện tại theo một nguồn sự thật có thẩm quyền;
+- phát cập nhật gần realtime tới người theo dõi;
+- đóng auction đúng theo rule đã công bố;
+- xác định kết quả có thể giải thích và kiểm toán;
+- khởi tạo payment, fulfillment, refund hoặc dispute workflow;
+- phòng chống bot, fraud và hành vi thao túng thị trường.
+
+Điểm khó nhất không phải CRUD listing, mà là **nhiều người cùng tranh một tài nguyên hữu hạn trong một cửa sổ thời gian**. Vì vậy, tính đúng, tính công bằng và bằng chứng kiểm toán quan trọng ngang với latency.
+
+---
+
+#### 2. Mục tiêu thiết kế
+
+Thiết kế một nền tảng đấu giá có thể:
+
+1. tiếp nhận lượng bid lớn, đặc biệt khi gần hết giờ;
+2. tạo một thứ tự có thẩm quyền cho các bid của cùng auction;
+3. không để retry, timeout hoặc concurrent requests tạo nhiều hiệu ứng logic;
+4. không chấp nhận bid sau deadline theo rule đã chọn;
+5. phát trạng thái mới nhanh nhưng không biến kênh realtime thành nguồn sự thật;
+6. tiếp tục hoạt động khi instance, zone hoặc dependency gặp lỗi;
+7. lưu đủ evidence để xử lý khiếu nại và điều tra fraud;
+8. hoàn tất hậu đấu giá bằng workflow payment đáng tin cậy.
+
+Một câu mô tả ngắn:
+
+> Auction platform là một **time-bounded concurrent state machine**: nhận các command cạnh tranh, tuần tự hóa quyết định trong phạm vi từng auction, tạo một kết quả duy nhất và phát các derived updates cho người dùng.
+
+---
+
+#### 3. Phạm vi chức năng của phiên bản thiết kế
+
+##### 3.1. In scope
+
+- đăng ký, đăng nhập và quản lý danh tính buyer/seller;
+- seller tạo, sửa trước khi mở, hủy theo policy và theo dõi listing;
+- item metadata, ảnh, start time, end time, currency, starting price;
+- reserve price và minimum bid increment;
+- tìm kiếm, xem chi tiết và watch auction;
+- đặt bid, nhận kết quả accepted/rejected và xem bid history được phép công khai;
+- cập nhật gần realtime khi current price hoặc leading bidder thay đổi;
+- tự động chuyển `SCHEDULED → ACTIVE → ENDED`;
+- chọn winner theo rule xác định trước;
+- outbid, won, lost và payment notifications;
+- payment initiation, retry/reconciliation và fulfillment handoff;
+- admin moderation, fraud review, dispute và audit.
+
+##### 3.2. Cần hỏi rõ trước khi thiết kế chi tiết
+
+- Đây là **English auction** giá tăng hay hỗ trợ Dutch/sealed-bid?
+- Bid là mức giá trực tiếp hay hỗ trợ **proxy/automatic bidding** với maximum amount bí mật?
+- Auction đóng cứng tại `end_time` hay dùng **soft close/anti-sniping**, tự gia hạn nếu có bid cuối giờ?
+- Reserve price có được công khai không? Nếu không đạt reserve thì xử lý thế nào?
+- Có cho seller hủy auction đang active hoặc rút bid không?
+- Currency, tax, shipping và địa lý có nằm trong scope không?
+- Buyer có phải pre-authorize payment/deposit trước khi bid không?
+- Một user có thể vừa là seller vừa là bidder không? Có cấm self-bidding và related-account bidding không?
+- Winner không thanh toán thì relist, mời bidder thứ hai hay mở dispute?
+
+Các câu trả lời này thay đổi invariants, state machine, payment flow và cả mô hình dữ liệu. Không nên âm thầm giả định.
+
+##### 3.3. Out of scope cho vòng thiết kế đầu tiên
+
+- logistics/warehouse/shipping optimization đầy đủ;
+- recommendation và quảng cáo ở mức sâu;
+- settlement đa tiền tệ, tax engine toàn cầu;
+- hệ thống machine-learning fraud detection chi tiết;
+- live video commerce;
+- nhiều loại auction khác English ascending auction.
+
+Ta vẫn để integration boundaries cho các phần này, nhưng không để chúng làm loãng đường bid quan trọng.
+
+---
+
+#### 4. Các actor chính
+
+| Actor | Mục tiêu | Hành động chính | Kỳ vọng quan trọng |
+|---|---|---|---|
+| Seller | Bán item theo luật công bố | Tạo listing, đặt thời gian/giá, theo dõi, fulfillment | Listing đúng, kết quả không bị thao túng |
+| Bidder | Cạnh tranh để mua item | Search/watch, đặt bid, nhận outbid/win, thanh toán | Phản hồi nhanh, rule công bằng, không mất bid hợp lệ |
+| Auction authority | Thi hành luật | Validate, order, accept/reject, close, chọn winner | Một quyết định authoritative, có audit trail |
+| Payment provider | Xử lý tài chính | Authorize/capture/refund, webhook | Idempotent integration và reconciliation |
+| Administrator/Trust team | Giữ marketplace an toàn | Moderation, fraud review, dispute, suspend | Evidence đầy đủ, quyền truy cập được kiểm soát |
+| Notification provider | Gửi email/SMS/push | Nhận delivery request, trả status | Best-effort delivery, không quyết định kết quả |
+
+Một người có thể mang nhiều business role, nhưng authorization phải dựa trên hành động cụ thể và quan hệ với object; không chỉ dựa vào nhãn “user”.
+
+---
+
+#### 5. Use case chính
+
+##### 5.1. Seller tạo auction
+
+1. Seller gửi item metadata, media và auction rules.
+2. Hệ thống xác thực seller, validate category/policy và ownership nếu cần.
+3. Media được lưu riêng; listing giữ references.
+4. Auction được tạo ở `DRAFT` hoặc `SCHEDULED`.
+5. Khi tới start time, hệ thống kích hoạt theo state-transition rule.
+
+##### 5.2. Bidder đặt bid
+
+1. Client gửi bid cùng stable `bid_request_id`.
+2. Hệ thống xác thực user, quyền tham gia và auction state.
+3. Auction authority kiểm tra deadline, increment, currency, current state và risk rules.
+4. Các command cạnh tranh của **cùng auction** được phân xử theo một authoritative order.
+5. Bid được durable commit hoặc bị reject với reason rõ ràng.
+6. Chỉ sau commit, hệ thống trả kết quả và phát event/update.
+
+##### 5.3. Auction kết thúc
+
+1. Sau authoritative close boundary, hệ thống không nhận thêm bid theo policy.
+2. Close transition được thực hiện đúng một **logical effect**, dù scheduler có retry.
+3. Winner/current price được cố định từ accepted bid history/state.
+4. Nếu reserve không đạt, auction kết thúc không có sale.
+5. Nếu có winner, hệ thống tạo payment/order workflow và notifications.
+
+##### 5.4. Hậu đấu giá
+
+- Payment thành công → xác nhận order và yêu cầu seller fulfillment.
+- Timeout/unknown outcome → query/reconcile với provider, không kết luận thất bại ngay.
+- Payment thất bại → retry/grace period/escalation theo policy.
+- Dispute/refund → workflow riêng, không sửa âm thầm bid history.
+
+---
+
+#### 6. Vòng đời auction phải là state machine rõ ràng
+
+Một mô hình tối thiểu:
+
+```text
+DRAFT → SCHEDULED → ACTIVE → CLOSING → ENDED
+  │          │          │                   │
+  └──────────┴──────────┴──> CANCELLED      ├──> PAYMENT_PENDING
+                                                ├──> SOLD
+                                                └──> UNSOLD
+```
+
+`CLOSING` có thể là trạng thái nội bộ ngắn để fence writes và finalize kết quả. Không nhất thiết phải lộ ra UI.
+
+Mỗi transition cần:
+
+- điều kiện trước rõ ràng;
+- actor hoặc timer được phép kích hoạt;
+- conditional/versioned write để chống transition lặp;
+- event tương ứng được phát bằng durable outbox;
+- audit record chứa rule version và quyết định;
+- policy khôi phục nếu downstream chưa hoàn tất.
+
+Không nên chỉ dùng một cron job “đổi status = ended”. Scheduler có thể trễ, chạy lặp hoặc chết đúng thời điểm. **Deadline quyết định bid còn hợp lệ hay không; background job chỉ materialize/finalize trạng thái.**
+
+---
+
+#### 7. Functional requirements
+
+##### 7.1. Identity và tài khoản
+
+- đăng ký/đăng nhập, MFA cho hành động rủi ro;
+- seller verification/KYC tùy marketplace;
+- device/session management;
+- role và object-level authorization;
+- suspend/ban và risk status có hiệu lực trong bid path.
+
+##### 7.2. Listing và discovery
+
+- tạo item/listing với media, category và mô tả;
+- cấu hình start/end, starting price, reserve và increment policy;
+- search/filter/sort và xem trang chi tiết;
+- watchlist và saved search;
+- version rules, không sửa điều kiện cốt lõi sau khi đã có bid trừ policy minh bạch.
+
+##### 7.3. Bidding
+
+- đặt bid với amount/currency và idempotency key;
+- trả accepted/rejected cùng authoritative current state/version;
+- không chấp nhận bid từ seller hoặc account không đủ điều kiện;
+- enforce minimum amount/increment;
+- tạo per-auction ordering có thể giải thích;
+- giữ immutable bid attempt/effect history theo retention/compliance;
+- hỗ trợ proxy bidding nếu product chọn, nhưng phải định nghĩa riêng.
+
+##### 7.4. Realtime experience
+
+- subscribe/unsubscribe auction updates;
+- current price, leading status, remaining time và lifecycle state;
+- outbid notification;
+- reconnect bằng version/cursor để bù event bị lỡ;
+- snapshot + stream merge, không tin rằng WebSocket luôn đầy đủ.
+
+##### 7.5. Closing và winner
+
+- đóng theo authoritative server time/rule;
+- chặn late bids;
+- một kết quả winner duy nhất;
+- reserve-aware outcome;
+- close/finalize idempotent;
+- winner result có thể reconstruct từ durable evidence.
+
+##### 7.6. Payment và fulfillment handoff
+
+- payment intent/order gắn với auction result version;
+- provider request dùng idempotency key;
+- webhook verification và deduplication;
+- retry/reconciliation cho timeout và unknown outcome;
+- trạng thái `PAYMENT_PENDING`, `PAID`, `FAILED`, `REFUNDED`, `DISPUTED`;
+- không lưu raw card data nếu dùng hosted/tokenized provider flow.
+
+##### 7.7. Notification và administration
+
+- outbid, ending-soon, won/lost, payment và fulfillment messages;
+- preference, quiet hours và channel policy, trừ mandatory transactional notice;
+- admin search theo auction/user/bid/payment IDs;
+- immutable audit evidence, reason codes và controlled override workflow;
+- fraud signals, bot mitigation và dispute support.
+
+---
+
+#### 8. Non-functional requirements phải đo được
+
+“Nhanh, scalable và available” chưa đủ để ra quyết định. Cần chuyển thành SLO/capacity target.
+
+| Thuộc tính | Ví dụ mục tiêu cần thống nhất | Điều cần đo |
+|---|---|---|
+| Bid acceptance latency | Chẳng hạn p99 dưới vài trăm ms trong region | Client→authority→durable decision→response |
+| Realtime freshness | Chẳng hạn p99 update sau accepted bid dưới 1 giây | Commit-to-visible lag |
+| Correctness | Không có hai winners cho một auction version | Conflicting-finalization count |
+| Durability | Accepted bid không mất sau acknowledged response | Recovery/replay verification |
+| Availability | Bid path SLO cao hơn search/notification | Success rate theo endpoint và auction phase |
+| Closing accuracy | Finalization lag được giới hạn; late bid acceptance bằng 0 theo rule | Deadline decision và close lag |
+| Scalability | Chịu flash crowd/hot auction và nhiều auctions song song | Bid/s, watchers, sockets, partition skew |
+| Security | AuthN/AuthZ, bot/fraud, secrets, payment scope | Denials, abuse, anomalies, audit coverage |
+| Recoverability | RTO/RPO riêng cho bid authority và supporting views | Failover, restore, replay drills |
+
+Hai latency khác nhau cần tách:
+
+- **decision latency**: mất bao lâu để biết bid được accept/reject;
+- **visibility latency**: mất bao lâu để mọi watcher nhìn thấy state mới.
+
+Decision phải đúng và durable. Visibility có thể eventual trong một cửa sổ ngắn và được sửa bằng snapshot/version.
+
+---
+
+#### 9. Các invariant cốt lõi
+
+Đây là phần nên nói sớm trong phỏng vấn vì nó dẫn dắt kiến trúc:
+
+1. Mỗi auction có đúng một rule set/version hiệu lực khi bidding.
+2. Chỉ auction `ACTIVE` và còn trong authoritative bidding window mới nhận bid.
+3. Mỗi accepted bid cao hơn mức tối thiểu theo price/increment rule hiện tại.
+4. Retry của cùng logical bid không tạo thêm một accepted bid mới.
+5. Accepted bid đã ACK phải tồn tại sau crash/failover.
+6. Mọi accepted bid của cùng auction có một authoritative sequence/order.
+7. State hiện tại phải tương ứng với prefix đã commit của ordered bid history.
+8. Auction chỉ có một final result cho một closing epoch/version.
+9. Không accepted bid nào được chen vào sau khi close đã được fence.
+10. Payment/order chỉ được tạo từ một final result hợp lệ và phải idempotent.
+11. Notification, cache và WebSocket update không phải nguồn sự thật.
+12. Admin override nếu được phép phải tạo event/evidence mới, không xóa lịch sử cũ.
+
+---
+
+#### 10. “Bid nào đến trước?” phải được định nghĩa chính xác
+
+Client timestamps không đáng tin vì:
+
+- đồng hồ thiết bị có thể lệch hoặc bị sửa;
+- network latency giữa users khác nhau;
+- retry có thể đến qua route khác;
+- nhiều replicas nhìn thấy requests theo thứ tự khác nhau.
+
+Vì vậy, fairness không thể là “thời gian user bấm nút” hay “gói tin đến load balancer đầu tiên” nếu hệ thống không lưu và cam kết theo mốc đó.
+
+Một policy production-oriented thường là:
+
+> Bid hợp lệ nếu được **auction authority** tiếp nhận và commit trước authoritative close boundary; các bid của cùng auction được gán sequence theo thứ tự authority chấp nhận.
+
+Có nhiều cách hiện thực authority sau này—single leader/home partition, conditional transaction hoặc serialized command stream—nhưng contract phải ổn định:
+
+```text
+Client request time        chỉ để telemetry/UX
+Edge receive time          có thể dùng evidence, không tự tạo truth
+Authority admission time   mốc policy nếu hệ thống chọn
+Commit sequence/time       thứ tự durable để quyết định state/winner
+Broadcast time             chỉ là thời gian người xem nhận update
+```
+
+Nếu yêu cầu fairness theo edge arrival toàn cầu, thiết kế phức tạp hơn đáng kể: cần trusted ingress timestamp, chống replay, routing determinism và rule xử lý khi edge/authority bị partition. Đây phải là product/legal decision, không phải chi tiết ngầm.
+
+---
+
+#### 11. Boundary tại thời điểm đóng auction
+
+Giả sử `end_time = T`:
+
+- phải định nghĩa nhận bid khi `time < T` hay `time <= T`;
+- time nào được dùng: authority clock/admission record, không phải client clock;
+- dùng đồng hồ monotonic cho interval trong process và đồng bộ wall clock để audit;
+- scheduler chạy sau `T` không có nghĩa bid giữa `T` và lúc job chạy được phép;
+- failover gần `T` phải dùng epoch/fencing để old owner không tiếp tục accept;
+- soft-close nếu có phải được commit như thay đổi `effective_end_time` có version.
+
+Ví dụ quyết định atomically trong authority:
+
+```text
+load auction state/version
+verify ACTIVE and authority_time < effective_end_time
+verify idempotency key and bid rule
+append accepted bid with auction_sequence
+update current winner/price and state version
+write outbox event
+commit
+```
+
+Close command cạnh tranh với bid command cũng đi qua cùng serialization boundary. Nhờ vậy, không tồn tại khoảng mơ hồ nơi một node đã đóng còn node khác vẫn nhận bid.
+
+---
+
+#### 12. Concurrency, retries và “exactly once”
+
+Nhiều người có thể cùng đọc current price là 100 rồi gửi 110. Nếu các application instances tự kiểm tra và cập nhật riêng, ta có race condition hoặc lost update.
+
+Điều hệ thống thực sự cần:
+
+- serialization/conditional write trong phạm vi `auction_id`;
+- version hoặc fencing token để reject stale owner/writer;
+- stable `bid_request_id` do client tạo trước lần gửi đầu;
+- durable idempotency record gắn với bidder + auction + request ID;
+- transaction bao gồm accepted bid, current state và outbox;
+- retry cùng ID trả lại cùng logical result;
+- downstream consumers vẫn giả định at-least-once và deduplicate.
+
+Không nên hứa “end-to-end exactly-once delivery”. Network timeout tạo tình huống client không biết server đã commit hay chưa. Mục tiêu khả thi là:
+
+> **At-least-once processing + idempotent conditional state transition = effectively-once bid effect.**
+
+Lưu ý: hai clicks thực sự khác nhau phải có hai request IDs; idempotency không được vô tình gộp các bid hợp lệ độc lập.
+
+---
+
+#### 13. Realtime update là fast path, authoritative read là recovery path
+
+WebSocket hoặc Server-Sent Events giúp push:
+
+- bid accepted/outbid;
+- current price/state version;
+- auction started/extended/ended;
+- winner/payment status phù hợp quyền xem.
+
+Nhưng realtime stream có thể duplicate, out-of-order hoặc bị mất khi reconnect. Mỗi event nên có:
+
+- `auction_id`;
+- `auction_version` hoặc `event_sequence`;
+- event ID;
+- server timestamp;
+- payload tối thiểu, không rò identity nhạy cảm.
+
+Client xử lý theo quy tắc:
+
+```text
+event.version == local.version + 1  → apply
+event.version <= local.version      → ignore duplicate/stale
+event.version > local.version + 1   → fetch snapshot/events to repair gap
+```
+
+Countdown trên UI chỉ là ước lượng được hiệu chỉnh theo server time. “Còn 1 giây” trên màn hình không đảm bảo request sẽ tới authority trước deadline.
+
+Notifications qua email/SMS/push càng không nằm trên correctness path. Chậm gửi outbid notification không làm bid history sai.
+
+---
+
+#### 14. Payment là workflow sau khi thắng, không phải một transaction với bid
+
+Không thể giữ database transaction xuyên qua Stripe/PayPal. Sau finalization nên dùng saga/state machine:
+
+```text
+Auction finalized
+      ↓ durable event
+Create payment/order intent ──idempotency key──> Provider
+      │                                         │
+      ├── confirmed <──── verified webhook/reconciliation
+      ├── failed → retry/grace/escalation policy
+      └── unknown → query provider, không charge lại mù quáng
+```
+
+Các nguyên tắc:
+
+- payment request gắn với `auction_result_id` duy nhất;
+- verify webhook signature và dedup provider event ID;
+- timeout là **unknown**, không tự động đồng nghĩa với failed;
+- reconcile định kỳ giữa internal ledger/state và provider;
+- giữ audit trail của authorization/capture/refund;
+- tokenization/hosted checkout giảm PCI scope;
+- xác định rõ chính sách winner không thanh toán.
+
+Payment outage không được làm mất hoặc thay đổi winner. Auction result và payment settlement là hai domain state machines liên kết bằng durable events.
+
+---
+
+#### 15. Security, fraud và marketplace trust
+
+##### 15.1. Identity và quyền
+
+- OIDC/session/device security cho user authentication;
+- object-level AuthZ: seller chỉ sửa listing của mình, bidder đủ điều kiện mới bid;
+- cấm seller bid trên auction của chính mình;
+- step-up authentication cho listing giá trị lớn, payout hoặc admin action;
+- least privilege cho service và admin tools.
+
+##### 15.2. Bot và abuse
+
+- rate limit theo account, device, IP, auction và risk score;
+- CAPTCHA/challenge chỉ khi rủi ro, tránh phá UX đại trà;
+- device/account graph, velocity và anomaly signals;
+- chống replay bằng TLS, token expiry, nonce/request ID;
+- quota/fairness để một hot auction không làm cạn toàn hệ thống;
+- detection cho shill bidding/collusion, account takeover và payment fraud.
+
+##### 15.3. Audit và privacy
+
+- append-only evidence cho bid decisions, state transitions và admin actions;
+- mã hóa in transit/at rest, quản lý secrets/keys;
+- log reason code, policy version, authority epoch và correlation IDs;
+- không log card data, access tokens hoặc PII không cần thiết;
+- retention, legal hold và quyền truy cập audit tách biệt.
+
+Fairness không chỉ là thuật toán chọn số lớn nhất. Nó còn gồm rule công khai, admission nhất quán, bot/fraud controls, clock/ordering policy và khả năng giải thích kết quả.
+
+---
+
+#### 16. Phân loại dữ liệu và nguồn sự thật
+
+| Dữ liệu | Tính chất | Yêu cầu |
+|---|---|---|
+| Auction rules/state | Authoritative, versioned | Conditional transition, consistency cao |
+| Accepted bid log | Append-only, audit-critical | Durable, ordered per auction, immutable evidence |
+| Current leader/price | Derived hoặc transactionally co-written | Read nhanh nhưng khớp committed prefix |
+| Listing/search document | Read-heavy projection | Eventual consistency thường chấp nhận được |
+| Watcher/subscription state | Ephemeral hoặc user preference | Scale cao, có thể rebuild tùy loại |
+| Realtime stream | Derived delivery | Có thể duplicate/mất; version để repair |
+| Payment/order | Transactional workflow | Idempotency, webhook evidence, reconciliation |
+| Media | Large immutable object | Object storage/CDN, access control/lifecycle |
+| Fraud features | Derived/sensitive | Streaming/batch, privacy và restricted access |
+| Audit trail | Append-only/compliance | Tamper-evident, retention và controlled access |
+
+Một bảng listing trong search index hoặc một giá trị Redis không được dùng để tuyên bố winner. Nguồn sự thật phải là accepted ordered state/log cùng finalization record.
+
+---
+
+#### 17. API contract sơ bộ từ bước định nghĩa phạm vi
+
+Chưa cần chọn framework, nhưng có thể xác định semantics:
+
+```http
+POST /v1/auctions
+POST /v1/auctions/{auction_id}/bids
+GET  /v1/auctions/{auction_id}
+GET  /v1/auctions/{auction_id}/bids?cursor=...
+POST /v1/auctions/{auction_id}/watch
+GET  /v1/me/bids
+GET  /v1/me/wins
+```
+
+Ví dụ đặt bid:
+
+```json
+{
+  "bid_request_id": "device-generated-stable-id",
+  "amount": "125.00",
+  "currency": "USD",
+  "expected_auction_version": 418
+}
+```
+
+Response nên phân biệt rõ:
+
+```json
+{
+  "status": "ACCEPTED",
+  "bid_id": "bid_...",
+  "auction_version": 419,
+  "effective_price": "125.00",
+  "leading": true,
+  "authoritative_time": "..."
+}
+```
+
+Reject reason có thể là `AUCTION_NOT_ACTIVE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `CURRENCY_MISMATCH`, `NOT_ELIGIBLE`, `RATE_LIMITED` hoặc `STALE_VERSION_RETRY`. Không nên trả thông tin làm lộ reserve/max proxy bid hoặc risk rule.
+
+`expected_auction_version` giúp client phát hiện state cũ, nhưng server vẫn phải tự validate atomically; client precondition không thay server-side concurrency control.
+
+---
+
+#### 18. Failure scenarios phải đưa vào scope ngay từ đầu
+
+| Sự cố | Hành vi mong muốn |
+|---|---|
+| Client timeout sau khi gửi bid | Retry cùng request ID và nhận lại cùng kết quả |
+| Auction processor crash sau commit trước response | Bid vẫn durable; retry dedup; outbox tiếp tục phát event |
+| Realtime event bị mất | Client phát hiện version gap và fetch authoritative snapshot |
+| Scheduler chạy close hai lần | Conditional transition/result ID khiến chỉ một logical finalization |
+| Old owner sống lại sau failover | Epoch/fencing token chặn stale writes |
+| Cache/search lag | Có thể hiển thị chậm; bid authority không dựa vào cache đó |
+| Hot auction tạo flash crowd | Per-auction partition/owner, admission, fan-out isolation và capacity headroom |
+| Payment provider timeout | Đánh dấu unknown, reconcile; không charge lại không kiểm soát |
+| Notification provider lỗi | Retry/DLQ; không rollback bid hoặc winner |
+| Một availability zone mất | Failover/reconnect nhưng vẫn giữ one-authority semantics |
+| Clock skew | Authority policy, clock monitoring và fencing; không tin client clock |
+
+Đặc biệt, “high availability” không có nghĩa hai leaders cùng nhận bid cho một auction. Availability phải đi cùng ownership consensus/fencing để tránh split-brain winner.
+
+---
+
+#### 19. Observability phục vụ cả vận hành và tranh chấp
+
+##### 19.1. Metrics
+
+- bid attempts/accepted/rejected theo reason;
+- p50/p95/p99 decision latency và commit latency;
+- realtime commit-to-visible lag;
+- duplicate/idempotency hit rate;
+- optimistic conflict/retry rate;
+- bids per hot auction và partition skew;
+- deadline/close-finalization lag;
+- stale-owner/fencing rejection;
+- WebSocket connections, reconnects và slow consumers;
+- payment unknown/failure/reconciliation age;
+- notification queue age;
+- fraud/rate-limit/challenge rate.
+
+##### 19.2. Correlation và audit
+
+Một luồng cần liên kết được:
+
+```text
+request_id
+  → bid_request_id
+  → bid_id
+  → auction_id + auction_sequence/version + authority_epoch
+  → outbox/event_id
+  → realtime notification IDs
+  → auction_result_id
+  → payment_intent/provider IDs
+```
+
+Audit evidence phải trả lời được:
+
+- rule/version nào được áp dụng;
+- bid được authority nhận và commit khi nào;
+- vì sao bid bị reject;
+- thứ tự authoritative là gì;
+- owner epoch nào ra quyết định;
+- auction đóng theo deadline/effective end time nào;
+- ai hoặc automation nào thực hiện override.
+
+---
+
+#### 20. Những điểm cần hiệu chỉnh từ transcript đơn giản
+
+| Cách nói đơn giản | Cách hiểu production-oriented |
+|---|---|
+| Hệ thống chọn bid “đến trước vài ms” | Phải định nghĩa authoritative admission/commit order trong phạm vi auction |
+| Mọi valid bid được xử lý exactly as intended | At-least-once transport + idempotency + serialization tạo effectively-once effect |
+| Auction đóng chính xác khi timer hết | Deadline chặn bid; scheduler/finalizer có thể chạy trễ nhưng phải idempotent |
+| Mọi người thấy trạng thái giống nhau ngay lập tức | Authority nhất quán; clients hội tụ gần realtime qua versioned stream + snapshot repair |
+| WebSocket cung cấp realtime truth | WebSocket là delivery fast path; committed auction state/log mới là truth |
+| Highest amount luôn thắng | Còn phụ thuộc eligibility, reserve, increment, proxy-bid và close rules |
+| Payment ngay sau khi thắng | Payment là saga bất đồng bộ với retry, unknown outcome và reconciliation |
+| Chống bot bằng rate limiting | Cần nhiều lớp: identity/device/risk graph/challenge/behavior/audit |
+| High availability bằng nhiều instances | Cần single-authority semantics, replication, failover epoch và fencing |
+
+---
+
+#### 21. Trade-offs cần nêu
+
+| Quyết định | Lợi ích | Chi phí/đánh đổi |
+|---|---|---|
+| Hard close | Rule đơn giản, thời gian cố định | Khuyến khích sniping, nhạy với network latency |
+| Soft close | Giảm lợi thế bid giây cuối | Auction kéo dài, capacity/UX phức tạp hơn |
+| Per-auction single authority | Order rõ, dễ enforce invariant | Hot auction và failover cần xử lý kỹ |
+| Strong consistent bid path | Winner đáng tin | Latency/availability trade-off khi partition |
+| Async realtime fan-out | Bid response nhanh, scale watchers độc lập | Eventual visibility, duplicate/gap repair |
+| Immutable bid log | Audit/replay tốt | Storage, privacy và retention cost |
+| Pre-authorization/deposit | Giảm winner không trả tiền | Friction, payment cost và accessibility |
+| Proxy bidding | UX tốt, ít phải online liên tục | Rule/price calculation và confidentiality phức tạp |
+
+Không có một lựa chọn đúng cho mọi marketplace. Product, legal, risk và SLO phải cùng quyết định.
+
+---
+
+#### 22. Cách trình bày bước 1 trong phỏng vấn
+
+Một recap khoảng 90 giây:
+
+1. Tôi giả định English ascending auction với seller listing, buyer bidding, hard close, reserve và minimum increment; proxy bidding cần xác nhận riêng.
+2. Core entities là User, Item/Listing, Auction, Bid, Watch, AuctionResult, Payment/Order và AuditEvent.
+3. Auction là time-bounded state machine từ scheduled tới active, closing và ended/sold/unsold.
+4. Invariant quan trọng nhất là accepted bids của cùng auction có một authoritative order, không late bid và đúng một final result.
+5. Bid request mang stable idempotency key; ACK chỉ sau durable conditional commit.
+6. Fairness dùng server authority/commit semantics, không dùng client timestamp hoặc UI countdown.
+7. WebSocket phát versioned updates nhanh; snapshot/cursor repair giúp client hội tụ sau gap/reconnect.
+8. Closing chạy cùng serialization boundary với bids; scheduler retry không tạo hai winners.
+9. Payment là idempotent saga sau finalization, với webhook verification và reconciliation.
+10. SLOs tách bid-decision latency khỏi realtime visibility; bid correctness ưu tiên hơn notification/search freshness.
+11. Security gồm object AuthZ, bot/fraud/shill-bid controls, payment tokenization và tamper-evident audit.
+12. Bước tiếp theo là ước lượng bid rate, watchers/connections, hot-auction skew, storage và close-time spikes.
+
+---
+
+#### 23. Checklist làm rõ phạm vi
+
+- [ ] Auction type và pricing rule?
+- [ ] Hard close hay soft close/anti-sniping?
+- [ ] Reserve price, starting price và increment semantics?
+- [ ] Direct bid hay proxy/max bid?
+- [ ] Rule cho bid bằng nhau và tie-breaker?
+- [ ] “Đến trước” đo tại boundary nào?
+- [ ] Seller có được sửa/hủy sau khi active hoặc đã có bid?
+- [ ] Bidder có được rút bid?
+- [ ] Eligibility, region, age, KYC hoặc deposit requirements?
+- [ ] Self-bidding, shill bidding và bot policy?
+- [ ] Latency SLO cho decision và realtime visibility?
+- [ ] Availability/durability target của bid path?
+- [ ] Maximum concurrent auctions/watchers/bidders?
+- [ ] Multi-region placement và data residency?
+- [ ] Winner không thanh toán thì xử lý ra sao?
+- [ ] Payment authorize/capture point và refund/dispute scope?
+- [ ] Bid identity/history được công khai tới mức nào?
+- [ ] Audit retention và legal/compliance requirements?
+- [ ] Degradation policy khi realtime, search, notification hoặc payment lỗi?
+
+---
+
+#### 24. Ý chính cần nhớ
+
+- Auction platform quản lý lifecycle từ listing tới bid, close, winner, payment và fulfillment.
+- Đây là time-bounded concurrent state machine, không chỉ là CRUD có WebSocket.
+- Functional scope phải chốt loại auction, reserve, increment, proxy bid và close policy.
+- “Bid đến trước” phải có authoritative definition; không dùng client timestamp.
+- Các bid của cùng auction cần một serialization/order boundary, không cần global order.
+- Deadline chặn late bid; scheduler chỉ finalize/materialize và có thể retry.
+- Stable request ID, conditional commit và outbox tạo effectively-once bid effect.
+- Accepted bid chỉ được ACK sau durability boundary.
+- Current price/cache/search/realtime là projections; accepted bid log/state mới là truth.
+- Realtime event phải có version/sequence và hỗ trợ snapshot/gap repair.
+- UI countdown chỉ mang tính hướng dẫn, không quyết định eligibility.
+- Closing và bid cạnh tranh phải được phân xử tại cùng authority với fencing.
+- Winner/result duy nhất phải reconstruct được từ durable evidence.
+- Payment là saga sau auction, không phải distributed transaction với bid.
+- Timeout payment là unknown outcome cần reconciliation.
+- Fairness gồm rule, ordering, time, anti-bot/fraud và auditability.
+- High availability phải tránh split-brain, không chỉ nhân bản service.
+- Observability cần phục vụ SLO lẫn giải quyết tranh chấp.
+- Kiến trúc bước sau phải tối ưu cả nhiều auctions song song lẫn một hot auction cực lớn.
+
+#### Công thức ghi nhớ
+
+> **Auction Platform = versioned time-bounded auction state machine + per-auction authoritative bid order + idempotent durable acceptance + fenced deterministic closing + realtime derived updates + auditable payment workflow.**
+
+---
+
+### Bài 89. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Vì sao phải ước lượng trước khi vẽ kiến trúc?
+
+System design không cần con số chính xác tuyệt đối, nhưng cần một **workload model nhất quán**. Ước lượng giúp trả lời:
+
+- dịch vụ nào chịu tải lớn nhất;
+- tải là đều hay burst theo thời điểm đóng auction;
+- partition key nào có nguy cơ trở thành hotspot;
+- đường nào cần strong correctness, đường nào có thể eventual/asynchronous;
+- cần bao nhiêu connection, storage, bandwidth và worker capacity;
+- external dependency nào cần quota, buffer và reconciliation;
+- bottleneck nằm ở toàn platform hay chỉ một auction cực nóng.
+
+Quy trình nên là:
+
+```text
+Business assumptions
+        ↓
+Average daily volume
+        ↓
+Average requests/second
+        ↓
+Peak factor + skew + fan-out amplification
+        ↓
+Per-service/per-partition capacity
+        ↓
+Bottlenecks, SLOs và degradation plan
+```
+
+**Average toàn hệ thống thường là con số ít hữu ích nhất đối với auction.** Hệ thống có thể nhàn phần lớn thời gian nhưng bị dồn tải vào vài giây cuối của một listing nổi tiếng.
+
+---
+
+#### 2. Các giả định từ bài học
+
+| Thông số | Giá trị giả định | Ý nghĩa thiết kế |
+|---|---:|---|
+| Registered users | 5 triệu | Quy mô identity/user data |
+| Daily active users | 500.000 | Cơ sở ước lượng traffic ngày |
+| Concurrent active listings | 1 triệu | Số auction state machines/timers đang được quản lý |
+| Average bids/auction | 10 | Cần gắn với cohort auction nào và time window nào |
+| Bids/day theo transcript | 10 triệu | Capacity scenario được transcript sử dụng |
+| Auctions completed/day | 100.000 | Tải closing/finalization trung bình |
+| Hot-auction watchers | 10.000 | Fan-out và connection hotspot cục bộ |
+| Payment attempts/day | xấp xỉ 100.000 | Chỉ đúng nếu gần như mọi auction kết thúc đều tạo payment |
+
+Các giá trị còn thiếu nhưng rất quan trọng:
+
+- peak concurrent users và tổng số realtime connections;
+- tỷ lệ DAU browse, watch và bid;
+- số auctions được tạo/kết thúc mỗi ngày;
+- phân bố bids/auction, không chỉ average;
+- số bid attempts so với accepted bids;
+- tỷ lệ auction bán thành công/đạt reserve;
+- phân bố end time theo phút/giờ/time zone;
+- kích thước listing, bid record và realtime event;
+- retention của bids/audit;
+- số watchers trung bình, p95, p99 và maximum;
+- retry rate, bot traffic và rejected-bid ratio;
+- multi-device connections/user;
+- payment provider throughput/quota.
+
+Trong phỏng vấn, nên nêu rõ phần nào do đề bài cung cấp và phần nào là giả định để capacity plan có thể điều chỉnh.
+
+---
+
+#### 3. Kiểm tra tính nhất quán của số liệu
+
+Transcript nói:
+
+```text
+1.000.000 active auctions × 10 bids ≈ 10.000.000 bids/day
+```
+
+Phép nhân đúng, nhưng **đơn vị thời gian chưa nhất quán**. Một triệu là số auction đang active tại một thời điểm, không nhất thiết là số auction hoàn tất hoặc nhận trọn 10 bid trong mỗi ngày.
+
+Nếu dùng số 100.000 auction hoàn tất/ngày và 10 bid/auction:
+
+```text
+100.000 auctions/day × 10 bids/auction
+= 1.000.000 bids/day
+```
+
+Để có 10 triệu bid/ngày, ít nhất một giả định khác phải đúng, ví dụ:
+
+- khoảng 1 triệu auctions đi qua bidding activity mỗi ngày;
+- trung bình gần 100 bid trên mỗi auction hoàn tất;
+- active auctions kéo dài nhiều ngày nhưng tổng daily bid activity vẫn đạt 10 triệu;
+- 10 triệu là **bid attempts** gồm retries/rejections/bot traffic, không chỉ accepted bids.
+
+Trong bài này, ta giữ hai kịch bản:
+
+| Kịch bản | Bids/day | Mục đích |
+|---|---:|---|
+| Cohort-consistent baseline | 1 triệu | `100k closes/day × 10 bids` |
+| Conservative capacity scenario | 10 triệu | Theo transcript, dùng để không đánh giá thấp bid path |
+
+Kiến trúc không đổi về nguyên tắc; capacity và partition count thay đổi theo số đo production thực tế.
+
+---
+
+#### 4. Chuyển daily volume thành average throughput
+
+Một ngày có:
+
+```text
+24 × 60 × 60 = 86.400 giây
+```
+
+##### 4.1. Bid throughput
+
+Baseline:
+
+```text
+1.000.000 / 86.400 ≈ 11,6 bids/giây trung bình
+```
+
+Kịch bản bảo thủ:
+
+```text
+10.000.000 / 86.400 ≈ 115,7 bids/giây trung bình
+```
+
+Đây chỉ là **logical bid volume**. Capacity ingress thực tế phải tính thêm:
+
+```text
+bid attempts
+= logical bids
+× retry factor
+× bot/invalid-attempt factor
+```
+
+Ví dụ minh họa, nếu legitimate retry/duplicate làm tăng 10% và invalid/bot requests thêm 30%:
+
+```text
+115,7 × 1,1 × 1,3 ≈ 165 request/giây trung bình
+```
+
+Con số này không phải dữ liệu đề bài; nó cho thấy cần phân biệt **attempt rate** với **accepted-bid rate**.
+
+##### 4.2. Auction closing throughput
+
+```text
+100.000 closes/day / 86.400 ≈ 1,16 closes/giây trung bình
+```
+
+Average rất thấp nhưng dễ gây hiểu nhầm. Nếu seller thường chọn các mốc tròn như 20:00 hoặc hệ thống batch listings theo campaign, hàng nghìn auctions có thể cùng đóng trong một phút.
+
+##### 4.3. Payment throughput
+
+Giới hạn trên đơn giản theo transcript:
+
+```text
+100.000 payment workflows/day / 86.400
+≈ 1,16 workflow/giây trung bình
+```
+
+Thực tế:
+
+```text
+payment workflows
+= closed auctions
+× sale/winner rate
+× payment-attempts-per-sale
+```
+
+Reserve chưa đạt, không có bid hoặc auction bị hủy làm giảm số sale; retry và payment failure lại làm tăng provider calls. Payment QPS nhỏ nhưng có giá trị kinh doanh và correctness cao.
+
+---
+
+#### 5. Average QPS không mô tả close-time burst
+
+Capacity cần ít nhất ba lớp:
+
+```text
+Platform average
+    < regional/time-of-day peak
+        < single-hot-auction burst
+```
+
+Một mô hình minh họa:
+
+| Lớp tải | Cách ước lượng |
+|---|---|
+| Average | Daily volume / 86.400 |
+| Platform peak | Average × peak factor đo từ traffic curve |
+| Hot-auction bid peak | Bids trong cửa sổ cuối / số giây của cửa sổ |
+| Fan-out peak | Accepted state changes/s × active watchers |
+| Reconnect peak | Connections bị mất / recovery window |
+
+Ví dụ **chỉ để minh họa**, nếu platform peak gấp 20 average:
+
+```text
+115,7 × 20 ≈ 2.315 bid attempts/giây
+```
+
+Nhưng ngay cả khi toàn platform chỉ có 2.315 bid/s, một auction có thể nhận phần lớn số đó trên cùng `auction_id`. Scale-out nhiều partitions không tự giải quyết được một hot key.
+
+---
+
+#### 6. Read-heavy ở cấp platform, write-critical ở cấp auction
+
+Các read phổ biến:
+
+- search/filter listings;
+- xem item detail và media;
+- đọc current price và auction status;
+- watchlist và bidder history;
+- tải realtime snapshot sau reconnect;
+- browse category/recommendation.
+
+Các write quan trọng:
+
+- tạo/sửa listing;
+- đặt bid;
+- watch/unwatch;
+- lifecycle transition;
+- finalization và winner record;
+- payment/order state transition;
+- admin/risk decision.
+
+Nếu “vài triệu reads/phút”, ví dụ 2 triệu/phút:
+
+```text
+2.000.000 / 60 ≈ 33.333 reads/giây
+```
+
+Con số cụ thể cần production forecast, nhưng quan hệ thường là:
+
+```text
+read QPS ≫ bid write QPS
+```
+
+Tuy nhiên:
+
+- search/detail reads có thể stale trong thời gian ngắn;
+- bid acceptance không được race, mất hoặc nhận sau deadline;
+- current-auction snapshot cần mới hơn search index;
+- winner/finalization cần correctness cao nhất.
+
+Do đó không nên dùng một consistency/caching policy cho tất cả workloads.
+
+---
+
+#### 7. Phân rã tải theo service/path
+
+| Path/service | Workload | Peak pattern | Correctness/latency |
+|---|---|---|---|
+| Search/Discovery | Read rất lớn | Time-of-day/campaign | Eventual consistency, cache-friendly |
+| Listing Detail | Read lớn | Item/hot-auction skew | Low latency; versioned snapshot |
+| Bid Ingest | Write nhỏ hơn read nhưng critical | Last-second burst | Strong per-auction correctness |
+| Auction Authority | Serialized state update | Hot-key concentration | Fencing, idempotency, durable commit |
+| Realtime Gateway | Long-lived connections | Watch spikes/reconnect storm | Low latency, bounded buffers |
+| Realtime Fan-out | Write amplification | Mỗi accepted update × watchers | Async, versioned, droppable/coalescible tùy event |
+| Lifecycle/Closing | Timer/state transition | End-time clustering | Idempotent, deadline-correct |
+| Payment | Low QPS, high value | Sau close waves | External dependency, reconciliation |
+| Notification | Fan-out/background | Outbid/ending/win bursts | Async, priority/channel isolation |
+| Fraud/Risk | Per attempt + streaming | Bot/campaign attack | Fast inline gate + deeper async analysis |
+| Audit/Analytics | Append/stream/batch | Theo bid/event volume | Durable, không chặn UX ngoài evidence tối thiểu |
+
+Scale từng component theo driver riêng. Không nên tăng toàn bộ monolith chỉ vì WebSocket connections hoặc notification backlog tăng.
+
+---
+
+#### 8. Hot auction là bottleneck trung tâm
+
+Giả sử một auction có 10.000 watchers. Vấn đề không chỉ là 10.000 connections mà là **fan-out amplification**.
+
+```text
+Realtime deliveries/s
+= accepted state changes/s × subscribed connections
+```
+
+Ví dụ minh họa:
+
+| Accepted changes của hot auction | Watchers | Logical deliveries/s |
+|---:|---:|---:|
+| 1/s | 10.000 | 10.000/s |
+| 10/s | 10.000 | 100.000/s |
+| 100/s | 10.000 | 1.000.000/s |
+
+Nếu payload wire-level trung bình 300 byte, 1 triệu deliveries/s tương đương tối thiểu:
+
+```text
+1.000.000 × 300 byte ≈ 300 MB/s payload
+```
+
+Chưa tính TLS, WebSocket framing, TCP/IP, retries và cross-region traffic.
+
+Điểm quan trọng:
+
+- bid authority có thể xử lý 100 accepted changes/s;
+- nhưng fan-out phía sau có thể phải phát 1 triệu messages/s;
+- một partition theo `auction_id` giữ order nhưng biến hot auction thành hot partition;
+- broadcast từng bid attempt là lãng phí; chỉ broadcast state transition phù hợp quyền xem;
+- có thể coalesce price updates trong vài chục ms cho UI, nhưng không được coalesce canonical bid log;
+- slow clients phải có bounded queue, snapshot fallback hoặc disconnect policy.
+
+**Correctness path và broadcast path phải tách nhau.** Accepted bid không chờ 10.000 watchers nhận xong mới ACK.
+
+---
+
+#### 9. Connection capacity và reconnect storm
+
+Transcript chỉ cho 10.000 watchers ở một auction, chưa cho tổng concurrent users. Có thể tạo scenario ban đầu:
+
+```text
+500.000 DAU × 10% concurrent = 50.000 concurrent users
+```
+
+Đây là giả định minh họa, không phải sự thật từ đề bài. Nếu mỗi user có trung bình 1,2 devices/tabs đang kết nối:
+
+```text
+50.000 × 1,2 = 60.000 connections
+```
+
+Với heartbeat mỗi 30 giây:
+
+```text
+60.000 / 30 ≈ 2.000 inbound heartbeats/giây
+```
+
+Capacity gateway cần tính:
+
+- file descriptors và memory/connection;
+- TLS handshake CPU;
+- heartbeat và idle timeout;
+- subscription count/connection;
+- outbound buffer và slow-client policy;
+- deploy draining;
+- connection registry writes/TTL renewals;
+- cross-region routing;
+- reconnect storm sau gateway/AZ/network failure.
+
+Nếu 20.000 connections rớt và cùng reconnect trong 10 giây:
+
+```text
+20.000 / 10 = 2.000 reconnects/giây
+```
+
+Mỗi reconnect còn kéo theo authentication, subscription restore và snapshot/gap sync. Cần exponential backoff, jitter, admission control và capacity riêng cho recovery path.
+
+---
+
+#### 10. Bid authority và hot partition
+
+Partition theo `auction_id` là lựa chọn tự nhiên vì:
+
+- tất cả bids của auction cần cùng order;
+- state transition và close cạnh tranh với cùng stream;
+- dễ route tới một owner/leader;
+- các auctions bình thường phân tán tốt.
+
+Nhưng một auction cực nóng không thể đơn giản chia bid writes sang nhiều shards độc lập mà vẫn giữ một order/winner rõ ràng. Bottleneck có thể nằm ở:
+
+- single leader CPU;
+- storage commit latency/IOPS;
+- lock/transaction contention;
+- synchronous replica quorum;
+- risk service trên inline path;
+- per-auction queue depth;
+- owner failover;
+- downstream event publication.
+
+Các biện pháp:
+
+- giữ command/message nhỏ và đường commit ngắn;
+- route ổn định tới auction owner, tránh distributed lock cho mỗi request;
+- batch/pipeline storage writes nếu semantics cho phép;
+- dùng conditional append/version và durable outbox;
+- cô lập hot auctions vào dedicated partitions/owners;
+- rate limit/admission theo auction và bidder;
+- pre-warm owner/cache/subscription topology trước close;
+- reserve CPU/IO capacity cho close-time window;
+- scale fan-out riêng, không thêm broadcast vào transaction;
+- đo `per-auction command lag`, không chỉ cluster CPU trung bình.
+
+Nếu một auction vượt khả năng xử lý tuần tự, product phải quyết định admission/queueing/fairness semantics. Không thể vừa nhận vô hạn bid tức thời vừa giữ strict per-auction order với latency bằng không.
+
+---
+
+#### 11. Closing storm và timer scalability
+
+Một triệu active listings không đồng nghĩa cần một triệu OS timers hoặc một cron quét toàn bảng mỗi giây.
+
+Bottleneck của lifecycle scheduler:
+
+- scan lớn để tìm auction đến hạn;
+- nhiều end times rơi vào cùng mốc tròn;
+- duplicate timers sau failover;
+- timer fire trễ do backlog;
+- close command tranh với bid cuối;
+- re-schedule khi soft-close;
+- event/payment avalanche ngay sau close.
+
+Capacity model:
+
+```text
+close commands/s
+= auctions có effective_end_time trong bucket
+/ bucket duration
+```
+
+Giải pháp sau này có thể dùng sharded time buckets, delay queue hoặc timing wheel, nhưng correctness vẫn phải nằm tại auction authority:
+
+1. timer chỉ yêu cầu `CLOSE(auction_id, expected_version)`;
+2. authority kiểm tra authoritative deadline/state;
+3. conditional transition/fencing đảm bảo một result;
+4. duplicate close command vô hại;
+5. event sau commit kích hoạt payment/notification.
+
+Metric quan trọng là `close_finalization_lag`, cùng số auction quá deadline nhưng chưa finalized.
+
+---
+
+#### 12. Storage estimate cho bids và audit
+
+Giả sử mỗi durable bid/evidence record sau metadata chiếm 0,5–1 KB:
+
+##### Baseline 1 triệu bids/ngày
+
+```text
+0,5–1 KB × 1.000.000
+= 0,5–1 GB/ngày raw
+≈ 0,18–0,365 TB/năm raw
+```
+
+##### Conservative 10 triệu bids/ngày
+
+```text
+0,5–1 KB × 10.000.000
+= 5–10 GB/ngày raw
+≈ 1,8–3,65 TB/năm raw
+```
+
+Đây chưa gồm:
+
+- replication;
+- indexes và LSM/write amplification;
+- idempotency records;
+- outbox/events;
+- audit/security logs;
+- backups/snapshots;
+- analytical copies;
+- rejected attempts nếu cần lưu cho fraud.
+
+Một planning multiplier tổng 3–8× raw là hoàn toàn có thể xảy ra tùy engine và retention, nhưng phải đo bằng schema/index thực tế.
+
+Storage access pattern cần hỗ trợ:
+
+- append bid theo auction;
+- đọc state/current result nhanh;
+- range/history theo `auction_id + sequence`;
+- lookup idempotency theo bidder/auction/request ID;
+- retention/tiering cho auction cũ;
+- audit export và dispute lookup;
+- không scan toàn bộ history để trả current price mỗi lần.
+
+Listing media không nằm trong database row. Ảnh/video nên đi object storage/CDN; metadata và references ở listing store.
+
+---
+
+#### 13. Cache và read bottlenecks
+
+Các ứng viên cache:
+
+- listing detail tương đối tĩnh;
+- auction snapshot có version/TTL ngắn;
+- category/search results;
+- user watchlist/profile projection;
+- authorization/risk hints có thời hạn phù hợp;
+- static media qua CDN.
+
+Các rủi ro:
+
+- hot key tại current-price cache;
+- cache stampede khi một auction nổi tiếng hết TTL;
+- stale state làm UI gửi bid dưới mức tối thiểu;
+- fan-out invalidation lớn;
+- Redis/network bandwidth trở thành bottleneck;
+- dùng cache làm authority dẫn đến sai winner.
+
+Controls:
+
+- request coalescing/single-flight;
+- TTL jitter và stale-while-revalidate cho dữ liệu phù hợp;
+- local/regional cache layer;
+- versioned snapshot;
+- negative caching cho listing không tồn tại;
+- cache hot-key replication nếu store hỗ trợ;
+- server luôn atomically revalidate bid, bất kể client/cache vừa đọc gì.
+
+Stale read có thể tạo reject và UX kém, nhưng không được tạo invalid accepted bid.
+
+---
+
+#### 14. Realtime fan-out bottlenecks
+
+Pipeline khái niệm:
+
+```text
+Durable bid commit
+       ↓ outbox/event
+Realtime fan-out workers
+       ↓ partition by auction/subscription shards
+Regional gateways
+       ↓
+Connected watchers
+```
+
+Điểm nghẽn:
+
+- broker partition nóng;
+- subscription lookup cho 10.000+ connections;
+- cross-region event duplication;
+- gateway outbound bandwidth;
+- serialization lặp lại cùng payload;
+- slow devices và backpressure;
+- reconnect snapshot storm;
+- gửi quá nhiều intermediate price changes mà client không kịp render.
+
+Controls:
+
+- publish một compact state-change event rồi fan-out theo region/gateway;
+- subscription index theo auction → gateway/shard, không phải lookup từng user từ database;
+- serialize payload một lần cho cohort phù hợp;
+- coalesce **display updates**, không bỏ durable bids;
+- sequence/version để clients phát hiện gap;
+- bounded per-connection buffer và disconnect/resync;
+- tách priority: `AUCTION_ENDED` quan trọng hơn typing-like/view-count signals;
+- capacity headroom và load test với skewed watcher distribution.
+
+---
+
+#### 15. Payment và external-provider bottleneck
+
+Payment average QPS thấp không có nghĩa không cần thiết kế scale/reliability:
+
+- closes có thể tạo burst payment intents;
+- provider quota/rate limit thấp hơn nội bộ;
+- timeout tạo unknown outcomes;
+- webhook có thể duplicate/out-of-order;
+- retry đồng loạt tạo retry storm;
+- fraud/manual review làm workflow kéo dài;
+- một provider outage có thể tạo backlog lớn.
+
+Controls:
+
+- durable payment queue/workflow;
+- provider-specific concurrency/rate limit;
+- idempotency key theo `auction_result_id`;
+- exponential backoff + jitter;
+- circuit breaker nhưng không làm mất work;
+- webhook verification/dedup;
+- reconciliation worker;
+- oldest-work age và provider-headroom metrics;
+- operator workflow cho stuck/unknown payments.
+
+Không cho payment provider nằm đồng bộ trong auction finalization transaction. Final result phải durable trước; payment xử lý sau qua reliable handoff.
+
+---
+
+#### 16. Asynchronous work và queue sizing
+
+Phù hợp để xử lý bất đồng bộ:
+
+- email/SMS/push;
+- payment workflow sau finalization;
+- search indexing;
+- analytics và fraud enrichment;
+- audit export;
+- media processing;
+- realtime broadcast sau durable bid commit;
+- receipts/invoices;
+- archival/tiering.
+
+Không được đẩy hoàn toàn sang async nếu thao tác nằm trong bid-decision invariant:
+
+- auction state/deadline validation;
+- eligibility cốt lõi;
+- increment/current price check;
+- idempotency decision;
+- per-auction order/sequence;
+- durable accepted/rejected result cần trả client;
+- fencing chống stale owner.
+
+Queue depth một mình chưa đủ. Cần:
+
+```text
+backlog drain time
+= queued work
+/ (sustainable processing rate - incoming rate)
+```
+
+Ví dụ queue có 1 triệu messages nhưng workers dư 100.000 msg/s thì ít nghiêm trọng hơn queue 100.000 messages trong khi chỉ dư 100 msg/s.
+
+Theo dõi queue age, lag theo partition/auction, retry rate, DLQ và downstream saturation.
+
+---
+
+#### 17. Bottleneck map
+
+| Bottleneck | Vì sao xuất hiện | Failure symptom | Control chính |
+|---|---|---|---|
+| Hot auction authority | Tất cả bid cùng key/order | Latency/queue tăng, timeout | Ownership, compact commit, isolation, admission |
+| Storage commit/quorum | Accepted bid phải durable | ACK chậm, throughput trần | Partitioning, schema/index tối giản, capacity headroom |
+| Lock/version contention | Concurrent bid updates | Conflict/retry storm | Serialized owner hoặc conditional append |
+| Realtime amplification | Một update × nhiều watchers | Broker/gateway/network overload | Async regional fan-out, coalescing, backpressure |
+| Hot cache key | Mọi viewer đọc cùng snapshot | Cache node/network saturation | Replication/local cache/versioned snapshot |
+| WebSocket gateways | Nhiều long-lived sockets | Memory/FD/heartbeat pressure | Horizontal gateways, drain, bounded buffers |
+| Reconnect storm | Gateway/AZ/mobile network lỗi | Auth/sync overload | Backoff/jitter, resume, admission, recovery capacity |
+| Timer/close clustering | End times tập trung | Finalization lag | Sharded scheduler, idempotent close, pre-warm |
+| Search index lag | Async projection backlog | Listing/current state stale | Lag SLO, snapshot authority, rebuild/replay |
+| Payment provider | Quota/outage/timeout | Pending/unknown tăng | Durable workflow, rate limit, reconciliation |
+| Notification provider | Outbid/win burst | User nhận chậm | Priority queues, channel isolation, dedup |
+| Fraud/risk check | Inline external/complex scoring | Bid latency tăng | Fast local rules, timeout policy, async enrichment |
+| Audit/log pipeline | Event volume lớn | Disk/network pressure | Structured sampling không áp dụng cho critical evidence, tiering |
+| Noisy tenant/auction | Skew không phản ánh cluster average | Một auction ảnh hưởng tất cả | Per-auction quotas, fair scheduling, workload isolation |
+
+---
+
+#### 18. Isolation và degradation hierarchy
+
+Các workload latency-sensitive không nên cạnh tranh tài nguyên với việc ít quan trọng hơn:
+
+```text
+Tier 0: bid authority + deadline/closing correctness
+Tier 1: bid response + authoritative auction snapshot
+Tier 2: realtime price/end updates
+Tier 3: payment initiation/reconciliation
+Tier 4: notifications, search refresh, analytics, receipts
+```
+
+Khi quá tải:
+
+1. drop/sample nonessential analytics trước;
+2. trì hoãn email, recommendation và view counters;
+3. coalesce realtime display updates nhưng giữ final/end event;
+4. serve stale listing/search với version warning nếu phù hợp;
+5. bảo vệ bid authority bằng admission/rate limits;
+6. tuyệt đối không “nới” deadline, bỏ idempotency hoặc ghi không durable để lấy throughput.
+
+Graceful degradation phải được xác định trước, không đợi incident mới quyết định.
+
+---
+
+#### 19. Capacity và SLO cần tách theo phase
+
+Auction có các phase tải khác nhau:
+
+| Phase | Đặc trưng |
+|---|---|
+| Scheduled | Listing reads, watch registrations, timer state |
+| Early active | Browse/read nhiều, bid thưa |
+| Closing window | Bid attempts, risk checks, snapshots và realtime fan-out tăng mạnh |
+| Finalizing | Close command, winner commit, final event |
+| Post-close | Payment, notifications, search update, fulfillment |
+
+Có thể pre-warm theo scheduled close:
+
+- chuyển ownership sớm và tránh rebalance gần deadline;
+- reserve compute/IO/fan-out capacity;
+- warm current snapshot/rules;
+- materialize subscription routing;
+- kiểm tra provider/internal health;
+- tăng monitoring sensitivity;
+- tránh deployment/maintenance trên hot partitions.
+
+Nhưng pre-warm chỉ là optimization. Correctness vẫn phải chịu được failover bất ngờ.
+
+---
+
+#### 20. Metrics và alerting cần thiết
+
+##### Bid path
+
+- attempts, accepted, rejected theo reason;
+- p50/p95/p99/end-to-end decision latency;
+- durable commit latency và error rate;
+- idempotency hits;
+- concurrency conflict/retry;
+- per-auction command queue depth/age;
+- late-bid rejection và accepted-after-deadline invariant alarm;
+- stale-epoch/fencing rejection.
+
+##### Realtime
+
+- active connections/subscriptions;
+- accepted-commit-to-visible lag;
+- deliveries/s và bytes/s;
+- fan-out factor distribution;
+- gateway outbound buffer/slow clients;
+- reconnect/s, auth/sync latency;
+- dropped/coalesced events và gap-repair rate.
+
+##### Lifecycle/payment
+
+- auctions due/closed/finalized;
+- close-finalization lag distribution;
+- duplicate close/result conflict count;
+- payment workflow age/status;
+- provider latency/quota/unknown outcome;
+- webhook lag/duplicates;
+- reconciliation mismatches.
+
+##### Capacity/skew
+
+- per-service CPU/memory/IO/network;
+- hottest auction/partition share;
+- p95/p99 watchers and bids per auction;
+- broker lag theo partition;
+- cache hit rate/hot-key load;
+- queue oldest age và estimated drain time.
+
+Cluster average màu xanh không có nghĩa hệ thống khỏe nếu một partition chứa auction quan trọng đang đỏ.
+
+---
+
+#### 21. Load-test scenarios
+
+Không chỉ chạy uniform QPS. Cần mô phỏng:
+
+1. **Normal day:** traffic phân tán trên nhiều auctions.
+2. **Hot auction:** 10.000 watchers, bid burst trong 10 giây cuối.
+3. **Closing wave:** nhiều auctions cùng end time.
+4. **Duplicate storm:** clients timeout và retry cùng bid IDs.
+5. **Bot attack:** invalid bid attempts cao hơn legitimate writes.
+6. **Slow clients:** gateway buffers tăng và phải backpressure.
+7. **Gateway/AZ failure:** hàng chục nghìn reconnect + snapshot recovery.
+8. **Owner failover at deadline:** old/new owner cạnh tranh, fencing phải giữ invariant.
+9. **Broker lag:** bid commit vẫn đúng, visibility chậm và client repair.
+10. **Payment outage:** backlog tăng nhưng auction result không mất/đổi.
+11. **Cache loss:** authority/storage không bị stampede làm sập.
+12. **Clock anomaly:** monitoring và close policy vẫn không nhận late bid sai.
+
+Kiểm tra correctness sau test quan trọng ngang với latency:
+
+- không duplicate logical bid;
+- không accepted bid sau boundary;
+- mỗi auction một result;
+- current state reconstruct được từ log;
+- payment intent không bị tạo nhiều lần;
+- realtime clients cuối cùng hội tụ đúng version.
+
+---
+
+#### 22. Cách trình bày bước 2 trong phỏng vấn
+
+Một recap ngắn:
+
+1. Đề bài có 5 triệu registered users, 500.000 DAU, 1 triệu active listings và 100.000 closes/day.
+2. Transcript dùng 10 triệu bids/day, tương đương khoảng 116 bid/s trung bình; tôi ghi chú rằng `100k closes × 10 bids` chỉ cho 1 triệu/day, nên 10 triệu là conservative scenario cần xác nhận.
+3. Average bid QPS nhỏ nhưng peak theo thời gian và per-auction skew mới quyết định thiết kế.
+4. Platform read-heavy, có thể tới hàng chục nghìn reads/s; bid write ít hơn nhưng cần strong correctness.
+5. Một hot auction có 10.000 watchers; 100 accepted updates/s có thể khuếch đại thành 1 triệu realtime deliveries/s.
+6. Partition theo auction giữ order nhưng một hot auction vẫn là hot key, cần owner isolation và admission.
+7. Realtime fan-out, connections và reconnect/snapshot storm được scale tách khỏi durable bid authority.
+8. 100.000 closes/day chỉ khoảng 1,16/s trung bình nhưng end-time clustering tạo closing storm.
+9. Payment QPS thấp nhưng cần durable queue, idempotency, provider quota và reconciliation.
+10. Với record 0,5–1 KB, 10 triệu bids/day tạo khoảng 5–10 GB raw/day trước replication/index/audit.
+11. Search, notification, analytics và broadcast dùng async pipelines; bid validation/order/durable commit không được đẩy khỏi correctness boundary.
+12. Capacity phải theo p99/per-partition metrics, không chỉ cluster average.
+
+---
+
+#### 23. Checklist ước lượng
+
+- [ ] Registered users, DAU, peak concurrency và devices/tabs/user?
+- [ ] Active, created và completed auctions/day được phân biệt?
+- [ ] Bids/auction dùng average, p95, p99 hay maximum?
+- [ ] Bid attempts, accepted bids, retries, rejects và bots tách riêng?
+- [ ] Average, platform peak và single-hot-auction peak?
+- [ ] Reads/search/detail/snapshot QPS và cacheability?
+- [ ] Watchers/auction distribution và total subscriptions/connections?
+- [ ] Fan-out deliveries/s và egress bandwidth?
+- [ ] Heartbeat, TLS handshake và reconnect/sync capacity?
+- [ ] Auction-authority per-key throughput và queue age?
+- [ ] End-time distribution và maximum closes/bucket?
+- [ ] Bid/audit/index/outbox raw size, replication và retention?
+- [ ] Payment sale rate, retry factor, provider quota và unknown outcomes?
+- [ ] Notification, search, analytics backlog/drain SLO?
+- [ ] Hot partition/cache key/broker partition detection?
+- [ ] Workload isolation và degradation order?
+- [ ] Multi-AZ failover headroom và recovery storm?
+- [ ] Load test có skew, close boundary và invariant validation?
+
+---
+
+#### 24. Ý chính cần nhớ
+
+- Estimate là workload model có đơn vị và giả định, không phải phép nhân rời rạc.
+- `1M active auctions × 10 bids` không tự động bằng 10M bids **mỗi ngày**.
+- `100k closes/day × 10 bids` chỉ suy ra 1M bids/day; giữ 10M/day như conservative scenario cần xác nhận.
+- 10M bids/day tương đương khoảng 116/s trung bình, chưa nói lên peak.
+- Average platform load, time-of-day peak và hot-auction burst là ba lớp khác nhau.
+- Auction workload read-heavy toàn cục nhưng correctness tập trung ở bid writes.
+- Per-auction distribution quan trọng hơn average bids/auction.
+- Partition theo `auction_id` giữ order nhưng không tự scale một hot auction.
+- Fan-out amplification có thể lớn hơn bid QPS hàng nghìn lần.
+- 100 updates/s × 10.000 watchers = 1 triệu logical deliveries/s.
+- Realtime broadcast phải tách khỏi durable bid-commit transaction.
+- WebSocket capacity gồm sockets, heartbeats, bandwidth, buffers, TLS và reconnect/sync storm.
+- Một triệu active auctions cần scalable scheduling, không phải một triệu process timers.
+- 100.000 closes/day chỉ 1,16/s trung bình nhưng mốc đóng có thể cluster mạnh.
+- Payment ít QPS nhưng business-critical và phụ thuộc provider không ổn định.
+- 10 triệu bid records 0,5–1 KB tạo khoảng 5–10 GB raw/ngày trước amplification.
+- Queue age và drain time có ý nghĩa hơn queue depth đơn lẻ.
+- Cache/search/realtime là derived views; không được thay bid authority.
+- Workload isolation bảo vệ bid/close path khỏi notification, analytics và fan-out overload.
+- Capacity planning phải theo hottest auction/partition và kiểm tra invariant dưới failure.
+
+#### Công thức ghi nhớ
+
+> **Auction scale = average business volume × peak factor × retry/abuse factor × skew, còn realtime load = accepted state-change rate × watcher fan-out; hãy thiết kế theo hot partition và deadline burst, không theo average QPS.**
+
+---
+
+### Bài 90. High-Level Design: Services, APIs & Communication
+
+#### 1. Từ yêu cầu sang high-level architecture
+
+Hai bài trước đã xác định:
+
+- auction là một time-bounded state machine;
+- bid cần thứ tự authoritative trong phạm vi từng auction;
+- bid và close command phải cạnh tranh tại cùng serialization boundary;
+- read traffic rất lớn nhưng có thể dùng projections/cache;
+- một hot auction tạo fan-out lớn hơn bid QPS nhiều bậc;
+- payment, notification và analytics không được kéo dài bid transaction.
+
+Vì vậy, high-level design nên tách thành các plane/path theo tính chất workload:
+
+```text
+Clients
+  │
+  ├── HTTP/API ──> Edge/WAF/API Gateway
+  │                    │
+  │                    ├── Query & Control Plane
+  │                    │     Listing, Search, User, Auction Query
+  │                    │
+  │                    └── Transactional Decision Plane
+  │                          Bid API → Auction Authority
+  │                                      │
+  │                                      └── durable state/bid/outbox commit
+  │
+  └── WebSocket ─> Realtime Edge/Gateways <── Fan-out Plane <── Event Bus/Outbox
+                                                            │
+                                                            ├── Notification
+                                                            ├── Payment/Order
+                                                            ├── Search projection
+                                                            ├── Fraud/Analytics
+                                                            └── Audit/read models
+
+Scheduler/Timer Service ── START/CLOSE command ──> Auction Authority
+```
+
+Điểm trung tâm của kiến trúc:
+
+> REST API, WebSocket, cache, scheduler và event bus đều bao quanh một **auction authority** có quyền duy nhất phân xử ordered commands và commit canonical state của từng auction.
+
+---
+
+#### 2. Bounded contexts và trách nhiệm service
+
+##### 2.1. Edge, WAF và API Gateway
+
+Trách nhiệm:
+
+- TLS termination theo deployment model;
+- DDoS/WAF/bot filtering sơ bộ;
+- route HTTP request tới đúng backend;
+- request-size limit, rate limit và quota;
+- validate token cơ bản hoặc chuyển identity context đã ký;
+- correlation/request ID;
+- canary/version routing và observability.
+
+Gateway không được:
+
+- tự quyết định bid hợp lệ;
+- giữ current winner làm source of truth;
+- dùng rate limit thay cho object-level authorization;
+- coi request đã tới edge là bid đã được chấp nhận.
+
+WebSocket thường có connection-aware edge/gateway pool riêng vì long-lived connections, drain và backpressure khác HTTP request-response.
+
+##### 2.2. Identity/User Service
+
+Sở hữu:
+
+- user profile và account status;
+- buyer/seller verification;
+- device/session metadata;
+- role/entitlement và risk/suspension signals;
+- payout/payment customer references, không phải raw card data.
+
+Authentication nên dùng identity provider/OIDC và signed short-lived tokens. Bid path không nên synchronous-call User Service cho mọi request nếu có thể xác minh token cục bộ và dùng versioned/cached eligibility projection. Tuy nhiên, auction authority vẫn phải enforce object/action eligibility bằng dữ liệu đủ mới theo risk policy.
+
+##### 2.3. Listing Service
+
+Sở hữu item/listing content:
+
+- title, description, category và attributes;
+- condition, shipping metadata;
+- media references;
+- moderation status;
+- seller association;
+- content version.
+
+Listing khác Auction:
+
+```text
+Listing = vật phẩm/nội dung được bán
+Auction = cơ chế bán có rule, thời gian và cạnh tranh bid
+```
+
+Tách hai khái niệm giúp một item có thể relist hoặc chạy auction mới mà không sửa lịch sử auction cũ.
+
+##### 2.4. Search/Discovery Service
+
+- index listing/auction projections;
+- search, filter, category browse và ranking;
+- chỉ trả candidate IDs/projection;
+- chấp nhận eventual consistency;
+- không quyết định auction đang nhận bid hay winner hiện tại.
+
+Trang detail có thể hydrate current authoritative/versioned auction snapshot sau khi lấy search result.
+
+##### 2.5. Auction Control Service
+
+Xử lý control-plane commands:
+
+- tạo auction từ listing hợp lệ;
+- validate rule, start/end time, reserve/increment policy;
+- schedule, cancel hoặc sửa trước activation theo policy;
+- expose lifecycle/query APIs;
+- phát command tới auction authority.
+
+Không nên có hai nguồn sửa lifecycle: control service tạo command, nhưng authoritative transition vẫn được serialize với bid/close tại owner của auction.
+
+##### 2.6. Bid API / Bid Ingress Service
+
+- nhận `PlaceBid` request;
+- authenticate, validate schema/currency/amount format;
+- rate limit theo bidder/device/auction;
+- gắn trace metadata;
+- route command tới đúng auction partition/owner;
+- trả accepted/rejected result từ authority.
+
+Bid Ingress có thể scale stateless. Nó không tự đọc cache rồi `UPDATE highest_bid`; quyết định phải được thực hiện atomically ở authority.
+
+##### 2.7. Auction Authority / Command Processor
+
+Đây là correctness core. Với từng `auction_id`, nó:
+
+- sở hữu owner epoch/fencing token hiện hành;
+- serialize `START`, `PLACE_BID`, `EXTEND`, `CANCEL`, `CLOSE` commands;
+- kiểm tra lifecycle, authoritative time, rules và eligibility;
+- deduplicate `bid_request_id`;
+- gán `auction_sequence`;
+- append accepted bid/evidence;
+- cập nhật current price/leader/state version;
+- ghi outbox trong cùng durability boundary;
+- finalize đúng một `auction_result_id`;
+- trả cùng logical response khi client retry.
+
+Authority có thể được hiện thực bằng leader-per-partition, actor/entity ownership, transactional row/conditional update hoặc ordered log processor. HLD tập trung vào **semantics**, chưa khóa công nghệ.
+
+##### 2.8. Scheduler/Timer Service
+
+- index các start/effective-end deadlines;
+- phát `START_AUCTION` hoặc `CLOSE_AUCTION` command khi đến hạn;
+- retry khi timeout;
+- theo dõi overdue work và close lag;
+- cập nhật timer khi soft-close thay đổi effective end time.
+
+Scheduler **không tự chọn winner** và không phải nguồn quyết định bid muộn. Authority kiểm tra deadline/state rồi idempotently transition/finalize.
+
+##### 2.9. Realtime Subscription và Fan-out Services
+
+- giữ long-lived WebSocket connections;
+- xác thực connect/subscribe;
+- map auction → gateway/subscription shards;
+- consume committed auction events;
+- broadcast compact versioned state updates;
+- quản lý backpressure, coalescing và slow clients;
+- hỗ trợ reconnect, snapshot/cursor gap repair.
+
+Không ghi canonical bid từ WebSocket broadcast path. Client có thể gửi bid qua HTTP hoặc WebSocket command transport, nhưng mọi command cuối cùng vẫn đi qua cùng bid authority và idempotency semantics.
+
+##### 2.10. Payment/Order Service
+
+- consume `AuctionFinalized` có winner;
+- tạo order/payment intent idempotently theo result ID;
+- tích hợp provider;
+- verify/deduplicate webhook;
+- quản lý pending/paid/failed/unknown/refund/dispute state;
+- reconcile định kỳ.
+
+Client không được tùy ý “khởi tạo payment cho auction bất kỳ”. Hệ thống tạo payment obligation từ final result; client chỉ xác nhận/chọn payment method trong phạm vi obligation đó.
+
+##### 2.11. Notification Service
+
+- nhận notification intents từ durable events;
+- áp preference, policy, dedup và priority;
+- render template;
+- gửi push/email/SMS/in-app qua adapters;
+- retry, DLQ và ghi delivery evidence.
+
+Outbid/won notification có thể chậm hoặc duplicate; chúng không thay đổi auction truth.
+
+##### 2.12. Risk, Audit, Analytics và Admin
+
+Risk có hai tầng:
+
+- inline lightweight decision đủ nhanh để chặn account/device rõ ràng nguy hiểm;
+- asynchronous deeper analysis cho bot, shill bidding, collusion và anomaly.
+
+Audit giữ evidence critical; analytics dùng stream/batch cho BI. Admin tools đọc qua audited, least-privilege APIs và mọi override tạo record/event mới.
+
+---
+
+#### 3. Tránh ownership chồng chéo giữa Auction Service và Bid Service
+
+Một cách phân tách nguy hiểm:
+
+```text
+Bid Service owns highest bid
+Auction Service owns active/closed status
+Scheduler independently writes ended=true
+```
+
+Tại deadline có thể xảy ra:
+
+```text
+Bid Service đọc ACTIVE ──────────────┐
+                                     ├─ concurrent writes → late bid hoặc wrong winner
+Auction Service ghi ENDED ───────────┘
+```
+
+Boundary đúng hơn:
+
+```text
+Bid API       ── PLACE_BID ──┐
+Auction API   ── CANCEL ─────┤
+Scheduler     ── CLOSE ──────┼──> same per-auction authority/serialized command stream
+Soft-close    ── EXTEND ─────┤
+Admin         ── OVERRIDE ───┘
+```
+
+Các service vẫn có responsibility riêng ở API/control/read plane, nhưng mọi mutation ảnh hưởng winner, deadline hoặc lifecycle phải hội tụ vào cùng authoritative aggregate/transaction boundary.
+
+---
+
+#### 4. API design bên ngoài
+
+##### 4.1. Identity APIs
+
+```http
+POST /v1/users
+POST /v1/sessions
+DELETE /v1/sessions/{session_id}
+GET /v1/me
+PATCH /v1/me
+```
+
+Trong production, login/token issuance có thể do dedicated identity provider đảm nhiệm. API Gateway và services verify token/audience/issuer/expiry; authorization vẫn nằm ở domain service.
+
+##### 4.2. Listing APIs
+
+```http
+POST  /v1/listings
+GET   /v1/listings/{listing_id}
+PATCH /v1/listings/{listing_id}
+POST  /v1/listings/{listing_id}/media-upload-intents
+GET   /v1/listings?query=...&category=...&cursor=...
+```
+
+Media upload nên dùng pre-signed/direct upload tới object storage; application service chỉ cấp upload intent và validate finalized object metadata.
+
+##### 4.3. Auction APIs
+
+```http
+POST /v1/auctions
+GET  /v1/auctions/{auction_id}
+GET  /v1/auctions?state=ACTIVE&cursor=...
+POST /v1/auctions/{auction_id}/cancel
+POST /v1/auctions/{auction_id}/watch
+DELETE /v1/auctions/{auction_id}/watch
+```
+
+Create request nên chứa rule version/parameters:
+
+```json
+{
+  "listing_id": "lst_123",
+  "auction_type": "ENGLISH_ASCENDING",
+  "start_time": "2026-08-25T12:00:00Z",
+  "end_time": "2026-08-28T12:00:00Z",
+  "currency": "USD",
+  "starting_price": "100.00",
+  "reserve_price": "150.00",
+  "minimum_increment": "5.00",
+  "close_policy": "HARD_CLOSE"
+}
+```
+
+Tiền dùng decimal/minor units, không dùng floating point.
+
+##### 4.4. Bid APIs
+
+```http
+POST /v1/auctions/{auction_id}/bids
+GET  /v1/auctions/{auction_id}/bids?cursor=...
+GET  /v1/me/bids?cursor=...
+```
+
+Request:
+
+```http
+Idempotency-Key: 018f...stable-client-request-id
+```
+
+```json
+{
+  "amount_minor": 12500,
+  "currency": "USD",
+  "expected_auction_version": 418
+}
+```
+
+Accepted response:
+
+```json
+{
+  "decision": "ACCEPTED",
+  "bid_id": "bid_456",
+  "auction_id": "auc_123",
+  "auction_sequence": 419,
+  "auction_version": 419,
+  "current_price_minor": 12500,
+  "leading": true,
+  "effective_end_time": "2026-08-28T12:00:00Z",
+  "authoritative_time": "2026-08-28T11:59:58.420Z"
+}
+```
+
+Reject response có stable reason code và authoritative snapshot/version đủ để client refresh:
+
+```json
+{
+  "decision": "REJECTED",
+  "reason": "BID_TOO_LOW",
+  "minimum_next_bid_minor": 13000,
+  "auction_version": 419,
+  "effective_end_time": "2026-08-28T12:00:00Z"
+}
+```
+
+`expected_auction_version` là hint/precondition hữu ích, nhưng server vẫn atomically kiểm tra state mới nhất. Hai requests khác nhau không dùng chung idempotency key.
+
+##### 4.5. Payment APIs
+
+```http
+GET  /v1/orders/{order_id}
+GET  /v1/payments/{payment_id}
+POST /v1/payments/{payment_id}/confirm
+POST /internal/v1/payment-provider/webhooks/{provider}
+```
+
+`confirm` chỉ hoạt động với payment obligation đã được tạo từ winner result; endpoint webhook phải verify signature, timestamp/replay window và provider event ID.
+
+##### 4.6. Pagination và read consistency
+
+- cursor-based pagination thay offset cho lịch sử lớn/đang thay đổi;
+- cursor chứa opaque last sequence/sort key/version;
+- detail response trả `auction_version` và `server_time`;
+- bid history công khai có thể che bidder identity;
+- endpoint yêu cầu read-your-write có thể đọc authoritative state hoặc session-aware projection;
+- search/list APIs chấp nhận eventual consistency và không dùng để quyết định bid eligibility.
+
+---
+
+#### 5. Internal command và event contract
+
+##### 5.1. Command khác event
+
+```text
+Command: yêu cầu một authority thử làm việc gì đó
+         PLACE_BID, CLOSE_AUCTION
+
+Event:   sự thật đã durable commit
+         BID_ACCEPTED, AUCTION_FINALIZED
+```
+
+Không publish `BidPlaced` trước khi commit rồi để consumers tự đoán nó hợp lệ. Tên event nên phản ánh sự thật, ví dụ:
+
+- `AuctionScheduled`;
+- `AuctionStarted`;
+- `BidAccepted`;
+- `AuctionEndTimeExtended`;
+- `AuctionFinalized`;
+- `PaymentRequested`;
+- `PaymentAuthorized`/`PaymentFailed`;
+- `OrderCreated`;
+- `UserSuspended`.
+
+##### 5.2. Event envelope
+
+```json
+{
+  "event_id": "evt_...",
+  "event_type": "BidAccepted",
+  "schema_version": 2,
+  "aggregate_type": "Auction",
+  "aggregate_id": "auc_123",
+  "aggregate_version": 419,
+  "auction_sequence": 419,
+  "authority_epoch": 12,
+  "occurred_at": "...",
+  "causation_id": "bid-request-id",
+  "correlation_id": "request-trace-id",
+  "payload": {}
+}
+```
+
+Yêu cầu:
+
+- unique event ID để dedup;
+- versioned schema và compatibility policy;
+- partition key = `auction_id` cho per-auction order;
+- payload không chứa reserve/max proxy bid hoặc PII không cần thiết;
+- consumers idempotent vì delivery thường at least once;
+- dead-letter/retry/replay có owner và runbook;
+- event retention đủ cho recovery/rebuild theo mục đích.
+
+##### 5.3. Transactional outbox
+
+Sai:
+
+```text
+1. Commit bid vào database
+2. Publish event
+3. Process chết giữa hai bước → bid tồn tại nhưng không ai nhận update
+```
+
+Đúng hơn:
+
+```text
+Một transaction/durability boundary:
+  - append bid
+  - update auction state/version
+  - record idempotency result
+  - insert outbox event
+
+Outbox relay publish at least once
+Consumers deduplicate event_id / business key
+```
+
+Outbox loại bỏ dual-write gap, nhưng không tạo exactly-once transport; consumers vẫn phải idempotent.
+
+---
+
+#### 6. Synchronous và asynchronous communication
+
+##### 6.1. Đồng bộ khi caller cần quyết định ngay
+
+Phù hợp:
+
+- client lấy auction detail/snapshot;
+- place bid và nhận authoritative accepted/rejected;
+- create/cancel auction;
+- confirm payment step cần user interaction;
+- query profile/order/payment status.
+
+Có thể dùng REST bên ngoài và gRPC/HTTP nội bộ tùy team, nhưng protocol không sửa được ownership/correctness sai.
+
+Bid synchronous path phải ngắn:
+
+```text
+Client
+ → Edge/WAF/API Gateway
+ → Bid Ingress
+ → Auction Authority + durable store
+ ← accepted/rejected
+```
+
+Tránh chuỗi:
+
+```text
+Bid Service
+ → User Service
+ → Listing Service
+ → Auction Service
+ → Risk SaaS
+ → Notification Service
+ → Analytics
+```
+
+Mỗi hop làm tăng tail latency và tạo failure coupling. Dùng verified token, local/versioned projections và fast inline risk policy cho dữ liệu cần thiết; side effects xảy ra sau commit.
+
+##### 6.2. Bất đồng bộ sau khi sự thật đã xảy ra
+
+Phù hợp:
+
+- realtime fan-out;
+- outbid/won notifications;
+- search index update;
+- analytics/fraud enrichment;
+- audit replication;
+- payment/order workflow sau finalization;
+- receipt/invoice/media work.
+
+Lợi ích:
+
+- loose coupling;
+- scale consumers độc lập;
+- hấp thụ burst bằng queue;
+- retries và replay;
+- lỗi notification không làm bid thất bại.
+
+Chi phí:
+
+- eventual consistency;
+- duplicate/out-of-order delivery;
+- backlog và stale projections;
+- schema evolution;
+- observability/reconciliation phức tạp.
+
+Quy tắc tốt hơn câu “cần trả lời thì sync, còn lại async” là:
+
+> Giữ invariant và decision trong một authority nhỏ; sau durable commit, phát fact để các derived workflows xử lý độc lập.
+
+---
+
+#### 7. Luồng tạo auction
+
+```text
+Seller Client
+   │ POST /auctions
+   ▼
+API Gateway
+   ▼
+Auction Control Service
+   ├── verify seller/listing/moderation
+   ├── validate immutable rules/time/currency
+   ├── create auction aggregate + rule version
+   └── write outbox: AuctionScheduled
+             │
+             ├── Timer index schedules START/CLOSE
+             ├── Search projection indexes discoverable view
+             ├── Realtime/notification prepares subscriptions/reminders
+             └── Audit/analytics consume event
+```
+
+Nếu Listing Service cần được gọi đồng bộ, dùng timeout/circuit breaker và chỉ cho tạo auction khi listing version/status hợp lệ. Có thể dùng local projection nhưng phải xác định freshness requirement.
+
+Rules ảnh hưởng bid không được sửa tùy tiện sau activation. Nếu policy cho phép đổi, phải version và thông báo rõ; current authority xử lý transition atomically.
+
+---
+
+#### 8. Luồng đọc và subscribe auction
+
+##### 8.1. Initial page load
+
+```text
+Client → Search/Listing Query → listing projection/media URLs
+       → Auction Query       → current snapshot + auction_version + server_time
+       → Realtime Gateway    → subscribe from version/cursor
+```
+
+Snapshot và stream có race:
+
+```text
+T1 client đọc snapshot version 100
+T2 bid 101 được commit
+T3 client subscribe
+```
+
+Nếu subscribe chỉ nhận event mới sau T3, client bỏ lỡ version 101. Cần một protocol, ví dụ:
+
+1. subscribe với `last_seen_version=100`;
+2. gateway/event store replay từ 101 nếu còn retention;
+3. hoặc subscribe trước, lấy snapshot rồi merge/dedup theo version;
+4. nếu gap không thể replay, client refetch authoritative snapshot.
+
+##### 8.2. Subscription authorization
+
+- xác thực user/anonymous policy;
+- kiểm tra auction visibility/region/age restrictions;
+- subscription token có scope và expiry;
+- không tiết lộ bidder identity hoặc private max bid;
+- giới hạn số subscriptions/connection/user;
+- cleanup khi disconnect bằng TTL/lease.
+
+---
+
+#### 9. Luồng đặt bid end-to-end
+
+```text
+Client
+  │ POST bid + Idempotency-Key
+  ▼
+Edge/WAF/API Gateway
+  │ auth context, coarse rate limit
+  ▼
+Bid Ingress
+  │ schema, amount/currency, fine-grained quota, route
+  ▼
+Auction Authority for auction_id
+  │
+  ├─ fence: authority epoch còn hợp lệ?
+  ├─ dedup: request ID đã xử lý?
+  ├─ AuthZ: bidder đủ điều kiện, không phải seller?
+  ├─ lifecycle/time: ACTIVE và trước effective_end_time?
+  ├─ rule: amount/increment/reserve/proxy semantics?
+  ├─ assign per-auction sequence/version
+  └─ atomic durable commit:
+       bid + current state + idempotency result + outbox
+  │
+  ├──────────── response ACCEPTED/REJECTED ───────────> Client
+  │
+  └─ outbox → Event Bus → Realtime Fan-out
+                         ├→ Notification: previous leader outbid
+                         ├→ Fraud/Analytics
+                         ├→ Read-model/cache update
+                         └→ Audit pipeline
+```
+
+Một số nguyên tắc:
+
+- rejected bid cũng có thể cần durable decision/audit tùy reason/risk policy;
+- ACK accepted chỉ sau durability boundary;
+- không chờ realtime/notification/analytics;
+- response và event dùng cùng committed auction version;
+- client timeout rồi retry cùng key nhận lại cùng decision;
+- event delivery duplicate không tạo duplicate notification logic nếu consumer dùng business dedup key.
+
+---
+
+#### 10. Luồng realtime bid delivery
+
+```text
+BidAccepted event
+       │
+       ▼
+Realtime Event Projector
+  - derive public-safe AuctionStateChanged
+  - remove private bidder/proxy/reserve fields
+  - optionally coalesce display updates
+       │
+       ▼
+Regional Fan-out Topics
+       │ partition/shard by auction + region/gateway
+       ▼
+WebSocket Gateways
+       │
+       ├── connection A: apply v419
+       ├── connection B: duplicate v419 → ignore
+       └── connection C: sees gap 417→419 → snapshot/replay
+```
+
+Public realtime payload có thể gồm:
+
+```json
+{
+  "type": "AUCTION_STATE_CHANGED",
+  "auction_id": "auc_123",
+  "auction_version": 419,
+  "current_price_minor": 12500,
+  "currency": "USD",
+  "effective_end_time": "...",
+  "state": "ACTIVE",
+  "server_time": "..."
+}
+```
+
+Bidder riêng có thể nhận private decision/leading/outbid event qua user-scoped channel. Không đưa full bid record hoặc PII lên public auction channel.
+
+##### WebSocket scaling
+
+- connection-aware load balancer;
+- stateless/rebuildable gateways;
+- subscription registry auction → gateway shards;
+- broker/pub-sub fan-out giữa gateway instances;
+- bounded per-connection queue;
+- ping/pong, idle timeout, deploy drain;
+- connection epoch để fence stale route;
+- backoff/jitter khi reconnect;
+- versioned snapshot/cursor recovery.
+
+Load balancer không “chuyển” live WebSocket sang instance khác khi gateway chết. Socket đóng, client reconnect rồi resubscribe/resync.
+
+---
+
+#### 11. Luồng đóng auction và chọn winner
+
+```text
+Timer Service sees due bucket
+       │ CLOSE_AUCTION(auction_id, observed_end_time/version)
+       ▼
+Auction Authority
+       │ serialize CLOSE with PLACE_BID commands
+       ├─ verify epoch/state/effective_end_time
+       ├─ fence future bid acceptance
+       ├─ resolve result from committed ordered state
+       ├─ reserve met? winner eligible?
+       └─ atomic commit:
+            ENDED/SOLD/UNSOLD
+            auction_result_id
+            final price/winner reference
+            outbox AuctionFinalized
+       │
+       └─ duplicate CLOSE returns same result
+             │
+             ├→ Realtime: final state
+             ├→ Notification: won/lost/seller
+             ├→ Payment/Order: create obligation if SOLD
+             ├→ Search: remove/update active projection
+             ├→ Audit/Analytics
+             └→ Timer index cleanup
+```
+
+Điểm cần hiệu chỉnh từ transcript:
+
+- scheduler không tự “xác định winner”;
+- scheduler chạy trễ không mở rộng deadline;
+- Redis expiry/keyspace notification không đủ làm nguồn sự thật duy nhất;
+- close command retry phải vô hại;
+- payment và notifications có idempotency riêng, không chỉ dựa vào scheduler không chạy lặp;
+- finalization không được đọc một eventually consistent cache để chọn winner.
+
+Nếu soft-close, accepted bid gần cuối có thể atomically cập nhật `effective_end_time` và phát `AuctionEndTimeExtended`; Timer Service reschedule dựa trên version mới. Close command với end-time/version cũ bị reject/no-op.
+
+---
+
+#### 12. Timer architecture options
+
+| Cách | Ưu điểm | Hạn chế | Vai trò phù hợp |
+|---|---|---|---|
+| Database scan/index | Đơn giản, durable | Scan/poll load, precision phụ thuộc interval | Quy mô nhỏ hoặc safety reconciler |
+| Sharded time buckets | Scale tốt, replay được | Bucket ownership/rebalancing | Durable due-work index |
+| Delayed queue/jobs | Handoff tự nhiên, retry | Max delay/ordering/visibility semantics tùy hệ | Trigger command, vẫn cần authority check |
+| Timing wheel | Hiệu quả cho nhiều timers | Recovery/persistence phức tạp | In-memory accelerator với durable backing |
+| Redis sorted set | Nhanh, dễ poll theo score | Hot shard, durability/failover cần thiết kế | Timer index/accelerator |
+| Redis expiration event | Dễ demo | Best-effort, delay/missed event semantics | Không dùng làm sole correctness trigger |
+| Cloud scheduler | Ít vận hành | Quota/cost/vendor granularity | Moderate scale, managed trigger |
+
+Production pattern an toàn:
+
+```text
+Durable auction deadline
+ + scalable timer index
+ + at-least-once CLOSE command
+ + idempotent authority transition
+ + periodic overdue reconciler
+```
+
+Reconciler quét auctions `effective_end_time < now AND state=ACTIVE/CLOSING` để sửa missed timer. Nó không thay primary scheduler nhưng ngăn auction mắc kẹt vô hạn.
+
+---
+
+#### 13. Luồng payment sau finalization
+
+```text
+AuctionFinalized(result_id, winner, price)
+       ▼
+Order/Payment Service
+  ├─ dedup by result_id
+  ├─ create internal order + payment obligation
+  ├─ publish PaymentRequested
+  └─ call provider with idempotency key
+          │
+          ├─ synchronous success/pending/timeout
+          └─ verified async webhook
+                    ▼
+              payment state machine
+                    ├→ Notification
+                    ├→ Fulfillment handoff
+                    └→ Reconciliation/Audit
+```
+
+Không gọi provider trong transaction giữ auction lock/owner. Nếu provider down, auction vẫn có final winner/result; payment ở `PENDING/UNKNOWN` và workflow retry/reconcile.
+
+Payment event ordering có scope riêng theo `payment_id`/`order_id`; không cần ép vào auction bid sequence sau khi obligation đã được tạo.
+
+---
+
+#### 14. Data model và ownership
+
+##### 14.1. Core entities
+
+```text
+User 1 ─── N Listing 1 ─── N Auction 1 ─── N Bid
+                                      │
+                                      ├── 0..1 AuctionResult
+                                      │            │
+                                      │            └── 0..1 Order ─── N PaymentAttempt
+                                      │
+                                      ├── N Watch
+                                      ├── N AuctionEvent/Outbox
+                                      └── N AuditDecision
+```
+
+Một Listing có thể có nhiều Auction attempts theo thời gian khi relist; một Auction chỉ tham chiếu một immutable-enough listing version/snapshot cần thiết cho dispute.
+
+##### 14.2. User
+
+```text
+user_id
+account_status
+verification_status
+risk_tier
+created_at
+profile_version
+```
+
+Identity credentials/token secrets không trộn tùy tiện vào domain user table.
+
+##### 14.3. Listing
+
+```text
+listing_id
+seller_id
+title / description / category / attributes
+media_refs[]
+moderation_status
+content_version
+created_at / updated_at
+```
+
+##### 14.4. Auction
+
+```text
+auction_id
+listing_id + listing_version
+seller_id
+auction_type + rule_version
+currency
+starting_price_minor
+reserve_price_encrypted_or_restricted
+minimum_increment_rule
+start_time
+original_end_time
+effective_end_time
+close_policy
+state
+current_price_minor
+current_leader_id (restricted)
+auction_version / last_sequence
+owner_epoch
+result_id nullable
+```
+
+Reserve/max proxy bid cần quyền truy cập chặt; không đưa vào public projections/events.
+
+##### 14.5. Bid
+
+```text
+auction_id                 partition/aggregate key
+auction_sequence           ordered range key
+bid_id                     global stable ID
+bid_request_id             idempotency
+bidder_id
+amount_minor / currency
+decision                   ACCEPTED/REJECTED if retained
+reason_code
+authority_time
+authority_epoch
+auction_rule_version
+risk_decision_ref
+created_at
+```
+
+Unique constraints/business keys:
+
+```text
+(auction_id, auction_sequence)
+(auction_id, bidder_id, bid_request_id)
+bid_id
+```
+
+##### 14.6. AuctionResult
+
+```text
+auction_result_id
+auction_id unique
+final_auction_version
+winner_id nullable
+winning_bid_id nullable
+final_price_minor
+reserve_met
+outcome SOLD | UNSOLD | CANCELLED
+finalized_at
+authority_epoch
+```
+
+##### 14.7. Watch/Subscription
+
+Hai khái niệm khác nhau:
+
+- durable `Watch`: user preference để theo dõi/reminder;
+- ephemeral realtime `Subscription`: connection/gateway đang nghe auction channel.
+
+Không lưu mỗi WebSocket connection như một durable business watch row.
+
+##### 14.8. Payment và attempts
+
+```text
+Payment:
+  payment_id, result_id unique, order_id, amount, currency,
+  state, provider_customer_ref, version
+
+PaymentAttempt:
+  attempt_id, payment_id, provider, provider_request_key,
+  provider_status, provider_event_id, timestamps, failure_code
+```
+
+##### 14.9. Idempotency, outbox và audit
+
+- Idempotency record lưu request hash + canonical response để cùng key với payload khác bị reject;
+- Outbox event nằm cùng transaction với aggregate mutation;
+- Audit record giữ actor, reason, rule/policy version, before/after references và correlation IDs;
+- analytics/log không thay immutable correctness evidence.
+
+---
+
+#### 15. Read models và consistency
+
+| View | Nguồn | Consistency chấp nhận được |
+|---|---|---|
+| Search results | Listing/Auction events → search index | Eventual |
+| Listing detail | Listing store/cache | Eventual theo content version |
+| Current auction snapshot | Authority state/read projection | Fresh/versioned; fallback authoritative |
+| Public bid history | Accepted bid projection | Slight lag, ordered cursor |
+| My bids | User-centric projection | Eventual + read-your-write overlay nếu cần |
+| Active auctions | Lifecycle projection/index | Eventual; authority revalidates command |
+| Payment status | Payment state store/projection | Versioned, provider reconciliation |
+| Realtime UI | Versioned event stream | Eventual, gap repair bằng snapshot |
+
+CQRS ở đây là ý tưởng tách write model giàu invariant khỏi query-shaped projections, không nhất thiết phải dùng framework phức tạp từ ngày đầu.
+
+Cache key nên chứa version hoặc invalidation event. Dù UI vừa đọc giá 125, authority vẫn có thể reject bid 130 nếu state đã tiến lên 135 trước khi request commit.
+
+---
+
+#### 16. Partitioning và routing
+
+##### Auction command plane
+
+```text
+partition_key = auction_id
+```
+
+Đảm bảo bids/lifecycle commands cùng auction đi qua một ordered owner. Consistent hashing/directory map có thể route ingress tới owner.
+
+##### Bid history
+
+```text
+partition = hash(auction_id) hoặc auction_id + time/sequence bucket
+sort key = auction_sequence
+```
+
+Hot/long auction có thể bucket history storage, nhưng current authority/order vẫn duy nhất.
+
+##### Event bus
+
+```text
+key = auction_id
+```
+
+Giữ per-auction event order trong một topic/partition generation. Khi repartition/migrate cần version/epoch và consumer dedup.
+
+##### Realtime fan-out
+
+Sau canonical event, có thể nhân theo:
+
+```text
+auction_id × region × gateway_shard
+```
+
+nhằm phân phối outbound work; fan-out partition không có quyền thay canonical order.
+
+##### Payment
+
+```text
+partition/order scope = payment_id hoặc order_id
+dedup business key = auction_result_id
+```
+
+---
+
+#### 17. Failure handling theo từng boundary
+
+| Failure | Hành vi |
+|---|---|
+| Bid Ingress chết trước authority | Client retry cùng idempotency key |
+| Authority commit rồi response mất | Retry trả canonical response đã lưu |
+| DB commit thành công nhưng publisher chết | Outbox relay publish sau khi hồi phục |
+| Event publish duplicate | Consumer dedup bằng event/business key |
+| Realtime gateway chết | Socket đóng; client reconnect, resubscribe, repair version gap |
+| Broker/fan-out lag | Bid vẫn đúng; visibility SLO giảm và client snapshot hội tụ |
+| Timer miss/worker chết | Retry + overdue reconciler gửi close command |
+| Duplicate timer | Authority trả same/no-op final result |
+| Old owner sống lại | Epoch/fencing chặn stale bid/close write |
+| Search/cache stale | Command authority revalidate; detail có version/refetch |
+| Notification lỗi | Queue retry/DLQ; không rollback auction |
+| Payment timeout | UNKNOWN + query/webhook/reconciliation, không charge lại mù |
+| Risk dependency chậm | Áp fail-open/fail-closed theo risk tier đã định nghĩa, không ngẫu nhiên |
+| Zone failure gần deadline | Owner failover có quorum/fencing; clients retry với same IDs |
+
+HLD phải chỉ rõ durability boundary và retry owner cho từng hop. “Có queue” không tự động tạo reliability.
+
+---
+
+#### 18. Security boundaries
+
+- WAF/DDoS/bot defense ở edge;
+- OIDC/authentication và short-lived scoped token;
+- AuthZ tại mỗi domain command, không tin gateway duy nhất;
+- seller không bid auction của mình;
+- listing visibility, bidder eligibility, region/age/KYC rules;
+- per-user/device/IP/auction rate limits;
+- request ID/replay protection và payload hash;
+- TLS service-to-service, workload identity/mTLS tùy threat model;
+- encryption at rest và restricted columns cho reserve/proxy maxima;
+- tokenized/hosted payment để giảm PCI scope;
+- verified webhooks;
+- least-privilege service accounts và secret rotation;
+- public/private event schemas tách biệt;
+- tamper-evident audit và controlled admin override;
+- privacy-safe logs/traces.
+
+Realtime subscription cũng phải AuthZ; đoán được `auction_id` không đồng nghĩa có quyền xem private auction/channel.
+
+---
+
+#### 19. Observability end-to-end
+
+Correlation chain:
+
+```text
+HTTP request_id
+ → bid_request_id
+ → auction_id + sequence/version + authority_epoch
+ → bid_id + outbox event_id
+ → public realtime event/version
+ → notification intent
+ → auction_result_id
+ → order/payment/provider IDs
+```
+
+SLO/metrics theo boundary:
+
+- gateway admission và rate-limit latency;
+- bid ingress→authority routing latency;
+- authority queue/decision/commit latency;
+- conflict, dedup và stale-epoch counts;
+- outbox age/publish lag;
+- event-bus consumer lag theo partition;
+- commit-to-realtime-visible lag;
+- gateway connection/buffer/reconnect/gap repair;
+- timer due→command và deadline→finalized lag;
+- payment workflow/provider/webhook/reconciliation age;
+- notification delay;
+- search/read-model freshness.
+
+Distributed trace không nên ghi raw bid secrets/payment/PII. Audit evidence và operational telemetry có retention/access policy khác nhau.
+
+---
+
+#### 20. Những điểm hiệu chỉnh so với sơ đồ đơn giản
+
+| Sơ đồ/transcript đơn giản | Thiết kế production-oriented |
+|---|---|
+| API Gateway là front door cho mọi traffic | HTTP API và long-lived WebSocket edge có thể là pools/policies riêng |
+| User Service được gọi để authenticate mọi bid | IdP/OIDC token được verify cục bộ; domain vẫn enforce object AuthZ/eligibility |
+| Auction Service quản lý lifecycle, Bid Service quản lý highest bid | Mọi mutation ảnh hưởng lifecycle/winner đi qua cùng per-auction authority |
+| Bid Service publish `bid placed` | Chỉ publish `BidAccepted` sau atomic durable commit/outbox |
+| Event bus làm hệ thống reliable | Vẫn cần idempotent consumers, ordering scope, retry/DLQ/reconciliation |
+| WebSocket server broadcast bid | Regional gateway/fan-out shards, subscription registry, backpressure và gap repair |
+| WebSocket luôn cho mọi người state giống nhau | Events có thể lag/mất/duplicate; versioned snapshot là recovery truth |
+| Scheduler đóng auction và chọn winner | Scheduler phát command; authority serialize với bids, fence và finalize |
+| Redis expiration trigger là timer đủ tin cậy | Chỉ là accelerator; cần durable deadline, retry và overdue reconciler |
+| Close retry không gửi notification/payment hai lần | Mỗi downstream workflow vẫn cần idempotency business key riêng |
+| Client khởi tạo payment sau khi auction kết thúc | System tạo obligation từ unique result; client confirm trong phạm vi đó |
+| User, Listing, Auction, Bid, Payment là đủ | Cần Result, Watch/Subscription, Idempotency, Outbox, Attempts và Audit evidence |
+| REST sync khi cần immediate response | Bid path còn phải tối thiểu hops và tránh distributed synchronous dependency chain |
+
+---
+
+#### 21. Trade-offs quan trọng
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Per-auction authority | Order/invariant rõ | Hot key, ownership/failover complexity |
+| Separate ingress and authority | Stateless edge scale, stable correctness core | Routing/directory thêm thành phần |
+| REST bid command | Retry/idempotency rõ, phổ biến | Separate WebSocket channel cho updates |
+| Bid over WebSocket | Một connection, lower framing overhead | Reconnect/request correlation phức tạp; vẫn cần same authority |
+| Event-driven side effects | Loose coupling, absorb burst | Eventual consistency, duplicates, schema/ops |
+| Transactional outbox | Không mất fact sau DB commit | Relay lag, duplicate publish, outbox cleanup |
+| WebSocket push | Low-latency UX | Connections, backpressure, reconnect/gap handling |
+| Separate Listing/Auction | Relist/version/audit rõ | Join/projection và consistency thêm |
+| CQRS read projections | Scale/query tối ưu | Projection lag/rebuild complexity |
+| Dedicated timer index | Scale deadlines tốt | Ownership/recovery/reschedule work |
+| Hard close authority | Deterministic boundary | Availability/latency trade-off khi partition |
+
+---
+
+#### 22. Evolution path
+
+Không cần bắt đầu bằng hàng chục microservices. Có thể giữ cùng semantics qua các giai đoạn:
+
+##### Giai đoạn nhỏ
+
+```text
+Modular monolith
+ + relational transaction/row version
+ + durable job table
+ + outbox
+ + Redis cache
+ + WebSocket gateway
+```
+
+##### Giai đoạn tăng trưởng
+
+- tách search/listing query;
+- tách realtime gateway/fan-out;
+- tách notification/payment workers;
+- shard auction aggregates theo `auction_id`;
+- dedicated timer service;
+- event bus và rebuildable projections.
+
+##### Giai đoạn rất lớn/hot auctions
+
+- explicit auction-owner partitions/actors;
+- hot-auction placement/isolation;
+- regional realtime fan-out tree;
+- pre-warm theo closing window;
+- multi-region authority/home-region strategy;
+- dedicated audit/fraud streams và capacity controls.
+
+Microservices là deployment choice. Invariants, ownership, idempotency và durable handoff mới là phần không được đánh mất khi tách hệ thống.
+
+---
+
+#### 23. Cách trình bày HLD trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. HTTP requests vào WAF/API Gateway; WebSocket traffic vào connection-aware realtime gateways.
+2. Listing Service sở hữu item content; Search là eventual projection; Auction Control tạo rules/lifecycle commands.
+3. Bid Ingress stateless validate sơ bộ và route theo `auction_id` tới auction authority.
+4. Mọi `PLACE_BID`, `CLOSE`, `EXTEND`, `CANCEL` của cùng auction được serialize tại cùng authority.
+5. Authority atomically ghi bid, current state/version, idempotency response và outbox rồi mới ACK.
+6. `BidAccepted` được partition theo auction; realtime, notification, search, fraud và analytics consume bất đồng bộ.
+7. Realtime fan-out dùng regional gateway shards, subscription registry, bounded buffers và versioned snapshot/gap recovery.
+8. Scheduler dùng durable time index/delayed work để gửi at-least-once close command; authority mới kiểm tra deadline và chọn một result.
+9. `AuctionFinalized` idempotently tạo order/payment obligation; provider calls/webhooks được retry và reconcile.
+10. Data model tách Listing, Auction, Bid, Result, Watch/Subscription, PaymentAttempt, Idempotency, Outbox và Audit.
+11. Search/cache/WebSocket là derived views; canonical auction aggregate và ordered bid evidence mới là source of truth.
+12. Failure recovery dựa trên same request ID, outbox, idempotent consumers, fencing, replay và overdue reconciliation.
+
+Deep dives nên chuẩn bị:
+
+- bid concurrency và per-auction order;
+- authority partition ownership/failover;
+- last-millisecond bid versus close command;
+- transactional outbox;
+- 10.000-watcher realtime fan-out;
+- snapshot/subscribe race và reconnect gaps;
+- scalable/idempotent timer architecture;
+- payment unknown outcome;
+- hot auction isolation;
+- multi-region fairness và clock semantics.
+
+---
+
+#### 24. HLD checklist
+
+- [ ] HTTP và WebSocket entry paths được tách theo capability?
+- [ ] Service ownership cho User, Listing, Auction, Bid, Result, Payment rõ?
+- [ ] Auction lifecycle và bid mutations có cùng authority?
+- [ ] Bid Ingress stateless và route theo auction ID?
+- [ ] Stable idempotency key, payload hash và canonical retry response?
+- [ ] Per-auction sequence/version và owner epoch/fencing?
+- [ ] Atomic bid/state/idempotency/outbox durability boundary?
+- [ ] ACK accepted chỉ sau durable commit?
+- [ ] Command/event naming và schema version rõ?
+- [ ] Event partition/order scope theo auction?
+- [ ] Consumer idempotency, retry, DLQ, replay và reconciliation?
+- [ ] Public event loại bỏ reserve/proxy/PII?
+- [ ] WebSocket subscription AuthZ và auction→gateway registry?
+- [ ] Regional fan-out, coalescing, bounded buffer và slow-client policy?
+- [ ] Snapshot/subscription race và version-gap recovery?
+- [ ] Scheduler chỉ trigger; authority check deadline/finalize?
+- [ ] Durable timer index, duplicate-safe close và overdue reconciler?
+- [ ] Soft-close reschedule dùng effective end-time version?
+- [ ] Result ID duy nhất và downstream business idempotency?
+- [ ] Payment provider timeout/webhook/reconciliation workflow?
+- [ ] Listing media direct object upload/CDN?
+- [ ] Search/cache/read models có freshness semantics?
+- [ ] Partition/routing/hot-auction isolation strategy?
+- [ ] Zone failure/reconnect/owner failover đã mô tả?
+- [ ] AuthN, object AuthZ, bot/risk, secrets/payment/audit boundaries?
+- [ ] Correlation và SLO từ request tới bid/event/result/payment?
+- [ ] Evolution path phù hợp team và scale thay vì microservices mặc định?
+
+---
+
+#### 25. Ý chính cần nhớ
+
+- HLD phải phản ánh invariant và workload, không chỉ liệt kê microservices.
+- Listing mô tả item; Auction mô tả selling event có rule và lifecycle.
+- Search/discovery là eventual projection, không phải auction authority.
+- Bid API/Ingress có thể riêng, nhưng highest bid và lifecycle không được có hai writers độc lập.
+- Tất cả bid/close/extend/cancel commands của một auction đi qua cùng serialized authority.
+- Authority commit bid, current state, idempotency result và outbox atomically trước ACK.
+- Chỉ phát `BidAccepted` sau commit, không phát fact mơ hồ trước validation.
+- Sync path giữ ngắn; notification, analytics, search và broadcast xảy ra sau commit.
+- Transactional outbox sửa dual-write gap nhưng consumers vẫn phải idempotent.
+- WebSocket là realtime delivery plane, không phải canonical storage.
+- Public auction channel và private bidder channel có dữ liệu/quyền khác nhau.
+- Snapshot + versioned stream + gap repair giải quyết reconnect và subscribe race.
+- Fan-out có thể shard theo region/gateway sau khi canonical order đã được quyết định.
+- Scheduler gửi at-least-once command; auction authority kiểm tra deadline và finalize.
+- Redis expiry không nên là cơ chế đóng auction duy nhất.
+- Duplicate close vô hại ở authority; payment/notification vẫn cần idempotency riêng.
+- `AuctionFinalized` tạo một obligation; client không tự tuyên bố quyền thanh toán.
+- Data model thực tế cần Result, Idempotency, Outbox, Attempts và Audit ngoài năm entity cơ bản.
+- Watch preference bền vững khác realtime connection subscription tạm thời.
+- Per-auction partitioning giữ order nhưng cần isolation cho hot auction.
+- Availability cần fencing, replay và reconciliation, không chỉ nhiều instances.
+- Có thể bắt đầu modular monolith; service boundaries và semantics vẫn giữ nguyên khi scale.
+- Kiến trúc tốt nối **authenticated command → fenced per-auction decision → atomic durable state/outbox → asynchronous projections/fan-out → idempotent closing/payment**.
+
+#### Công thức ghi nhớ
+
+> **Auction HLD = HTTP/realtime edge + query/control services + one authoritative serialized command path per auction + atomic bid/state/outbox commit + versioned asynchronous fan-out + idempotent timer finalization + reconciled payment workflow.**
+
+---
+
+### Bài 91. Making Tech & Infra Decisions Strategically
+
+#### 1. Công nghệ phải đi sau yêu cầu
+
+Không có một “best stack” cho mọi auction platform. Trình tự đúng là:
+
+```text
+Requirement/invariant
+        ↓
+Capability cần có
+        ↓
+Candidate technologies
+        ↓
+Trade-off + failure model + team capability
+        ↓
+Decision + trigger để xem xét lại
+```
+
+Ví dụ:
+
+```text
+Per-auction ordered durable bid decision
+≠ “chọn Java vì Java nhanh”
+
+= cần một serialized authority
+  + transactional/conditional durability
+  + idempotency
+  + fencing
+  + đo được tail latency
+```
+
+Ngôn ngữ, framework và cloud product chỉ là phương tiện hiện thực. Nếu ownership và invariant sai, thay Node.js bằng Java hoặc PostgreSQL bằng một database khác không tự sửa được hệ thống.
+
+---
+
+#### 2. Decision matrix tổng quát
+
+| Nhu cầu | Capability | Lựa chọn đại diện | Câu hỏi đánh đổi |
+|---|---|---|---|
+| Responsive web UI | Component UI, state sync, reconnect | React, Vue | Team skill, bundle, SSR/SEO, ecosystem |
+| HTTP/control APIs | Mature runtime, concurrency, observability | Java/Spring Boot, Node.js/TypeScript, Go, .NET | Latency, CPU profile, libraries, operability |
+| Ordered bid correctness | Transaction/conditional append + owner | PostgreSQL, distributed KV/DB có conditional writes, actor/log processor | Hot key, failover, latency, consistency |
+| Read scalability | Cache + query projections | Redis, CDN, search engine, read replicas | Staleness, invalidation, hot keys |
+| Durable event fan-out | Broker/queue + replay/retry | Kafka/Pulsar, SQS/SNS, cloud pub/sub | Ordering, retention, operations, cost |
+| Realtime updates | Persistent server push | WebSocket, managed realtime gateway | Connections, fan-out, backpressure, reconnect |
+| Auction timers | Durable due-work index + retry | DB job table, time buckets, queue/scheduler, Redis accelerator | Precision, quota, recovery, duplicate trigger |
+| Payments | Tokenized provider integration | Stripe, PayPal hoặc regional provider | Coverage, fees, webhooks, compliance |
+| Horizontal deployment | Container/serverless orchestration | Kubernetes, ECS/managed containers, serverless workers | Control versus operational burden |
+| Identity | Standards-based IdP | OIDC + OAuth 2.0 | Key rotation, claims, MFA, availability |
+| Observability | Metrics/logs/traces/alerts | OpenTelemetry, Prometheus, Grafana, managed stack | Cardinality, retention, cost, privacy |
+
+Không nên đưa tất cả các sản phẩm này vào sơ đồ chỉ vì chúng phổ biến. Mỗi box phải giải quyết một yêu cầu đã được nêu.
+
+---
+
+#### 3. Front-end: React hoặc Vue chỉ là một phần nhỏ của quyết định
+
+React/Vue đều phù hợp để xây:
+
+- listing/search/detail pages;
+- countdown và current-price view;
+- bid form với optimistic UX có kiểm soát;
+- WebSocket subscription/reconnect;
+- payment/notification state;
+- seller/admin workflows.
+
+Nhưng frontend auction cần nhiều hơn chọn framework:
+
+##### 3.1. State model
+
+Tách rõ:
+
+```text
+Authoritative server state
+  auction_version, current price, lifecycle, effective_end_time
+
+Local UI state
+  form input, loading, selected image, animation
+
+Pending command state
+  bid_request_id, awaiting decision, retry status
+```
+
+Không hiển thị bid là accepted chỉ vì client đã bấm nút. UI có thể báo `Submitting…`; chỉ chuyển `Accepted` khi nhận authoritative response/version.
+
+##### 3.2. Realtime convergence
+
+- lưu `last_seen_auction_version`;
+- dedup/out-of-order events;
+- gap thì fetch snapshot;
+- reconnect với exponential backoff + jitter;
+- đồng bộ server clock offset cho countdown;
+- tắt nút bid theo UI chỉ để UX, server vẫn kiểm tra deadline;
+- không render private bidder/reserve/proxy information.
+
+##### 3.3. Web delivery
+
+- CDN cho JS/CSS/images;
+- code splitting và image optimization;
+- SSR/prerender nếu discovery/SEO cần;
+- Content Security Policy và dependency/supply-chain controls;
+- feature flags nhưng không để client flag thay server auction rule.
+
+React hay Vue không quyết định scalability của bid authority; client correctness/reconnect protocol mới là phần đáng nói trong system design.
+
+---
+
+#### 4. Backend runtime: Node.js hay Java/Spring Boot?
+
+##### Node.js/TypeScript
+
+Điểm mạnh:
+
+- I/O-heavy API và realtime ecosystem tốt;
+- cùng ngôn ngữ với frontend;
+- development nhanh;
+- event-loop model phù hợp nhiều network operations.
+
+Lưu ý:
+
+- CPU-heavy work chặn event loop nếu không tách worker;
+- đo event-loop lag và memory/GC;
+- thư viện/async error discipline quan trọng;
+- một process vẫn không thay được multi-instance ownership.
+
+##### Java/Spring Boot
+
+Điểm mạnh:
+
+- mature transaction, database, security và observability ecosystem;
+- concurrency/runtime tooling tốt;
+- phù hợp domain service dài hạn và team enterprise;
+- virtual threads/reactive stack là các lựa chọn, không phải mục tiêu tự thân.
+
+Lưu ý:
+
+- memory/startup/GC cần tune theo deployment;
+- framework defaults có thể tạo quá nhiều threads/connections;
+- synchronous dependency chain vẫn gây tail latency dù runtime mạnh.
+
+##### Cách chọn
+
+Chọn theo:
+
+- kinh nghiệm đội ngũ và on-call maturity;
+- p99 latency qua load test thực tế;
+- database/broker/payment libraries;
+- profiling, tracing và deployment toolchain;
+- hiring/maintenance horizon;
+- CPU versus I/O workload;
+- số lượng stack mà tổ chức có thể vận hành an toàn.
+
+Một stack đại diện hợp lý có thể dùng Java/Spring Boot cho auction authority/payment và Node.js cho BFF/query/realtime orchestration, nhưng dùng hai runtime làm tăng build, security patch và observability overhead. Một runtime duy nhất cũng hoàn toàn hợp lệ.
+
+---
+
+#### 5. PostgreSQL cho transactional source of truth
+
+PostgreSQL phù hợp giai đoạn đầu và quy mô đáng kể vì:
+
+- ACID transactions;
+- unique constraints cho idempotency/result;
+- row/version checks và locks;
+- relational integrity cho auction, result, order và payment;
+- indexes/range queries;
+- mature replication, backup và point-in-time recovery;
+- outbox có thể ghi cùng transaction.
+
+##### 5.1. Một transaction đặt bid đại diện
+
+```text
+BEGIN
+  SELECT auction aggregate FOR UPDATE
+  verify owner epoch/state/effective_end_time/rules
+  lookup or insert idempotency key
+  append Bid(auction_id, sequence, ...)
+  update Auction(current_price, leader, version, ...)
+  insert Outbox(BidAccepted, same version)
+COMMIT
+```
+
+Hoặc dùng optimistic conditional write:
+
+```sql
+UPDATE auctions
+SET current_price_minor = :amount,
+    current_leader_id = :bidder,
+    version = version + 1
+WHERE auction_id = :id
+  AND version = :expected
+  AND state = 'ACTIVE'
+  AND effective_end_time > :authority_time;
+```
+
+Nếu affected rows = 0, reload/re-evaluate hoặc trả stale/conflict theo policy. Việc append bid, idempotency và outbox vẫn phải nằm trong atomic strategy tương ứng.
+
+##### 5.2. Schema/index considerations
+
+- money lưu integer minor units hoặc fixed decimal, không `float`;
+- index bids theo `(auction_id, auction_sequence)`;
+- unique `(auction_id, bidder_id, bid_request_id)`;
+- unique result theo `auction_id`;
+- partial/index theo `effective_end_time` cho due auctions nếu DB timer index;
+- partition/tier bid và audit history theo time/hash khi lớn;
+- tránh quá nhiều secondary indexes trên high-write path;
+- archive cold auctions theo retention policy.
+
+##### 5.3. Scaling PostgreSQL
+
+- connection pooler và bounded application pools;
+- read replicas cho query phù hợp staleness, không cho authoritative bid decision;
+- HA primary/standby nhiều AZ;
+- sharding theo auction ID khi một cluster không đủ;
+- logical/CDC stream cho projections nếu cần;
+- PITR, backup verification và restore drills.
+
+##### 5.4. Giới hạn
+
+Một hot auction vẫn serialize trên một row/aggregate. Thêm read replica hoặc database shards không làm một hot key có nhiều writers an toàn. Khi contention vượt SLO:
+
+- route commands tới một in-memory per-auction owner/actor;
+- owner serially processes rồi durable appends/batches;
+- cô lập hot auction;
+- hoặc dùng database có conditional transaction phù hợp.
+
+Nhưng chuyển công nghệ không loại bỏ nhu cầu một authoritative order.
+
+---
+
+#### 6. Khi nào cân nhắc database phân tán/NoSQL?
+
+Các lựa chọn như DynamoDB, Cassandra/Scylla hoặc distributed SQL/KV có thể phù hợp cho:
+
+- auction/bid volume rất lớn;
+- horizontal partitions được quản lý sẵn;
+- predictable key-based access;
+- multi-region/data-residency requirements;
+- high availability cần vượt khả năng một PostgreSQL cluster.
+
+Nhưng cần kiểm tra cụ thể:
+
+- conditional write/transaction semantics;
+- per-key throughput và hot-partition behavior;
+- ordering/range read theo auction sequence;
+- idempotency uniqueness;
+- cross-region consistency/latency;
+- backup/PITR/change stream;
+- transaction cost và operational expertise.
+
+NoSQL “scale ngang” không tự giải quyết hot auction. Nếu cùng `auction_id` là partition key, nó vẫn có per-partition ceiling. Random-shard bids để tăng write throughput lại làm winner/order cần coordination phức tạp hơn.
+
+Polyglot storage hợp lý theo access pattern:
+
+```text
+PostgreSQL/distributed transactional store → auction/result/order authority
+Search engine                            → discovery projection
+Redis                                    → cache/soft state
+Object storage                           → media
+Broker/event log                         → async propagation/replay
+Warehouse/lake                           → analytics
+```
+
+Không dùng polyglot persistence nếu team không đủ khả năng backup, monitor và khôi phục từng store.
+
+---
+
+#### 7. Redis: dùng đúng vai trò
+
+Redis phù hợp cho:
+
+- cache-aside listing/auction snapshots có version;
+- rate-limit counters;
+- ephemeral WebSocket connection/subscription registry;
+- short-lived eligibility/risk hints;
+- distributed pub/sub accelerator cho realtime;
+- sorted-set timer index như accelerator;
+- session state nếu security model cho phép;
+- hot read protection.
+
+Redis không nên là nguồn duy nhất cho:
+
+- accepted bid history;
+- current winner/final result;
+- idempotency evidence cần sống qua eviction/failover;
+- auction deadline;
+- payment ledger;
+- audit trail.
+
+##### Cache-aside pattern
+
+```text
+GET auction snapshot
+  ├─ cache hit with version → return
+  └─ miss → read authoritative/projection store
+           → populate with TTL/jitter
+```
+
+Sau commit, outbox/event invalidates hoặc updates cache. Tuy nhiên race vẫn có thể tạo stale cache, nên:
+
+- payload có auction version;
+- không ghi đè version mới bằng version cũ;
+- TTL + event invalidation;
+- single-flight chống stampede;
+- hot-key replication/local cache nếu cần;
+- bid authority luôn revalidate.
+
+##### Redis Pub/Sub versus durable broker
+
+Redis Pub/Sub nhanh nhưng subscriber offline có thể bỏ lỡ message. Nó phù hợp fast-path fan-out nếu client có snapshot/version recovery; không thay durable event bus/outbox cho payment, audit hoặc search rebuild.
+
+Redis keyspace expiration cũng không phải sole auction timer: notification có thể trễ/mất theo failure semantics. Dùng durable deadline + retry/reconciler.
+
+##### Distributed lock caveat
+
+Không nên biến một Redis lock thiếu fencing thành quyền tuyệt đối cập nhật winner. Lock lease có thể hết khi process pause, owner cũ thức dậy rồi ghi stale state. Nếu dùng lease/ownership, durable store phải kiểm tra monotonically increasing fencing token.
+
+---
+
+#### 8. Event broker và queue
+
+Transcript không nhắc broker cụ thể, nhưng HLD cần asynchronous propagation cho:
+
+- `BidAccepted` realtime/read models;
+- `AuctionFinalized` payment/order;
+- notifications;
+- search indexing;
+- analytics/fraud;
+- audit replication.
+
+##### Kafka/Pulsar-like event log
+
+Phù hợp khi cần:
+
+- throughput cao;
+- retained event stream và replay;
+- nhiều independent consumer groups;
+- per-partition order theo `auction_id`;
+- event-driven projections/analytics.
+
+Đánh đổi:
+
+- partition planning/rebalancing;
+- consumer lag/poison message/schema management;
+- operational burden hoặc managed-service cost;
+- hot auction có thể làm nóng một partition.
+
+##### Managed queues/pub-sub như SQS/SNS/cloud equivalents
+
+Phù hợp khi:
+
+- ưu tiên ít vận hành;
+- work-queue semantics;
+- retry/DLQ đơn giản;
+- throughput/order scope phù hợp service limits.
+
+Cần hiểu standard queue thường at-least-once và có thể out-of-order; FIFO/message-group order có throughput/hot-group trade-off.
+
+##### Chiến lược kết hợp
+
+- transactional outbox là durable handoff từ authority;
+- event log cho domain facts/replay/multi-consumer;
+- work queues riêng cho email, payment attempt, media jobs;
+- partition/channel isolation theo priority;
+- schema registry/compatibility và idempotent consumers.
+
+Không đặt event broker vào giữa request và commit chỉ vì “event-driven”. Nếu bid được ACK dựa trên message publish nhưng chưa có authoritative decision, semantics trở nên mơ hồ. Command log/actor architecture có thể hợp lệ, nhưng ACK chỉ sau durability/decision boundary đã định nghĩa.
+
+---
+
+#### 9. WebSocket infrastructure
+
+WebSocket được chọn vì server cần push low-latency, không phải vì nó là công nghệ “modern”.
+
+##### Components
+
+```text
+Client
+ → WebSocket-aware Load Balancer/Edge
+ → Regional Realtime Gateway Pool
+ → Connection/Subscription Registry (soft state)
+ ← Regional Fan-out Topics/Bus
+ ← Public-safe versioned auction events
+```
+
+##### Capacity controls
+
+- connection/memory/file-descriptor limits;
+- heartbeat/idle timeout;
+- authentication và subscription authorization;
+- bounded outbound buffer;
+- slow-client disconnect/resync;
+- deploy connection draining;
+- backoff/jitter reconnect;
+- snapshot/cursor recovery;
+- message compression chỉ khi CPU/bandwidth trade-off đáng giá;
+- per-connection/user/auction subscription quotas.
+
+##### Self-managed versus managed realtime
+
+| Lựa chọn | Ưu điểm | Đánh đổi |
+|---|---|---|
+| Gateway service trên Kubernetes/ECS | Kiểm soát protocol/cost/routing | Phải vận hành connections, drain, autoscale |
+| Managed WebSocket/API realtime | Ít quản lý connection layer | Giá, quotas, vendor model và fan-out integration |
+| Third-party realtime provider | Ra mắt nhanh, global network | Data/control/cost/lock-in và correctness integration |
+
+WebSocket update chỉ là derived delivery. Nếu gateway chết, client reconnect và repair gap; hệ thống không cố chuyển socket sống sang node khác.
+
+---
+
+#### 10. Timer và scheduler technology
+
+Một stack đại diện:
+
+```text
+PostgreSQL auction.effective_end_time = durable truth
+Sharded DB table/time buckets hoặc managed delayed work = due-work index
+Scheduler workers = at-least-once START/CLOSE command producers
+Redis sorted set/timing wheel = optional acceleration
+Overdue reconciler = safety net
+Auction authority = final deadline/state decision
+```
+
+Chọn theo:
+
+- số active timers và closes/s trong peak bucket;
+- required precision;
+- maximum supported delay;
+- reschedule frequency nếu soft close;
+- retry/dedup semantics;
+- regional failover;
+- quota/cost;
+- khả năng reconstruct index từ durable auction state.
+
+Không cần “exactly-once timer”. Cần at-least-once trigger + idempotent close transition + unique result. Timer có thể chạy trễ trong SLO, nhưng bid authority vẫn chặn bid theo effective deadline.
+
+---
+
+#### 11. Load balancer và traffic routing
+
+##### HTTP APIs
+
+L7 load balancer/API Gateway:
+
+- health checks;
+- TLS/policy;
+- path/host routing;
+- request/connection limits;
+- zonal balancing;
+- retries chỉ cho safe/idempotent operations;
+- graceful draining.
+
+Không tự động retry `POST bid` với một ID mới. Retry phải giữ cùng idempotency key; gateway không nên retry mù khi outcome không biết.
+
+##### Auction owner routing
+
+Sau stateless ingress, cần route theo `auction_id`:
+
+- consistent hashing tới partition;
+- metadata/directory service;
+- broker partition owner;
+- actor placement runtime.
+
+Owner change tăng epoch; stale owner bị durable store fence.
+
+##### WebSocket
+
+- hỗ trợ HTTP upgrade và long idle timeout;
+- connection affinity chỉ giúp socket tồn tại trên node đang giữ nó;
+- registry giúp event tìm đúng gateways;
+- failover yêu cầu client reconnect, không phải LB live-migrate connection.
+
+##### Multi-region
+
+Một pattern:
+
+```text
+User → nearest edge/realtime region
+Bid command → auction home region/owner
+Committed event → regional fan-out
+```
+
+Điều này giữ one-order semantics nhưng bidder xa có thêm latency. Active-active multi-writer cho cùng auction cần consensus/global serialization và phức tạp hơn nhiều; không chọn chỉ vì mục tiêu “global”.
+
+---
+
+#### 12. Containers, Kubernetes, serverless hay managed platform?
+
+##### Kubernetes
+
+Phù hợp khi:
+
+- nhiều long-running services;
+- cần custom networking/placement;
+- team có platform/SRE maturity;
+- cần scale pools độc lập;
+- hot-auction isolation/dedicated nodes.
+
+Chi phí:
+
+- cluster upgrades, networking, security, autoscaling và on-call;
+- resource requests/limits khó tune;
+- không tự sửa application-level backpressure/ownership.
+
+##### Managed containers/ECS-like platforms
+
+- ít control-plane vận hành hơn;
+- tốt cho stateless APIs/workers;
+- vẫn hỗ trợ service autoscaling;
+- phù hợp team nhỏ hơn.
+
+##### Serverless functions
+
+Tốt cho:
+
+- sporadic background jobs;
+- webhooks;
+- notifications/media transforms;
+- low-volume control operations.
+
+Cần thận trọng với:
+
+- long-lived WebSocket nếu không dùng managed connection gateway;
+- per-auction in-memory ownership;
+- cold starts gần deadline;
+- concurrency explosion làm quá tải DB/provider;
+- execution duration, ordering và cost ở sustained traffic.
+
+##### Managed services
+
+Managed PostgreSQL, Redis, broker, load balancer và object storage giảm undifferentiated operations, nhưng cần:
+
+- quota và failover semantics;
+- backup/restore test;
+- version/maintenance window;
+- observability/export;
+- egress/cross-region cost;
+- exit/portability plan theo business risk.
+
+---
+
+#### 13. Autoscaling: chọn đúng tín hiệu
+
+CPU là một tín hiệu, không phải toàn bộ câu trả lời.
+
+| Component | Scale signals phù hợp |
+|---|---|
+| HTTP/query service | RPS, p99 latency, CPU, concurrency |
+| Bid Ingress | admitted requests/s, routing latency, CPU |
+| Auction Authority | command queue age, p99 decision latency, active owners, partition load |
+| Realtime Gateway | connections, outbound bytes/s, buffer, event-loop lag, memory |
+| Fan-out workers | broker lag, oldest event age, deliveries/s |
+| Scheduler | due-work age, closes pending, finalization lag |
+| Payment workers | queue age, provider headroom/concurrency |
+| Notification workers | channel queue age, provider quota |
+| Search indexers | change-stream lag, bulk throughput |
+
+Autoscaling limitations:
+
+- scale-up có startup/warm-up delay;
+- một hot auction không chia được chỉ bằng thêm generic pods;
+- thêm consumers quá mức có thể làm DB/provider sập;
+- WebSocket connections không tự rebalance sang pod mới;
+- scale-down cần drain và ownership handoff;
+- queue-depth-only policy có thể gây oscillation;
+- cold starts nguy hiểm ở closing window.
+
+Vì auction có biết trước end times, nên kết hợp:
+
+```text
+reactive autoscaling
++ scheduled/preemptive scaling trước close waves
++ minimum warm capacity
++ N+1/AZ-failure headroom
++ downstream-aware caps
+```
+
+---
+
+#### 14. High availability và disaster recovery
+
+##### Compute
+
+- ít nhất nhiều instances/AZ cho stateless services;
+- anti-affinity/failure-domain spread;
+- health checks và graceful drain;
+- Pod/service disruption budgets phù hợp;
+- immutable deployment và fast rollback.
+
+##### Auction authority
+
+- replicated durable state;
+- single active owner per auction epoch;
+- consensus/lease + fencing;
+- deterministic/replayable recovery;
+- pause/queue hoặc reject có reason khi không thể bảo đảm correctness;
+- failover drills sát deadline.
+
+##### PostgreSQL
+
+- multi-AZ primary/standby;
+- synchronous/asynchronous replication theo RPO/latency trade-off;
+- automated failover nhưng application phải reconnect/retry idempotently;
+- backups + WAL/PITR;
+- restore verification;
+- read replicas không thay standby correctness semantics.
+
+##### Redis
+
+- cluster/replicas phù hợp soft-state availability;
+- chấp nhận cache loss và rebuild;
+- không để Redis loss làm mất winner/bids/timers;
+- thundering-herd protection khi cold cache.
+
+##### Broker
+
+- replicated topics/queues;
+- producer acknowledgement phù hợp;
+- consumer checkpoints;
+- replay và DLQ;
+- outbox retention đủ khi broker unavailable.
+
+##### Multi-region/DR
+
+- auction home region và data residency;
+- cross-region backup/replication;
+- RTO/RPO riêng cho bid path, read/search và analytics;
+- DNS/traffic failover;
+- owner epoch/fencing khi promote region;
+- reconcile bids/payment/events sau recovery;
+- không tuyên bố active-active nếu chưa giải quyết global ordering.
+
+---
+
+#### 15. Security technology decisions
+
+##### Authentication và authorization
+
+Hiệu chỉnh thuật ngữ:
+
+- **OAuth 2.0** chủ yếu là authorization framework;
+- **OpenID Connect (OIDC)** thêm identity/authentication layer;
+- access token chứng minh delegated access, không tự thay domain authorization.
+
+Triển khai:
+
+- managed/self-hosted IdP;
+- short-lived signed access tokens;
+- JWKS/key rotation và cached verification;
+- refresh-token protection/revocation policy;
+- MFA/step-up cho seller, payout và admin;
+- RBAC kết hợp object/attribute rules;
+- service/workload identity.
+
+##### Transport security
+
+Nói **TLS**, không dùng SSL cũ như chuẩn mục tiêu:
+
+- HTTPS/WSS từ client;
+- TLS/mTLS nội bộ tùy threat model;
+- certificate automation/rotation;
+- secure ciphers/protocol versions;
+- HSTS và secure cookie flags nếu dùng browser session.
+
+TLS bảo vệ data in transit nhưng không ngăn service được cấp quyền sai, SQL injection, bot hoặc dữ liệu bị log lộ.
+
+##### Secrets và dữ liệu
+
+- secret manager/KMS, không hard-code;
+- envelope encryption cho sensitive fields;
+- reserve/proxy max restricted access;
+- tokenized payment method;
+- signed, short-lived media URLs;
+- immutable/tamper-evident audit storage;
+- least privilege IAM và network segmentation;
+- dependency/container scanning và patch policy.
+
+##### Edge và application defense
+
+- WAF/DDoS protection;
+- hierarchical rate limiting;
+- bot/risk scoring;
+- CSRF protection nếu cookie auth;
+- validation/parameterized queries;
+- CSP/XSS controls;
+- verified provider webhooks;
+- admin access isolation và audit.
+
+---
+
+#### 16. Observability stack và SLOs
+
+Một stack đại diện:
+
+- OpenTelemetry cho traces/metrics/log correlation;
+- Prometheus-compatible metrics;
+- Grafana/managed dashboards;
+- centralized structured logs;
+- error tracking;
+- broker/database/cloud native telemetry;
+- paging/on-call và incident management.
+
+Quan trọng hơn product name là telemetry contract:
+
+##### Golden signals theo business path
+
+- bid decision p50/p95/p99;
+- accepted/rejected/duplicate/conflict rates;
+- per-auction command lag;
+- committed-after-deadline invariant alarm;
+- authority ownership/fencing changes;
+- outbox age và event lag;
+- commit-to-visible latency;
+- connections/reconnects/slow clients;
+- finalization lag;
+- payment unknown/reconciliation age.
+
+##### Cardinality/privacy
+
+Không đưa mọi `auction_id`, `user_id`, `bid_id` thành metric label vì cardinality nổ. Dùng:
+
+- metrics aggregated theo region/service/partition/tier;
+- sampled traces có correlation IDs;
+- searchable structured logs/audit với access/retention riêng;
+- targeted hot-auction diagnostic tooling;
+- không log access token, full payment data hoặc private proxy maximum.
+
+##### SLO-driven alerts
+
+Alert theo user/business impact như bid decision latency, close lag và payment stuck age; không chỉ CPU > 80%. Runbook phải chỉ ra degradation, retry/replay và recovery steps.
+
+---
+
+#### 17. Cost model
+
+Cloud pay-as-you-go không tự động rẻ. Cost drivers chính có thể là:
+
+- realtime egress: updates × watchers × regions;
+- WebSocket connection-hours;
+- Redis memory;
+- database provisioned IOPS/replicas/backups;
+- broker retention và cross-AZ traffic;
+- object storage/media CDN egress;
+- search cluster;
+- observability log/trace ingestion;
+- payment/SMS/email provider fees;
+- idle multi-AZ/multi-region headroom.
+
+Mô hình:
+
+```text
+Realtime cost
+≈ connection-hours
+ + delivered events × payload bytes
+ + cross-region replication/fan-out
+
+Bid storage cost
+≈ records/day × bytes/record × retention
+ × replication/index/backup amplification
+```
+
+Controls không làm hỏng correctness:
+
+- coalesce public display updates;
+- compact event payload;
+- CDN/object lifecycle;
+- tier cold bid/audit history;
+- sampling cho noncritical telemetry, không sample critical audit evidence;
+- autoscale workers theo lag nhưng giữ warm headroom;
+- budgets/quotas/tagging và unit-cost dashboard;
+- choose managed service dựa cả staff/on-call cost.
+
+Không scale down authority/storage dưới safe capacity chỉ để tiết kiệm gần closing wave.
+
+---
+
+#### 18. Representative production stack
+
+Một phương án minh họa, không phải đáp án duy nhất:
+
+```text
+Web UI              React/TypeScript + CDN
+HTTP Edge           Managed L7 Load Balancer + WAF + API Gateway
+Realtime Edge       WebSocket-aware LB + regional gateway service
+Backend             Java/Spring Boot hoặc Node.js/TypeScript services
+Auction authority   Partitioned owner/actor workers
+Transactional data  Managed PostgreSQL HA + connection pooler
+Cache/soft state    Redis Cluster
+Search              Elasticsearch/OpenSearch-like projection
+Event stream        Managed Kafka/Pulsar-like service
+Work queues         Managed queues cho payment/notification/media
+Timers              Durable time-bucket/job store + workers + reconciler
+Media               Object storage + CDN
+Identity            OIDC provider; OAuth 2.0 access tokens
+Payments            Tokenized hosted/provider APIs + verified webhooks
+Compute             Kubernetes hoặc managed containers; serverless workers có chọn lọc
+Observability       OpenTelemetry + metrics/dashboard/log/alert stack
+Secrets/keys        Cloud secret manager + KMS
+```
+
+Tại quy mô nhỏ, có thể thay Kafka, Kubernetes, search cluster và actor runtime bằng:
+
+- modular monolith;
+- PostgreSQL transaction + outbox/job tables;
+- Redis cache;
+- managed queue;
+- vài stateless instances và WebSocket gateway.
+
+Giữ semantics đúng rồi tách dần khi metrics chứng minh bottleneck.
+
+---
+
+#### 19. Requirement → strategic technology decision
+
+| Requirement/bottleneck | Decision đại diện | Tại sao | Guardrail |
+|---|---|---|---|
+| Bid correctness | PostgreSQL transaction/conditional update + per-auction owner | ACID, unique constraints, order boundary | Hot-key metrics, fencing, idempotency |
+| Low bid latency | Short synchronous path, pooled connections | Giảm hops và setup cost | Bounded pools, timeout budget |
+| Read-heavy browse | Redis/cache + search projection + CDN | Giảm primary load | Version, TTL, invalidation, authority recheck |
+| Durable event handoff | Transactional outbox + broker | Không mất event sau bid commit | Idempotent consumer, lag/DLQ |
+| 10k watchers/hot auction | WebSocket gateways + regional fan-out | Persistent push và horizontal delivery | Backpressure, coalescing, gap repair |
+| Millions active timers | Durable time buckets/jobs + reconciler | At-least-once scalable trigger | Authority deadline check, unique result |
+| Payment reliability | Provider idempotency + webhooks + reconciliation | External outcome không chắc chắn | Durable workflow, unknown state |
+| Horizontal compute | Containers/orchestrator | Scale service pools độc lập | Downstream-aware caps, drain |
+| Predictable close waves | Scheduled pre-scaling + warm headroom | Autoscaling phản ứng có thể quá chậm | Forecast plus reactive metrics |
+| Identity | OIDC/OAuth 2.0 + local token verification | Standard identity/delegation, giảm sync hop | Key rotation, object AuthZ |
+| In-transit protection | TLS/WSS | Mã hóa client/service traffic | Cert rotation, no secret logging |
+| HA | Multi-AZ replicas + fenced ownership | Chịu instance/zone failure mà không split brain | Failover/restore drills |
+| Operability | OpenTelemetry + SLO dashboards | Quan sát end-to-end và hot partitions | Cardinality/privacy controls |
+
+---
+
+#### 20. Những điểm hiệu chỉnh so với transcript đơn giản
+
+| Transcript đơn giản hóa | Cách hiểu production-oriented |
+|---|---|
+| React/Vue tạo UI realtime | Framework chỉ hỗ trợ UI; cần versioned state, reconnect và authoritative response semantics |
+| Node.js/Java hỗ trợ concurrency | Runtime không thay per-auction serialization, DB transaction hay fencing |
+| PostgreSQL lưu transactional data | Phải thiết kế transaction, indexes, idempotency, outbox, HA, pool và hot-row behavior |
+| Redis cache active auction | Chỉ là versioned derived state; không giữ winner/deadline/audit truth duy nhất |
+| Redis cũng giúp realtime | Pub/Sub có thể là fast path nhưng không thay durable broker và snapshot recovery |
+| Load balancer tránh server bottleneck | Không giải quyết DB/hot partition; live WebSocket vẫn reconnect khi node chết |
+| WebSocket lập tức notify mọi user | Cần regional fan-out, bounded buffers, coalescing, lag/gap recovery |
+| OAuth2 xác minh user | OIDC thường dùng cho authentication; OAuth 2.0 là authorization framework |
+| SSL/TLS bảo vệ credentials/payment | Dùng modern TLS; mã hóa transit không thay AuthZ, tokenization, app security |
+| Cloud pay-as-you-go trả đúng phần dùng | Vẫn có idle HA, egress, storage, observability và provider cost |
+| Autoscaling tự xử lý heavy auction | Có delay và không split hot key; cần pre-warm, isolation, headroom, backpressure |
+| Nhiều app instances tạo HA | Cần multi-AZ data, fenced owner, broker durability, retry/recovery drills |
+| Chọn product phổ biến là đủ | Cần evidence từ SLO/load/failure/cost và ADR có review trigger |
+
+---
+
+#### 21. ADR: ghi lại quyết định để không biến stack thành giáo điều
+
+Mỗi Architecture Decision Record nên có:
+
+```text
+Title: PostgreSQL làm authoritative auction store giai đoạn 1
+Context: volume, SLO, team skill, transaction/invariant
+Decision: schema/locking/version/outbox/HA pattern
+Alternatives: DynamoDB, distributed SQL, event-sourced actor
+Consequences: hot-row ceiling, operational/cost impact
+Metrics: p99 commit, conflict rate, hottest-auction QPS
+Review trigger: X QPS/key, Y ms p99, cluster/storage threshold
+Owner/date/status
+```
+
+Review trigger ví dụ:
+
+- per-auction lock/command wait vượt SLO;
+- database CPU/IO hoặc connection saturation kéo dài;
+- event lag làm realtime/payment vượt SLO;
+- Redis hot key hoặc memory vượt safe headroom;
+- gateway connection/egress cost vượt target;
+- multi-region/residency trở thành business requirement;
+- recovery drills không đạt RTO/RPO;
+- team operational burden lớn hơn lợi ích tự quản lý.
+
+Quyết định tốt là quyết định phù hợp hiện tại và biết lúc nào cần thay đổi.
+
+---
+
+#### 22. Cách trình bày bước 4 trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. React/Vue đều phù hợp, nhưng client phải giữ stable bid IDs, versioned auction state và reconnect/gap recovery.
+2. Java/Spring Boot hoặc Node.js đều dùng được; tôi chọn theo team, libraries và measured p99, không dựa vào ngôn ngữ để đảm bảo correctness.
+3. PostgreSQL là lựa chọn ban đầu cho auction/result/order authority nhờ ACID, unique constraints, version/lock và transactional outbox.
+4. Bid path route theo auction tới một owner; database conditional transaction/fencing giữ order và chặn stale writer.
+5. Redis cache listing/snapshot, rate limits và connection registry; nó không giữ canonical winner/bid/deadline.
+6. Outbox phát domain events vào Kafka/Pulsar-like log hoặc managed pub/sub; downstream consumers at-least-once và idempotent.
+7. Regional WebSocket gateway pools fan-out public-safe versioned updates, có backpressure, coalescing và snapshot repair.
+8. Durable timer index/job queue phát close command; authority finalize idempotently; reconciler sửa timer bị lỡ.
+9. Payment provider dùng tokenization, idempotency, verified webhooks và reconciliation.
+10. HTTP và WebSocket load balancing khác nhau; WebSocket failover cần client reconnect.
+11. Containers/Kubernetes hoặc managed compute scale từng pool; metrics gồm queue age, connections và decision latency, không chỉ CPU.
+12. Scheduled pre-scaling và warm multi-AZ headroom bảo vệ close waves; autoscaling không giải quyết hot key tức thì.
+13. OIDC xử lý authentication, OAuth 2.0 delegated authorization; TLS/WSS mã hóa transit và services vẫn enforce object AuthZ.
+14. OpenTelemetry/metrics/logs theo dõi từ bid request tới result/payment với cardinality/privacy controls.
+15. Mỗi lựa chọn có ADR và review trigger dựa trên SLO, failure drills, cost và team maturity.
+
+---
+
+#### 23. Tech & infra checklist
+
+- [ ] Frontend có pending/accepted state, stable request ID và server-version merge?
+- [ ] Countdown dùng server time offset và không quyết định eligibility?
+- [ ] Backend runtime được load/profile theo workload thực?
+- [ ] Số runtime/framework có phù hợp team/on-call?
+- [ ] Authoritative store cung cấp transaction/conditional write/unique constraints?
+- [ ] Per-auction lock/version/owner và hot-key ceiling được đo?
+- [ ] Money type, schema, indexes, partition/tiering hợp lý?
+- [ ] Connection pools bounded và tổng DB connections không vượt safe limit?
+- [ ] HA replicas, PITR, backup và restore drill?
+- [ ] Redis chỉ chứa cache/soft state và có rebuild plan?
+- [ ] Cache version/invalidation/TTL jitter/stampede protection?
+- [ ] Redis Pub/Sub failure semantics được chấp nhận nhờ snapshot recovery?
+- [ ] Outbox và event broker retention/order/partition/schema?
+- [ ] Consumers idempotent, retry/DLQ/replay/reconcile?
+- [ ] WebSocket LB/gateway capacity, drain, buffer và reconnect policy?
+- [ ] Subscription AuthZ, public/private event separation và gap repair?
+- [ ] Durable timer index, retry, reconciler và soft-close reschedule?
+- [ ] Payment tokenization, idempotency, webhook verification và unknown outcome?
+- [ ] Autoscaling dùng đúng metric theo component?
+- [ ] Warm capacity/pre-scaling và AZ-failure headroom?
+- [ ] Scale-out caps bảo vệ DB/broker/provider?
+- [ ] Multi-region có home authority/fencing/data residency?
+- [ ] OIDC/OAuth terminology và domain AuthZ đúng?
+- [ ] TLS/WSS/cert rotation/secrets/KMS/IAM/network controls?
+- [ ] SLO metrics/traces/logs có cardinality và privacy policy?
+- [ ] Cost model tính connection-hours, egress, replicas, broker và telemetry?
+- [ ] Managed versus self-managed đã tính cả staff/on-call cost?
+- [ ] ADR ghi alternatives, consequences, owner và review trigger?
+
+---
+
+#### 24. Ý chính cần nhớ
+
+- Technology follows architecture and invariants, không ngược lại.
+- React/Vue quyết định developer/UI experience, không quyết định bid correctness.
+- Node.js và Java đều có thể scale; ownership, storage transaction và failure semantics quan trọng hơn.
+- PostgreSQL là lựa chọn mạnh cho transactional authority nếu thiết kế lock/version, idempotency, outbox và HA đúng.
+- Read replicas không được dùng để quyết định bid trên state có thể stale.
+- Sharding tăng aggregate capacity nhưng không tự chia một hot auction.
+- Redis phù hợp cache/rate limit/connection registry, không phải winner/payment/audit truth.
+- Redis Pub/Sub nhanh nhưng không durable; versioned snapshot sửa gap.
+- Redis lease không có fencing có thể cho stale owner ghi sai.
+- Durable broker hỗ trợ fan-out/replay; delivery vẫn thường at least once.
+- Transactional outbox đóng dual-write gap giữa authority store và event bus.
+- WebSocket infrastructure phải xử lý connections, egress, slow clients, drain và reconnect.
+- Timer chỉ cần at-least-once trigger; close transition/result phải idempotent.
+- Load balancer không sửa hot database key và không live-migrate WebSocket.
+- Kubernetes cung cấp orchestration, không tự cung cấp backpressure hay application correctness.
+- Serverless phù hợp selective background work; thận trọng với long-lived ownership/connections và downstream concurrency.
+- Autoscale theo command/queue age, latency, connections và provider headroom, không chỉ CPU.
+- Close times cho phép pre-scale; luôn giữ warm capacity và failure headroom.
+- OAuth 2.0 là authorization framework; OIDC thường cung cấp authentication.
+- Dùng modern TLS/WSS; mã hóa transit chỉ là một lớp của defense in depth.
+- Cloud pay-as-you-go vẫn có egress, idle HA, storage và operational cost.
+- Observability cần business correctness metrics, không chỉ infrastructure metrics.
+- Mỗi technology decision cần trade-off, failure model, owner và review trigger.
+- Kiến trúc tốt nối **requirement → capability → measured technology choice → guardrail → evolution trigger**.
+
+#### Công thức ghi nhớ
+
+> **Auction technology strategy = transactional fenced authority + versioned Redis acceleration + durable outbox/event transport + reconnectable WebSocket fan-out + at-least-once timers + idempotent payment integration + workload-aware autoscaling + multi-AZ observable recovery.**
+
+---
+
+### Bài 92. The Final Design — Auction Platform
+
+#### 1. Kết quả cuối cùng cần đạt được
+
+Final design không chỉ ghép các box API Gateway, Redis, database và WebSocket. Nó phải chứng minh được năm tính chất:
+
+1. **Correct bid decision:** concurrent bids của cùng auction được phân xử theo một authoritative order.
+2. **Deterministic closing:** bid và close command cạnh tranh tại cùng boundary; không có late bid hoặc hai winners.
+3. **Low-latency experience:** accepted state được push nhanh tới hàng nghìn watchers mà không kéo fan-out vào bid transaction.
+4. **Recoverability:** retry, duplicate event, gateway failure, missed timer và payment timeout đều có đường hội tụ.
+5. **Auditability:** kết quả có thể giải thích từ rule version, ordered bid evidence, authority epoch và final result.
+
+Kiến trúc phải phục vụ cả:
+
+- khoảng 1 triệu active listings theo giả định;
+- read-heavy browse/search;
+- conservative scenario 10 triệu bids/ngày;
+- hot auction có 10.000 watchers;
+- close-time burst và external payment failures.
+
+---
+
+#### 2. Sơ đồ kiến trúc hoàn chỉnh
+
+```text
+┌──────────────────────────── Clients ────────────────────────────┐
+│ Web / Mobile                                                    │
+│ - HTTP commands/queries     - WebSocket subscriptions           │
+└───────────────┬─────────────────────────────┬────────────────────┘
+                │ HTTPS                       │ WSS
+                ▼                             ▼
+      ┌───────────────────┐       ┌─────────────────────────┐
+      │ CDN / WAF / HTTP  │       │ Realtime Edge / LB      │
+      │ API Gateway       │       │ WebSocket Gateways      │
+      └─────────┬─────────┘       └───────────┬─────────────┘
+                │                             │
+       ┌────────┼───────────────┐             │ subscription registry
+       │        │               │             ▼
+       ▼        ▼               ▼        ┌───────────────┐
+ ┌──────────┐ ┌───────────┐ ┌─────────┐  │ Redis/soft   │
+ │Identity/ │ │Listing &  │ │Auction  │  │ realtime     │
+ │User      │ │Search     │ │Query/   │  │ state        │
+ └──────────┘ └─────┬─────┘ │Control  │  └───────────────┘
+                    │       └────┬────┘
+                    │            │ commands
+                    │            ▼
+                    │      ┌──────────────┐       ┌─────────────────┐
+                    └─────>│ Bid Ingress  │──────>│ Auction Authority│
+                           └──────────────┘ route │ partition/owner │
+                                                 └────────┬────────┘
+                                                          │ atomic commit
+                         ┌────────────────────────────────┼───────────────┐
+                         ▼                                ▼               ▼
+                  ┌─────────────┐                 ┌────────────┐  ┌──────────┐
+                  │Auction/Bid  │                 │Idempotency │  │ Outbox   │
+                  │DB of record │                 │/Result     │  │ records  │
+                  └─────────────┘                 └────────────┘  └────┬─────┘
+                                                                        │ relay
+                                                                        ▼
+                                                             ┌──────────────────┐
+                                                             │ Durable Event Bus│
+                                                             └──────┬───────────┘
+                  ┌─────────────────┬──────────────────┬─────────────┼────────────┐
+                  ▼                 ▼                  ▼             ▼            ▼
+          ┌──────────────┐  ┌──────────────┐  ┌────────────┐ ┌────────────┐ ┌─────────┐
+          │Realtime      │  │Notification  │  │Payment/    │ │Search/Read │ │Risk/    │
+          │Fan-out       │  │Workers       │  │Order Saga  │ │Projections │ │Audit/BI │
+          └──────┬───────┘  └──────────────┘  └─────┬──────┘ └────────────┘ └─────────┘
+                 │                                   │
+                 └────────> WebSocket Gateways       ▼
+                                               ┌──────────────┐
+                                               │Payment       │
+                                               │Provider      │
+                                               └──────────────┘
+
+ Durable Timer Index / Scheduler ── START/CLOSE commands ──> Auction Authority
+ Overdue Reconciler             ── repair missed timers ───> Auction Authority
+
+ Listing Media ── direct upload ──> Object Storage ──> CDN
+```
+
+Ba loại giao tiếp cùng tồn tại:
+
+- **synchronous API** cho query và bid decision cần phản hồi ngay;
+- **asynchronous events/queues** cho derived workflows sau commit;
+- **WebSocket push** cho trải nghiệm realtime, với snapshot recovery.
+
+---
+
+#### 3. Các plane và nguồn sự thật
+
+| Plane | Thành phần | Vai trò | Có phải source of truth? |
+|---|---|---|---|
+| Edge plane | CDN, WAF, API Gateway, realtime LB | Bảo vệ, route, admission | Không |
+| Identity plane | IdP/OIDC, User Service | Identity/profile/account status | Có cho identity domain |
+| Query plane | Listing, Search, Auction Query, Redis | Browse và read-optimized views | Không cho bid/winner |
+| Command plane | Bid Ingress, Auction Control, Scheduler | Nhận/route commands | Chưa, cho tới authority commit |
+| Decision plane | Auction Authority | Order, validate, commit bid/lifecycle/result | Có |
+| Event plane | Outbox, broker | Durable propagation của committed facts | Event copy/replay, không tự sửa authority |
+| Realtime plane | Fan-out, gateways, subscription registry | Đưa updates tới connections | Không |
+| Workflow plane | Payment, Notification, Search indexer | Side effects/derived state | Có trong domain riêng như payment |
+| Evidence plane | Bid log, result, audit | Dispute/reconstruction/compliance | Có cho evidence tương ứng |
+
+Một nguyên tắc ngắn:
+
+> Redis, search index, WebSocket event và email đều có thể sai hoặc chậm tạm thời; auction authority cùng durable bid/result evidence không được mơ hồ.
+
+---
+
+#### 4. Service ownership cuối cùng
+
+##### Identity/User
+
+- user/profile, buyer/seller verification và account status;
+- OIDC/OAuth integration, MFA/step-up;
+- device/session references;
+- suspension/risk signals và payout references.
+
+##### Listing
+
+- item content, category, condition và seller ownership;
+- media metadata/references;
+- moderation/content version;
+- không sở hữu current bid hoặc auction lifecycle.
+
+##### Search/Discovery
+
+- search/filter/rank trên eventual projections;
+- index từ listing/auction events;
+- stale result được authority revalidate khi user hành động.
+
+##### Auction Control/Query
+
+- create/schedule/cancel API;
+- validate rule configuration;
+- expose snapshot/read models;
+- gửi lifecycle commands tới authority;
+- không independently update winner/state ngoài authority.
+
+##### Bid Ingress
+
+- authenticate context, validate payload, quota và route;
+- scale stateless;
+- không dùng cache read rồi tự quyết định bid.
+
+##### Auction Authority
+
+- single logical writer per auction epoch;
+- serialize bid/start/extend/cancel/close;
+- deadline/rule/eligibility/idempotency checks;
+- atomic bid/state/result/outbox commit;
+- per-auction sequence, version và fencing.
+
+##### Scheduler/Reconciler
+
+- tìm timers đến hạn và phát commands at least once;
+- phát lại missed work;
+- không tự chọn winner.
+
+##### Realtime
+
+- connection/subscription lifecycle;
+- public/private event transformation;
+- regional/gateway fan-out;
+- backpressure, coalescing, reconnect và gap repair.
+
+##### Payment/Order
+
+- obligation từ unique auction result;
+- provider integration, webhook, retry và reconciliation;
+- sở hữu payment state, không thay auction result.
+
+##### Notification
+
+- outbid/won/lost/payment messages;
+- preference, priority, channel isolation, retry và dedup;
+- không nằm trên correctness path.
+
+##### Risk/Audit/Analytics/Admin
+
+- inline eligibility/risk gate tối thiểu;
+- async fraud/shill/bot analysis;
+- immutable evidence và controlled override;
+- BI/operational insights không gây backpressure lên bid commit.
+
+---
+
+#### 5. Data ownership cuối cùng
+
+| Dữ liệu | Owner/write authority | Read acceleration |
+|---|---|---|
+| User/account status | Identity/User Service | Token claims, local/versioned cache |
+| Listing content | Listing Service | CDN, Redis, search index |
+| Auction rules/lifecycle | Auction Authority | Auction query projection/cache |
+| Accepted bid order | Auction Authority | Bid-history projection |
+| Current price/leader | Auction Authority | Versioned snapshot/cache/realtime event |
+| Auction result | Auction Authority | Result/order projections |
+| Durable watch preference | Watch/User-facing domain | Cache/query view |
+| Active WebSocket subscription | Realtime Gateway/soft registry | Redis-like TTL registry |
+| Payment/order | Payment/Order Service | Payment query projection |
+| Media object | Object storage + Listing metadata owner | CDN |
+| Search document | Search Service | Search cluster itself, rebuildable |
+| Audit evidence | Audit/evidence store | Restricted investigation index |
+
+Không chia sẻ một database rồi để mọi service tự cập nhật mọi bảng. Dù deployment ban đầu là modular monolith, ownership logic vẫn phải rõ.
+
+---
+
+#### 6. Luồng 1 — Seller tạo auction
+
+```text
+1. Seller tạo listing và direct-upload media qua upload intent.
+2. Listing Service validate metadata, ownership và moderation state.
+3. Seller gọi POST /auctions với listing_id/version và auction rules.
+4. Auction Control xác thực seller, time/rule/currency/reserve/increment.
+5. Auction aggregate được durable tạo ở DRAFT/SCHEDULED với rule version.
+6. Outbox phát AuctionScheduled.
+7. Timer index đăng ký start/effective-end deadlines.
+8. Search/read projections cập nhật bất đồng bộ.
+9. Client nhận auction_id, state, version và authoritative times.
+```
+
+Rule ảnh hưởng bidding trở thành immutable hoặc chỉ thay đổi qua versioned transition theo policy. Listing content cần lưu version/snapshot đủ để xử lý tranh chấp về sau.
+
+Failure handling:
+
+- client retry create dùng idempotency key;
+- outbox bảo đảm timer/search event không mất sau DB commit;
+- timer index có thể rebuild từ durable auctions;
+- media orphan được lifecycle cleanup nếu listing creation không hoàn tất.
+
+---
+
+#### 7. Luồng 2 — Buyer mở trang và theo dõi auction
+
+```text
+Client
+  ├─ GET listing/search projection
+  ├─ GET auction snapshot(version=N, server_time, effective_end_time)
+  └─ WebSocket SUBSCRIBE(auction_id, last_seen_version=N)
+         │
+         ├─ authorize visibility/subscription quota
+         ├─ register connection/gateway lease
+         └─ replay N+1... hoặc yêu cầu refetch nếu có gap
+```
+
+Client merge rules:
+
+- event version `≤ local` → duplicate/stale, bỏ qua;
+- event version `= local + 1` → apply;
+- event version `> local + 1` → gap repair;
+- reconnect → resubscribe bằng last seen version/cursor;
+- countdown dựa trên server-time offset nhưng chỉ mang tính UX.
+
+Search result có thể nói auction còn active trong khi authority vừa đóng. Detail/bid request phải dựa trên authoritative/versioned state mới hơn.
+
+---
+
+#### 8. Luồng 3 — Đặt bid thành công
+
+```text
+Client
+  │ POST /auctions/{id}/bids
+  │ Idempotency-Key: stable logical bid ID
+  ▼
+WAF/API Gateway
+  │ token validation, coarse bot/rate controls
+  ▼
+Bid Ingress
+  │ schema/money/currency, auction+bidder quota, route by auction_id
+  ▼
+Auction Authority(owner_epoch=E)
+  │
+  ├─ fence epoch E
+  ├─ lookup idempotency key + payload hash
+  ├─ verify ACTIVE and authority_time < effective_end_time
+  ├─ verify bidder eligibility/self-bid/risk policy
+  ├─ verify amount/increment/proxy rule
+  ├─ assign auction_sequence/version N+1
+  └─ atomic durable commit:
+       Bid + AuctionState + IdempotencyResponse + Outbox(BidAccepted)
+  │
+  ├─ return ACCEPTED(version=N+1) to client
+  └─ outbox relay publishes event at least once
+```
+
+Sau commit:
+
+```text
+BidAccepted
+  ├─ public realtime state change → watchers
+  ├─ private leading/outbid event → affected users
+  ├─ cache/query projection update
+  ├─ fraud/analytics processing
+  └─ audit/evidence replication
+```
+
+Bid response không chờ fan-out, email hoặc analytics. Nếu response mất sau commit, retry cùng key trả lại canonical accepted result.
+
+---
+
+#### 9. Luồng 4 — Hai bid cạnh tranh
+
+Giả sử A và B cùng đọc price 100 rồi gửi 110 và 120:
+
+```text
+A: PLACE_BID(110) ─┐
+                    ├─> same auction mailbox/authority
+B: PLACE_BID(120) ─┘
+
+Authoritative order ví dụ:
+sequence 501: A=110 accepted
+sequence 502: B=120 accepted
+```
+
+Hoặc nếu B được authority nhận/commit trước:
+
+```text
+sequence 501: B=120 accepted
+sequence 502: A=110 rejected BID_TOO_LOW
+```
+
+Điều quan trọng không phải client timestamp mà là policy admission/order tại authority.
+
+Nếu dùng optimistic database writes:
+
+1. cả hai đọc version 500;
+2. một conditional update thắng và tạo version 501;
+3. request còn lại conflict;
+4. authority reload state rồi re-evaluate, không tự động coi là failure;
+5. kết quả mới có thể accepted hoặc rejected theo amount/rule.
+
+Không broadcast optimistic winner trước durable commit vì client có thể thấy trạng thái phải rollback.
+
+---
+
+#### 10. Luồng 5 — Realtime fan-out cho hot auction
+
+```text
+Canonical BidAccepted(version=502)
+       ▼
+Public Event Projector
+  - bỏ PII/reserve/proxy max
+  - tạo compact AuctionStateChanged
+       ▼
+Durable/Regional Fan-out Topics
+       ▼
+Subscription Index
+  auction_id → gateway shards in regions
+       ▼
+Gateway workers → up to 10.000+ watcher connections
+```
+
+Để tránh một bid transaction bị khuếch đại thành synchronous 10.000 sends:
+
+- canonical event được publish một lần;
+- fan-out shard theo region/gateway;
+- serialize payload theo cohort thay vì mỗi user nếu payload giống nhau;
+- coalesce intermediate **display** updates trong cửa sổ nhỏ khi cần;
+- ưu tiên final/extended/outbid events;
+- bounded outbound queues;
+- slow client bị drop/disconnect rồi snapshot-resync;
+- đo commit-to-visible p99 và delivery egress.
+
+Coalescing chỉ áp dụng derived UI state. Accepted bid log và per-auction sequence vẫn giữ đầy đủ.
+
+---
+
+#### 11. Luồng 6 — Bid cuối cùng cạnh tranh với close
+
+Tình huống quan trọng nhất:
+
+```text
+PLACE_BID X ─┐
+             ├─> same auction authority/serialized stream
+CLOSE T ─────┘
+```
+
+Authority dùng `effective_end_time`, authority clock/admission policy, state version và owner epoch.
+
+##### Trường hợp bid hợp lệ trước boundary
+
+```text
+sequence 900: Bid X accepted
+sequence 901: Close command finalizes X/current leader
+```
+
+##### Trường hợp close thắng hoặc bid tới muộn
+
+```text
+sequence 900: Close command → state ENDED + result committed
+sequence 901: Bid X → reject AUCTION_CLOSED
+```
+
+Scheduler có thể phát command muộn, nhưng authority vẫn không nhận bid sau authoritative deadline. Ngược lại, một close trigger đến sớm phải no-op/reschedule nếu chưa tới effective end time.
+
+Nếu soft close:
+
+- accepted bid trong extension window atomically tăng `effective_end_time`;
+- phát `AuctionEndTimeExtended` với version mới;
+- old timer command mang version/end time cũ bị no-op;
+- client countdown cập nhật từ versioned event.
+
+---
+
+#### 12. Luồng 7 — Finalization
+
+```text
+Timer Index → Scheduler → CLOSE_AUCTION
+                           ▼
+                    Auction Authority
+                      ├─ check state/time/epoch
+                      ├─ fence further bids
+                      ├─ determine reserve outcome
+                      ├─ bind winner/winning bid/final price
+                      └─ atomic commit:
+                           Auction ENDED/SOLD/UNSOLD
+                           unique AuctionResult
+                           Outbox AuctionFinalized
+```
+
+`AuctionFinalized` dẫn tới:
+
+- realtime final state;
+- winner/loser/seller notifications;
+- search/listing projection update;
+- payment/order obligation nếu `SOLD`;
+- audit/analytics;
+- timer cleanup.
+
+Các downstream effects dedup theo `auction_result_id`, không chỉ kỳ vọng close event không lặp.
+
+Periodic overdue reconciler tìm:
+
+```text
+state ∈ {SCHEDULED, ACTIVE, CLOSING}
+AND relevant_deadline < now
+AND transition chưa hoàn tất
+```
+
+rồi phát lại command. Nó sửa missed timer nhưng không sửa trực tiếp winner.
+
+---
+
+#### 13. Luồng 8 — Payment và fulfillment handoff
+
+```text
+AuctionFinalized(result_id, winner, final_amount)
+        ▼
+Payment/Order Service
+  ├─ dedup result_id
+  ├─ create order/payment obligation
+  ├─ call provider with stable idempotency key
+  └─ persist state before/after external attempt
+        │
+        ├─ immediate response
+        ├─ verified provider webhook
+        └─ reconciliation query
+                    ▼
+      PENDING / AUTHORIZED / PAID / FAILED / UNKNOWN / REFUNDED
+                    │
+                    ├─ Notification
+                    ├─ Seller fulfillment handoff
+                    └─ Dispute/manual review
+```
+
+Rules:
+
+- provider timeout → `UNKNOWN`, không charge lại mù quáng;
+- webhook có thể duplicate/out-of-order;
+- verify signature và replay window;
+- state transition conditional/versioned;
+- internal ledger/evidence đối soát với provider;
+- raw card data không đi qua auction service;
+- payment failure không thay đổi bid history;
+- winner-nonpayment policy là workflow/product rule riêng.
+
+---
+
+#### 14. Durable boundaries và delivery semantics
+
+| Boundary | Khi nào được coi là thành công? | Retry/dedup key |
+|---|---|---|
+| Create auction | Aggregate + outbox durable commit | Client idempotency key |
+| Place bid | Bid/state/idempotency/outbox commit | Bid request ID + payload hash |
+| Publish event | Broker durable acknowledgement theo policy | Event ID |
+| Realtime display | Best-effort delivery; client version hội tụ | Auction version/event ID |
+| Close auction | Unique result + state + outbox commit | Auction ID + close/result version |
+| Create payment | Payment obligation durable | Auction result ID |
+| Provider request | Provider accepts idempotent request | Provider request key |
+| Webhook | Verified status event persisted/applied | Provider event ID |
+| Notification | Logical delivery/attempt tracked | Event + recipient + channel/business key |
+
+Không có một end-to-end global exactly-once mechanism. Mỗi boundary dùng at-least-once retry cộng idempotency/conditional transition để tạo **effectively-once business effects**.
+
+---
+
+#### 15. Cache và projection strategy
+
+##### Cache được phép tăng tốc
+
+- listing/detail content;
+- active-auction snapshot có version và TTL ngắn;
+- search/category results;
+- user watchlist projection;
+- connection/subscription routing;
+- rate-limit/risk hints.
+
+##### Cache không được quyết định
+
+- bid có đạt minimum/current rule không;
+- bid còn trước deadline không;
+- winner/final result;
+- payment đã settle chưa;
+- admin/audit truth.
+
+Cache flow:
+
+```text
+Query → cache hit(version) → response
+      → miss → projection/authority read → populate TTL+jitter
+
+Committed event → update/invalidate only if incoming version newer
+```
+
+Controls:
+
+- single-flight/request coalescing;
+- stale-while-revalidate cho noncritical reads;
+- local/regional cache cho hot keys;
+- negative caching;
+- thundering-herd limits;
+- Redis loss → rebuild, không mất canonical state;
+- read replica/search/cache lag metrics.
+
+---
+
+#### 16. Scaling strategy
+
+##### Scale ngang dễ dàng
+
+- API Gateway/Bid Ingress;
+- Listing/Search query services;
+- WebSocket gateway pools;
+- regional fan-out workers;
+- notification/search/analytics consumers;
+- payment workers trong provider limits.
+
+##### Scale theo partition/ownership
+
+- Auction Authority partitioned theo `auction_id`;
+- event topics keyed theo `auction_id`;
+- bid history partitioned/bucketed theo auction + sequence;
+- timer buckets sharded theo due time + shard.
+
+##### Hot auction
+
+- pin/pre-warm dedicated owner;
+- reserve compute/DB/broker/fan-out headroom;
+- route ổn định, tránh rebalance gần close;
+- per-auction admission/fair scheduling;
+- compact commit path;
+- fan-out tách region/gateway;
+- coalesce display events;
+- isolate noisy auction/tenant;
+- theo dõi per-auction command lag, không chỉ cluster average.
+
+Không thể split authoritative writes của một hot auction tùy ý sang nhiều owners mà vẫn giữ order. Nếu per-key sequential capacity không đủ, cần thay representation/processing engine, batching phù hợp semantics hoặc admission policy—không chỉ thêm pods.
+
+---
+
+#### 17. Availability và failure recovery
+
+| Sự cố | Hệ thống phản ứng |
+|---|---|
+| HTTP/API instance chết | Load balancer route request mới tới instance khỏe |
+| WebSocket gateway chết | Existing sockets đóng; clients reconnect/resubscribe/resync |
+| Bid response bị mất | Client retry cùng ID; authority trả same decision |
+| Auction owner chết | Partition ownership failover; epoch tăng; stale owner bị fence |
+| DB primary failover | Requests timeout/retry idempotently; new primary giữ committed data theo RPO semantics |
+| Redis mất | Cache/registry rebuild; DB/event truth còn; chống stampede |
+| Broker ngừng tạm thời | Outbox tích lại; bid commit theo capacity policy; publish sau hồi phục |
+| Consumer lỗi | Retry/DLQ/replay; không rollback canonical bid |
+| Realtime lag | UI chậm; version gap/refetch giúp hội tụ |
+| Timer bị mất/lặp | Scheduler retry + reconciler; authority close idempotently |
+| Payment provider lỗi | Queue/backoff/circuit/reconciliation; result vẫn durable |
+| Notification provider lỗi | Channel queue retry/DLQ; auction không bị ảnh hưởng |
+| Zone mất | Multi-AZ service/data failover với warm headroom |
+| Region mất | Promote/failover theo home-authority/fencing plan và RTO/RPO |
+
+Availability hierarchy khi quá tải:
+
+1. bảo vệ auction authority và finalization;
+2. giữ bid response và authoritative snapshot;
+3. coalesce/degrade realtime intermediate updates;
+4. trì hoãn search refresh/notifications/analytics;
+5. không bỏ durability, deadline hoặc fencing để lấy throughput.
+
+---
+
+#### 18. Multi-region model
+
+Một mô hình dễ giải thích và giữ correctness:
+
+```text
+Client kết nối region gần nhất
+        │
+        ├─ reads/media/realtime edge tại region gần
+        │
+        └─ bid command route tới Auction Home Authority
+                         │
+                         ├─ commit ordered state
+                         └─ replicate event tới regional fan-out
+```
+
+Trade-off:
+
+- user xa home region chịu thêm bid latency;
+- đổi lại có một order/winner rõ ràng;
+- regional WebSocket delivery vẫn gần người dùng;
+- auction ownership có thể placement theo seller/market/audience trước khi active;
+- không migrate owner gần deadline trừ failure bắt buộc;
+- cross-region failover dùng epoch/fencing và reconciliation.
+
+Active-active multi-writer cho cùng auction cần global consensus/serialization. Nếu không có, network partition có thể tạo hai leaders và hai winner candidates. “Global platform” không đồng nghĩa “mọi region được ghi cùng auction độc lập”.
+
+---
+
+#### 19. Security và trust trong final design
+
+##### Edge
+
+- DDoS/WAF, bot detection và hierarchical rate limits;
+- TLS/WSS;
+- request/body limits và abuse reputation;
+- credential stuffing protection.
+
+##### Identity/domain
+
+- OIDC authentication, OAuth 2.0 access delegation;
+- MFA/step-up;
+- object-level AuthZ tại service;
+- self-bid/related-account/eligibility rules;
+- account/device/session risk and revocation.
+
+##### Bid integrity
+
+- stable idempotency key + payload hash;
+- per-auction order/version;
+- owner epoch/fencing;
+- server-authoritative time;
+- signed service identity và least privilege;
+- private reserve/proxy fields không phát public.
+
+##### Data/payment
+
+- encryption at rest, KMS/secrets rotation;
+- tokenized/hosted payment;
+- verified webhook;
+- data minimization và retention;
+- protected backups/audit.
+
+##### Marketplace trust
+
+- bot/shill/collusion signals;
+- velocity/device/account graph;
+- admin override approval/audit;
+- dispute evidence reconstruct được;
+- không xóa/sửa âm thầm accepted bid history.
+
+API Gateway authentication là lớp đầu, không phải lớp duy nhất. Mỗi domain service vẫn kiểm tra quyền trên object/action hiện tại.
+
+---
+
+#### 20. Observability và vận hành
+
+##### Bid correctness SLOs
+
+- bid decision latency/error rate;
+- accepted-after-deadline count phải bằng 0;
+- conflicting result count phải bằng 0;
+- dedup/idempotency hit;
+- stale-owner fencing rejection;
+- per-auction command queue age;
+- durable commit latency.
+
+##### Realtime SLOs
+
+- commit-to-visible p50/p95/p99;
+- event/broker lag;
+- deliveries và egress/s;
+- connections, reconnect, resubscribe và gap repair;
+- slow-client disconnect/coalescing;
+- hottest-auction watcher/fan-out load.
+
+##### Lifecycle/payment SLOs
+
+- deadline-to-finalization lag;
+- overdue auctions;
+- duplicate close attempts versus effects;
+- payment pending/unknown oldest age;
+- provider quota/latency/errors;
+- webhook/reconciliation mismatch.
+
+##### Correlation
+
+```text
+request_id
+ → bid_request_id
+ → auction_id + sequence/version + owner_epoch
+ → bid_id + event_id
+ → realtime display version
+ → auction_result_id
+ → order/payment/provider IDs
+```
+
+Metrics tránh high-cardinality IDs; logs/traces/audit dùng restricted searchable storage với sampling/retention phù hợp. Critical evidence không được sample mất.
+
+##### Runbooks/drills
+
+- hot-auction overload;
+- owner failover sát deadline;
+- Redis cold-cache recovery;
+- broker lag/outbox buildup;
+- WebSocket reconnect storm;
+- closing storm;
+- payment provider outage;
+- database restore/PITR;
+- regional failover và fencing validation.
+
+---
+
+#### 21. Requirement → final architectural decision
+
+| Requirement | Final decision |
+|---|---|
+| Secure buyer/seller access | OIDC identity, short-lived tokens, domain AuthZ và MFA/risk controls |
+| Item listing/discovery | Listing authority + object storage/CDN + eventual search projection |
+| Low-latency bid decision | Short HTTP/command path tới partitioned Auction Authority |
+| Concurrent bid correctness | Per-auction serialization, version/sequence, transaction và fencing |
+| Retry without duplicate bid | Stable request ID, payload hash và durable idempotency response |
+| No late bid | Authority checks effective deadline; scheduler time không quyết định eligibility |
+| Exactly one winner | Unique versioned AuctionResult committed cùng final transition |
+| Hot-auction scalability | Isolated owner + async regional/gateway fan-out + admission/backpressure |
+| Realtime UX | WebSocket gateways, subscription index, versioned updates và gap repair |
+| Read-heavy traffic | CDN/search/Redis/query projections; authority revalidates writes |
+| Reliable events | Transactional outbox + durable broker + idempotent consumers |
+| Millions timers | Durable sharded timer index, at-least-once commands và overdue reconciler |
+| Payment reliability | Result-driven saga, provider idempotency, webhook verification, reconciliation |
+| Notifications | Async priority/channel queues, dedup và delivery evidence |
+| High availability | Multi-AZ replicas, warm capacity, owner failover epoch/fencing |
+| Global users | Nearest edge/realtime + auction home authority + regional event distribution |
+| Fraud/fairness | Rate/risk/eligibility rules + immutable audit evidence |
+| Operability | End-to-end correlation, business SLOs, runbooks và restore/failover drills |
+| Cost control | Coalesced display fan-out, tiering, workload autoscaling và unit-cost metrics |
+
+---
+
+#### 22. Bottleneck → final control
+
+| Bottleneck | Final control |
+|---|---|
+| Hot auction row/owner | Stable per-auction owner, compact commit, isolation, admission |
+| DB connection/IOPS | Bounded pools, minimal indexes, partition/tier, capacity headroom |
+| Duplicate/retry storm | Idempotency key + canonical response + rate limits |
+| Last-second concurrency | Same bid/close command stream + authoritative time |
+| Scheduler miss/duplicate | Durable timer index + retry + unique result + reconciler |
+| Realtime 1:N amplification | Async regional/gateway shards, compact/coalesced display events |
+| Hot cache key/stampede | Versioned cache, single-flight, TTL jitter, local replicas |
+| Slow WebSocket client | Bounded buffer, backpressure, disconnect/snapshot resync |
+| Gateway/AZ failure | Client backoff/reconnect, lease registry rebuild, recovery headroom |
+| Broker lag | Outbox durability, consumer lag alarms, replay/isolation |
+| Search/read projection lag | Freshness SLO, version and authoritative snapshot fallback |
+| Payment timeout/quota | Durable workflow, provider cap, idempotency, unknown/reconcile |
+| Bot/shill bidding | Edge/app limits, identity/device/risk graph, audit/review |
+| Multi-region split brain | Home authority, consensus/lease, monotonically fenced epoch |
+| Observability overload | Cardinality budgets, structured evidence tiers, privacy controls |
+
+---
+
+#### 23. Những điểm hiệu chỉnh so với final diagram đơn giản
+
+| Transcript/sơ đồ đơn giản hóa | Final design production-oriented |
+|---|---|
+| API Gateway xử lý authentication | Gateway verify/admit; IdP quản lý identity và services vẫn object-authorize |
+| User/Auction/Bid services độc lập là đủ | Cần ownership contract; bid/lifecycle mutations cùng auction authority |
+| Bid Service “xử lý đúng concurrency” | Phải có per-auction serialization, transaction, idempotency, sequence và fencing |
+| WebSockets “enable realtime bidding” | WebSocket chủ yếu push updates; bid command vẫn cần authoritative durable decision path |
+| WebSocket server broadcast cho users | Gateway pool + subscription registry + regional fan-out + backpressure/gap repair |
+| Scheduler đảm bảo start/end chính xác | Scheduler chỉ trigger; authority deadline chặn bid và idempotently finalize |
+| Relational storage lưu transactional data | Cần explicit schema/transaction/outbox/HA/PITR/hot-key strategy |
+| Redis cải thiện performance | Cache/soft state only; version, invalidation, rebuild và no canonical winner |
+| Message queue decouple và tăng resilience | Cần outbox, ordering scope, idempotent consumer, DLQ/replay/reconcile |
+| Payment Service gọi provider | Cần result-driven obligation, stable idempotency, webhook verify và unknown outcome |
+| Nhiều app instances là scalable/reliable | Data/owner/broker/timer/gateway failure semantics mới quyết định reliability |
+| Hỗ trợ “thousands concurrent auctions” | Capacity assumptions nêu khoảng 1 triệu active listings; phải thiết kế timers/partitions theo con số đó |
+| Mọi người thấy update ngay | Visibility là eventual trong SLO; version/snapshot giúp hội tụ |
+| Final design production-ready vì đủ boxes | Production readiness cần SLOs, runbooks, backups, fencing, security, cost và tested recovery |
+
+---
+
+#### 24. Trade-offs cuối cùng
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Per-auction authority | Correct order/close dễ giải thích | Hot-key ceiling và owner failover |
+| PostgreSQL transaction ban đầu | ACID/constraints/operability mạnh | Row contention và eventual sharding |
+| Redis acceleration | Low read/routing latency | Staleness, eviction, stampede và rebuild |
+| Outbox + event bus | Durable loose coupling | Lag, duplicates, schema/ops complexity |
+| WebSocket push | Fast interactive UX | Connection/egress/backpressure/reconnect cost |
+| Coalesced display updates | Giảm fan-out | Bỏ qua intermediate UI states, cần canonical log riêng |
+| Durable timer + reconciler | Miss/duplicate tolerant | More state/operations và finalization lag SLO |
+| Result-driven payment saga | Isolate provider failures | Eventual settlement và reconciliation |
+| Home-region authority | One global order rõ | Cross-region bid latency |
+| Multi-service decomposition | Independent scale/ownership | Network, deployment và on-call complexity |
+| Strong bid consistency | Trustworthy winner | Availability/latency trade-off khi partition |
+| Immutable evidence | Audit/dispute/replay | Storage, privacy và retention cost |
+
+Không có perfect design. Nếu team/scale nhỏ, modular monolith + PostgreSQL transaction/outbox + durable jobs + Redis cache + WebSocket gateway có thể tốt hơn microservices/Kubernetes/Kafka đầy đủ.
+
+---
+
+#### 25. Cách trình bày final design trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. Clients dùng HTTP qua WAF/API Gateway cho commands/queries và WebSocket gateway pool cho versioned realtime updates.
+2. Listing sở hữu item metadata/media references; Search/Redis/CDN phục vụ read-heavy projections nhưng không quyết định bid.
+3. Bid Ingress stateless validate/quota và route theo `auction_id` tới một home authority/owner.
+4. Mọi bid/start/extend/cancel/close command của cùng auction được serialize tại authority với owner epoch/fencing.
+5. Authority atomically ghi accepted bid, current state/version, idempotency response và outbox trước khi ACK.
+6. Retry cùng bid request ID trả same decision; accepted event chỉ xuất hiện sau durable commit.
+7. Outbox/event bus tách realtime fan-out, notification, search, fraud và analytics khỏi bid path.
+8. Regional fan-out gửi compact public/private events tới WebSocket gateways; clients dedup/gap-repair bằng auction version.
+9. Scheduler dùng durable time index phát close command at least once; authority kiểm tra effective deadline và tạo một unique result.
+10. Overdue reconciler sửa missed timers; duplicate close không tạo duplicate result/effects.
+11. `AuctionFinalized` idempotently tạo payment obligation; provider timeout/webhook được xử lý bằng workflow và reconciliation.
+12. PostgreSQL/distributed transactional store giữ canonical state, Redis giữ cache/soft state, object storage/CDN giữ media.
+13. Hot auctions được pre-warm/isolate; fan-out shard theo region/gateway, còn canonical order vẫn per auction.
+14. Multi-AZ data/compute, owner fencing, client reconnect/replay và tested restore/failover tạo availability.
+15. OIDC/domain AuthZ, TLS, bot/fraud controls, private event fields và immutable audit bảo vệ trust.
+
+Deep dives nên chuẩn bị:
+
+- simultaneous bids và idempotency;
+- bid versus close ở millisecond cuối;
+- PostgreSQL lock/version versus actor owner;
+- hot auction/fan-out amplification;
+- snapshot-subscribe race;
+- scheduler duplicate/miss/soft-close;
+- Redis loss/cache stampede;
+- outbox/broker failure;
+- payment unknown outcome;
+- owner/AZ/region failover và fencing;
+- proxy bidding nếu interviewer mở rộng scope.
+
+---
+
+#### 26. Final checklist
+
+- [ ] Scope: auction type, reserve/increment, hard/soft close, proxy bidding?
+- [ ] Business invariants và authoritative arrival/deadline semantics?
+- [ ] Listing, Auction, Bid, Result, Payment ownership rõ?
+- [ ] HTTP query/command và WebSocket delivery paths tách đúng?
+- [ ] Search/cache/realtime được ghi rõ là projections?
+- [ ] Bid Ingress route theo auction tới một owner?
+- [ ] Bid/close/extend/cancel cùng serialization boundary?
+- [ ] Per-auction sequence/version và owner epoch/fencing?
+- [ ] Stable bid request ID, payload hash và canonical retry response?
+- [ ] Atomic bid/state/idempotency/outbox commit trước ACK?
+- [ ] Unique AuctionResult và reserve-aware outcome?
+- [ ] Command versus committed event contract rõ?
+- [ ] Outbox relay, broker partition/order, schema và consumer idempotency?
+- [ ] Realtime public/private payloads và subscription AuthZ?
+- [ ] Regional fan-out, coalescing, backpressure và slow-client handling?
+- [ ] Snapshot-subscribe/reconnect/version-gap recovery?
+- [ ] Durable timer index, retry, overdue reconciler và close-lag alert?
+- [ ] Soft-close effective-end-time version/reschedule nếu áp dụng?
+- [ ] Payment obligation từ result, provider idempotency/webhook/reconcile?
+- [ ] Redis/cache hot-key, stampede và rebuild plan?
+- [ ] DB pool/index/partition/HA/PITR/restore drills?
+- [ ] Hot-auction owner isolation, pre-warm và admission?
+- [ ] Autoscaling signals và downstream-aware caps?
+- [ ] Multi-AZ headroom, WebSocket reconnect storm và owner failover?
+- [ ] Multi-region home authority/data residency/fencing?
+- [ ] OIDC/object AuthZ/TLS/secrets/payment/privacy/bot/fraud controls?
+- [ ] End-to-end IDs, SLO metrics, cardinality/privacy và runbooks?
+- [ ] Cost model cho egress, connection-hours, DB, broker, cache và telemetry?
+- [ ] Evolution path/ADR/review triggers phù hợp team và scale?
+
+---
+
+#### 27. Ý chính cần nhớ
+
+- Final design được tổ chức quanh per-auction correctness boundary, không quanh danh sách sản phẩm.
+- Listing, search và cache phục vụ discovery; authority phục vụ bid/lifecycle truth.
+- Auction Service và Bid Service không được là hai writers cạnh tranh của cùng aggregate.
+- Bid Ingress stateless; Auction Authority stateful theo partition/owner semantics.
+- Stable bid ID và atomic idempotency record biến network retry thành một logical effect.
+- Accepted bid chỉ ACK sau durable commit; fan-out xảy ra sau qua outbox.
+- WebSocket cung cấp delivery realtime, không cung cấp durable bid correctness.
+- Public và private realtime events cần tách để không lộ bidder/reserve/proxy data.
+- Versioned snapshot/stream giúp clients hội tụ sau duplicate, gap hoặc reconnect.
+- Hot auction làm fan-out nổ lớn; canonical commit và broadcast phải tách rời.
+- Bid và close command đi qua cùng order boundary để xử lý millisecond cuối.
+- Deadline nằm ở authority; scheduler chỉ phát at-least-once trigger.
+- Unique result và downstream idempotency ngăn duplicate payment/notification effects.
+- Payment là workflow riêng với unknown outcome và reconciliation.
+- Redis, search và read replicas không quyết định winner.
+- Load balancer không chia một hot key và không chuyển live WebSocket khi node chết.
+- Multi-AZ availability cần durable replication, warm headroom, fencing và tested recovery.
+- Multi-region giữ nearest edge nhưng một home authority cho order rõ ràng.
+- Fairness gồm rule, identity, time/order semantics, bot/fraud control và audit evidence.
+- Observability phải đo business invariants, hot partitions và end-to-end lag.
+- Final design có thể triển khai bằng modular monolith trước; semantics vẫn giữ khi tách services.
+- Không có kiến trúc duy nhất; mỗi quyết định phải truy nguyên về requirement, bottleneck và trade-off.
+- Kiến trúc tốt nối **listing/rules → ordered durable bid decision → versioned realtime convergence → fenced final result → reconciled settlement**.
+
+#### Công thức ghi nhớ
+
+> **Final Auction Platform = scalable read/discovery plane + one fenced ordered authority per auction + atomic bid/state/idempotency/outbox commit + reconnectable regional realtime fan-out + durable duplicate-safe closing + result-driven payment saga + auditable multi-AZ recovery.**
+
+---
+
+## Phần 18 — Design an Online Rental Platform (Airbnb)
+
+### Bài 93. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần giải quyết
+
+Thiết kế một online rental marketplace nơi:
+
+- **Host** đăng chỗ ở, quản lý nội dung, giá và lịch trống;
+- **Guest** tìm kiếm, xem chi tiết, đặt chỗ và thanh toán;
+- nền tảng ngăn hai booking nội bộ cùng chiếm một inventory trong các ngày giao nhau;
+- sau chuyến đi, các bên có thể đánh giá nhau theo policy;
+- media, notification, payment và external calendar được tích hợp an toàn;
+- administrators/trust team kiểm duyệt và xử lý fraud, abuse, dispute.
+
+Luồng kinh doanh tổng quát:
+
+```text
+Host tạo Listing
+      ↓
+Listing được xác minh/đăng công khai
+      ↓
+Host mở Calendar + Pricing
+      ↓
+Guest Search → Listing Detail → Quote
+      ↓
+Kiểm tra Availability → giữ chỗ tạm thời
+      ↓
+Payment authorization/confirmation
+      ↓
+Booking CONFIRMED
+      ↓
+Pre-stay reminders → Check-in → Check-out
+      ↓
+Payout / Review / Refund / Dispute nếu có
+```
+
+Điểm khó cốt lõi không phải CRUD listing, mà là:
+
+> **Tìm kiếm trên dữ liệu lớn với độ trễ thấp, trong khi vẫn bảo đảm một inventory không được xác nhận cho hai khoảng ngày giao nhau dưới concurrent booking và external failures.**
+
+---
+
+#### 2. Scope phải chốt trước: “rental inventory” là gì?
+
+Tên “online rental platform” khá rộng. Transcript đang hướng tới short-term accommodation như Airbnb. Cần chốt inventory model:
+
+##### Mô hình A — Entire-place, một listing là một inventory unit
+
+```text
+Listing L
+  └── mỗi đêm chỉ có capacity = 1
+```
+
+Đây là mô hình đơn giản nhất cho case study.
+
+##### Mô hình B — Nhiều phòng/unit riêng trong cùng property
+
+```text
+Property
+  ├── Unit 101
+  ├── Unit 102
+  └── Unit 103
+```
+
+Mỗi unit có calendar riêng; listing có thể ánh xạ tới unit cụ thể.
+
+##### Mô hình C — Room type có quantity
+
+```text
+Deluxe Room Type
+  └── inventory = 20 phòng tương đương mỗi đêm
+```
+
+Booking trừ quantity theo từng night thay vì khóa một unit duy nhất.
+
+Trong phần này, giả định chính:
+
+> Mỗi bookable listing đại diện một inventory unit có capacity 1 trong mỗi đêm; mô hình room-type quantity là mở rộng cần data/invariant khác.
+
+Nếu không làm rõ điểm này, câu “không double-book” chưa đủ chính xác.
+
+---
+
+#### 3. Các actor và hệ thống liên quan
+
+| Actor/system | Mục tiêu | Hành động chính | Rủi ro/đòi hỏi |
+|---|---|---|---|
+| Guest | Tìm và thuê nơi ở | Search, xem, quote, book, pay, cancel, review | Giá/availability đúng lúc confirm |
+| Host | Kiếm tiền từ tài sản | Tạo listing, media, price, block dates, accept/manage booking | Calendar và payout đáng tin cậy |
+| Administrator/Trust team | Giữ marketplace an toàn | Verify, moderate, suspend, investigate, resolve dispute | Audit, least privilege, evidence |
+| Platform authority | Thi hành rules | Availability, booking state, policy, notifications | Không double-book, idempotent workflow |
+| Payment provider | Xử lý tiền | Authorize, capture, refund, webhook | Timeout, duplicate, unknown outcome |
+| External calendar | Đồng bộ busy/free hints | Import/export iCalendar/calendar events | Trễ, duplicate, conflict, không transactional |
+| Media/object platform | Lưu và phân phối ảnh/video | Upload, scan, transform, CDN | Abuse, privacy, cost, lifecycle |
+| Notification providers | Email/SMS/push | Confirmation, reminder, cancellation | Best-effort, quota, dedup |
+| Map/geocoding service | Chuẩn hóa và tìm theo vị trí | Geocode, map tiles, place search | Quota, cost, privacy, approximation |
+
+Một user có thể vừa là guest vừa là host. Role chỉ là một phần authorization; hệ thống còn phải kiểm tra ownership, booking relationship, listing state và action policy.
+
+---
+
+#### 4. Các hành trình chính
+
+##### 4.1. Host onboarding và publish listing
+
+1. User đăng ký, xác minh email và identity/KYC nếu policy yêu cầu.
+2. Host tạo property/listing draft.
+3. Upload media trực tiếp vào object storage qua upload intent.
+4. Điền location, amenities, capacity, house rules, pricing và cancellation policy.
+5. Cấu hình availability/calendar blocks.
+6. Platform validate/moderate nội dung.
+7. Listing chuyển sang `PUBLISHED` và được index vào search.
+
+##### 4.2. Guest search và xem chi tiết
+
+1. Guest nhập location, check-in, check-out, số khách và filters.
+2. Search trả candidates nhanh từ index/read models.
+3. Listing detail hydrate content, media, rating và availability/price projection.
+4. Trước khi booking, Quote Service tính lại giá/tax/fee/policy với version/expiry.
+5. Search/detail không phải cam kết giữ inventory.
+
+##### 4.3. Booking
+
+1. Guest gửi booking request với listing, `[check_in, check_out)`, guest count và quote ID.
+2. Hệ thống xác thực eligibility, rules và quote.
+3. Booking authority atomically giữ inventory hoặc reject conflict.
+4. Payment được authorize/confirm theo workflow.
+5. Booking chuyển thành `CONFIRMED` hoặc hold được release/expire.
+6. Sau commit, search/calendar/notification được cập nhật bất đồng bộ.
+
+##### 4.4. Stay, cancellation và review
+
+- reminder/check-in instructions trước stay;
+- host/guest cancellation theo policy;
+- refund/payout adjustments qua payment saga;
+- booking hoàn tất sau checkout;
+- chỉ participant đủ điều kiện mới tạo review;
+- review publication/moderation theo product policy;
+- dispute không sửa âm thầm booking/payment history.
+
+---
+
+#### 5. Functional requirements — Identity và trust
+
+- đăng ký, đăng nhập và logout/revocation;
+- email/phone verification;
+- guest/host profile;
+- MFA hoặc step-up cho payout/admin/risky action;
+- host identity/property verification tùy market;
+- account status: active, restricted, suspended;
+- saved payment/payout references dưới dạng token;
+- device/session management;
+- report user/listing/review;
+- admin moderation với reason và audit trail.
+
+Hiệu chỉnh quan trọng:
+
+- email verification giảm một phần fake accounts nhưng không đủ chống fraud;
+- authentication xác minh user là ai;
+- authorization quyết định user có được publish listing, block dates, xem booking hoặc refund hay không.
+
+---
+
+#### 6. Functional requirements — Listing và media
+
+Host cần:
+
+- tạo/sửa/unpublish/archive listing;
+- địa chỉ, geolocation, time zone và local regulations;
+- loại chỗ ở, capacity và amenities;
+- title/description/house rules;
+- ảnh/video, cover order và captions;
+- base price, fees, taxes và currency;
+- minimum/maximum stay;
+- advance notice, booking window và check-in/out rules;
+- cancellation/refund policy;
+- instant-book hay request-to-book;
+- visibility/moderation state;
+- version history cho fields ảnh hưởng booking/dispute.
+
+Media flow nên là:
+
+```text
+Client → request upload intent
+       → direct upload object storage
+       → malware/content scan
+       → image/video processing variants
+       → moderation
+       → attach immutable media reference to listing version
+       → deliver via CDN
+```
+
+Không đẩy file lớn qua application database hoặc giữ binary trong listing row.
+
+---
+
+#### 7. Functional requirements — Availability và pricing
+
+Host có thể:
+
+- mở/đóng ngày;
+- đặt manual block;
+- cấu hình recurring/default availability;
+- cập nhật nightly/base/seasonal price;
+- weekend/event/length-of-stay rules;
+- minimum stay và lead time;
+- import/export external calendars;
+- xem confirmed bookings và pending holds.
+
+Availability có nhiều nguồn:
+
+```text
+Bookable
+= Host calendar says open
+- confirmed bookings
+- active booking holds
+- maintenance/manual blocks
+- policy restrictions
+- trusted external busy blocks
+```
+
+Search có thể dùng precomputed availability projection. Booking authority phải kiểm tra lại canonical inventory trong transaction/conditional boundary.
+
+Pricing cũng không chỉ là một field:
+
+```text
+Total quote
+= Σ nightly rates
++ cleaning/service/host fees
++ taxes
+- discounts/credits
++ currency conversion policy nếu có
+```
+
+Quote phải có ID/version, currency, line items và expiry để biết mức giá nào đang được cam kết.
+
+---
+
+#### 8. Functional requirements — Search và discovery
+
+Guest cần tìm theo:
+
+- location/bounding box/radius;
+- check-in và check-out;
+- guest count;
+- price range/currency;
+- property/room type;
+- amenities;
+- rating/review count;
+- instant book;
+- accessibility/policy filters;
+- sort/rank và pagination.
+
+Search response nên gồm projection đủ nhẹ:
+
+- listing ID, thumbnail, approximate/display price;
+- approximate location theo privacy policy;
+- rating/amenities summary;
+- availability hint;
+- ranking metadata nội bộ không lộ ra client.
+
+Không nên join transactional tables phức tạp cho mỗi search trên toàn khu vực. Search index/cache/read models tối ưu discovery; authoritative availability và quote được xác minh lại ở bước sau.
+
+---
+
+#### 9. Functional requirements — Booking
+
+- yêu cầu quote authoritative;
+- tạo booking hold có TTL;
+- instant book hoặc host approval flow;
+- confirm/cancel/expire booking;
+- chống duplicate request;
+- chống overlapping confirmed/held inventory;
+- guest count, property rule và eligibility validation;
+- payment authorization/capture;
+- booking history cho guest/host;
+- cancellation/refund/no-show;
+- amendments: đổi ngày/số khách nếu scope cho phép;
+- support/admin override có kiểm soát;
+- durable outbox/events cho downstream systems.
+
+Cần chốt payment choreography:
+
+##### Option A — Hold inventory rồi authorize payment
+
+```text
+Atomic inventory hold
+ → payment authorization
+ → confirm booking
+ → failure/timeout: reconcile rồi confirm hoặc release hold
+```
+
+Ưu điểm: không charge guest khi inventory đã mất. Nhược điểm: hold có thể chiếm inventory trong lúc payment chậm.
+
+##### Option B — Authorize payment rồi reserve inventory
+
+Ưu điểm: ít hold không thanh toán. Nhược điểm: inventory có thể mất sau authorization, cần void/refund.
+
+Thông thường dùng saga với short-lived hold, idempotency và reconciliation; không có distributed transaction với payment provider.
+
+---
+
+#### 10. Functional requirements — Payment và payout
+
+- tạo payment obligation từ quote/booking hold;
+- payment authorize/capture theo policy;
+- provider idempotency key;
+- verified webhook và provider-event dedup;
+- trạng thái pending/authorized/captured/failed/unknown/refunded/disputed;
+- refund toàn phần/một phần;
+- host payout sau điều kiện/mốc thời gian phù hợp;
+- platform fee/tax records;
+- reconciliation giữa internal ledger/state và provider;
+- chargeback/dispute support;
+- tokenization/hosted payment để giảm PCI scope.
+
+“Payment thành công” và “booking confirmed” là hai domain states phải phối hợp. Timeout không đồng nghĩa với failure; có thể provider đã charge nhưng response bị mất.
+
+---
+
+#### 11. Functional requirements — Review
+
+- review gắn với completed/eligible booking;
+- một review logic theo reviewer/booking/side;
+- rating + text/media nếu cho phép;
+- thời hạn viết/chỉnh sửa;
+- publication policy, ví dụ double-blind window nếu product chọn;
+- report/moderation/appeal;
+- aggregate rating được cập nhật từ reviews hợp lệ;
+- xóa khỏi public view không đồng nghĩa xóa audit evidence;
+- chống spam, retaliation và fake reviews.
+
+Review không chỉ là nội dung gắn với listing; eligibility xuất phát từ booking relationship và stay state.
+
+---
+
+#### 12. Functional requirements — Calendar synchronization
+
+External calendar integration cần:
+
+- export confirmed bookings/blocks;
+- import external busy intervals;
+- periodic polling hoặc webhook nếu provider hỗ trợ;
+- normalize time zone và all-day/date semantics;
+- stable external event/source IDs;
+- deduplicate và handle update/delete;
+- cursor/sync token, retry và reconciliation;
+- conflict detection và host alert;
+- source priority/policy.
+
+Giới hạn quan trọng:
+
+> Google Calendar/iCalendar sync thường asynchronous và không có distributed transaction với nền tảng khác. Nó giúp giảm double-book nhưng không thể cam kết tuyệt đối không có cross-platform conflict.
+
+Chỉ nền tảng của ta mới bảo đảm no-double-book cho canonical inventory nội bộ. Với external channels, cần:
+
+- sync thường xuyên;
+- conflict alert/manual resolution;
+- buffer/advance notice;
+- channel manager có stronger integration nếu business yêu cầu;
+- policy rõ khi hai hệ thống cùng confirm trong race window.
+
+---
+
+#### 13. Functional requirements — Notifications
+
+Các notification intent:
+
+- email/account verification;
+- listing published/rejected;
+- booking request/hold/confirmation;
+- host accept/decline nếu request-to-book;
+- payment success/failure/action required;
+- cancellation/refund;
+- upcoming stay/check-in/check-out;
+- calendar conflict;
+- review window;
+- security/account alerts.
+
+Notification phải:
+
+- xử lý bất đồng bộ sau durable business event;
+- ưu tiên transactional/security messages;
+- dedup theo event + recipient + channel;
+- áp preference/locale/time zone/quiet hours phù hợp;
+- retry/DLQ và theo dõi provider delivery;
+- không chứa địa chỉ/PII nhạy cảm quá mức trong lock-screen push;
+- không được xem là source of truth cho booking/payment.
+
+---
+
+#### 14. Booking lifecycle cần là state machine
+
+Một mô hình instant-book đại diện:
+
+```text
+CREATED
+   ↓ inventory reserved
+HELD ──payment authorized──> CONFIRMED
+  │                              │
+  ├── TTL/payment failure ─> EXPIRED/FAILED
+  │                              │
+  └── cancel ──────────────> CANCELLED
+                                 │
+CONFIRMED ──stay starts──> IN_PROGRESS
+                                 │
+                                 └── checkout ─> COMPLETED
+
+CONFIRMED/COMPLETED ──policy workflow──> REFUND_PENDING/REFUNDED/DISPUTED
+```
+
+Request-to-book có thể thêm:
+
+```text
+PENDING_HOST_APPROVAL → APPROVED → HELD/PAYMENT → CONFIRMED
+                      → DECLINED/EXPIRED
+```
+
+Không dùng một field `is_booked` hoặc `payment_status` để diễn tả toàn bộ workflow. Mỗi transition cần:
+
+- precondition/state version;
+- actor hoặc timer được phép;
+- inventory effect;
+- payment effect/handoff;
+- idempotency business key;
+- event/outbox;
+- compensation/reconciliation path;
+- audit reason.
+
+---
+
+#### 15. Availability interval semantics
+
+Đối với accommodation, nên mô hình khoảng ngày theo dạng nửa mở:
+
+```text
+[check_in_date, check_out_date)
+```
+
+Ví dụ:
+
+```text
+Booking A: [10 Aug, 12 Aug) → ở đêm 10 và 11
+Booking B: [12 Aug, 14 Aug) → ở đêm 12 và 13
+```
+
+A và B không overlap; turnover cùng ngày checkout/check-in được phép nếu business rule cho phép.
+
+Hai interval overlap khi:
+
+```text
+A.check_in < B.check_out
+AND B.check_in < A.check_out
+```
+
+Phải chốt:
+
+- booking theo property-local **date** hay UTC timestamp;
+- check-in/out time và turnover buffer;
+- daylight-saving/time-zone changes;
+- minimum/maximum nights;
+- same-day booking cutoff;
+- maintenance block và host override;
+- room quantity/capacity nếu không phải unit=1.
+
+Thông thường inventory nights dùng local dates của property; các audit/event timestamps dùng UTC instants. Không convert local stay date thành UTC tùy tiện rồi gây lệch ngày.
+
+---
+
+#### 16. Core invariants
+
+1. Mỗi published listing trỏ tới một host/property hợp lệ và một rule/content version.
+2. Chỉ listing/inventory ở trạng thái bookable mới nhận hold/booking.
+3. `check_in < check_out`, guest count và stay length thỏa rules.
+4. Với capacity 1, không có hai `HELD/CONFIRMED` intervals hiệu lực overlap theo policy.
+5. Retry cùng logical booking request không tạo thêm hold/booking/payment.
+6. Hold có TTL rõ ràng và expiry/release idempotent.
+7. Booking chỉ `CONFIRMED` khi inventory và payment condition theo choreography đều thỏa.
+8. Quote phải khớp listing/pricing/policy version hoặc được reprice với user confirmation.
+9. Payment/order amount/currency liên kết với booking/quote version cụ thể.
+10. Provider timeout không được tự suy thành payment failed.
+11. Search/cache/calendar projection không được dùng làm final booking authority.
+12. Cancellation/refund/payout transitions tuân policy version của booking.
+13. Review chỉ được tạo bởi participant đủ điều kiện của stay/booking tương ứng.
+14. External calendar event không được âm thầm ghi đè confirmed internal booking.
+15. Admin override tạo audit event mới, không xóa lịch sử cũ.
+
+Invariant quan trọng nhất:
+
+> **No overlapping effective reservations for the same inventory unit and date range.**
+
+---
+
+#### 17. Consistency boundaries
+
+| Operation/data | Consistency cần | Lý do |
+|---|---|---|
+| Search index | Eventual | Tối ưu discovery, có thể trễ nhẹ |
+| Listing media/content cache | Eventual/versioned | Dễ cache/CDN |
+| Display price | Eventual/approximate có nhãn | Final quote sẽ tính lại |
+| Availability in search | Eventual hint | Không phải reservation guarantee |
+| Authoritative quote | Strong/versioned trong validity window | Guest cần biết amount/rules |
+| Create booking hold | Strong per inventory/date range | Ngăn overlap/double-book |
+| Confirm/cancel booking | Strong conditional transition | Inventory/payment effect |
+| Payment provider status | Eventual/reconciled | External asynchronous system |
+| Calendar sync | Eventual | External systems không transaction chung |
+| Rating aggregate | Eventual | Derived from moderated reviews |
+| Admin/audit evidence | Durable/append-only | Trust và dispute |
+
+Đây là ví dụ điển hình của hệ thống dùng **strong consistency có chọn lọc**: không cần làm search toàn cầu strongly consistent để ngăn double-book; chỉ booking/inventory boundary cần bảo đảm mạnh.
+
+---
+
+#### 18. Non-functional requirements
+
+##### 18.1. Availability
+
+- platform hoạt động 24/7, đa múi giờ;
+- booking path có SLO cao hơn analytics/recommendation;
+- multi-instance/multi-AZ cho critical services;
+- graceful degradation: search có thể stale, notification có thể chậm, booking correctness không được nới;
+- dependency failures có retry/circuit/reconciliation;
+- RTO/RPO riêng cho listing/search và booking/payment.
+
+##### 18.2. Scalability
+
+- hàng triệu users/listings;
+- read-heavy search/detail;
+- seasonal/holiday/campaign spikes;
+- location skew: một thành phố/sự kiện trở thành hot shard;
+- concurrent booking attempts cho cùng listing/date;
+- media traffic và CDN egress;
+- calendar sync jobs và notification bursts;
+- scale từng workload độc lập.
+
+##### 18.3. Performance
+
+Transcript đề xuất dưới 300 ms cho “key operations”, nhưng nên tách SLO:
+
+| Operation | SLO cần định nghĩa riêng |
+|---|---|
+| Search | Ví dụ p95 < 300 ms cho cached/common query |
+| Listing detail | p95/p99 riêng, gồm/exclude media rõ ràng |
+| Quote | Fresh pricing/availability computation |
+| Booking decision | p99 từ request tới durable held/confirmed/rejected |
+| Payment confirmation | Có external latency và async pending state |
+| Search freshness | Listing/availability commit-to-search lag |
+
+Không nên hứa mọi operation, mọi percentile và external payment đều dưới 300 ms.
+
+##### 18.4. Reliability
+
+- không double-book nội bộ;
+- accepted/confirmed booking không mất sau ACK;
+- idempotent retries;
+- hold expiry không leak inventory;
+- outbox/reliable event handoff;
+- payment/calendar reconciliation;
+- backup/PITR/restore drills;
+- audit và invariant monitoring.
+
+##### 18.5. Security và privacy
+
+- OIDC/authentication, object-level authorization;
+- TLS và encryption at rest;
+- payment tokenization;
+- PII/address minimization và access controls;
+- signed media URLs nếu private;
+- WAF/rate limits/bot/fraud;
+- host/guest/admin separation;
+- secrets/KMS/IAM;
+- logs không chứa credentials/card/địa chỉ nhạy cảm;
+- regulatory retention/deletion handling.
+
+##### 18.6. Localization
+
+- UI language và locale formatting;
+- property-local time zone;
+- stay dates versus UTC audit timestamps;
+- display currency versus charge/settlement currency;
+- FX rate source/snapshot/expiry;
+- tax/fee/regulatory differences;
+- address/map formats;
+- translated listing content với source/version.
+
+---
+
+#### 19. Security và marketplace trust
+
+##### Guest/host account risk
+
+- fake accounts và credential stuffing;
+- account takeover;
+- stolen payment instruments;
+- refund/chargeback abuse;
+- fake property/identity;
+- off-platform payment phishing;
+- review manipulation;
+- host/guest safety incidents.
+
+##### Controls
+
+- email/phone/device verification;
+- host KYC/property verification theo risk;
+- MFA/step-up;
+- risk scoring/velocity limits;
+- listing/media/content moderation;
+- secure in-platform messaging nếu nằm trong scope;
+- payout delay/reserve theo policy;
+- anomaly and relationship graph;
+- evidence-preserving dispute workflow;
+- admin approval cho high-impact override;
+- privacy-aware address disclosure chỉ sau booking stage phù hợp.
+
+Trust không thể được giải quyết chỉ bằng email verification và review moderation. Identity, payment, content, behavioral risk và operational response phải phối hợp.
+
+---
+
+#### 20. Dữ liệu cốt lõi cần nhận diện
+
+```text
+User
+  ├── GuestProfile
+  ├── HostProfile
+  └── Verification / AccountStatus
+
+Property / Listing / ListingVersion
+  ├── MediaAsset
+  ├── Amenity
+  ├── PricingRule
+  ├── CancellationPolicyVersion
+  └── InventoryUnit / AvailabilityRule
+
+Quote
+Booking / BookingHold
+  ├── ReservedNight(s) hoặc Range Exclusion
+  ├── GuestParty
+  ├── BookingStateHistory
+  └── BookingOutbox
+
+Payment / PaymentAttempt / Refund / Payout
+ExternalCalendarConnection / CalendarEvent
+Review / ReviewModeration
+NotificationIntent / DeliveryAttempt
+AuditEvent / Report / Dispute
+```
+
+Phân biệt:
+
+- **Property**: địa điểm/tài sản vật lý;
+- **Listing**: nội dung thương mại được publish;
+- **Inventory unit**: thứ thực sự bị giữ theo ngày;
+- **Booking**: hợp đồng/reservation workflow;
+- **Quote**: snapshot có hạn của giá và policy.
+
+Gộp tất cả vào một `Listing` row làm mô hình booking, pricing và relisting khó tiến hóa.
+
+---
+
+#### 21. API contract sơ bộ
+
+REST là lựa chọn đại diện cho web/mobile, không phải lựa chọn duy nhất.
+
+##### Listing và search
+
+```http
+POST  /v1/listings
+GET   /v1/listings/{listing_id}
+PATCH /v1/listings/{listing_id}
+POST  /v1/listings/{listing_id}/media-upload-intents
+GET   /v1/search?location=...&check_in=...&check_out=...&guests=...&cursor=...
+```
+
+##### Calendar/pricing
+
+```http
+GET /v1/listings/{listing_id}/calendar?from=...&to=...
+PUT /v1/listings/{listing_id}/availability
+PUT /v1/listings/{listing_id}/pricing-rules
+POST /v1/calendar-connections
+```
+
+##### Quote/booking
+
+```http
+POST /v1/quotes
+POST /v1/bookings
+GET  /v1/bookings/{booking_id}
+POST /v1/bookings/{booking_id}/cancel
+POST /v1/bookings/{booking_id}/confirm-payment
+```
+
+Booking request đại diện:
+
+```json
+{
+  "booking_request_id": "stable-client-id",
+  "listing_id": "lst_123",
+  "inventory_unit_id": "unit_123",
+  "check_in": "2026-12-20",
+  "check_out": "2026-12-23",
+  "guest_count": 2,
+  "quote_id": "quote_456",
+  "expected_quote_version": 7
+}
+```
+
+Response có thể là:
+
+```json
+{
+  "booking_id": "bkg_789",
+  "state": "HELD",
+  "hold_expires_at": "2026-08-26T10:05:00Z",
+  "payment_id": "pay_123",
+  "amount_minor": 45000,
+  "currency": "USD"
+}
+```
+
+Client gửi stable idempotency key; server phải reject cùng key với payload khác. Search response/quote không tự reserve inventory.
+
+##### Review
+
+```http
+POST /v1/bookings/{booking_id}/reviews
+GET  /v1/listings/{listing_id}/reviews?cursor=...
+POST /v1/reviews/{review_id}/reports
+```
+
+---
+
+#### 22. Failure scenarios cần đưa vào scope
+
+| Sự cố | Hành vi mong muốn |
+|---|---|
+| Hai guests book cùng listing/date | Một hold/confirm thắng; bên kia nhận unavailable/requote |
+| Client timeout sau create booking | Retry cùng ID nhận cùng booking/result |
+| Inventory held nhưng payment response mất | Payment `UNKNOWN`; reconcile trước confirm/release |
+| Payment authorized nhưng confirm DB lỗi | Saga/reconciler hoàn tất confirm hoặc void/refund an toàn |
+| Hold expiry worker chạy lặp | Conditional expiry/release chỉ có một logical effect |
+| Search vẫn hiện available sau booking | Booking authority reject; projection sớm hội tụ |
+| Redis/cache mất | Rebuild; canonical booking/inventory không mất |
+| Search cluster lỗi | Degrade browse/cache; booking/history authority vẫn tồn tại |
+| Notification lỗi | Retry/DLQ; không rollback booking |
+| External calendar import trễ | Có thể phát sinh cross-platform conflict; alert/reconcile theo policy |
+| External calendar event bị duplicate | Dedup theo source/calendar/event/version |
+| Media processing lỗi | Listing giữ pending/failed asset; retry, không publish broken URL |
+| Provider webhook duplicate/out-of-order | Verify, dedup, conditional payment transition |
+| Host sửa giá sau quote | Quote version/expiry quyết định honor hay reprice |
+| Property time zone thay đổi/sai | Versioned correction và manual review cho affected bookings |
+| Zone/region failure | Failover theo RTO/RPO; idempotent retry và fenced booking authority |
+
+---
+
+#### 23. Các điểm cần hiệu chỉnh từ transcript đơn giản
+
+| Transcript đơn giản hóa | Cách hiểu production-oriented |
+|---|---|
+| “Availability chính xác và không double-book” | Search hint có thể stale; booking authority mới atomically reserve range |
+| Host quản lý pricing | Giá là versioned rule set; final quote gồm fees/tax/currency/expiry |
+| Payment gateway xử lý payment an toàn | Platform vẫn cần obligation, idempotency, webhook verify, reconciliation và ledger/state |
+| External calendar tránh double-book | Async calendar sync chỉ giảm rủi ro, không bảo đảm cross-platform transaction |
+| Email verification giúp trust | Chỉ là một tín hiệu; cần identity/property/payment/risk/moderation controls |
+| Object storage giữ media | Còn cần direct upload, scan, transform, moderation, signed access và CDN |
+| REST API phục vụ web/mobile | API style không quyết định correctness; cần idempotency/version/error semantics |
+| Search cập nhật “real-time” | Search thường eventual; phải định nghĩa freshness SLO |
+| Availability có thể trễ sau booking | Chỉ projection/search được trễ; canonical inventory phải đổi atomically |
+| Mọi key operation dưới 300 ms | Tách SLO/percentile cho search, quote, booking và external payment |
+| Local currency/time zone/language | Cần phân biệt display/charge/settlement FX và local dates/UTC instants |
+| Listing là đơn vị đặt phòng | Property, listing và inventory unit có thể khác nhau |
+
+---
+
+#### 24. Trade-offs cần chốt
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Instant book | Conversion và UX nhanh | Availability/payment correctness chặt hơn |
+| Request-to-book | Host kiểm soát | Latency, expiry và temporary inventory complexity |
+| Short inventory hold | Giảm payment race | Có thể block inventory cho abandoned checkout |
+| Search availability projection | Query nhanh ở quy mô lớn | False-positive/stale, phải revalidate |
+| Per-night rows | Constraint/capacity rõ | Nhiều writes cho stay dài |
+| Range exclusion/locking | Ít rows, model tự nhiên | Engine-specific contention/index complexity |
+| External calendar sync | Giảm manual work/conflict | Eventual, inconsistent provider semantics |
+| Honor quote tới expiry | UX dự đoán được | Host/FX/fee risk trong validity window |
+| Reprice at checkout | Giá luôn mới | User surprise và conversion giảm |
+| Third-party payment | Giảm PCI/ops | Provider cost, quota, outage và lock-in |
+| Global search projection | Fast discovery | Data freshness/residency/rebuild complexity |
+| Strong booking consistency | Không double-book nội bộ | Availability/latency trade-off khi partition |
+
+---
+
+#### 25. Các câu hỏi làm rõ trong phỏng vấn
+
+##### Product/inventory
+
+- Chỉ accommodation hay cả xe/thiết bị?
+- Entire place, unit cụ thể hay room-type quantity?
+- Instant book hay host approval?
+- Hold có TTL bao lâu?
+- Cho amendment, split stay hoặc multi-room booking không?
+- Same-day turnover và cleaning buffer?
+
+##### Pricing/payment
+
+- Base/nightly/dynamic pricing trong scope tới đâu?
+- Taxes/fees/discount/coupon?
+- Charge currency và host settlement currency?
+- Authorize/capture khi nào?
+- Cancellation/refund/no-show/payout policy?
+- Quote được giữ giá bao lâu?
+
+##### Search/localization
+
+- Geo-radius hay city/region search?
+- Availability filter cần freshness tới mức nào?
+- Ranking/personalization có nằm trong scope?
+- p95/p99 search SLO và result count?
+- Languages, time zones, currencies và regulatory regions?
+
+##### Trust/external systems
+
+- Host/property verification?
+- Review là one-sided hay double-blind?
+- External calendar dùng iCal polling hay provider APIs/webhooks?
+- Cross-platform double-book được xử lý thế nào?
+- Address được tiết lộ ở bước nào?
+- Admin/dispute/audit retention?
+
+##### Scale/reliability
+
+- Users, DAU, listings, searches/day, bookings/day?
+- Peak theo season/location/campaign?
+- Concurrent booking attempts trên một inventory/date?
+- Media volume và calendar connections?
+- Availability, durability, RTO/RPO và data residency?
+
+---
+
+#### 26. Cách trình bày bước 1 trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Tôi giới hạn scope ở short-term accommodation; mỗi bookable listing ban đầu là một inventory unit capacity 1.
+2. Actors gồm guest, host, admin/trust, payment provider, external calendar, media và notification systems.
+3. Host publish listing/media, price và calendar; guest search, nhận quote, tạo hold, pay, stay và review.
+4. Search/read-heavy views có thể eventual và cache/index; booking inventory phải strong consistent theo date range.
+5. Stay interval dùng property-local `[check_in, check_out)` để hai booking nối tiếp tại checkout date không overlap.
+6. Core invariant là không có hai effective held/confirmed reservations overlap cùng inventory.
+7. Booking dùng state machine và short-lived hold; retries có stable booking request ID.
+8. Quote có version/expiry và line items; booking authority revalidates availability/rules trước hold.
+9. Payment là external saga với idempotency, webhook và reconciliation, không phải distributed transaction.
+10. External calendar sync eventual nên chỉ giảm cross-platform conflict, không thể bảo đảm tuyệt đối.
+11. Review eligibility xuất phát từ completed booking; media dùng object storage/direct upload/CDN.
+12. NFRs gồm high availability, search latency, booking correctness, security, localization, observability và DR.
+13. Bước tiếp theo sẽ ước lượng search QPS, booking attempts, inventory writes, media, calendar jobs và seasonal/geographic skew.
+
+---
+
+#### 27. Scope checklist
+
+- [ ] Rental domain và inventory unit/capacity model?
+- [ ] Property, listing và inventory unit được phân biệt?
+- [ ] Instant-book hay request-to-book?
+- [ ] Date interval dùng `[check-in, check-out)` và property time zone?
+- [ ] Turnover/cleaning buffer và stay-length rules?
+- [ ] Availability sources và source priority?
+- [ ] Core overlap/no-double-book invariant?
+- [ ] Hold TTL, expiry và compensation?
+- [ ] Stable booking request ID/idempotency semantics?
+- [ ] Pricing components, quote version/expiry và reprice policy?
+- [ ] Display, charge và settlement currencies?
+- [ ] Payment authorization/capture/refund/payout choreography?
+- [ ] Timeout/unknown outcome và reconciliation?
+- [ ] Search filters, pagination, ranking và freshness SLO?
+- [ ] Search versus authoritative availability boundary?
+- [ ] Listing/media upload/scan/moderation/CDN?
+- [ ] External calendar polling/webhook/dedup/conflict limitations?
+- [ ] Cancellation, amendment, no-show và dispute scope?
+- [ ] Review eligibility/publication/moderation policy?
+- [ ] Identity, host/property verification và address privacy?
+- [ ] Admin override/audit/retention?
+- [ ] SLOs riêng cho search, quote, booking và payment?
+- [ ] Peak season/location/concurrent-inventory contention?
+- [ ] HA, RTO/RPO, multi-region và data residency?
+- [ ] Graceful degradation khi search/cache/calendar/payment/provider lỗi?
+
+---
+
+#### 28. Ý chính cần nhớ
+
+- Rental platform kết nối discovery, inventory, booking, payment, stay và trust workflows.
+- Property, listing và bookable inventory unit là ba khái niệm khác nhau.
+- Phải chốt inventory capacity=1 hay room-type quantity trước khi thiết kế concurrency.
+- Search availability là hint/projection; booking authority mới là nguồn quyết định.
+- Search có thể eventual, còn inventory reservation cần strong consistency có chọn lọc.
+- Khoảng stay nên dùng property-local `[check_in, check_out)`.
+- Core invariant là không có hai effective reservations overlap cùng inventory/date range.
+- Booking không phải một row có `is_booked`; nó là state machine.
+- Short-lived hold giúp phối hợp inventory với external payment mà không cần distributed transaction.
+- Hold expiry/release và booking retry phải idempotent.
+- Quote là snapshot versioned có expiry, line items và currency.
+- Display price không nhất thiết là final payable amount.
+- Provider timeout là unknown payment outcome cần reconciliation.
+- External calendar sync bất đồng bộ chỉ giảm, không loại bỏ cross-platform double-book.
+- Host calendar open không đủ; confirmed bookings, holds và blocks cùng quyết định availability.
+- Email verification chỉ là một lớp trust, không thay KYC/risk/moderation.
+- Review phải gắn với booking/stay đủ điều kiện và có moderation/audit.
+- Media thuộc object storage/CDN pipeline, không nằm trong transactional database.
+- Localization gồm local date/time, language, display/charge/settlement currencies và policy địa phương.
+- “Dưới 300 ms” phải gắn operation, percentile và measurement boundary.
+- Availability cao không được đánh đổi bằng cách nhận hai booking khi authority bị partition.
+- Mọi admin override cần reason và immutable evidence.
+- Kiến trúc tốt nối **discover approximately → quote explicitly → reserve atomically → pay idempotently → confirm durably → reconcile external effects**.
+
+#### Công thức ghi nhớ
+
+> **Online Rental Platform = scalable geo-search over eventual projections + versioned pricing quote + atomic date-range inventory reservation + idempotent booking/payment saga + asynchronous calendar/media/notification workflows + localized auditable trust controls.**
+
+---
+
+### Bài 94. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của bước ước lượng
+
+Ta không cần dự báo chính xác đến từng request. Mục tiêu là xây một **workload model có đơn vị và giả định nhất quán** để trả lời:
+
+- search, listing detail, booking hay media chi phối tài nguyên nào;
+- average traffic khác peak/seasonal/geographic traffic ra sao;
+- một confirmed booking tạo bao nhiêu hold, payment, inventory và event writes;
+- dữ liệu nào tăng tuyến tính theo ngày và dữ liệu nào có thể archive/rebuild;
+- bottleneck nằm ở toàn hệ thống hay một listing/date range nóng;
+- external calendar/payment quotas khuếch đại tải như thế nào;
+- consistency và latency budget nào cần ưu tiên.
+
+Quy trình:
+
+```text
+Business volumes
+      ↓
+Requests/records/bytes per day
+      ↓ chia cho 86.400
+Average throughput
+      ↓ × peak/retry/fan-out/skew factors
+Peak per-service/per-partition load
+      ↓
+Storage, bandwidth, connection và downstream capacity
+      ↓
+Bottlenecks + SLO + degradation plan
+```
+
+Average QPS chỉ là điểm bắt đầu. Rental traffic bị skew mạnh theo kỳ nghỉ, giờ địa phương, thành phố, sự kiện và listing nổi tiếng.
+
+---
+
+#### 2. Các giả định từ transcript
+
+| Thông số | Giá trị | Ý nghĩa |
+|---|---:|---|
+| Daily active users | 5 triệu | Quy mô người dùng hoạt động/ngày |
+| Peak concurrent users | 100.000 | Khoảng 2% DAU online đồng thời ở peak |
+| Property listings | 50 triệu | Supply/search corpus |
+| Searches/day | 42 triệu | Read-heavy discovery workload |
+| Confirmed bookings/day | 1 triệu | Business-critical inventory/payment volume |
+| Payment workflows/day | Khoảng 1 triệu | Nếu mỗi confirmed booking tạo một primary payment flow |
+| Media/listing | Trung bình 10 ảnh, đôi khi video | Object count, storage, processing, CDN egress |
+| Structured listing size | Khoảng 5 KB | Chỉ metadata thô, chưa gồm indexes/versions/media |
+
+Các thông số còn thiếu nhưng ảnh hưởng kiến trúc mạnh:
+
+- registered users và monthly active users;
+- search result pages/session và page size;
+- listing-detail views/day;
+- average stay length;
+- quote/hold/booking-attempt-to-confirm ratio;
+- payment retry/failure/3DS rate;
+- booking cancellation/amendment rate;
+- new/updated listings và media uploads/day;
+- average original/derived image/video size;
+- percentage listings kết nối external calendars;
+- calendar polling interval/webhook capability;
+- availability horizon, pricing-rule density;
+- peak factor theo season/time zone/city;
+- maximum concurrent attempts trên cùng listing/date;
+- retention của booking, payment, audit và events.
+
+Ta phải ghi rõ số nào từ đề bài và số nào là scenario giả định.
+
+---
+
+#### 3. Kiểm tra tính nhất quán của transcript
+
+Transcript nói:
+
+```text
+1.000.000 bookings/day
+và khoảng 1.000.000.000 booking records/year
+```
+
+Nhưng:
+
+```text
+1.000.000 × 365 = 365.000.000 confirmed bookings/year
+```
+
+Vì vậy, **canonical booking rows** tăng khoảng 365 triệu/năm, không phải một tỷ, nếu assumptions giữ nguyên.
+
+Con số trên một tỷ có thể hợp lý nếu “booking records” bao gồm nhiều rows/events cho mỗi booking:
+
+```text
+365M bookings/year × 3 state/event records/booking
+≈ 1,095B records/year
+```
+
+Hoặc nếu tính thêm:
+
+- quote/hold attempts không thành công;
+- payment attempts và webhooks;
+- reserved-night rows;
+- cancellation/refund/state history;
+- outbox/audit/notification events.
+
+Khi capacity planning, phải gọi đúng tên dataset: `Booking`, `BookingStateEvent`, `ReservedNight`, `PaymentAttempt` không thể gộp thành một “record” mơ hồ.
+
+---
+
+#### 4. User concurrency
+
+```text
+100.000 peak concurrent users / 5.000.000 DAU
+= 2% DAU concurrently active
+```
+
+Con số này chưa trực tiếp thành QPS. Cần request rate mỗi active user:
+
+```text
+Peak user-driven RPS
+= concurrent users × requests/user/second
+```
+
+Ví dụ minh họa:
+
+| Hành vi peak | Requests/user/s | Tổng RPS |
+|---|---:|---:|
+| Một request mỗi 10 giây | 0,1 | 10.000 |
+| Một request mỗi 5 giây | 0,2 | 20.000 |
+| Một request mỗi 2 giây | 0,5 | 50.000 |
+
+Thực tế requests không đều:
+
+- search/autocomplete/map pan tạo bursts;
+- một search page kéo nhiều thumbnail/media requests;
+- client retries/prefetch/background refresh làm tăng load;
+- web và mobile có cache/network behavior khác nhau;
+- bots/crawlers có thể lớn hơn một số legitimate endpoints.
+
+Vì vậy cần endpoint traffic mix từ product analytics hoặc assumptions riêng.
+
+---
+
+#### 5. Search throughput
+
+Một ngày có 86.400 giây:
+
+```text
+42.000.000 searches/day / 86.400
+≈ 486 searches/giây trung bình
+```
+
+Searches/user/day:
+
+```text
+42M / 5M DAU = 8,4 searches/DAU/day
+```
+
+Nếu peak factor là 10× — chỉ là scenario để sizing:
+
+```text
+486 × 10 ≈ 4.860 search requests/giây peak
+```
+
+Nhưng “một search” có thể gồm:
+
+- autocomplete/place lookup;
+- geo query;
+- availability/date filtering;
+- price/ranking computation;
+- result pagination/infinite scroll;
+- map bounds refresh;
+- facets/counts;
+- listing-card hydration.
+
+Do đó backend operations/search có thể lớn hơn API searches. Cần tách:
+
+```text
+logical search sessions
+search API requests
+search-engine queries
+downstream hydration/cache lookups
+media objects delivered
+```
+
+Search bottleneck thường nằm ở geo/filter/index query, shard fan-out, ranking/hydration và cache-key cardinality chứ không chỉ request count.
+
+---
+
+#### 6. Listing-detail traffic chưa được cho
+
+Transcript khẳng định read-heavy nhưng không cung cấp detail views. Có thể xây scenario:
+
+```text
+detail views/day
+= searches/day × result-click-through rate × details/click session
+```
+
+Ví dụ minh họa, nếu mỗi search trung bình dẫn tới 2 detail views:
+
+```text
+42M × 2 = 84M detail views/day
+84M / 86.400 ≈ 972 views/s average
+10× peak ≈ 9.720 views/s
+```
+
+Không dùng con số này như fact; mục đích là sizing cache, listing store, review aggregates, quote/availability service và media CDN.
+
+Một detail page có thể gọi:
+
+- listing content;
+- media manifest;
+- review summary/pages;
+- availability calendar;
+- price preview/quote;
+- map/location;
+- host summary;
+- similar listings.
+
+Nên tránh synchronous fan-out không giới hạn từ một page request. BFF/aggregation, batching, cache và degradation policy cần được cân nhắc ở HLD.
+
+---
+
+#### 7. Booking và payment throughput
+
+##### Confirmed bookings
+
+```text
+1.000.000 / 86.400 ≈ 11,6 confirmed bookings/giây trung bình
+```
+
+##### Payment workflows
+
+Nếu một primary payment/booking:
+
+```text
+≈ 11,6 payment workflows/giây trung bình
+```
+
+Con số nhỏ hơn search nhiều, nhưng correctness/business value lớn hơn.
+
+##### Booking attempts
+
+Confirmed bookings không bằng booking ingress. Ta cần:
+
+```text
+booking attempts
+= confirmed bookings
+× attempts-per-confirmation
+× legitimate retry factor
++ invalid/bot attempts
+```
+
+Ví dụ minh họa, nếu có 5 booking/hold attempts cho mỗi confirmation:
+
+```text
+5.000.000 attempts/day / 86.400
+≈ 57,9 attempts/giây average
+```
+
+Nếu 10× peak:
+
+```text
+≈ 579 attempts/giây peak
+```
+
+Đây vẫn là aggregate load. Một listing phổ biến có thể nhận nhiều attempts trên cùng date range, tạo lock/conflict hotspot dù cluster QPS thấp.
+
+##### Payment call amplification
+
+Nếu mỗi confirmation trung bình có:
+
+- 1 authorization;
+- 0,1 retry;
+- 1,2 webhook/status events;
+- một tỷ lệ refund/cancel riêng;
+
+thì provider/internal payment messages lớn hơn 1 triệu/ngày. Capacity phải đo attempts và callbacks, không chỉ successful transactions.
+
+---
+
+#### 8. Reserved-night write amplification
+
+Nếu availability materialize theo từng đêm, một booking tạo nhiều writes.
+
+Giả sử minh họa average stay = 4 đêm:
+
+```text
+1M confirmed bookings/day × 4 nights
+= 4M confirmed reserved-night entries/day
+≈ 46,3 writes/s average
+```
+
+Nếu 5 hold attempts/confirmation và mỗi hold đều thử giữ 4 đêm:
+
+```text
+5M holds/day × 4 nights
+= 20M attempted night reservations/day
+≈ 231,5 night mutations/s average
+```
+
+Chưa gồm:
+
+- hold release/expiry;
+- cancellation/reopen inventory;
+- host/manual/external blocks;
+- amendment chuyển ngày;
+- price/availability projection events;
+- replication/index/outbox.
+
+Vì vậy, “1 triệu booking writes/day” đánh giá thấp inventory workload nếu schema dùng per-night rows.
+
+Range-based constraint/locking giảm số rows nhưng có range-overlap index/locking complexity khác. Quyết định sẽ phụ thuộc access pattern, stay length và database semantics.
+
+---
+
+#### 9. Search-to-book funnel
+
+Từ transcript:
+
+```text
+42M searches/day : 1M bookings/day
+= 42 searches : 1 confirmed booking
+```
+
+Đây không nhất thiết là conversion chính xác vì:
+
+- một user có nhiều searches cho cùng trip;
+- một booking có thể bắt nguồn từ recommendation/direct link;
+- bot/search refresh có thể được tính;
+- “search” và “booking” có cohort/time window khác nhau.
+
+Nhưng tỷ lệ này cho thấy:
+
+- discovery read plane cần scale độc lập;
+- cache/index optimization có tác động cost lớn;
+- booking authority có QPS thấp hơn nhưng không được tối ưu correctness kém;
+- stale search có thể gây wasted clicks/failed booking attempts;
+- freshness SLO ảnh hưởng conversion, không chỉ technical metrics.
+
+Nên theo dõi funnel:
+
+```text
+search → result impression → listing view → quote
+→ booking hold → payment authorize → confirmed booking
+```
+
+và reason/latency ở từng bước.
+
+---
+
+#### 10. Listing structured storage
+
+Raw estimate:
+
+```text
+50.000.000 listings × 5 KB
+= 250.000.000 KB
+≈ 250 GB raw metadata
+```
+
+Transcript nói “vài trăm GB” là hợp lý cho raw payload. Nhưng production footprint còn gồm:
+
+- primary/secondary indexes;
+- replicas;
+- listing/content versions;
+- amenities/normalized relationships;
+- geo fields;
+- pricing/availability rules;
+- audit/moderation state;
+- backups/PITR;
+- search documents;
+- caches;
+- analytics copy.
+
+Nếu tổng amplification 3–8× raw, structured listing footprint có thể từ hàng trăm GB tới vài TB. Đây chỉ là planning range; cần đo schema/index/document thực tế.
+
+50 triệu listings cũng không đồng nghĩa 50 triệu active/bookable listings. Cần tách:
+
+- draft/published/suspended/archived;
+- active/inactive inventory;
+- listings được search index;
+- listings có booking/calendar traffic;
+- geographic distribution.
+
+Lifecycle/archival làm giảm hot working set dù corpus lịch sử lớn.
+
+---
+
+#### 11. Booking storage
+
+Với 365 triệu canonical bookings/năm:
+
+| Kích thước row trung bình | Raw/year |
+|---:|---:|
+| 1 KB | Khoảng 365 GB |
+| 3 KB | Khoảng 1,1 TB |
+| 5 KB | Khoảng 1,8 TB |
+
+Chỉ khi row cỡ trên 2,74 KB thì raw canonical bookings vượt khoảng 1 TB/năm.
+
+Tổng footprint lớn hơn do:
+
+- state history;
+- reserved nights/ranges;
+- quote snapshot;
+- guest/host projections;
+- payment attempts/refunds/payouts;
+- idempotency records;
+- outbox/events;
+- audit/dispute evidence;
+- indexes, replicas và backups.
+
+Retention/tiering:
+
+- active/upcoming/recent bookings ở hot transactional store;
+- old read history có indexed archive/read projection;
+- finance/audit retention theo luật;
+- PII minimization/tokenization;
+- analytics copy tách khỏi OLTP;
+- deletion/anonymization không phá financial/legal evidence.
+
+---
+
+#### 12. Availability horizon storage
+
+Nếu materialize 365 ngày cho toàn bộ 50 triệu listings:
+
+```text
+50M × 365 = 18,25B listing-day cells
+```
+
+Nếu mỗi cell dùng:
+
+| Bytes/cell | Raw cho một năm horizon |
+|---:|---:|
+| 16 B | Khoảng 292 GB |
+| 32 B | Khoảng 584 GB |
+| 64 B | Khoảng 1,17 TB |
+
+Chưa gồm index/replica/version. Nếu horizon 2 năm, gần gấp đôi.
+
+Không nhất thiết materialize mọi ngày cho mọi listing. Các mô hình:
+
+- default availability rule + sparse blocks/bookings;
+- per-night materialization chỉ trong rolling horizon/hot listings;
+- range records với overlap constraint;
+- hybrid: canonical sparse/range + precomputed search bitmap/calendar projection;
+- room-type quantity counters theo night.
+
+Trade-off nằm giữa:
+
+- booking-write simplicity/correctness;
+- availability-search speed;
+- storage amplification;
+- long-stay transaction size;
+- update/rebuild cost.
+
+---
+
+#### 13. Media object count và storage
+
+```text
+50M listings × 10 images/listing
+= 500M original image objects
+```
+
+Nếu average original image:
+
+| Kích thước ảnh | Raw originals |
+|---:|---:|
+| 0,5 MB | 250 TB |
+| 1 MB | 500 TB |
+| 2 MB | 1 PB |
+
+Video có thể làm tổng storage/egress tăng rất mạnh dù tỷ lệ listing có video thấp.
+
+Mỗi original thường sinh nhiều derivatives:
+
+- thumbnails/card size;
+- detail/mobile/tablet/web variants;
+- modern formats;
+- moderation/scan artifacts;
+- metadata;
+- replication/versioning/lifecycle copies.
+
+Nếu 4 derived variants tổng kích thước bằng 1× original, storage media thành khoảng 2× raw originals trước replication/versioning.
+
+Vì vậy cần:
+
+- object storage độc lập database;
+- content-addressed/immutable object keys nếu phù hợp;
+- direct upload;
+- asynchronous scan/transcode/resize;
+- CDN;
+- lifecycle/orphan cleanup;
+- quotas và abuse controls;
+- image/video metadata store;
+- deletion/privacy propagation.
+
+---
+
+#### 14. Media delivery và CDN egress
+
+Một search page có thể trả 20 listing cards. Giả sử mỗi thumbnail 100 KB:
+
+```text
+42M searches/day × 20 thumbnails × 100 KB
+= 84 TB/day logical image delivery
+```
+
+Average payload rate:
+
+```text
+84 TB / 86.400 ≈ 972 MB/s
+```
+
+Nếu peak 10×, logical edge delivery có thể gần 9,7 GB/s. Đây là scenario minh họa; thực tế bị ảnh hưởng bởi:
+
+- browser/device cache;
+- pagination/lazy loading;
+- result page size;
+- WebP/AVIF/compression;
+- thumbnail dimensions;
+- duplicate listings giữa searches;
+- CDN edge hit rate;
+- geographic distribution.
+
+CDN cache hit giảm origin load và latency, nhưng end-user egress vẫn là cost lớn. Cần đo:
+
+- bytes/search và bytes/detail view;
+- CDN hit ratio theo region/variant;
+- origin fetch/egress;
+- image transformation cache hit;
+- video start/complete rate;
+- cost per search/listing view.
+
+Không trả full-resolution image cho listing card.
+
+---
+
+#### 15. Media ingest chưa thể ước lượng từ corpus
+
+50 triệu listings là tồn lượng, không cho biết upload/day. Công thức:
+
+```text
+upload objects/day
+= new listings/day × media/new listing
++ updated media/day
+```
+
+Ví dụ minh họa, nếu 100.000 listing mới/cập nhật media mỗi ngày, 10 ảnh × 1 MB:
+
+```text
+100.000 × 10 × 1 MB = 1 TB/day original ingest
+```
+
+Processing workload còn nhân theo variants và video transcoding. Cần tách:
+
+- upload ingress bandwidth;
+- scan/moderation queue;
+- transform CPU/GPU;
+- derived storage;
+- publish latency;
+- failed/orphan objects;
+- delete/lifecycle throughput.
+
+---
+
+#### 16. External calendar synchronization amplification
+
+Transcript chưa cho số calendar connections. Polling toàn bộ listings có thể trở thành bottleneck rất lớn.
+
+Ví dụ minh họa:
+
+```text
+50M listings × 10% connected
+= 5M external calendars
+```
+
+Nếu poll mỗi 15 phút:
+
+```text
+5M / 900 giây ≈ 5.556 sync requests/giây trung bình
+```
+
+Đây có thể vượt quota/cost của providers và tạo write churn lớn dù booking QPS chỉ khoảng 11,6/s.
+
+Controls:
+
+- webhook/push/change token khi provider hỗ trợ;
+- adaptive polling theo upcoming occupancy/activity;
+- jitter polling để tránh synchronized waves;
+- conditional requests/ETag/sync cursor;
+- per-provider quotas, backoff và circuit breaker;
+- dedup by source/calendar/event/version;
+- only-changed interval updates;
+- priority cho near-term calendar horizon;
+- oldest-sync-age/freshness metric;
+- reconciliation và host-facing stale/conflict indicator.
+
+iCalendar feeds thường không có realtime guarantee. Capacity và UX phải phản ánh độ trễ đó.
+
+---
+
+#### 17. Availability update amplification
+
+Một booking confirmation có thể tạo:
+
+```text
+1 canonical booking transition
+N reserved-night/range changes
+1 outbox/domain event
+1 search availability projection update
+1 host calendar projection update
+1 external calendar export/update
+guest + host notification intents
+payment/order state updates
+analytics/audit events
+```
+
+Do đó:
+
+```text
+confirmed booking QPS ≠ total write/event QPS
+```
+
+Search index không nhất thiết update từng night event riêng lẻ. Có thể aggregate/debounce listing availability changes, nhưng booking authority state phải commit đúng ngay.
+
+Các bottleneck:
+
+- hot inventory lock/range constraint;
+- long-stay writes;
+- cache invalidation;
+- search indexing backlog;
+- host calendar page rebuild;
+- external sync quota;
+- notification/payment fan-out.
+
+Tách canonical write path khỏi derived propagation giúp booking latency không phụ thuộc tất cả downstream consumers.
+
+---
+
+#### 18. Geographic và seasonal skew
+
+Global totals che giấu hotspots:
+
+- Paris/New York/Tokyo có nhiều search hơn khu vực khác;
+- kỳ nghỉ/lễ hội/sự kiện làm query và booking tăng đột ngột;
+- giờ cao điểm di chuyển theo time zone;
+- một listing nổi tiếng nhận concurrent holds;
+- natural disaster/weather tạo cancellation/refund/support spike;
+- marketing campaign tạo traffic không giống historical baseline.
+
+Capacity model cần:
+
+```text
+global average
+→ regional peak
+→ city/geohash hotspot
+→ listing/date-range contention
+```
+
+Partition theo listing ID phân tán booking authority nhưng không giải quyết nhiều requests cùng listing. Search sharding theo geography giúp locality nhưng một thành phố hot vẫn skew; cần replica/partition routing và capacity isolation.
+
+Các percentile/distribution cần thu thập:
+
+- searches theo geohash/region;
+- listings/results per query;
+- bookings per listing/day;
+- concurrent attempts per inventory/date;
+- stay length;
+- watchers/views per listing;
+- media bytes per region;
+- calendar providers/connections;
+- cancellation/payment failure by market.
+
+---
+
+#### 19. Search bottlenecks
+
+Search yêu cầu kết hợp:
+
+- geo query;
+- text/filter/facets;
+- guest capacity/amenities;
+- price/ranking;
+- date-range availability hint;
+- pagination;
+- personalization/policy.
+
+Điểm nghẽn:
+
+- scatter-gather quá nhiều shards;
+- high-cardinality filters/cache keys;
+- geo-hot shards;
+- ranking/enrichment fan-out;
+- large result windows/deep offset pagination;
+- availability bitmap/range filtering;
+- index refresh backlog;
+- cache stampede cho hot destination/date;
+- typo/autocomplete provider quota;
+- search nodes CPU/heap/GC.
+
+Controls ở HLD sau:
+
+- geo/text search engine/index;
+- cursor/search-after pagination;
+- query/result cache có TTL/jitter;
+- precomputed searchable fields;
+- limited facets/result window;
+- batch hydration;
+- approximate/eventual availability filter;
+- revalidate quote/booking;
+- shard replicas và hot-region isolation;
+- load shed/degrade optional ranking features.
+
+Metric không chỉ là p99 search latency mà còn result quality, zero-result rate, index freshness và false-available rate.
+
+---
+
+#### 20. Availability và booking bottlenecks
+
+##### Consistency hotspot
+
+Hai guests cùng đặt `[20, 23)` trên một inventory:
+
+```text
+Request A ─┐
+           ├─> same inventory/date-range authority
+Request B ─┘
+```
+
+Chỉ một effective hold được commit nếu ranges overlap và capacity=1.
+
+Điểm nghẽn:
+
+- row/range lock contention;
+- serializable transaction conflicts;
+- long-stay multi-row writes;
+- hold cleanup/expiry lag;
+- retries với unknown outcome;
+- quote/pricing synchronous dependencies;
+- payment latency trong lúc inventory bị giữ;
+- listing/date hot key;
+- database connection/IOPS;
+- replica lag nếu dùng sai cho availability decision.
+
+Controls:
+
+- partition/route theo inventory ID;
+- short transaction và deterministic lock order;
+- database exclusion/unique per-night constraint hoặc conditional reservation;
+- stable booking request ID;
+- bounded hold TTL;
+- payment ngoài inventory transaction;
+- outbox sau canonical transition;
+- expiry/reconciliation workers;
+- monitor conflict/hold age per inventory;
+- không đọc replica/cache để confirm availability.
+
+Raw booking throughput thấp không có nghĩa concurrency problem nhỏ; contention phụ thuộc số requests cùng inventory/date.
+
+---
+
+#### 21. Payment bottlenecks
+
+External provider tạo failure domain:
+
+- p99 latency và timeout;
+- quota/rate limits;
+- 3DS/user-action flows;
+- duplicate/out-of-order webhook;
+- provider partial outage;
+- unknown authorization/capture result;
+- refund/payout delays;
+- retry storm;
+- fraud/manual review;
+- multi-currency/region restrictions.
+
+Controls:
+
+- durable payment state machine/queue;
+- provider request idempotency;
+- timeout budget và exponential backoff+jitter;
+- per-provider concurrency/rate caps;
+- verified/deduplicated webhooks;
+- reconciliation jobs;
+- oldest pending/unknown age alerts;
+- circuit breaker nhưng không làm mất work;
+- optional multi-provider routing nếu business/consistency justify;
+- manual operations path cho stuck cases.
+
+Không giữ database lock trong lúc gọi provider. Inventory hold bảo vệ khoảng thời gian payment xử lý; saga quyết định confirm hoặc release/compensate.
+
+---
+
+#### 22. Media bottlenecks
+
+Media là ba bài toán khác nhau:
+
+##### Storage
+
+- hàng trăm triệu objects;
+- hàng trăm TB tới PB;
+- lifecycle/version/deletion/replication.
+
+##### Ingest/processing
+
+- burst uploads;
+- malware/NSFW/copyright scan;
+- resize/transcode CPU/GPU;
+- queue lag;
+- partial upload/orphan cleanup;
+- publish readiness.
+
+##### Delivery
+
+- thumbnail/detail/video bandwidth;
+- global edge cache;
+- cache-key/variant explosion;
+- origin protection;
+- hot listing;
+- signed URL/privacy;
+- egress cost.
+
+Database chỉ lưu metadata/object references. Object store/CDN scale độc lập; processing chạy async và listing không publish broken/unmoderated asset.
+
+---
+
+#### 23. Hot path và cold path
+
+##### Hot path
+
+- geo search/autocomplete;
+- listing cards/detail;
+- availability/quote read;
+- create hold/booking;
+- confirm/cancel booking;
+- media thumbnail delivery;
+- near-term calendar sync;
+- payment state transitions.
+
+##### Warm/background path
+
+- search indexing;
+- notification;
+- external calendar sync/export;
+- media scan/transform;
+- review aggregate;
+- fraud/analytics;
+- hold expiry/reconciliation.
+
+##### Cold path
+
+- old completed booking/review history;
+- archived listing versions;
+- audit/legal evidence;
+- admin reports;
+- data warehouse/batch analysis.
+
+Không phải cold path nào cũng không quan trọng. Audit/payment history có low QPS nhưng durability/compliance cao. “Cold” nói về access/performance, không nói về business value.
+
+---
+
+#### 24. Bottleneck map
+
+| Bottleneck | Driver | Biểu hiện | Control chính |
+|---|---|---|---|
+| Geo search cluster | 42M searches/day + filters | p99/CPU/heap/shard fan-out | Geo index, replicas, cache, search-after, degradation |
+| Hot destination shard | Seasonal/event skew | Một shard quá tải | Routing/replicas/split/isolation |
+| Listing hydration | N downstream reads/card/detail | Tail latency | BFF/batch/cache/precomputed projection |
+| Stale availability search | Async projection lag | Click/quote thất bại | Freshness SLO, delta update, authority recheck |
+| Hot inventory/date | Concurrent booking attempts | Lock/conflict/timeouts | Per-inventory authority/constraint/idempotency |
+| Long-stay booking | N nightly writes | Transaction/lock lớn | Range model hoặc batched deterministic nights |
+| Hold leakage | Expiry worker lag | False unavailable | TTL state, due index, reconciler |
+| Booking DB | Connections/IO/indexes | Commit p99 tăng | Pool, minimal indexes, partition/HA/headroom |
+| Payment provider | Latency/quota/outage | Pending/unknown | Saga, caps, idempotency, webhook/reconcile |
+| Calendar polling | Millions feeds/interval | Provider quota/job backlog | Webhook/cursor/adaptive polling/jitter |
+| Search/calendar fan-out | One booking → many updates | Queue lag | Outbox, async aggregation, priority/isolation |
+| Media storage | 500M+ images/video | Capacity/lifecycle cost | Object storage, tiering, deletion workflow |
+| Media processing | Variants/video/moderation | Queue/CPU/GPU lag | Async workers, autoscale, per-type isolation |
+| CDN egress | Result/detail media | Bandwidth/cost | Right-sized variants, lazy load, caching |
+| Cache hot key/stampede | Hot listing/destination | Redis/origin overload | TTL jitter, single-flight, local cache |
+| Cancellation event | Weather/policy incident | Refund/support surge | Queues, rate caps, priority, runbook |
+| Analytics/audit | Event amplification | Broker/storage lag | Separate consumers/storage tiers |
+
+---
+
+#### 25. Isolation và degradation order
+
+Phân tầng:
+
+```text
+Tier 0: canonical inventory reservation + booking state
+Tier 1: quote/payment decision + booking read-your-write
+Tier 2: search/listing/availability projections
+Tier 3: transactional notifications + calendar export
+Tier 4: recommendation, analytics, review aggregates, noncritical media variants
+```
+
+Khi quá tải:
+
+1. giảm optional facets/personalization/recommendations;
+2. serve cached listing/search với freshness indicator;
+3. trì hoãn noncritical media variants/analytics;
+4. batch/debounce search/calendar projection updates;
+5. ưu tiên booking-confirmation và security notifications;
+6. rate limit/admit booking attempts để bảo vệ database/payment;
+7. không bỏ availability recheck, durability, idempotency hoặc payment reconciliation.
+
+Search outage có thể làm conversion giảm; booking correctness outage có thể tạo nghĩa vụ với hai guests. Hai failure classes cần priority/runbook khác nhau.
+
+---
+
+#### 26. Queue sizing và backlog drain
+
+Queues có thể dùng cho:
+
+- search index updates;
+- media processing;
+- notifications;
+- calendar import/export;
+- payment retries/reconciliation;
+- hold expiry;
+- audit/analytics.
+
+Theo dõi:
+
+```text
+backlog drain time
+= queued work
+/ (sustainable processing rate - incoming rate)
+```
+
+Queue depth không đủ vì work item có cost khác nhau:
+
+- image resize khác video transcode;
+- one calendar feed có thể chứa hàng nghìn events;
+- one booking update có thể chạm nhiều nights;
+- one search document update có thể coalesce với updates tiếp theo.
+
+Metrics:
+
+- oldest message/job age;
+- lag theo partition/provider/priority;
+- processing duration distribution;
+- retry/DLQ rate;
+- duplicate/idempotency hits;
+- downstream quota/headroom;
+- estimated drain time;
+- business freshness: search/calendar/payment/media publish lag.
+
+---
+
+#### 27. Storage summary
+
+| Dataset | Raw estimate từ assumptions/scenario | Ghi chú |
+|---|---:|---|
+| Listing metadata | Khoảng 250 GB | Chưa indexes/versions/replicas/search |
+| Canonical bookings | 365M rows/year | Khoảng 365 GB–1,8 TB/year nếu 1–5 KB |
+| Booking state/events | Có thể >1B rows/year | Nếu trung bình ≥3 events/booking |
+| Reserved nights | 4M confirmed rows/day | Nếu 4 nights/booking; holds làm lớn hơn |
+| 365-day availability grid | 18,25B cells | 292 GB–1,17 TB raw nếu 16–64 B/cell |
+| Original images | 500M objects | 250 TB–1 PB nếu 0,5–2 MB/image |
+| Derived media | Có thể tương đương hoặc vượt originals | Tùy variants/video/versioning |
+| Users | Chưa đủ assumptions | Thường không phải dataset lớn nhất |
+| Search index | Chưa đủ document/index factor | Có geo/inverted/doc values/replicas |
+| Payment/audit | Chưa đủ attempts/retention | Small QPS nhưng retention/compliance cao |
+
+Raw bytes không phải provisioned bytes. Luôn tính index, replication, backup, versions, tombstones, write amplification và headroom.
+
+---
+
+#### 28. SLO và capacity metrics
+
+##### Search/listing
+
+- search p50/p95/p99;
+- search QPS và shard fan-out;
+- zero-result/error/timeout rate;
+- result cache hit;
+- search index freshness;
+- false-available click/quote rate;
+- listing detail/cache latency;
+- CDN bytes/hit rate/origin load.
+
+##### Booking/inventory
+
+- booking attempt/hold/confirm rates;
+- p99 inventory-decision/booking latency;
+- overlap-conflict rate;
+- idempotency hit;
+- hold age/expiry lag/leaked holds;
+- transaction conflict/lock wait;
+- per-inventory/date hotspot;
+- confirmed booking durability/invariant alarms;
+- booking-outbox age.
+
+##### Payment
+
+- authorization/capture/refund rates;
+- provider latency/error/quota;
+- pending/unknown oldest age;
+- webhook delay/duplicate;
+- reconciliation mismatch;
+- payment-to-confirmed conversion.
+
+##### Calendar/media
+
+- calendars connected và sync jobs/s;
+- oldest sync age/provider lag/conflicts;
+- media upload bytes/objects;
+- scan/transform queue age;
+- publish latency/failure;
+- storage growth và CDN egress/unit cost.
+
+##### Infrastructure/skew
+
+- CPU/memory/IO/network/connections;
+- database pool saturation;
+- broker lag;
+- hot geohash/listing/partition share;
+- queue drain time;
+- AZ-failure headroom;
+- cost per search, listing view, booking và media GB.
+
+---
+
+#### 29. Load-test scenarios
+
+1. **Normal global traffic:** search/read mix phân tán.
+2. **Holiday peak:** 10× search và booking attempts.
+3. **Hot city/event:** đa số geo queries vào một shard/region.
+4. **Hot listing:** hàng trăm guests giữ cùng date range.
+5. **Long-stay booking:** transaction chạm nhiều nights.
+6. **Duplicate retry storm:** client timeouts nhưng giữ stable request IDs.
+7. **Payment slow/outage:** holds tích lại, unknown outcomes tăng.
+8. **Calendar provider outage:** polling backlog rồi recovery burst.
+9. **Search projection lag:** booking đúng nhưng stale availability tăng.
+10. **Redis loss:** cold cache/stampede nhưng canonical inventory an toàn.
+11. **Media campaign upload:** scan/transform queue và object throughput.
+12. **CDN miss/hot media:** origin shielding và egress spike.
+13. **Mass cancellation:** refund, notification, support surge.
+14. **Database/AZ failover:** retries idempotent, không overlap bookings.
+15. **Hold-expiry worker failure:** reconciler phục hồi inventory.
+
+Sau test phải kiểm tra invariant:
+
+- không overlapping effective reservations;
+- không duplicate logical booking/payment;
+- confirmed booking không mất;
+- hold hết hạn được release;
+- search/calendar cuối cùng hội tụ;
+- payment unknown được reconcile;
+- media/reference lifecycle không orphan vô hạn.
+
+---
+
+#### 30. Cách trình bày bước 2 trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. Hệ thống có 5 triệu DAU, 100.000 peak concurrent users, 50 triệu listings, 42 triệu searches và 1 triệu bookings/day.
+2. Search trung bình khoảng 486 QPS; với scenario peak 10× là khoảng 4.860 QPS trước internal query/hydration amplification.
+3. Booking confirmations chỉ khoảng 11,6/s trung bình, nhưng attempts, holds và concurrent contention trên cùng inventory/date mới quyết định capacity.
+4. 1 triệu bookings/day là 365 triệu canonical bookings/year, không phải một tỷ; trên một tỷ chỉ hợp lý khi tính multiple state/event rows.
+5. Nếu average stay 4 nights, confirmed bookings tạo 4 triệu reserved-night rows/day; hold attempts có thể nhân lớn hơn.
+6. Search-to-book volume khoảng 42:1, cho thấy read plane scale riêng nhưng booking path cần strong correctness.
+7. Listing metadata thô khoảng 250 GB; indexes, versions, replicas, search và backups làm footprint lớn hơn.
+8. 50 triệu listings × 10 images = 500 triệu originals, khoảng 250 TB–1 PB nếu mỗi ảnh 0,5–2 MB.
+9. Một scenario 20 thumbnails ×100 KB cho 42 triệu searches tạo 84 TB/day logical edge delivery, nên CDN và right-sized variants rất quan trọng.
+10. Materialize 365 ngày cho mọi listing tạo 18,25 tỷ listing-day cells; cần cân nhắc sparse/range/hybrid availability.
+11. Nếu 10% listings có calendar poll mỗi 15 phút, load minh họa khoảng 5.556 sync requests/s—có thể lớn hơn booking QPS hàng trăm lần.
+12. Bottlenecks khác nhau: geo search là query/shard problem; inventory là concurrency problem; media là object/bandwidth problem; payment/calendar là external reliability/quota problem.
+13. Capacity phải theo regional/city/listing skew, endpoint amplification và queue drain time, không chỉ global average.
+
+---
+
+#### 31. Checklist ước lượng
+
+- [ ] DAU, registered users, peak concurrency và session duration?
+- [ ] Requests/concurrent user và endpoint traffic mix?
+- [ ] Searches/day, pages/search, page size và peak factor?
+- [ ] Detail views/search và downstream hydration calls?
+- [ ] Listings total versus active/published/bookable?
+- [ ] New/updated listings và media uploads/day?
+- [ ] Booking attempts, holds và confirmations tách riêng?
+- [ ] Attempts-per-confirmation, retries, bots và payment failures?
+- [ ] Average/p95/max stay length và reserved-night amplification?
+- [ ] Concurrent attempts per hot inventory/date range?
+- [ ] Availability horizon và sparse/range/per-night representation?
+- [ ] Listing/booking/event/night row sizes và indexes?
+- [ ] Replication, backup, versioning, retention và headroom factor?
+- [ ] Original image/video count, average size và derived variants?
+- [ ] Media delivery bytes/search/detail và CDN hit/egress?
+- [ ] External calendar connection ratio, interval, webhook/quota?
+- [ ] Calendar backlog/freshness/conflict SLO?
+- [ ] Geo/seasonal/event/time-zone skew?
+- [ ] Search/index/cache freshness và false-available rate?
+- [ ] Payment attempts/webhooks/refunds/payouts/provider limits?
+- [ ] Queue oldest age, drain rate và downstream headroom?
+- [ ] Hot/warm/cold data paths và tiering?
+- [ ] Degradation priority bảo vệ booking authority?
+- [ ] Load tests có hot listing, duplicate retry, provider outage và failover?
+- [ ] Correctness invariants được kiểm tra sau load/failure test?
+
+---
+
+#### 32. Ý chính cần nhớ
+
+- Ước lượng phải phân biệt business objects, attempts, state events và derived writes.
+- 5 triệu DAU và 100.000 concurrent users không tự suy ra QPS nếu chưa có request rate.
+- 42 triệu searches/day tương đương khoảng 486 searches/s trung bình.
+- Scenario peak 10× cho khoảng 4.860 search/s, chưa gồm hydration/internal amplification.
+- 1 triệu confirmed bookings/day chỉ khoảng 11,6/s trung bình.
+- 1 triệu/day bằng 365 triệu canonical bookings/year, không phải một tỷ.
+- Một tỷ records/year có thể xuất hiện khi mỗi booking sinh nhiều state/event/night/payment rows.
+- Booking attempts và holds có thể lớn hơn confirmed bookings nhiều lần.
+- Average stay biến một booking thành nhiều reserved-night mutations.
+- Search-to-book volume khoảng 42:1 cho thấy read-heavy workload.
+- Aggregate booking QPS nhỏ nhưng hot listing/date-range contention vẫn nghiêm trọng.
+- Listing metadata thô khoảng 250 GB; provisioned footprint lớn hơn do indexes/versions/replicas.
+- Materialize 365 ngày cho 50 triệu listings tạo 18,25 tỷ cells.
+- 500 triệu original images tạo hàng trăm TB tới PB media storage.
+- Media delivery/egress có thể đắt hơn structured storage rất nhiều.
+- Corpus size không cho biết upload throughput; cần new/update rate.
+- Calendar polling amplification có thể vượt booking QPS hàng trăm lần.
+- Geo/season/time-zone skew quan trọng hơn global average.
+- Search là scalability/freshness problem; inventory là concurrency/correctness problem.
+- Payment là unknown-outcome/reconciliation problem; media là storage/processing/egress problem.
+- One booking tạo nhiều downstream events; canonical commit phải tách khỏi propagation.
+- Queue age và drain time có ý nghĩa hơn depth đơn thuần.
+- Cold data có thể ít QPS nhưng vẫn cần durability/compliance cao.
+- Capacity planning phải theo hottest geohash/listing/provider và invariant under failure.
+
+#### Công thức ghi nhớ
+
+> **Rental scale = user traffic × endpoint amplification + bookings × attempts × stay nights + listings × media variants + calendars ÷ sync interval; hãy thiết kế theo geo/seasonal skew và hot-inventory contention, không theo average QPS.**
+
+---
+
+### Bài 95. High-Level Design: Services, APIs & Communication
+
+#### 1. Kiến trúc phải phản ánh hai thế giới khác nhau
+
+Online rental platform có hai loại workload trái ngược:
+
+```text
+Discovery plane
+  - search, listing detail, media, review summary
+  - read-heavy, geo/filter, cache/index-friendly
+  - eventual consistency chấp nhận được
+
+Reservation plane
+  - quote, hold, booking, cancel, inventory release
+  - ít QPS hơn nhưng business-critical
+  - strong per-inventory/date-range correctness
+```
+
+Vì vậy, final HLD không nên cho Search Service đọc/ghi cùng một availability state rồi tin rằng cache/index sẽ ngăn double-book. Search trả candidates; Reservation Authority mới quyết định inventory.
+
+---
+
+#### 2. Sơ đồ high-level architecture
+
+```text
+┌──────────────────────────── Clients ─────────────────────────────┐
+│ Web / Mobile                                                     │
+└───────────────┬──────────────────────────────────────────────────┘
+                │ HTTPS
+                ▼
+      ┌───────────────────────┐
+      │ CDN / WAF / API       │
+      │ Gateway / BFF         │
+      └──────────┬────────────┘
+                 │
+     ┌───────────┼───────────────┬────────────────┬──────────────┐
+     ▼           ▼               ▼                ▼              ▼
+┌─────────┐ ┌──────────┐  ┌────────────┐  ┌──────────────┐ ┌─────────┐
+│Identity/│ │Listing   │  │Search      │  │Quote/Pricing │ │Review   │
+│User     │ │Service   │  │Service     │  │Service       │ │Service  │
+└─────────┘ └────┬─────┘  └─────┬──────┘  └──────┬───────┘ └─────────┘
+                 │              │                 │
+                 │        Search Index/Cache      │
+                 │              │                 │
+                 └──────────────┼─────────────────┘
+                                │ candidates/quote inputs
+                                ▼
+                     ┌──────────────────────────┐
+Booking request ────>│ Reservation Authority   │
+                     │ Booking + Inventory      │
+                     │ Hold/Confirm/Release     │
+                     └────────────┬─────────────┘
+                                  │ atomic state + outbox
+                    ┌─────────────┴──────────────┐
+                    ▼                            ▼
+          ┌──────────────────┐        ┌────────────────────┐
+          │Transactional DB │        │Outbox → Event Bus  │
+          │Booking/Inventory│        └──────────┬─────────┘
+          └──────────────────┘                   │
+                                ┌────────────────┼─────────────────┐
+                                ▼                ▼                 ▼
+                         ┌────────────┐   ┌────────────┐    ┌────────────┐
+                         │Payment/    │   │Notification│    │Search/     │
+                         │Payout Saga │   │Service     │    │Availability│
+                         └─────┬──────┘   └────────────┘    │Projection │
+                               │                            └────────────┘
+                               ▼
+                         Payment Provider
+
+ Listing Client ── upload intent ──> Media Service ──> Object Storage/CDN
+
+ External Calendars <──> Calendar Sync Service ── commands/events ──>
+                              Reservation Authority / Projections
+
+ Analytics / Audit / Fraud consume durable events independently
+```
+
+Ba kiểu giao tiếp:
+
+- **synchronous REST/gRPC** cho query hoặc decision user đang chờ;
+- **asynchronous event/queue** cho side effects và projections sau commit;
+- **provider webhook/polling** cho hệ thống bên ngoài, luôn cần verify/dedup/reconcile.
+
+---
+
+#### 3. Service boundaries và ownership
+
+##### 3.1. Edge, WAF, API Gateway và BFF
+
+- TLS termination theo deployment model;
+- DDoS/WAF/bot filtering;
+- route web/mobile requests;
+- coarse rate limit, request-size và quota;
+- verify access-token basics;
+- correlation ID, version/canary routing;
+- optional BFF aggregation cho listing-detail/mobile payload.
+
+Gateway không được:
+
+- tự quyết định user có sở hữu listing hay không;
+- dùng search/cache result để confirm booking;
+- retry non-idempotent booking bằng request ID mới;
+- giữ pricing/inventory truth.
+
+##### 3.2. Identity/User Service
+
+Sở hữu:
+
+- account/profile/preferences;
+- guest/host verification và account status;
+- language/time zone/display currency preferences;
+- payment/payout customer references;
+- device/session metadata;
+- admin/support role references.
+
+OIDC/identity provider xử lý authentication/token issuance. Domain services vẫn enforce object-level authorization.
+
+##### 3.3. Listing Service
+
+Sở hữu:
+
+- property/listing content và versions;
+- host ownership;
+- address/geolocation/time zone;
+- amenities, capacity, house rules;
+- publication/moderation lifecycle;
+- media references;
+- cancellation/pricing policy references.
+
+Không sở hữu confirmed booking hoặc canonical reserved dates.
+
+##### 3.4. Media Service
+
+- tạo direct-upload intent;
+- kiểm tra file metadata/checksum/quota;
+- malware/content scan;
+- resize/transcode và moderation;
+- attach versioned media manifest vào listing;
+- object lifecycle/orphan deletion;
+- signed URL/CDN delivery theo visibility.
+
+##### 3.5. Search Service
+
+- geo/text/filter/facet query;
+- cursor/search-after pagination;
+- ranking và policy filtering;
+- đọc search documents/availability hints;
+- trả listing IDs và lightweight cards;
+- scale độc lập khỏi transactional database.
+
+Search index là rebuildable eventual projection. Nó không cấp booking guarantee.
+
+##### 3.6. Availability Query Service
+
+- đọc calendar nhanh cho listing detail/host UI;
+- trả projected bookable/blocked nights;
+- cung cấp freshness/version metadata;
+- cache/bitmap/range read model;
+- không thực hiện final inventory reservation.
+
+Tên “Availability Service” trong sơ đồ đơn giản dễ gây nhầm. Ta tách:
+
+```text
+Availability Query = read model/projection
+Inventory Reservation = authoritative write boundary
+```
+
+##### 3.7. Quote/Pricing Service
+
+- tính nightly price, fees, taxes, discounts;
+- normalize guest count/stay rules;
+- dùng pricing/policy/FX versions;
+- tạo immutable-enough quote snapshot có expiry;
+- trả line items, charge currency và reprice rules.
+
+Quote không reserve inventory; Reservation Authority revalidates quote validity và availability khi tạo hold.
+
+##### 3.8. Reservation Authority
+
+Đây là correctness core, sở hữu:
+
+- booking request idempotency;
+- booking hold/TTL;
+- canonical reserved nights/ranges;
+- booking lifecycle;
+- no-overlap/capacity invariant;
+- confirm/cancel/release/amend commands;
+- inventory version/fencing;
+- atomic booking/inventory/outbox transition.
+
+Booking API/Orchestrator có thể là facade, nhưng không được có một writer khác cạnh tranh với Inventory Service. Mọi mutation ảnh hưởng bookability phải đi qua cùng consistency boundary.
+
+##### 3.9. Payment/Payout Service
+
+- tạo obligation từ booking hold/quote;
+- provider authorization/capture/refund;
+- webhook verification/dedup;
+- pending/unknown reconciliation;
+- platform fee/tax/ledger references;
+- host payout workflow;
+- idempotent payment events/commands.
+
+##### 3.10. Calendar Sync Service
+
+- kết nối/credentials/cursors cho providers;
+- import/export busy events;
+- polling/webhook, retry/backoff/quota;
+- normalize local date/time zone;
+- dedup/update/delete external events;
+- phát commands để apply external blocks;
+- conflict/staleness detection và host alert.
+
+External sync không ghi thẳng vào search cache hoặc overwrite internal confirmed booking.
+
+##### 3.11. Notification Service
+
+- consume booking/payment/listing/calendar events;
+- preferences, locale, priority và templates;
+- email/SMS/push/in-app adapters;
+- logical-delivery dedup;
+- retry/DLQ/delivery evidence.
+
+##### 3.12. Review/Rating Service
+
+- verify completed-stay eligibility từ booking projection/authority;
+- create/edit trong policy window;
+- moderation/report/appeal;
+- aggregate rating projection;
+- prevent duplicate logical review.
+
+##### 3.13. Risk, Audit, Analytics và Admin
+
+- inline lightweight risk/eligibility signals;
+- asynchronous fraud/content analysis;
+- immutable business/audit evidence;
+- operational telemetry và BI;
+- controlled admin override với reason/approval.
+
+---
+
+#### 4. Vì sao không để Availability Service “lock” rồi Booking Service tự tạo reservation?
+
+Sơ đồ đơn giản thường mô tả:
+
+```text
+Booking Service → check Availability Service
+                → lock dates
+                → create booking ở database khác
+```
+
+Rủi ro:
+
+- hold thành công nhưng Booking Service chết trước khi lưu draft;
+- booking được lưu nhưng hold token mất;
+- timeout khiến caller không biết hold đã tồn tại;
+- release/expiry chạy lặp;
+- Availability và Booking stores disagree;
+- confirm ở một service nhưng inventory vẫn hold ở service khác;
+- distributed transaction hoặc compensation quá phức tạp cho invariant chính.
+
+Boundary an toàn hơn:
+
+```text
+Reservation Authority transaction:
+  - dedup booking_request_id
+  - validate listing/inventory/range/quote reference
+  - assert no overlap or sufficient nightly quantity
+  - create BookingHold/Booking aggregate
+  - reserve nights/range
+  - write outbox BookingHeld
+  - commit
+```
+
+Payment và downstream effects vẫn là saga, nhưng **inventory hold và canonical booking identity** được tạo cùng durability boundary.
+
+Nếu tổ chức bắt buộc tách Inventory và Booking services, Inventory must own a durable hold token; Booking references it, và reconciler xử lý orphan states. Complexity đó phải được nói rõ, không che bằng một synchronous RPC.
+
+---
+
+#### 5. API design bên ngoài
+
+##### 5.1. Identity/Profile
+
+```http
+POST   /v1/users
+GET    /v1/me
+PATCH  /v1/me
+POST   /v1/verifications/email
+GET    /v1/hosts/{host_id}
+```
+
+Login/token endpoints có thể do external/dedicated IdP cung cấp.
+
+##### 5.2. Listing/Media
+
+```http
+POST   /v1/listings
+GET    /v1/listings/{listing_id}
+PATCH  /v1/listings/{listing_id}
+POST   /v1/listings/{listing_id}/publish
+POST   /v1/listings/{listing_id}/media-upload-intents
+POST   /v1/media/{media_id}/complete
+```
+
+Host update dùng expected listing version/ETag để tránh lost update. Publish chỉ thành công khi verification/moderation/media/rules đủ điều kiện.
+
+##### 5.3. Search/Availability
+
+```http
+GET /v1/search?location=...&check_in=...&check_out=...&guests=...&cursor=...
+GET /v1/listings/{listing_id}/availability?from=...&to=...
+GET /v1/listings/{listing_id}/price-preview?check_in=...&check_out=...
+```
+
+Search/detail response phải nói rõ `availability_as_of`, price semantics và không hàm ý inventory đã được giữ.
+
+##### 5.4. Quote
+
+```http
+POST /v1/quotes
+```
+
+```json
+{
+  "listing_id": "lst_123",
+  "inventory_unit_id": "unit_123",
+  "check_in": "2026-12-20",
+  "check_out": "2026-12-23",
+  "guest_count": 2,
+  "display_currency": "VND"
+}
+```
+
+Response:
+
+```json
+{
+  "quote_id": "q_456",
+  "quote_version": 7,
+  "expires_at": "2026-08-26T10:10:00Z",
+  "charge_currency": "USD",
+  "total_minor": 45000,
+  "line_items": [],
+  "pricing_policy_version": 12,
+  "cancellation_policy_version": 4
+}
+```
+
+##### 5.5. Booking
+
+```http
+POST /v1/bookings
+GET  /v1/bookings/{booking_id}
+GET  /v1/me/bookings?role=guest&cursor=...
+POST /v1/bookings/{booking_id}/cancel
+POST /v1/bookings/{booking_id}/amendments
+```
+
+```http
+Idempotency-Key: stable-booking-request-id
+```
+
+```json
+{
+  "quote_id": "q_456",
+  "inventory_unit_id": "unit_123",
+  "check_in": "2026-12-20",
+  "check_out": "2026-12-23",
+  "guest_count": 2,
+  "payment_method_token": "pm_..."
+}
+```
+
+Response có thể là:
+
+```json
+{
+  "booking_id": "bkg_789",
+  "state": "HELD_PAYMENT_PENDING",
+  "hold_expires_at": "2026-08-26T10:05:00Z",
+  "payment_id": "pay_123",
+  "next_action": {
+    "type": "PROVIDER_CHALLENGE"
+  }
+}
+```
+
+Nếu payment hoàn tất ngay, response có thể trả `CONFIRMED`; nếu cần 3DS/webhook, trả pending/next action. Không giữ HTTP request vô hạn để chờ external provider.
+
+##### 5.6. Payment/Webhook
+
+```http
+GET  /v1/payments/{payment_id}
+POST /v1/payments/{payment_id}/confirm
+POST /internal/v1/payment-webhooks/{provider}
+```
+
+Webhook endpoint không tin request body đơn thuần; phải verify signature/timestamp và dedup provider event ID.
+
+##### 5.7. Calendar/Review
+
+```http
+POST   /v1/listings/{listing_id}/calendar-connections
+GET    /v1/listings/{listing_id}/calendar-sync-status
+DELETE /v1/calendar-connections/{connection_id}
+
+POST /v1/bookings/{booking_id}/reviews
+GET  /v1/listings/{listing_id}/reviews?cursor=...
+POST /v1/reviews/{review_id}/reports
+```
+
+---
+
+#### 6. API semantics và error model
+
+Các nguyên tắc:
+
+- money dùng integer minor units/fixed decimal, không float;
+- stay dates là ISO local dates theo property time zone;
+- timestamps/audit dùng UTC instant;
+- cursor pagination thay deep offset;
+- stable idempotency key cho create booking/payment/cancel mutation;
+- ETag/expected version cho host updates;
+- error reason có thể hành động được;
+- không lộ raw address, provider secret hoặc fraud rule.
+
+Booking errors đại diện:
+
+```text
+LISTING_NOT_BOOKABLE
+INVENTORY_UNAVAILABLE
+QUOTE_EXPIRED
+QUOTE_CHANGED_CONFIRMATION_REQUIRED
+GUEST_COUNT_EXCEEDED
+MINIMUM_STAY_NOT_MET
+PAYMENT_ACTION_REQUIRED
+PAYMENT_PENDING
+RATE_LIMITED
+BOOKING_REQUEST_CONFLICT
+```
+
+Một timeout phải được phân biệt với business rejection. Client query booking bằng idempotency/request ID hoặc retry cùng key để lấy canonical outcome.
+
+---
+
+#### 7. Internal commands và domain events
+
+##### Command versus event
+
+```text
+Command: yêu cầu authority thử thay đổi state
+  CREATE_HOLD, CONFIRM_BOOKING, RELEASE_HOLD, CANCEL_BOOKING
+
+Event: fact đã durable commit
+  BookingHeld, BookingConfirmed, BookingCancelled, InventoryReleased
+```
+
+Không publish `BookingCreated` mơ hồ trước khi biết đó là draft, hold hay confirmed.
+
+Event đại diện:
+
+- `ListingPublished`;
+- `ListingContentUpdated`;
+- `PricingRulesUpdated`;
+- `AvailabilityBlockApplied`;
+- `QuoteIssued` nếu cần audit/analytics;
+- `BookingHeld`;
+- `PaymentAuthorizationRequested`;
+- `PaymentAuthorized`;
+- `PaymentOutcomeUnknown`;
+- `BookingConfirmed`;
+- `BookingExpired`;
+- `BookingCancelled`;
+- `InventoryReleased`;
+- `RefundRequested`/`RefundCompleted`;
+- `StayCompleted`;
+- `ReviewPublished`;
+- `ExternalCalendarConflictDetected`.
+
+##### Event envelope
+
+```json
+{
+  "event_id": "evt_...",
+  "event_type": "BookingHeld",
+  "schema_version": 2,
+  "aggregate_type": "Booking",
+  "aggregate_id": "bkg_789",
+  "aggregate_version": 3,
+  "inventory_unit_id": "unit_123",
+  "occurred_at": "...",
+  "causation_id": "booking-request-id",
+  "correlation_id": "request-trace-id",
+  "payload": {}
+}
+```
+
+Yêu cầu:
+
+- at-least-once delivery được giả định;
+- consumer idempotent;
+- partition/order scope theo booking hoặc inventory tùy stream;
+- schema compatibility/versioning;
+- PII/payment/address minimization;
+- replay/DLQ/runbook;
+- transactional outbox tại source authority.
+
+---
+
+#### 8. Transactional outbox và inbox/dedup
+
+Dual-write lỗi:
+
+```text
+1. Commit BookingHeld vào DB
+2. Process chết trước khi publish event
+3. Inventory bị giữ nhưng Payment/Search/Notification không biết
+```
+
+Pattern:
+
+```text
+Reservation transaction:
+  BookingHold + ReservedInventory + IdempotencyResponse + Outbox
+
+Outbox relay:
+  publish at least once
+
+Consumers:
+  Inbox/EventDedup + conditional domain transition
+```
+
+Outbox không tạo exactly-once end-to-end. Nó bảo đảm fact không bị bỏ quên sau source commit; downstream vẫn có thể nhận duplicate.
+
+Business dedup keys:
+
+- booking creation: booking request ID;
+- payment obligation: booking/hold ID + version;
+- provider attempt: stable provider request key;
+- notification: event + recipient + channel/template purpose;
+- calendar export: booking event/version + calendar connection;
+- review: booking + reviewer + review side.
+
+---
+
+#### 9. Luồng search end-to-end
+
+```text
+Client
+  │ GET /search(location, dates, guests, filters, cursor)
+  ▼
+API Gateway/BFF
+  ▼
+Search Service
+  ├─ normalize place → geospatial boundary
+  ├─ query search index by geo/text/filter
+  ├─ use availability/pricing hints
+  ├─ rank/paginate
+  └─ batch hydrate lightweight listing cards/cache
+  ▼
+Result with availability_as_of + display price semantics
+```
+
+Search documents có thể chứa:
+
+- geolocation/geohash;
+- listing state/type/capacity/amenities;
+- normalized text;
+- rating aggregate;
+- price bucket/display price hint;
+- availability bitmap/range hints trong horizon;
+- policy/visibility fields;
+- document version.
+
+Không đưa full canonical booking list vào search engine. Availability changes được coalesce/index async để tránh một booking đẩy hàng chục writes không cần thiết.
+
+Search result có thể false positive do lag. Quote/booking path revalidates; false negative làm mất cơ hội kinh doanh và cũng cần freshness monitoring.
+
+---
+
+#### 10. Luồng listing detail và quote
+
+```text
+Listing Detail request
+  ├─ Listing Service/cache → content/version/media manifest
+  ├─ Availability Query   → projected calendar/freshness
+  ├─ Review projection    → rating/recent reviews
+  └─ Pricing preview      → estimated/display price
+
+User chọn dates
+  ▼
+POST /quotes
+  ├─ authoritative-enough pricing rules/version
+  ├─ tax/fees/discount/FX snapshot
+  ├─ validate stay/guest rules
+  ├─ optional current availability check
+  └─ persist/sign quote snapshot + expiry
+```
+
+Quote may say “currently available”, nhưng inventory vẫn chưa được giữ. UI phải diễn đạt đúng để không tạo false guarantee.
+
+BFF/aggregator cần:
+
+- deadline/timeout budget cho từng downstream;
+- parallel calls có giới hạn;
+- fallback cho optional review/recommendation;
+- cache/batch;
+- không biến detail request thành synchronous call graph hàng chục services.
+
+---
+
+#### 11. Luồng instant booking end-to-end
+
+```text
+Guest
+  │ POST /bookings + Idempotency-Key + quote/payment token
+  ▼
+API Gateway
+  │ auth context, rate/bot limits
+  ▼
+Booking API / Reservation Authority
+  │
+  ├─ dedup request ID + payload hash
+  ├─ verify guest/listing/inventory eligibility
+  ├─ verify quote version/expiry/currency
+  ├─ verify range/rules and no overlap
+  └─ atomic commit:
+       Booking(HELD_PAYMENT_PENDING)
+       Inventory reservation/hold TTL
+       canonical response
+       Outbox BookingHeld
+  │
+  ├─ return pending/next action
+  └─ async event
+          ▼
+Payment Service
+  ├─ create obligation/attempt idempotently
+  ├─ call provider outside reservation transaction
+  └─ response/webhook/reconciliation
+          │
+          ├─ PaymentAuthorized
+          │       ▼
+          │  Reservation Authority
+          │    conditional CONFIRM if hold valid
+          │    commit BookingConfirmed + outbox
+          │
+          └─ failed/expired
+                  ▼
+             release hold idempotently
+```
+
+`BookingConfirmed` sau đó kích hoạt:
+
+- guest/host confirmation;
+- search/availability projection update;
+- external calendar export;
+- trip/stay workflow;
+- fraud/audit/analytics;
+- payout scheduling.
+
+Notification/calendar/search failures không rollback confirmed booking.
+
+---
+
+#### 12. Race: hai guests đặt cùng ngày
+
+Giả sử cả A và B thấy `[20,23)` available:
+
+```text
+A create hold ─┐
+               ├─> same inventory consistency boundary
+B create hold ─┘
+```
+
+Authority atomically áp một trong các strategy:
+
+##### Strategy A — Per-night uniqueness/capacity rows
+
+Trong một transaction, insert/claim nights 20, 21, 22. Unique/conditional capacity constraint làm chỉ một request thắng.
+
+##### Strategy B — Range exclusion constraint
+
+Với database hỗ trợ, ngăn effective reservation ranges overlap cùng inventory.
+
+Khái niệm PostgreSQL:
+
+```sql
+EXCLUDE USING gist (
+  inventory_unit_id WITH =,
+  stay_range WITH &&
+)
+WHERE (state IN ('HELD', 'CONFIRMED'));
+```
+
+Production cần xử lý hold expiry/state/index semantics cẩn thận; đây là minh họa constraint, không phải schema hoàn chỉnh.
+
+##### Strategy C — Per-inventory serialized owner/command stream
+
+Route hold/cancel/block commands theo inventory ID tới một owner, commit durable state/sequence.
+
+Kết quả:
+
+```text
+A: HELD
+B: INVENTORY_UNAVAILABLE hoặc conflict/requote
+```
+
+Không dùng:
+
+```text
+SELECT availability=true
+... rồi hai service cùng INSERT booking
+```
+
+vì read-then-write rời rạc tạo race. Redis lock thiếu durable fencing cũng không phải source of truth.
+
+---
+
+#### 13. Hold expiry và recovery
+
+Hold cần:
+
+- `hold_expires_at` authoritative;
+- state/version;
+- booking/payment references;
+- due-work index;
+- idempotent `EXPIRE_HOLD` command;
+- reconciliation nếu timer bị lỡ;
+- grace policy khi payment outcome unknown.
+
+Flow:
+
+```text
+Timer worker sees due hold
+  → EXPIRE_HOLD(booking_id, expected_version)
+  → Authority checks state/time/payment condition
+  → BookingExpired + InventoryReleased + outbox
+```
+
+Không dùng Redis TTL/key-expiry notification làm sole release mechanism. Redis mất key không được tự release/confirm inventory; canonical database/authority quyết định.
+
+Race payment versus expiry:
+
+```text
+PaymentAuthorized ─┐
+                   ├─> same booking state authority/version checks
+ExpireHold ────────┘
+```
+
+- nếu payment decision thắng khi hold còn valid → confirm;
+- nếu expiry thắng → không confirm mù; void/refund/reconcile payment theo saga;
+- duplicate commands trả same/no-op result.
+
+---
+
+#### 14. Cancellation/amendment flow
+
+Cancellation không chỉ update `status=CANCELLED`:
+
+```text
+Cancel command
+  ├─ authenticate actor/object relationship
+  ├─ load booking + cancellation policy version
+  ├─ calculate refund/fee/payout adjustment
+  ├─ atomically cancel + release inventory + outbox
+  └─ async refund/payment/calendar/search/notification workflows
+```
+
+Amendment nên là explicit workflow:
+
+- tạo new quote cho dates/guest count;
+- atomically reserve difference/new range;
+- điều chỉnh payment/refund;
+- release old range chỉ khi transition an toàn;
+- version booking;
+- tránh khoảng hở làm mất cả old lẫn new reservation;
+- audit before/after.
+
+Một phương án đơn giản trong interview là đưa amendment ra khỏi scope ban đầu và thực hiện cancel + rebook có policy rõ.
+
+---
+
+#### 15. Calendar synchronization flow
+
+##### Import
+
+```text
+Provider webhook hoặc poll job
+  → Calendar Sync Service
+  → verify connection/source/cursor
+  → parse/normalize event to property-local date range
+  → dedup/update/delete by external event ID/version
+  → command ApplyExternalBlock to Reservation Authority
+  → authority checks conflict/priority and commits
+  → availability/search projections update
+```
+
+Nếu external block overlap confirmed internal booking:
+
+- không overwrite booking;
+- tạo conflict record/alert;
+- áp source priority/business resolution policy;
+- lưu evidence và last-sync age.
+
+##### Export
+
+```text
+BookingConfirmed/Cancelled
+  → Calendar Export Worker
+  → provider request with stable business key
+  → store external event ID/version
+  → retry/reconcile
+```
+
+Provider call không nằm trong booking transaction. Export lag cần SLO/alert vì làm tăng cross-platform conflict risk.
+
+---
+
+#### 16. Payment communication pattern
+
+Payment provider có cả synchronous response và asynchronous webhook:
+
+```text
+Payment command → provider API
+                     │
+                     ├─ immediate authorized/declined
+                     ├─ requires user action
+                     └─ timeout/unknown
+
+Provider webhook ──> verified ingest ──> durable payment event/state
+Reconciler       ──> provider query  ──> repair missing/unknown status
+```
+
+Yêu cầu:
+
+- stable provider idempotency key;
+- internal payment obligation/attempt trước external call;
+- no raw card storage;
+- signature/timestamp/replay verification;
+- provider event dedup;
+- conditional state transitions;
+- out-of-order handling;
+- retry/backoff/jitter/quota;
+- unknown outcome state;
+- reconciliation và operator tools.
+
+Synchronous “payment success” không phải evidence duy nhất; webhook/reconciliation có thể sửa state theo provider truth và domain policy.
+
+---
+
+#### 17. Synchronous versus asynchronous communication
+
+##### Synchronous — user cần decision/result ngay
+
+- search/listing detail;
+- quote;
+- create booking hold decision;
+- cancel request acceptance;
+- current booking/payment status;
+- host listing/calendar command response.
+
+REST bên ngoài là hợp lý. gRPC nội bộ có thể dùng cho typed, low-latency calls nhưng không nên tạo deep synchronous chain.
+
+Critical booking path nên ngắn:
+
+```text
+Client → Gateway → Reservation Authority/DB → held/rejected response
+```
+
+Pricing/eligibility data cần thiết nên có local/versioned snapshot hoặc bounded dependency semantics. Không gọi tuần tự User → Listing → Availability → Pricing → Fraud SaaS → Payment → Notification trong một DB lock.
+
+##### Asynchronous — committed fact và downstream side effect
+
+- search indexing;
+- notification;
+- calendar import/export;
+- media processing;
+- payment webhook/retry/reconcile;
+- review aggregates;
+- analytics/audit/fraud enrichment;
+- hold-expiry jobs.
+
+Async đem lại loose coupling và burst absorption, nhưng yêu cầu:
+
+- eventual consistency được product chấp nhận;
+- idempotent consumer;
+- order scope;
+- retry/DLQ/replay;
+- backlog/freshness monitoring;
+- reconciliation.
+
+---
+
+#### 18. Data stores theo access pattern
+
+##### Relational/transactional store
+
+Phù hợp cho:
+
+- booking/inventory reservation;
+- quote/payment/order references;
+- users/host/listing metadata khi scale phù hợp;
+- reviews nếu cần relationship/eligibility/transactions;
+- unique/idempotency/exclusion constraints;
+- outbox.
+
+PostgreSQL/MySQL là examples, nhưng tính năng overlap constraint khác nhau. Thiết kế phải phù hợp engine cụ thể.
+
+##### Search index
+
+Elasticsearch/OpenSearch-like engine:
+
+- full text;
+- geo distance/bounds;
+- filters/facets;
+- ranking;
+- denormalized listing documents;
+- availability/price hints.
+
+Không phải canonical store.
+
+##### Redis/cache/soft state
+
+- popular listing/detail cache;
+- recent search result/cache fragments;
+- availability query snapshots có version;
+- rate limits;
+- session/short-lived state theo security model;
+- single-flight/hot-key protection.
+
+Không phải canonical inventory/payment/audit truth.
+
+##### Object storage/CDN
+
+- originals và derived media;
+- direct upload;
+- lifecycle/versioning;
+- global delivery.
+
+##### Broker/work queues
+
+- durable facts, multi-consumer replay;
+- payment/calendar/notification/media work;
+- priority/provider isolation;
+- at-least-once semantics.
+
+##### Reviews: không mặc định cần NoSQL
+
+Transcript gợi ý NoSQL cho review/availability snapshots. Điều này có thể đúng ở scale lớn, nhưng lựa chọn theo query/invariant:
+
+- canonical review + eligibility/moderation có thể ở relational DB;
+- per-listing review feed/aggregate là projection có thể ở NoSQL/search/cache;
+- authoritative availability phải transactional/serialized;
+- availability snapshots/bitmaps phục vụ read có thể ở Redis/NoSQL/search.
+
+“Data lớn” không tự động đồng nghĩa NoSQL.
+
+---
+
+#### 19. Data model và core entities
+
+```text
+User
+  ├── HostProfile / GuestProfile
+  ├── Verification
+  └── Preference
+
+Property
+  └── Listing ── ListingVersion ── MediaAsset
+         │
+         ├── InventoryUnit
+         │      ├── AvailabilityRule
+         │      ├── InventoryReservation / ReservedNight
+         │      └── ExternalCalendarBlock
+         │
+         ├── PricingRule / PolicyVersion
+         └── SearchDocument (derived)
+
+Quote
+Booking ── BookingStateHistory
+   ├── BookingHold
+   ├── GuestParty
+   └── OutboxEvent
+
+PaymentObligation ── PaymentAttempt ── Refund
+HostPayout
+CalendarConnection ── CalendarSyncCursor/Event
+Review ── ReviewModeration/Report
+NotificationIntent ── DeliveryAttempt
+AuditEvent / Dispute
+```
+
+---
+
+#### 20. Representative relational schema
+
+##### Listing và inventory
+
+```text
+properties(
+  property_id, host_id, address_ref, latitude, longitude,
+  property_timezone, verification_status, version
+)
+
+listings(
+  listing_id, property_id, host_id, state,
+  current_content_version, inventory_model,
+  base_currency, created_at, updated_at
+)
+
+listing_versions(
+  listing_id, version, title, description, amenities,
+  house_rules, capacity, policy_refs, created_at
+)
+
+inventory_units(
+  inventory_unit_id, listing_id, capacity_mode,
+  quantity, state, version
+)
+```
+
+##### Quote
+
+```text
+quotes(
+  quote_id, listing_id, inventory_unit_id,
+  check_in_date, check_out_date, guest_count,
+  charge_currency, total_minor, line_items_json,
+  pricing_version, policy_version, fx_snapshot_ref,
+  expires_at, created_at
+)
+```
+
+##### Booking/idempotency
+
+```text
+bookings(
+  booking_id, booking_request_id, guest_id, host_id,
+  listing_id, inventory_unit_id,
+  check_in_date, check_out_date,
+  quote_id, state, hold_expires_at,
+  booking_version, created_at, updated_at
+)
+
+booking_idempotency(
+  guest_id, booking_request_id, request_hash,
+  booking_id, canonical_response, expires_at
+)
+
+booking_state_history(
+  booking_id, sequence, from_state, to_state,
+  reason, actor_ref, occurred_at
+)
+```
+
+##### Inventory — per-night option
+
+```text
+inventory_reservations(
+  inventory_unit_id, local_date,
+  booking_id, reservation_state,
+  hold_expires_at, version
+)
+```
+
+Capacity 1 có conditional/unique rule trên effective reservation mỗi `(inventory_unit_id, local_date)`.
+
+Room-type quantity có:
+
+```text
+inventory_by_night(
+  inventory_unit_id, local_date,
+  total_quantity, held_quantity, confirmed_quantity, version
+)
+```
+
+và conditional update bảo đảm:
+
+```text
+held_quantity + confirmed_quantity + requested_quantity
+≤ total_quantity
+```
+
+##### Payment
+
+```text
+payment_obligations(
+  payment_id, booking_id, amount_minor, currency,
+  state, version, provider_customer_ref
+)
+
+payment_attempts(
+  attempt_id, payment_id, provider,
+  provider_request_key, provider_reference,
+  state, failure_code, created_at, updated_at
+)
+```
+
+##### Calendar/media/review
+
+```text
+calendar_connections(
+  connection_id, listing_id, provider, credential_ref,
+  sync_cursor, last_success_at, state
+)
+
+external_calendar_events(
+  connection_id, external_event_id, external_version,
+  start_local_date, end_local_date, state, last_seen_at
+)
+
+media_assets(
+  media_id, listing_id, object_key, checksum,
+  type, processing_state, moderation_state, version
+)
+
+reviews(
+  review_id, booking_id, reviewer_id, reviewee_id,
+  rating, content, state, created_at
+)
+```
+
+Actual secrets/card data/object bytes không nằm trong các domain rows này.
+
+---
+
+#### 21. Partitioning và indexing
+
+##### Booking/inventory
+
+- route/write partition theo `inventory_unit_id` để cùng inventory có one consistency boundary;
+- booking lookup theo `booking_id`;
+- guest/host booking lists dùng user-centric projections;
+- history/tiering theo time/region;
+- deterministic lock order theo local dates cho multi-night transaction;
+- hot inventory isolation nếu cần.
+
+##### Search
+
+- geo-aware shards/replicas;
+- fields cho geo point, text, amenities, capacity, state;
+- search-after cursor thay deep offset;
+- avoid unbounded result windows/facets;
+- document version để reject stale projection update.
+
+##### Calendar
+
+- due-sync jobs partition theo provider/account/time bucket;
+- per-provider quota/fairness;
+- jitter schedule;
+- external event unique `(connection_id, external_event_id)`;
+- freshness index cho stale connections.
+
+##### Media
+
+- object key không phụ thuộc mutable display name;
+- metadata index theo listing/state;
+- CDN cache key chứa variant/version;
+- lifecycle theo orphan/archive/deletion policy.
+
+---
+
+#### 22. Cache strategy
+
+Cache candidates:
+
+- public listing versions;
+- listing-card projections;
+- popular destination/search fragments;
+- review aggregates;
+- price preview có short TTL/version;
+- availability query snapshot;
+- geocoding/place data theo provider terms;
+- auth/risk hints phù hợp freshness.
+
+Controls:
+
+- cache-aside;
+- TTL + jitter;
+- event invalidation/update only if version newer;
+- single-flight/request coalescing;
+- negative cache;
+- regional/local caches;
+- stale-while-revalidate cho content/search;
+- thundering-herd protection;
+- cache key cardinality budget;
+- rebuild after loss.
+
+Không cache booking confirmation decision như một general answer. Idempotency store có thể trả canonical response cho **same logical request**, khác với cache availability cho requests mới.
+
+---
+
+#### 23. Failure handling
+
+| Failure | Hành vi mong muốn |
+|---|---|
+| Search index/cache stale | Có thể trả hint cũ; quote/booking authority revalidate |
+| Two booking attempts overlap | Constraint/authority chỉ cho một effective hold |
+| Client timeout sau hold commit | Retry same key trả same booking/hold |
+| Reservation commit nhưng event chưa publish | Outbox relay publish sau recovery |
+| Payment response mất | State UNKNOWN; webhook/query reconciliation |
+| Payment authorized sau hold expired | Conditional confirm fails; void/refund/reconcile |
+| Hold-expiry worker chạy lặp | Expected state/version làm một logical release |
+| Expiry worker chết | Due-work index + overdue reconciler phục hồi |
+| Notification lỗi | Retry/DLQ; booking không rollback |
+| Search indexer lag | Freshness alert; batch/replay; booking vẫn đúng |
+| External calendar provider down | Backoff, stale indicator, conflict risk/runbook |
+| External busy block conflicts booking | Không overwrite; conflict record/host ops |
+| Redis mất | Rebuild cache; canonical booking/inventory còn |
+| Media processor chết | Queue retry; asset remains pending, not published |
+| Review Service lag | Review/rating view stale, stay/booking unaffected |
+| DB primary/AZ failure | Idempotent retry/failover; no overlap invariant retained |
+| Old inventory owner resumes | Epoch/fencing prevents stale reservation writes |
+
+---
+
+#### 24. Security boundaries
+
+- OIDC authentication và short-lived tokens;
+- object-level AuthZ ở Listing/Booking/Review/Admin services;
+- host chỉ sửa listing/inventory của mình;
+- guest chỉ xem booking/payment/address đúng relationship và phase;
+- address/door instructions disclosure theo booking state/time;
+- WAF, rate limits và bot/fraud signals;
+- MFA/step-up cho payout/refund/admin;
+- TLS/service identity;
+- secrets manager/KMS;
+- payment tokenization và provider webhook verification;
+- external calendar credentials encrypted/revocable;
+- signed upload/download URLs;
+- media scan/moderation;
+- parameterized queries/input validation;
+- audit log cho override/refund/payout/calendar conflict;
+- PII/data-retention/deletion controls;
+- no tokens/card/address/private messages in logs/events.
+
+Transcript nói OAuth 2.0 + JWT; hiểu đúng là OIDC thường cung cấp user authentication, OAuth 2.0 cung cấp delegated authorization, JWT chỉ là một token format. Authorization không kết thúc ở API Gateway.
+
+---
+
+#### 25. Observability và correlation
+
+Correlation chain:
+
+```text
+request_id
+ → quote_id/version
+ → booking_request_id
+ → booking_id/version + inventory unit/date range
+ → hold/inventory mutation IDs
+ → outbox/event IDs
+ → payment/provider IDs
+ → calendar export/import IDs
+ → notification/review/dispute IDs
+```
+
+Metrics:
+
+##### Search
+
+- QPS/p95/p99, shard fan-out/cache hit;
+- index freshness;
+- false available/unavailable rate;
+- hydration/dependency latency;
+- zero result/conversion.
+
+##### Reservation
+
+- hold attempts/success/conflict;
+- booking decision/commit p99;
+- per-inventory lock/queue age;
+- idempotency hits;
+- hold expiry/leak age;
+- overlap invariant violations phải bằng 0;
+- outbox lag;
+- quote-expired/reprice rates.
+
+##### Payment/calendar/media
+
+- payment pending/unknown/reconciliation age;
+- webhook duplicates/lag;
+- calendar last-success/freshness/conflicts/provider quota;
+- media upload/scan/transform/publish lag;
+- notification queue age;
+- event-bus lag/DLQ.
+
+Metrics không dùng raw user/listing/booking IDs làm unbounded labels. Traces/logs/audit có access/retention riêng và không ghi secrets/PII không cần thiết.
+
+---
+
+#### 26. Requirement → HLD decision
+
+| Requirement | HLD decision |
+|---|---|
+| Fast geo/filter search | Dedicated denormalized search index + replicas/cache |
+| Accurate booking | Reservation Authority atomically owns booking hold + inventory |
+| No double-book | Per-night/range constraint hoặc serialized per-inventory owner |
+| Retry safety | Stable booking ID, request hash và canonical idempotency response |
+| Price transparency | Versioned expiring quote with line items/currency/policy |
+| Payment reliability | Hold-first saga, idempotent provider calls, webhook/reconcile |
+| Search scalability | Search/query plane isolated from booking write plane |
+| Availability UX | Projected calendar/bitmap with freshness metadata |
+| Projection reliability | Transactional outbox + durable broker + idempotent consumers |
+| Rich media | Direct object upload, async processing/moderation, CDN |
+| External calendars | Provider-specific async sync, cursor/dedup/quota/conflict workflow |
+| Reviews/trust | Booking-derived eligibility + moderation/audit |
+| Notifications | Async priority/channel queues; not correctness source |
+| Global/localization | Property-local dates, UTC events, locale/FX/versioned policy |
+| Security | OIDC + domain AuthZ + TLS/KMS/payment tokenization/risk controls |
+| Evolution | Clear ownership works in modular monolith or separated services |
+
+---
+
+#### 27. Bottleneck → architectural control
+
+| Bottleneck | Control |
+|---|---|
+| Geo search/filter load | Search index, geo shards/replicas, cache, limited facets |
+| Detail-service fan-out | BFF/batch/parallel deadlines/cached projections/degradation |
+| Stale search availability | Freshness/version + quote/booking revalidation |
+| Concurrent same-date booking | One reservation boundary + DB constraint/owner |
+| Long-stay multi-night writes | Deterministic transaction, range/per-night trade-off |
+| Duplicate/timeouts | Idempotency store + canonical response |
+| Hold leak/expiry race | Durable expiry commands + version checks + reconciler |
+| Payment latency/outage | External call outside DB lock + saga/unknown/reconcile |
+| Calendar polling/quota | Webhook/cursor/adaptive polling/jitter/provider isolation |
+| Search/calendar write amplification | Outbox + coalesced projections/batch consumers |
+| Media size/traffic | Object storage, derivatives, CDN, lifecycle |
+| Cache stampede | TTL jitter, single-flight, local cache, backend admission |
+| Microservice coupling | Short sync path, committed events, owned data/contracts |
+| Database/AZ failure | HA replicas, retry idempotency, fenced ownership, restore drills |
+
+---
+
+#### 28. Những điểm hiệu chỉnh so với transcript đơn giản
+
+| Transcript/sơ đồ đơn giản | Production-oriented design |
+|---|---|
+| API Gateway làm authentication | IdP/OIDC xác thực; gateway verify/admit; services object-authorize |
+| Mỗi capability thành microservice | Boundaries trước, deployment sau; modular monolith vẫn hợp lệ |
+| Availability Service kiểm tra rồi lock ngày | Read projection tách khỏi Reservation Authority atomic hold |
+| Booking Service tạo draft sau availability lock | Hold + canonical booking identity + inventory commit cùng boundary |
+| Payment success rồi Booking Service finalize | Saga/state machine xử lý pending, webhook, timeout, expiry và compensation |
+| `Booking Created` kích hoạt side effects | Dùng fact cụ thể: Held/Confirmed/Cancelled/Expired |
+| RabbitMQ/Kafka tự tạo resilience | Cần outbox, idempotent consumers, order, retry/DLQ/reconcile |
+| Sync khi user cần response, async nếu background | Còn phải giữ invariant trong one authority và tránh deep sync chain |
+| OAuth2/JWT xác thực user | OIDC thường cho authentication; OAuth2 là authorization; JWT là format |
+| Relational DB cho user/listing/booking | Cần ownership, schema, constraints, partition, HA và idempotency |
+| NoSQL cho availability/reviews vì scale | Canonical availability cần strong boundary; reviews có thể relational; projections mới tùy access pattern |
+| Elasticsearch lưu listing search | Chỉ read projection, không canonical listing/inventory source |
+| Redis chứa recent search/popular listing | Có version/TTL/invalidation/stampede plan; không booking truth |
+| CDN phục vụ static assets | Object ingest/scan/variants/version/lifecycle/privacy vẫn cần thiết kế |
+| Availability update external calendar | Sync eventual không loại bỏ cross-platform race/conflict |
+| Simple tables Users/Listings/Availability/Bookings | Cần Property/InventoryUnit/Quote/Hold/History/Attempts/Outbox/Calendar cursor/Audit |
+
+---
+
+#### 29. Trade-offs quan trọng
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Dedicated search index | Fast geo/filter scale | Projection lag/rebuild/ops |
+| Availability hints in search | Lọc nhanh | False positives/negatives |
+| Reservation Authority | Clear no-overlap invariant | Hot inventory/partition complexity |
+| Per-night reservation rows | Simple capacity check/calendar | Write amplification for long stays |
+| Range exclusion | Compact natural interval model | DB-specific index/lock complexity |
+| Short-lived hold | Safe payment choreography | Temporary inventory loss/expiry work |
+| Async side effects | Responsive/loosely coupled | Eventual consistency/duplicates/backlogs |
+| Outbox | Reliable state→event handoff | Relay/cleanup/duplicate publishing |
+| Redis cache | Low read latency | Staleness/eviction/hot keys |
+| Polyglot stores | Query-specific performance | Operational/backup/recovery complexity |
+| Third-party payment/calendar | Faster capability delivery | Quota/outage/lock-in/reconciliation |
+| Microservices | Independent scale/ownership | Network/deploy/on-call overhead |
+
+---
+
+#### 30. Evolution path
+
+##### Giai đoạn đầu
+
+```text
+Modular monolith
++ PostgreSQL transaction/constraints
++ outbox + durable jobs
++ Redis cache
++ managed search
++ object storage/CDN
++ external payment
+```
+
+Modules vẫn tách:
+
+- Listing;
+- Search projection;
+- Quote/Pricing;
+- Reservation/Inventory;
+- Payment;
+- Notification/Calendar/Media/Review.
+
+##### Khi tăng trưởng
+
+- tách Search và Media đầu tiên vì workload khác biệt;
+- tách Notification/Calendar/Payment workers;
+- partition booking/inventory theo inventory unit;
+- dedicated broker/change stream;
+- user/host-centric booking projections;
+- geo/regional search clusters.
+
+##### Quy mô toàn cầu
+
+- inventory home-region/authority;
+- hot listing isolation;
+- regional search/media edge;
+- data residency;
+- multi-region event propagation;
+- fenced failover;
+- provider routing và global operations.
+
+Không tách database/service chỉ vì sơ đồ đẹp. Tách khi ownership, scale, deploy hoặc failure isolation có lợi rõ và team đủ khả năng vận hành.
+
+---
+
+#### 31. Cách trình bày HLD trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. Web/mobile đi qua CDN/WAF/API Gateway; gateway route/rate-limit nhưng domain services vẫn authorize.
+2. Listing Service sở hữu property content/version/media references; Media dùng direct object upload, async processing và CDN.
+3. Search Service dùng denormalized geo/text index, cache và projected availability để phục vụ read-heavy traffic.
+4. Search availability chỉ là hint; Quote/Pricing tạo versioned expiring price snapshot.
+5. Booking API route tới Reservation Authority, nơi booking hold và inventory range được commit atomically.
+6. No-double-book được enforce bằng per-night capacity/unique constraint, range exclusion hoặc serialized owner theo inventory.
+7. Stable booking request ID và payload hash làm retries effectively-once.
+8. BookingHeld được ghi cùng outbox; Payment Service xử lý provider ngoài database lock.
+9. PaymentAuthorized và ExpireHold cạnh tranh qua versioned booking state; failure tạo release/void/refund/reconcile workflow.
+10. Chỉ BookingConfirmed kích hoạt canonical calendar/search updates, notifications và trip/payout workflows phù hợp.
+11. Calendar Sync dùng provider cursor/webhook/polling, dedup và conflict record; không overwrite confirmed internal booking.
+12. PostgreSQL-like store giữ canonical booking/inventory/payment references; search, Redis và NoSQL views là derived.
+13. Broker/queues dùng at-least-once; outbox/inbox/idempotent consumers đóng reliability gaps.
+14. Security dùng OIDC/domain AuthZ, payment tokenization, encrypted calendar credentials và address/media privacy.
+15. Observability theo dõi search freshness, booking conflict/hold age, payment unknown và calendar sync lag.
+
+Deep dives nên chuẩn bị:
+
+- two users booking same dates;
+- per-night versus range inventory model;
+- payment-versus-hold-expiry race;
+- idempotency after client timeout;
+- search availability freshness;
+- quote version/repricing;
+- external calendar conflict;
+- cancellation/amendment compensation;
+- hot listing and DB contention;
+- regional inventory ownership/failover.
+
+---
+
+#### 32. HLD checklist
+
+- [ ] Discovery và Reservation planes tách rõ?
+- [ ] Property, Listing, InventoryUnit ownership?
+- [ ] Search index/read availability được đánh dấu derived/eventual?
+- [ ] Quote có version, expiry, line items, currency và policy refs?
+- [ ] Availability Query khác Reservation Authority?
+- [ ] Hold + booking identity + inventory mutation cùng consistency boundary?
+- [ ] No-overlap/capacity constraint strategy rõ?
+- [ ] Property-local half-open date interval semantics?
+- [ ] Stable booking request ID, request hash và canonical retry response?
+- [ ] Booking/payment/hold state machines và version checks?
+- [ ] External provider call không nằm trong inventory transaction?
+- [ ] Payment unknown/webhook/reconcile và expiry race?
+- [ ] Transactional outbox + consumer inbox/dedup?
+- [ ] Command/event names phản ánh fact cụ thể?
+- [ ] Event partition/order/schema/PII/replay policy?
+- [ ] Search documents, geo/index/pagination/cache/freshness?
+- [ ] Listing-detail BFF fan-out/timeout/degradation?
+- [ ] Media direct upload/scan/variants/moderation/CDN/lifecycle?
+- [ ] Calendar credentials/cursor/dedup/quota/jitter/conflict handling?
+- [ ] Confirmed booking không bị external block overwrite?
+- [ ] Cancellation/amendment inventory/payment compensation?
+- [ ] Review eligibility từ completed booking?
+- [ ] User/host booking lists dùng query projections?
+- [ ] DB schema/index/partition/hot inventory/HA/restore plan?
+- [ ] Redis only cache/soft state và có rebuild/stampede plan?
+- [ ] OIDC/object AuthZ/TLS/secrets/payment/address privacy?
+- [ ] End-to-end correlation và business SLOs?
+- [ ] Modular-monolith-to-services evolution path?
+
+---
+
+#### 33. Ý chính cần nhớ
+
+- HLD phải tách read-heavy discovery khỏi strongly consistent reservation.
+- Search Service scale độc lập bằng geo/text index và denormalized documents.
+- Search availability chỉ là projected hint, không phải booking guarantee.
+- Quote là versioned expiring price/policy snapshot, không reserve inventory.
+- Availability Query Service khác authoritative Inventory Reservation boundary.
+- Booking Service và Availability Service không được là hai independent writers của hold/inventory.
+- Reservation Authority commit booking identity, hold, inventory và outbox atomically.
+- No-double-book cần database constraint/conditional capacity hoặc serialized inventory owner.
+- Read-then-write availability check rời rạc sẽ race.
+- Stable booking ID và payload hash biến timeout retry thành một logical booking.
+- Payment provider call phải ngoài inventory DB transaction.
+- Booking/payment phối hợp bằng saga, hold TTL, versioned commands và reconciliation.
+- PaymentAuthorized và ExpireHold phải được phân xử trên canonical booking state.
+- Outbox sửa state/event dual-write gap; consumers vẫn idempotent.
+- Dùng fact cụ thể như BookingHeld/Confirmed/Expired, không dùng BookingCreated mơ hồ.
+- Notification, search, calendar và analytics xử lý sau durable business commit.
+- External calendar sync eventual; conflict record quan trọng hơn overwrite mù.
+- Reviews không mặc định cần NoSQL; storage chọn theo invariants và access patterns.
+- Redis/cache/search/CDN tăng tốc nhưng không giữ booking/payment truth.
+- Media là direct-upload + processing/moderation + object storage/CDN pipeline.
+- API Gateway không thay domain authorization.
+- OAuth 2.0, OIDC và JWT có vai trò khác nhau.
+- Schema thực tế cần Quote, Hold, InventoryUnit, StateHistory, PaymentAttempt, Outbox và SyncCursor.
+- Có thể bắt đầu modular monolith; consistency boundary vẫn phải đúng.
+- Kiến trúc tốt nối **eventual candidate discovery → versioned quote → atomic inventory hold → reconciled payment → durable confirmation → asynchronous projections**.
+
+#### Công thức ghi nhớ
+
+> **Rental HLD = CDN/search-based discovery plane + versioned quote service + one transactional reservation authority for booking and inventory + outbox-driven payment/calendar/notification sagas + object-media pipeline + secure rebuildable read projections.**
+
+---
+
+### Bài 96. Making Tech & Infra Decisions Strategically
+
+#### 1. Từ requirement tới technology decision
+
+Không chọn Azure, Kubernetes, Redis hay Kafka trước rồi tìm chỗ đặt chúng vào sơ đồ. Trình tự:
+
+```text
+Requirement/invariant
+       ↓
+Capability cần thiết
+       ↓
+Candidate technologies
+       ↓
+Consistency/failure/cost/team trade-off
+       ↓
+Decision + guardrail + review trigger
+```
+
+Ví dụ:
+
+```text
+Không double-book
+≠ “dùng microservices + Redis lock”
+
+= one Reservation Authority
+  + atomic range/night capacity constraint
+  + idempotency
+  + durable state/outbox
+  + fenced failover
+```
+
+Công nghệ phải hiện thực semantics này, không được thay thế nó bằng tên sản phẩm.
+
+---
+
+#### 2. Decision matrix tổng quát
+
+| Requirement | Capability | Lựa chọn đại diện | Trade-off cần hỏi |
+|---|---|---|---|
+| Global HTTP access | Edge routing, WAF, CDN | Azure Front Door-like edge, Cloudflare, cloud LB/CDN | Latency, routing, cost, vendor |
+| Web/mobile APIs | Managed/container compute | AKS, Container Apps/App Service-like service, Kubernetes/ECS | Control versus operations |
+| Transactional booking | ACID/conditional constraints | PostgreSQL, Azure SQL-like relational DB, distributed SQL | Hot inventory, failover, sharding |
+| Fast geo search | Search engine/index | Elasticsearch/OpenSearch, Azure AI Search-like service | Geo/filter features, freshness, cost |
+| Cache/soft state | In-memory key-value | Managed Redis-compatible cache | Staleness, eviction, hot keys |
+| Durable async workflow | Queue/event broker | RabbitMQ, Kafka, managed Service Bus/pub-sub | Ordering, replay, operations |
+| Media | Object storage + CDN | Azure Blob Storage-like object store + CDN | Egress, variants, lifecycle |
+| Scheduled/async work | Durable jobs/functions/workers | Queue workers, Functions, container jobs | Cold start, concurrency, ordering |
+| Identity/security | OIDC IdP, IAM, secrets/KMS | Managed identity platform, Key Vault-like service | Claims, key rotation, availability |
+| Observability | Metrics/logs/traces | OpenTelemetry, Azure Monitor/App Insights-like stack, Prometheus/Grafana | Cardinality, cost, privacy |
+
+Các tên Azure chỉ là ví dụ triển khai. AWS, GCP, on-prem hoặc multi-cloud có thể cung cấp capability tương đương.
+
+---
+
+#### 3. Compute platform
+
+##### Option A — Managed application/container platform
+
+Phù hợp khi:
+
+- team muốn giảm cluster operations;
+- phần lớn services stateless;
+- autoscaling/deployment chuẩn;
+- cần ra mắt nhanh;
+- chưa cần custom scheduler/networking sâu.
+
+Lợi ích:
+
+- patch/control plane được quản lý nhiều hơn;
+- tích hợp logs, identity, certificates;
+- scale service độc lập;
+- ít platform engineering hơn.
+
+##### Option B — Kubernetes/AKS-like platform
+
+Phù hợp khi:
+
+- nhiều long-running services/workers;
+- custom placement/network policy;
+- nhiều workload classes;
+- team có SRE/platform maturity;
+- cần portability hoặc advanced autoscaling.
+
+Chi phí:
+
+- cluster/node upgrades;
+- ingress/network/storage complexity;
+- resource requests/limits;
+- autoscaling/draining;
+- supply-chain/runtime security;
+- on-call burden.
+
+Kubernetes không tự cung cấp:
+
+- no-double-book constraint;
+- idempotency;
+- event delivery exactly once;
+- payment reconciliation;
+- database capacity;
+- application backpressure.
+
+##### Option C — Serverless functions
+
+Tốt cho:
+
+- provider webhooks;
+- notification/calendar jobs;
+- media metadata callbacks;
+- bursty lightweight transforms;
+- reconciliation triggers.
+
+Cần thận trọng:
+
+- cold start trên latency-sensitive booking path;
+- concurrency explosion làm quá tải database/provider;
+- execution time cho video processing;
+- per-inventory serialized ownership;
+- ordering và retry semantics;
+- sustained-load cost.
+
+Một hệ thống có thể kết hợp managed containers cho APIs/authorities, functions cho selective background jobs và specialized media workers.
+
+---
+
+#### 4. Backend language/framework
+
+Java/Spring Boot, .NET, Go hoặc Node.js/TypeScript đều có thể hiện thực hệ thống này. Chọn theo:
+
+- transaction/database/search/provider libraries;
+- team skill và hiring;
+- measured p99 latency/throughput;
+- CPU versus I/O profile;
+- tracing/profiling/debugging;
+- memory/startup/GC;
+- release/security patch process;
+- số runtime mà on-call có thể vận hành.
+
+Representative split:
+
+- Reservation/Payment: Java/.NET/Go hoặc runtime có mature transactional tooling;
+- BFF/query/realtime orchestration: Node.js/Java/.NET/Go đều được;
+- media/video processing: native/tool-specific workers.
+
+Không cần nhiều ngôn ngữ nếu một stack đáp ứng được. Polyglot runtime làm tăng CI/CD, patching, tracing và operational cost.
+
+---
+
+#### 5. Relational database cho booking authority
+
+PostgreSQL hoặc relational database tương đương phù hợp vì:
+
+- ACID transactions;
+- unique/foreign-key/check constraints;
+- row/version locking;
+- range/exclusion constraints nếu engine hỗ trợ;
+- idempotency và outbox cùng transaction;
+- reliable point/range/history queries;
+- replication, backups và PITR maturity.
+
+##### Per-night model
+
+Transaction giữ tất cả nights:
+
+```text
+BEGIN
+  dedup booking request
+  validate booking/quote/rules
+  claim [check_in, check_out) nights in deterministic order
+  create booking hold + expiry
+  write canonical response + outbox
+COMMIT
+```
+
+Capacity=1 được bảo vệ bằng unique/conditional constraint. Room-type quantity dùng conditional counters trên mỗi night.
+
+##### Range model
+
+Một date range row + exclusion/serialized check giảm writes cho stay dài nhưng cần database/index semantics phù hợp và xử lý active hold expiry cẩn thận.
+
+##### Database guardrails
+
+- money là integer minor units/fixed decimal;
+- local stay dates tách UTC event timestamps;
+- bounded connection pools;
+- short transactions;
+- deterministic lock order;
+- minimum indexes trên hot write path;
+- statement/lock timeout;
+- idempotent retry cho serialization/deadlock conflict;
+- query plans và table/index bloat monitoring;
+- partition/archive completed history;
+- restore/PITR drills.
+
+Read replicas phục vụ booking history/reporting phù hợp staleness, không dùng để quyết định inventory còn trống.
+
+---
+
+#### 6. Scaling transactional data
+
+##### Giai đoạn đầu
+
+- một HA relational cluster;
+- schema/constraints đúng;
+- connection pooler;
+- read replicas cho noncritical queries;
+- outbox;
+- partition/tiering theo time khi cần.
+
+##### Khi lớn hơn
+
+- split ownership databases theo bounded context: Listing, Reservation, Payment;
+- shard Reservation theo `inventory_unit_id`/home region;
+- user/host booking lists là projections;
+- hot listing isolation;
+- CDC/outbox cho read models;
+- distributed SQL/KV chỉ khi consistency/region/scale justify.
+
+Sharding tăng aggregate throughput nhưng không chia concurrent writes của một hot inventory. Mọi requests cùng unit/date vẫn cần một authoritative constraint/order.
+
+##### Multi-region
+
+Không để mỗi region independently confirm cùng inventory. Pattern dễ hiểu:
+
+```text
+Global edge/search reads
+        ↓
+Booking command → Inventory Home Region/Authority
+        ↓
+Strong local commit
+        ↓
+Async cross-region projections/events
+```
+
+Failover home region cần:
+
+- durable replication;
+- leader/ownership election;
+- monotonically increasing epoch/fencing;
+- stated RPO/RTO;
+- client idempotent retry;
+- reconciliation sau promotion.
+
+Cross-region asynchronous replica có thể mất recent writes theo RPO khi disaster; synchronous cross-region replication tăng latency và giảm availability trong partition. Phải nêu trade-off, không chỉ nói “replicate multi-region”.
+
+---
+
+#### 7. Search technology
+
+Elasticsearch/OpenSearch/Azure AI Search-like engine phù hợp cho:
+
+- full-text;
+- geo-distance/bounding box;
+- amenities/capacity/property filters;
+- facets;
+- ranking;
+- search-after/cursor;
+- denormalized documents.
+
+Search index nhận `ListingPublished/Updated`, pricing/availability projection updates qua outbox/event consumers.
+
+Guardrails:
+
+- document version để stale consumer không ghi đè state mới;
+- bounded result windows/facets;
+- geo-aware shards/replicas;
+- aliases/versioned index for zero-downtime rebuild;
+- bulk indexing/coalescing;
+- index freshness SLO;
+- query timeout/load shedding;
+- source database/event replay rebuild plan;
+- no PII/full address/private host data in public documents.
+
+Availability in search có thể là bitmap/range hint hoặc coarse flag. Final quote/hold revalidates transactional inventory.
+
+---
+
+#### 8. Redis/cache technology
+
+Managed Redis-compatible cache có thể giữ:
+
+- public listing/document fragments;
+- popular search results/facets;
+- review aggregates;
+- availability query snapshots có version;
+- short-lived price preview;
+- rate-limit counters;
+- distributed single-flight hints;
+- session/soft state nếu security model cho phép.
+
+Không giữ duy nhất:
+
+- canonical booking hold;
+- confirmed reserved nights;
+- idempotency evidence;
+- payment state/ledger;
+- calendar conflict truth;
+- audit history.
+
+Cache strategy:
+
+```text
+cache-aside
++ TTL jitter
++ event/version invalidation
++ single-flight
++ stale-while-revalidate cho read phù hợp
++ local/regional hot cache
++ cold-cache admission protection
+```
+
+##### Distributed lock caveat
+
+Redis lock có thể là optimization, nhưng không thay database constraint/fencing. Lease có thể hết khi process pause; stale holder thức dậy vẫn ghi nếu durable store không kiểm tra fencing token.
+
+##### Availability cache caveat
+
+Cache nói “available” chỉ là hint. Reservation transaction không bỏ qua authoritative overlap/capacity check dù cache vừa được refresh.
+
+---
+
+#### 9. Object storage và media delivery
+
+Azure Blob Storage-like object storage được chọn vì:
+
+- hàng trăm triệu objects;
+- durability/scale;
+- tiering/lifecycle;
+- lower cost hơn relational blob rows;
+- direct upload;
+- event integration;
+- CDN/edge delivery.
+
+Pipeline:
+
+```text
+Client requests short-lived upload intent
+  → direct upload quarantine/original bucket
+  → object-created event
+  → scan/validate/checksum
+  → image resize/video transcode
+  → content moderation
+  → publish immutable variants/manifest
+  → CDN delivery
+```
+
+Controls:
+
+- private-by-default upload container;
+- MIME sniffing, size/resolution/duration limits;
+- checksum/content ID;
+- signed URLs/SAS-like short-lived access;
+- object versioning/lifecycle/orphan cleanup;
+- region/data-residency placement;
+- CDN origin shielding;
+- cache-control/versioned keys;
+- right-sized formats;
+- deletion propagation;
+- upload/processing quotas.
+
+Blob Storage giữ bytes; relational metadata giữ listing relationship, state, moderation và version.
+
+---
+
+#### 10. Message broker: RabbitMQ, Kafka hay managed queue?
+
+Không có một broker tốt nhất cho mọi workload.
+
+##### RabbitMQ-like broker
+
+Mạnh ở:
+
+- work queues;
+- flexible routing/exchanges;
+- per-message ack/retry;
+- moderate-latency task dispatch.
+
+Trade-off:
+
+- replay/long retention không phải core strength như event log;
+- cluster operations/throughput planning;
+- ordering phụ thuộc queue/consumer design.
+
+##### Kafka-like event log
+
+Mạnh ở:
+
+- high-throughput retained facts;
+- replay/rebuild projections;
+- many consumer groups;
+- order trong partition;
+- analytics/CDC integration.
+
+Trade-off:
+
+- partition/rebalance/schema/lag operations;
+- poison event handling;
+- task scheduling/retry cần pattern/topics riêng;
+- key hotspot.
+
+##### Managed queue/pub-sub/Service Bus-like option
+
+Mạnh ở:
+
+- giảm operations;
+- queues/topics, retry/DLQ;
+- sessions/message grouping nếu cần scoped order;
+- cloud identity/monitoring integration.
+
+Trade-off:
+
+- quota, message size, retention/ordering constraints;
+- vendor cost/lock-in;
+- replay semantics tùy product.
+
+##### Recommended split theo semantics
+
+```text
+Transactional outbox → durable event log/topic
+  ListingUpdated, BookingHeld/Confirmed/Cancelled, PaymentStatusChanged
+
+Work queues
+  email/SMS, calendar sync, media processing, payment retry, hold expiry
+```
+
+Một managed platform có thể thực hiện cả hai vai trò nếu semantics đủ, nhưng vẫn cần tách topic/queue, priority và provider/channel failure domains.
+
+---
+
+#### 11. Messaging reliability
+
+Pattern bắt buộc:
+
+- source mutation + outbox cùng transaction;
+- relay publish at least once;
+- consumer inbox/dedup;
+- conditional/idempotent state transition;
+- exponential backoff + jitter;
+- bounded retry và DLQ/parking lot;
+- poison-message runbook;
+- schema registry/compatibility;
+- partition/order scope;
+- replay safety;
+- queue age/drain-time metrics.
+
+Ví dụ:
+
+```text
+BookingConfirmed event được giao hai lần
+  → Search projector chỉ apply version mới một lần
+  → Notification dùng booking+recipient+purpose dedup
+  → Calendar export dùng booking+calendar+version key
+  → Payout scheduler dùng booking/milestone key
+```
+
+Kafka/RabbitMQ không tự tạo exactly-once business workflow. Idempotency phải nằm trong từng consumer/domain.
+
+---
+
+#### 12. Payment infrastructure
+
+Sử dụng third-party payment provider qua tokenized/hosted flow để giảm PCI scope.
+
+Internal components:
+
+- Payment Obligation store;
+- Payment Attempt store;
+- provider adapter;
+- webhook ingress;
+- retry/reconciliation workers;
+- refund/chargeback/payout workflows;
+- operator console/audit.
+
+Flow:
+
+```text
+BookingHeld
+  → create obligation idempotently
+  → provider authorize with stable request key
+  → immediate/pending/action-required/unknown
+  → verified webhook/reconciliation
+  → PaymentAuthorized/Failed/Unknown event
+  → Reservation Authority confirm/release/compensate
+```
+
+Guardrails:
+
+- no provider call inside inventory database transaction;
+- per-provider timeout/rate/concurrency cap;
+- no blind retry after unknown outcome;
+- signature + timestamp + event-ID dedup;
+- out-of-order transition checks;
+- internal/provider reconciliation;
+- circuit breaker không làm mất queued work;
+- manual review for stuck/high-risk cases;
+- secrets/KMS rotation;
+- multi-currency and provider-region policy.
+
+---
+
+#### 13. Calendar synchronization infrastructure
+
+Một stack đại diện:
+
+```text
+Calendar Connection Store
+  credential reference + provider + sync cursor + last success
+
+Provider Webhook Ingress
+  verify → durable enqueue
+
+Adaptive Poll Scheduler
+  due buckets + jitter + provider quotas
+
+Provider-specific Workers
+  fetch delta → normalize → dedup → apply block command
+
+Export Workers
+  BookingConfirmed/Cancelled → provider idempotent update
+
+Reconciler
+  detect stale/missing/conflicting states
+```
+
+Không autoscale workers vượt provider quota. Scale theo:
+
+- oldest sync age;
+- provider headroom;
+- due job count;
+- change volume;
+- near-term stay priority;
+- error/backoff state.
+
+Credentials lưu trong secret/encrypted credential store; logs/events không chứa refresh tokens/calendar private content không cần thiết.
+
+---
+
+#### 14. Autoscaling strategy
+
+Horizontal scaling hữu ích, nhưng metric phải theo workload.
+
+| Component | Scale signal phù hợp |
+|---|---|
+| API/BFF | RPS, concurrency, p99, CPU |
+| Search API | query concurrency, p99, timeout, CPU |
+| Search cluster | shard CPU/heap/query queue/index lag |
+| Listing/Quote | RPS, cache miss, downstream latency |
+| Reservation API | attempts, p99 decision, DB pool/lock wait |
+| Reservation workers/owners | active partitions, command queue age, hot inventory |
+| Event consumers | partition lag, oldest event age |
+| Notification | channel queue age + provider quota |
+| Payment | obligation age + provider headroom |
+| Calendar sync | due/oldest sync age + provider quota |
+| Media processors | queue age weighted by image/video cost |
+
+Autoscaling không giải quyết:
+
+- một hot inventory lock;
+- database connection/IO ceiling;
+- provider quota;
+- stale search document;
+- Redis hot key;
+- wrong transaction boundary.
+
+Controls:
+
+- minimum warm instances;
+- pre-scaling cho holiday/campaign;
+- separate workload pools;
+- downstream-aware maximum replicas;
+- connection pool budgets;
+- graceful scale-down/drain;
+- backpressure/admission/load shedding;
+- N+1/AZ-failure headroom.
+
+---
+
+#### 15. Load balancing và edge routing
+
+Global edge/load balancing:
+
+- nearest healthy region cho search/listing/media;
+- WAF/DDoS/TLS;
+- static/media caching;
+- health/probe-based routing;
+- failover policy;
+- regional/data-residency controls.
+
+Regional L7 load balancer/API Gateway:
+
+- path/version routing;
+- per-endpoint/request limits;
+- zonal spread;
+- connection draining;
+- safe retry policy.
+
+Booking retry:
+
+- chỉ retry tự động khi giữ nguyên idempotency key;
+- tránh proxy retry mù nếu timeout sau downstream commit;
+- client có thể query canonical state.
+
+Reservation routing:
+
+- route command tới inventory home shard/region;
+- owner/DB partition mapping;
+- epoch/fencing khi ownership thay đổi;
+- không dựa vào sticky session để bảo đảm correctness.
+
+Load balancer loại bỏ single application instance nhưng không loại bỏ single database writer, hot partition hoặc stateful external dependency.
+
+---
+
+#### 16. High availability
+
+##### Stateless services
+
+- nhiều instances trên nhiều availability zones;
+- health checks;
+- anti-affinity/failure-domain spread;
+- rolling/canary deployment;
+- graceful drain;
+- dependency timeout/circuit breaker.
+
+##### Relational database
+
+- zonal HA primary/standby;
+- automatic failover với reconnect/retry;
+- synchronous replica trong region nếu RPO=0 cho acknowledged commits;
+- read replicas cho non-authoritative queries;
+- backups/WAL/PITR;
+- restore verification;
+- capacity to survive node/AZ loss.
+
+##### Search
+
+- shard replicas across failure domains;
+- snapshots;
+- index rebuild from source/events;
+- query degradation nếu một optional feature lỗi.
+
+##### Redis
+
+- managed HA/cluster;
+- rebuildable cache;
+- application survives eviction/loss;
+- cold-cache rate limiting/single-flight.
+
+##### Broker
+
+- replicated durable topics/queues;
+- producer acknowledgement policy;
+- consumer checkpoint;
+- outbox buffer when unavailable;
+- replay/DLQ.
+
+##### Object storage
+
+- appropriate redundancy tier;
+- versioning/lifecycle;
+- deletion/restore policy;
+- CDN origin failover where justified.
+
+High availability là property end-to-end. Nếu database/payment provider hoặc identity platform down, nhiều API instances không giúp booking hoàn tất.
+
+---
+
+#### 17. Multi-region và disaster recovery
+
+Phân loại:
+
+##### Active-active reads
+
+Search, listing cache, media/CDN và public content có thể serve nhiều regions từ replicated projections.
+
+##### Single-home writes per inventory
+
+Booking commands của một inventory route tới one home region/authority để giữ no-overlap order.
+
+##### Payment/calendar
+
+Workflow placement theo booking/home/provider region; events replicate nhưng provider calls/dedup có owner rõ để tránh duplicate charge/export.
+
+##### DR design cần ghi
+
+- data replication mode/lag;
+- RPO/RTO cho booking, payment, listing, search, media;
+- failover decision owner;
+- DNS/global-routing TTL/health;
+- database promotion;
+- inventory epoch/fencing;
+- replay outbox/events;
+- reconcile unknown booking/payment/calendar states;
+- data residency/legal constraints;
+- failback procedure;
+- regular drills.
+
+Một trade-off rõ:
+
+```text
+Synchronous cross-region booking commit
+  + lower RPO
+  - higher latency và partition sensitivity
+
+Asynchronous cross-region replication
+  + lower local latency
+  - non-zero RPO và recovery reconciliation
+```
+
+Không tuyên bố “multi-region replicas” là zero-data-loss nếu replication asynchronous.
+
+---
+
+#### 18. Security infrastructure
+
+##### Identity và access
+
+- OIDC-compatible IdP;
+- OAuth 2.0 access tokens;
+- short-lived token + secure refresh flow;
+- MFA/step-up;
+- workload/managed identities;
+- RBAC/ABAC và object ownership;
+- admin privileged access workflow.
+
+##### Network
+
+- WAF/DDoS;
+- TLS everywhere phù hợp threat model;
+- private network/endpoints cho DB/cache/broker/storage;
+- network segmentation;
+- egress allowlists/provider controls;
+- certificate automation.
+
+##### Secrets/keys/data
+
+- Key Vault-like secrets/KMS;
+- no secrets in image/config/log;
+- rotation;
+- encryption at rest;
+- payment/calendar credentials tokenized/encrypted;
+- signed media URLs;
+- backup encryption/access;
+- PII/address masking and field-level access.
+
+##### Workload/software supply chain
+
+- minimal images, scanning/signing/SBOM;
+- patch policy;
+- dependency vulnerability scanning;
+- least-privilege service accounts;
+- admission/policy controls;
+- audit for deployment/config changes.
+
+##### Application/marketplace
+
+- input validation/parameterized queries;
+- CSRF/XSS/CSP/session protection;
+- hierarchical rate limit;
+- bot/fraud/velocity/device graph;
+- provider webhook verification;
+- content/media moderation;
+- immutable admin/refund/payout evidence.
+
+---
+
+#### 19. Observability stack
+
+Representative components:
+
+- OpenTelemetry instrumentation;
+- metrics system and dashboards;
+- centralized structured logs;
+- distributed tracing;
+- error tracking;
+- cloud/database/search/broker native telemetry;
+- alert/on-call and incident workflow;
+- business invariant/audit monitors.
+
+##### Golden paths
+
+```text
+Search:
+request → index query → hydrate → response
+
+Booking:
+request → quote validation → inventory transaction → hold response
+→ payment obligation/provider → confirm/release
+
+Calendar:
+provider webhook/poll → normalize → apply block → projection/export
+
+Media:
+upload intent → object → scan/transform/moderate → publish/CDN
+```
+
+##### SLO metrics
+
+- search p95/p99, index freshness, false availability;
+- booking decision/commit latency;
+- overlap invariant count = 0;
+- lock/conflict/idempotency rates;
+- hold expiry/leak age;
+- outbox/broker lag;
+- payment pending/unknown/reconcile age;
+- calendar freshness/conflict/provider quota;
+- media processing/publish lag;
+- DB pool/IO, cache hit/hot keys, search shard health;
+- queue oldest age/drain time;
+- cost per search/booking/media GB.
+
+##### Cardinality/privacy
+
+- không dùng every user/listing/booking ID làm metric label;
+- trace IDs/correlation trong sampled/restricted traces;
+- critical audit evidence không sample mất;
+- redact tokens, payment, address, calendar content và sensitive PII;
+- retention/access policy khác nhau cho ops logs và legal evidence.
+
+---
+
+#### 20. Cost decisions
+
+Cloud pay-as-you-go không đồng nghĩa luôn rẻ. Cost drivers:
+
+- search nodes/replicas và query volume;
+- relational compute/IO/HA/read replicas/backups;
+- Redis memory;
+- media storage/derivatives;
+- CDN and cross-region egress;
+- broker retention/throughput;
+- calendar provider calls;
+- payment/SMS/email fees;
+- observability ingestion/retention;
+- idle multi-AZ/multi-region headroom;
+- Kubernetes/platform team operations.
+
+Unit economics:
+
+```text
+cost/search
+cost/listing detail view
+cost/quote
+cost/booking attempt
+cost/confirmed booking
+cost/media GB stored/delivered
+cost/calendar connection/month
+```
+
+Cost controls không phá correctness:
+
+- right-size media variants/lazy load/CDN;
+- tier/archive old bookings/media;
+- coalesce search/calendar projection updates;
+- cache popular reads;
+- scale workers by lag/provider headroom;
+- log sampling cho noncritical telemetry;
+- managed versus self-managed tính cả staff/on-call;
+- reserve safe booking/HA capacity.
+
+Không giảm transaction durability hoặc giữ inventory trong Redis-only để tiết kiệm database cost.
+
+---
+
+#### 21. Representative Azure-oriented stack
+
+Một phương án minh họa:
+
+```text
+Global edge          Azure Front Door/WAF-like global edge + CDN
+API management       API Management-like gateway/BFF layer
+Compute              AKS hoặc managed container/application platform
+Background jobs      Container workers + selective Functions/jobs
+Transactional store  Managed PostgreSQL hoặc Azure SQL-like HA database
+Search               Managed Elasticsearch/OpenSearch/Azure AI Search-like engine
+Cache                 Managed Redis-compatible cache
+Events/work queues    Kafka/RabbitMQ hoặc managed Service Bus/Event streaming
+Media                 Azure Blob Storage-like object store + CDN
+Identity              OIDC-compatible managed identity provider
+Secrets/keys          Key Vault-like service + workload identities
+Payments              External tokenized provider + webhook/reconciler
+Observability         OpenTelemetry + Azure Monitor/App Insights-like tooling
+Analytics             Event/warehouse/lake pipeline tách khỏi OLTP
+```
+
+Không nhất thiết dùng tất cả products từ ngày đầu. Stack nhỏ hơn:
+
+```text
+Managed app/container service
++ PostgreSQL HA
++ outbox/job tables + managed queue
++ Redis
++ managed search
++ Blob/object storage + CDN
++ external payment/identity
++ centralized telemetry
+```
+
+Chỉ thêm Kubernetes, Kafka hoặc databases chuyên biệt khi workload/team/operational metrics chứng minh nhu cầu.
+
+---
+
+#### 22. Requirement → strategic technology choice
+
+| Requirement/bottleneck | Decision | Tại sao | Guardrail |
+|---|---|---|---|
+| No double-book | Relational constraint/serialized reservation authority | Atomic range/night capacity | Idempotency, short transactions, fencing |
+| Fast search | Dedicated geo/text index | Query millions listings efficiently | Eventual hint, version/freshness, revalidate |
+| Read latency | Redis/cache + CDN | Giảm DB/search/origin load | TTL/version/single-flight, no truth |
+| Durable side effects | Outbox + event bus/queues | Không mất committed fact, decouple | Idempotent consumers, DLQ/replay |
+| Payment reliability | External provider adapter + saga | Tokenization, isolate failure | Unknown state, webhook/reconcile |
+| Calendar scale | Adaptive workers + cursor/webhook | Giảm polling amplification | Quotas, jitter, freshness/conflict alert |
+| Media scale | Blob/object storage + async pipeline + CDN | Object count/storage/egress phù hợp | Scan, variants, lifecycle/privacy |
+| Horizontal scale | Managed containers/Kubernetes | Scale workloads độc lập | Downstream-aware caps, warm capacity |
+| Global reads | Edge/CDN + regional projections | Low latency | Data version/residency/rebuild |
+| Global booking correctness | Inventory home authority | One write order | Cross-region latency, fenced DR |
+| Security | OIDC/IAM/KMS/private endpoints/WAF | Defense in depth | Rotation, least privilege, audit |
+| Operability | OpenTelemetry + business SLOs | Diagnose end-to-end | Cardinality/privacy/cost budgets |
+
+---
+
+#### 23. Những điểm hiệu chỉnh so với transcript đơn giản
+
+| Transcript đơn giản hóa | Production-oriented decision |
+|---|---|
+| Cloud/auto-scale xử lý millions users | Autoscale đúng workload nhưng bị giới hạn bởi DB, hot inventory và provider quota |
+| Load balancer loại single point of failure | Chỉ giúp compute entry; data/owner/broker/provider vẫn cần HA/recovery |
+| Replicate databases across regions tăng resilience | Phải nêu single-writer/consistency, replication lag, RPO/RTO và fencing |
+| SQL cho transactional data | Cần cụ thể constraints, transactions, idempotency, pools, partitions, HA, PITR |
+| Blob Storage cho images/videos | Còn direct upload, scan, transform, moderation, CDN, lifecycle và privacy |
+| RabbitMQ/Kafka làm background async | Cần chọn queue versus event-log semantics, outbox, dedup, replay, DLQ |
+| Payment xử lý async không block user | User vẫn cần durable hold/pending state; unknown outcome phải reconcile |
+| Redis giảm database load | Không dùng Redis làm canonical inventory, idempotency hoặc payment truth |
+| Microservices scale/deploy độc lập | Chỉ khi ownership/data contracts rõ; tách Availability/Booking sai có thể phá invariant |
+| Monitoring và centralized logging đủ observability | Cần metrics/traces/business invariants, SLOs, privacy/cardinality và runbooks |
+| Azure pay-as-you-go cân bằng cost | Egress, HA headroom, search/cache, telemetry và operational cost vẫn lớn |
+| Technology names quyết định production readiness | Reliability đến từ tested failure semantics, security, backup và operations |
+
+---
+
+#### 24. ADR và evolution triggers
+
+Mỗi quyết định nên có Architecture Decision Record:
+
+```text
+Context
+Requirement/SLO/invariant
+Decision
+Alternatives
+Consequences
+Failure model
+Metrics
+Cost/owner
+Review trigger
+```
+
+Ví dụ review triggers:
+
+- reservation lock wait/conflict p99 vượt SLO;
+- database connection/IO/storage headroom dưới ngưỡng;
+- một inventory/shard chiếm tỷ lệ tải bất thường;
+- search index freshness/p99 vượt SLO;
+- calendar oldest-sync age tăng vì provider quota;
+- media egress/unit cost vượt budget;
+- broker lag làm confirmation side effects trễ;
+- payment unknown age/reconciliation mismatch tăng;
+- multi-region/data residency trở thành bắt buộc;
+- Kubernetes/self-managed operations tốn hơn managed alternative;
+- restore/failover drill không đạt RTO/RPO.
+
+Quyết định tốt không phải tồn tại mãi; nó có điều kiện để được xem xét lại.
+
+---
+
+#### 25. Cách trình bày bước 4 trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. Tôi chọn managed cloud edge/WAF/CDN cho global reads và API routing, nhưng booking commands route về inventory home authority.
+2. Services chạy trên managed containers hoặc Kubernetes tùy team maturity; functions chỉ dùng cho selective background work.
+3. PostgreSQL/Azure SQL-like relational store giữ booking/inventory nhờ ACID, constraints, idempotency và outbox.
+4. Per-night unique/capacity rows hoặc range exclusion/serialized owner enforce no-double-book; read replica không quyết định availability.
+5. Search dùng geo/text engine với denormalized documents và versioned availability hints; quote/booking luôn revalidate.
+6. Redis cache listing/search/availability snapshots và rate limits; cache loss không làm mất booking.
+7. Blob/object storage giữ originals/variants; upload trực tiếp, scan/transform/moderate async và deliver qua CDN.
+8. Outbox đưa committed facts tới Kafka-like event log hoặc managed pub/sub; work queues xử lý payment, notification, media và calendar jobs.
+9. Consumers at-least-once và idempotent; queue/event broker không tự tạo exactly-once business effects.
+10. Payment provider nằm ngoài reservation transaction; hold + saga + webhook/reconciliation xử lý latency/unknown outcomes.
+11. Calendar sync scale theo provider cursor/webhook/adaptive polling, không vượt quota và lưu conflict/freshness.
+12. Autoscale theo p99, queue age, connections, search shards và provider headroom, không chỉ CPU; pre-scale seasonal peaks.
+13. Stateless services/data stores trải nhiều AZ; booking database/owner failover giữ epoch/fencing và tested PITR.
+14. Multi-region reads active-active, nhưng mỗi inventory có one write home; replication mode quyết định latency/RPO trade-off.
+15. OIDC/IAM, TLS/private endpoints, Key Vault/KMS, payment tokenization, WAF và audit tạo defense in depth.
+16. OpenTelemetry/business SLOs theo dõi search freshness, booking conflicts, hold leakage, payment unknown và calendar/media lag.
+17. Mỗi technology choice có ADR, unit cost và review trigger.
+
+---
+
+#### 26. Tech & infra checklist
+
+- [ ] Technology được nối với requirement/invariant cụ thể?
+- [ ] Managed platform versus Kubernetes phù hợp team/on-call?
+- [ ] Serverless chỉ dùng khi cold start/concurrency/order phù hợp?
+- [ ] Backend runtime được load/profile theo workload?
+- [ ] Relational transaction/constraint model chống overlap rõ?
+- [ ] Money/local dates/UTC timestamps/schema/index semantics đúng?
+- [ ] Connection pools, lock timeout, retry và hot inventory metrics?
+- [ ] Read replica không dùng cho booking decision?
+- [ ] Partition/sharding/home-region strategy theo inventory unit?
+- [ ] DB zonal HA, backups/PITR và restore drill?
+- [ ] Cross-region replication có stated RPO/RTO/fencing?
+- [ ] Search engine document/version/geo/filter/pagination/rebuild?
+- [ ] Search freshness và false-availability SLO?
+- [ ] Redis chỉ cache/soft state, TTL/version/stampede/rebuild?
+- [ ] Redis lock không thay constraint/fencing?
+- [ ] Blob direct upload/quarantine/scan/variants/moderation/CDN/lifecycle?
+- [ ] Broker lựa chọn theo queue/event-log semantics?
+- [ ] Outbox/inbox, idempotency, schema, ordering, DLQ/replay?
+- [ ] Payment obligation/attempt/webhook/reconcile/provider caps?
+- [ ] Calendar cursor/webhook/adaptive polling/quota/freshness/conflict?
+- [ ] Autoscaling metrics đúng từng component?
+- [ ] Downstream-aware replica caps và warm/AZ headroom?
+- [ ] Load balancer retry giữ idempotency key?
+- [ ] OIDC/domain AuthZ/IAM/TLS/private network/secrets/KMS?
+- [ ] Payment/calendar/media/address privacy và credential rotation?
+- [ ] OpenTelemetry/SLO metrics/logs/traces/runbooks?
+- [ ] Metric cardinality, PII redaction và telemetry cost?
+- [ ] Unit-cost dashboards và storage/egress/tiering policy?
+- [ ] ADR có alternatives, failure model, owner và review trigger?
+
+---
+
+#### 27. Ý chính cần nhớ
+
+- Technology follows requirements, invariants, scale và team capability.
+- Cloud giúp provision/managed operations nhưng không tự bảo đảm correctness.
+- Kubernetes điều phối compute; nó không ngăn double-book hoặc reconcile payment.
+- Managed containers có thể tốt hơn Kubernetes nếu team/scale chưa cần control phức tạp.
+- PostgreSQL/relational DB là lựa chọn mạnh cho booking authority nhờ ACID và constraints.
+- Per-night hay range model là trade-off về writes, contention và engine capability.
+- Read replica/search/cache không được confirm availability.
+- Sharding tăng total capacity nhưng không tự chia một hot inventory.
+- Multi-region writes cần home authority hoặc global serialization; replicas đơn thuần không đủ.
+- Replication mode phải đi cùng RPO/RTO và latency/partition trade-off.
+- Search engine giữ geo/filter projection, không canonical listing/booking truth.
+- Redis tăng tốc read/soft state; không giữ duy nhất hold, payment hoặc idempotency.
+- Redis lock không fencing có thể cho stale writer phá inventory invariant.
+- Object storage là bytes layer; media còn cần upload, scan, variants, moderation và CDN.
+- RabbitMQ phù hợp work queues; Kafka phù hợp retained streams/replay; managed queues giảm operations.
+- Broker vẫn at least once; outbox/inbox và consumer idempotency mới tạo reliable effects.
+- Payment nằm ngoài DB transaction và cần hold, unknown state, webhook cùng reconciliation.
+- Calendar polling có thể lớn hơn booking QPS; scale theo cursor/webhook/quota và freshness.
+- Autoscaling phải dùng p99/lag/queue age/provider headroom, không chỉ CPU.
+- Autoscaling không sửa hot keys, downstream saturation hoặc wrong ownership.
+- Load balancer không loại mọi single point of failure.
+- HA/DR cần multi-AZ data, fenced ownership, backups, restore/failover drills.
+- OIDC/IAM, TLS/private endpoints, secrets/KMS, tokenization và audit là defense in depth.
+- Observability phải đo business invariants và freshness, không chỉ infrastructure health.
+- Cost model phải tính search, Redis, replicas, media/CDN egress và telemetry.
+- Mỗi quyết định cần ADR, guardrails và review trigger.
+- Kiến trúc tốt nối **transactional source of truth → rebuildable acceleration → durable async workflows → workload-aware scaling → tested secure recovery**.
+
+#### Công thức ghi nhớ
+
+> **Rental technology strategy = relational constrained reservation authority + geo-search projection + versioned Redis acceleration + object-media/CDN pipeline + outbox-backed event/work queues + reconciled payment/calendar integrations + downstream-aware autoscaling + fenced multi-AZ/multi-region recovery.**
+
+---
+
+### Bài 97. The Final Design — Online Rental Platform
+
+#### 1. Final design phải chứng minh điều gì?
+
+Kiến trúc hoàn chỉnh phải đồng thời đáp ứng:
+
+1. **Discovery scalability:** tìm kiếm nhanh trên hàng chục triệu listings bằng geo/filter/ranking.
+2. **Booking correctness:** hai guests không thể cùng confirm một inventory cho các ngày giao nhau.
+3. **Price clarity:** giá cuối gắn với một quote/policy/currency version có thời hạn.
+4. **External reliability:** payment, calendar, notification và media có thể chậm/lỗi mà hệ thống vẫn hội tụ.
+5. **Global availability:** reads gần user, critical writes có authority/failover rõ.
+6. **Trust:** identity, property, payment, review, address và admin actions có security/audit.
+7. **Operability:** đo được freshness, contention, hold leakage, unknown payment và recovery.
+
+Final architecture không phải một tập hợp microservices ngẫu nhiên. Nó được tổ chức quanh hai ranh giới:
+
+```text
+Eventual discovery/read boundary
+              ↓
+Strong reservation/inventory boundary
+```
+
+---
+
+#### 2. Sơ đồ kiến trúc hoàn chỉnh
+
+```text
+┌────────────────────────────── Clients ──────────────────────────────┐
+│ Web / Mobile                                                       │
+└─────────────────┬──────────────────────────────────────────────────┘
+                  │ HTTPS
+                  ▼
+       ┌─────────────────────────┐
+       │ Global Edge / CDN / WAF │
+       │ API Gateway / BFF       │
+       └────────────┬────────────┘
+                    │
+        ┌───────────┼──────────────┬──────────────┬───────────────┐
+        ▼           ▼              ▼              ▼               ▼
+  ┌──────────┐ ┌──────────┐ ┌────────────┐ ┌──────────────┐ ┌──────────┐
+  │Identity/ │ │Listing   │ │Search      │ │Quote/Pricing │ │Review/   │
+  │User      │ │Service   │ │Service     │ │Service       │ │Rating    │
+  └──────────┘ └────┬─────┘ └─────┬──────┘ └──────┬───────┘ └──────────┘
+                    │             │               │
+                    │       ┌─────▼────────┐      │
+                    │       │Search Index  │      │
+                    │       │+ Read Cache  │      │
+                    │       └──────────────┘      │
+                    │                             │
+                    └─────────────────────────────┼──────────────┐
+                                                  │              │
+                                                  ▼              ▼
+                                        ┌────────────────┐ ┌──────────────┐
+Booking/Cancel/Amend commands ─────────>│ Reservation    │ │Availability  │
+                                        │ Authority      │ │Query View    │
+                                        │ Booking+Inv.   │ │(projected)   │
+                                        └───────┬────────┘ └──────────────┘
+                                                │ atomic transaction
+                         ┌──────────────────────┼───────────────────────┐
+                         ▼                      ▼                       ▼
+                  ┌──────────────┐      ┌───────────────┐      ┌────────────┐
+                  │Booking/Inv.  │      │Idempotency /  │      │Outbox      │
+                  │DB of Record  │      │Quote/History  │      │Records     │
+                  └──────────────┘      └───────────────┘      └─────┬──────┘
+                                                                    │ relay
+                                                                    ▼
+                                                         ┌──────────────────┐
+                                                         │Durable Event Bus │
+                                                         └────────┬─────────┘
+             ┌─────────────────────┬──────────────────┬────────────┼──────────────┐
+             ▼                     ▼                  ▼            ▼              ▼
+      ┌────────────┐       ┌────────────┐     ┌────────────┐ ┌────────────┐ ┌───────────┐
+      │Payment /   │       │Notification│     │Calendar    │ │Search/     │ │Audit/Risk/│
+      │Payout Saga │       │Service     │     │Sync        │ │Read Models │ │Analytics  │
+      └─────┬──────┘       └────────────┘     └─────┬──────┘ └────────────┘ └───────────┘
+            │                                       │
+            ▼                                       ▼
+      Payment Provider                       External Calendars
+
+ Host/Client ── upload intent ──> Media Service ──> Object Storage ──> CDN
+
+ Durable hold-expiry jobs / reconciler ── commands ──> Reservation Authority
+```
+
+Synchronous path cho user decision được giữ ngắn; mọi projection và external effect đi qua durable handoff sau canonical commit.
+
+---
+
+#### 3. Các plane của hệ thống
+
+| Plane | Thành phần | Vai trò | Source of truth? |
+|---|---|---|---|
+| Edge plane | CDN, WAF, API Gateway, BFF | Route, protect, aggregate | Không |
+| Identity plane | IdP, User Service | Account, identity, verification | Có trong identity domain |
+| Content plane | Listing, Media | Property content/media versions | Có trong content domain |
+| Discovery plane | Search index, Redis, read models | Geo/filter/listing discovery | Không cho booking |
+| Pricing plane | Pricing/Quote | Versioned price/policy snapshot | Quote là authoritative trong validity scope |
+| Reservation plane | Reservation Authority | Hold/confirm/release inventory and booking | Có |
+| Event plane | Outbox, broker, queues | Durable propagation/work dispatch | Copy of facts/work, không tự sửa reservation |
+| Financial plane | Payment/Payout | Provider-facing payment states | Có trong payment domain |
+| Integration plane | Calendar, Notification | External sync/delivery | Có state riêng, không phải booking truth |
+| Trust/evidence plane | Review, Risk, Audit, Admin | Trust, moderation, investigation | Theo domain/evidence |
+
+---
+
+#### 4. Data ownership cuối cùng
+
+| Dữ liệu | Write owner | Read acceleration |
+|---|---|---|
+| User/profile/account status | Identity/User Service | Token claims/versioned cache |
+| Property/listing content | Listing Service | Redis/CDN/search document |
+| Media bytes | Object storage | CDN/variants |
+| Media metadata/state | Media/Listing domain | Listing projection |
+| Pricing rules/policies | Pricing/Listing owner theo boundary | Quote cache/projection |
+| Quote snapshot | Quote/Pricing Service | Short-lived lookup cache |
+| Canonical inventory | Reservation Authority | Availability projection/cache/search hint |
+| Booking state | Reservation Authority | Guest/host booking projections |
+| Payment/refund/payout | Payment/Payout Service | Payment query projection |
+| External calendar connection/event | Calendar Sync Service | Sync-status view |
+| Review/moderation | Review Service | Rating/review feed projection |
+| Notification delivery | Notification Service | User inbox/status view |
+| Audit/dispute evidence | Audit/Trust domain | Restricted investigation index |
+
+“Mỗi service sở hữu database” nghĩa service khác không ghi trực tiếp dữ liệu của nó. Deployment ban đầu có thể dùng cùng database cluster nhưng schema/module ownership và access boundary vẫn rõ; tách vật lý khi scale/failure/organization justify.
+
+---
+
+#### 5. Luồng 1 — Host tạo và publish listing
+
+```text
+1. Host được identity/property policy xác minh.
+2. POST /listings tạo draft và content version.
+3. Client xin upload intents rồi gửi media trực tiếp vào quarantine object storage.
+4. Media workers scan, resize/transcode và moderation.
+5. Host cấu hình inventory unit, local time zone, pricing, rules và calendar.
+6. Listing Service validate required fields/media/policies.
+7. Publish transition + ListingPublished outbox commit.
+8. Search indexer tạo document; cache/CDN chỉ phục vụ approved media/version.
+9. Calendar Scheduler bắt đầu sync nếu host kết nối provider.
+```
+
+Failure controls:
+
+- create/publish mutation có idempotency/expected version;
+- media asset pending không được publish như ready;
+- orphan uploads được cleanup;
+- search event bị lỡ được outbox/replay/rebuild;
+- listing bị unpublish sẽ phát tombstone/version để index/cache không tiếp tục serve.
+
+---
+
+#### 6. Luồng 2 — Guest search và xem listing
+
+```text
+Guest → GET /search(location, dates, guests, filters)
+          ▼
+       Search Service
+          ├─ geo/text/filter/facet query
+          ├─ availability and display-price hints
+          ├─ rank/search-after page
+          └─ batch hydrate listing cards/cache
+          ▼
+       Candidate results + availability_as_of
+
+Guest → GET /listings/{id}
+          ├─ content/version/cache
+          ├─ media manifest/CDN URLs
+          ├─ review aggregate
+          ├─ projected availability
+          └─ price preview
+```
+
+Search/result semantics:
+
+- search index có thể stale trong freshness SLO;
+- availability là hint, không giữ chỗ;
+- exact address có thể được che trước confirmed booking;
+- display price có thể là estimate;
+- listing detail phải nói `as_of`/quote requirement;
+- cursor pagination tránh deep offset;
+- optional review/recommendation failure không cần làm hỏng core detail page.
+
+---
+
+#### 7. Luồng 3 — Tạo quote
+
+```text
+POST /quotes(listing, unit, [check_in, check_out), guests, display currency)
+       ▼
+Quote/Pricing Service
+  ├─ load versioned pricing/stay/policy rules
+  ├─ property-local date calculation
+  ├─ calculate nightly amounts, fees, taxes, discount
+  ├─ select charge currency + FX snapshot if needed
+  ├─ optional current availability validation
+  └─ persist/sign quote snapshot + expiry
+```
+
+Quote response gồm:
+
+- quote ID/version;
+- inventory/date/guest inputs;
+- line items;
+- charge/display currency semantics;
+- pricing/cancellation policy versions;
+- expiry;
+- availability disclaimer nếu chưa giữ inventory.
+
+Quote không được dùng vô thời hạn. Khi expired hoặc rules thay đổi, hệ thống honor/reprice theo policy và có thể yêu cầu user xác nhận lại.
+
+---
+
+#### 8. Luồng 4 — Tạo booking hold
+
+```text
+Guest
+ │ POST /bookings + stable Idempotency-Key + quote_id
+ ▼
+WAF/API Gateway
+ │ verify token, coarse rate/bot limit
+ ▼
+Reservation Authority for inventory_unit_id
+ │
+ ├─ dedup key + request hash
+ ├─ domain AuthZ/guest/listing eligibility
+ ├─ validate property-local date range/guest rules
+ ├─ validate quote version/expiry
+ ├─ assert no overlapping effective reservation
+ └─ atomic transaction:
+      Booking(HELD_PAYMENT_PENDING)
+      Reserved nights/range + hold TTL
+      Idempotency canonical response
+      State history
+      Outbox BookingHeld
+ │
+ ├─ response HELD/PAYMENT_ACTION_REQUIRED
+ └─ outbox relay → Payment Service
+```
+
+Critical invariant được bảo vệ bởi:
+
+- per-night unique/capacity constraint;
+- hoặc range exclusion/conditional transaction;
+- hoặc serialized inventory owner;
+- cùng durable idempotency và version/fencing.
+
+Search/Redis/replica không được dùng để bỏ qua authoritative check.
+
+---
+
+#### 9. Luồng 5 — Payment và confirmation
+
+```text
+BookingHeld
+    ▼
+Payment Service
+  ├─ dedup booking/hold version
+  ├─ create PaymentObligation + Attempt
+  ├─ call provider with stable idempotency key
+  └─ accept immediate response/webhook/reconciliation
+          │
+          ├── AUTHORIZED
+          │      ▼
+          │  Reservation Authority
+          │    ├─ hold still valid/version matches?
+          │    └─ commit BookingConfirmed + outbox
+          │
+          ├── FAILED
+          │      ▼
+          │  Release/expire hold idempotently
+          │
+          └── UNKNOWN/ACTION_REQUIRED
+                 ▼
+             Keep bounded pending state,
+             client action or reconciliation
+```
+
+Sau `BookingConfirmed`:
+
+- guest/host transactional notification;
+- availability/search projection update;
+- external calendar export;
+- trip/stay workflow;
+- payout scheduling;
+- analytics/audit/fraud.
+
+Không chờ email, search indexing hoặc external calendar để ACK confirmed booking.
+
+Nếu payment authorization tới sau khi hold đã expire:
+
+- confirm conditional write thất bại;
+- Payment Service void/refund theo saga;
+- không tái chiếm inventory mù quáng;
+- sự cố được reconcile/audit.
+
+---
+
+#### 10. Luồng 6 — Hai guests tranh cùng inventory
+
+```text
+Guest A hold [20,23) ─┐
+                      ├─> same inventory authority/constraint
+Guest B hold [21,24) ─┘
+```
+
+Intervals overlap vì:
+
+```text
+20 < 24 AND 21 < 23
+```
+
+Chỉ một transaction thắng. Request còn lại nhận `INVENTORY_UNAVAILABLE` hoặc quote alternatives.
+
+Nếu A timeout sau commit:
+
+```text
+A retry same booking request ID
+  → authority finds idempotency record
+  → returns same booking ID/state
+  → does not create a second hold
+```
+
+Nếu dùng per-night rows, tất cả nights được claim trong một transaction và lock theo deterministic order. Nếu dùng range constraint, database/owner atomically reject overlap. Check-then-insert qua hai services riêng không đủ.
+
+---
+
+#### 11. Luồng 7 — Hold expiry
+
+```text
+Durable due-job index
+  → EXPIRE_HOLD(booking_id, expected_version)
+  → Reservation Authority checks now/state/payment
+  → commit BookingExpired + InventoryReleased + outbox
+```
+
+Properties:
+
+- at-least-once timer delivery;
+- conditional/idempotent expiry;
+- Redis TTL chỉ là accelerator, không phải truth;
+- overdue reconciler tìm holds đã quá hạn;
+- payment-versus-expiry race được phân xử trên cùng booking version;
+- queue lag/oldest hold age có alert;
+- grace window chỉ theo explicit payment policy.
+
+Hold leakage làm search false-unavailable và mất doanh thu, nên cần business metric chứ không chỉ timer worker health.
+
+---
+
+#### 12. Luồng 8 — Cancellation, refund và inventory release
+
+```text
+Cancel request
+  → authenticate actor + object relationship
+  → load booking/cancellation-policy version
+  → calculate fee/refund/payout impact
+  → atomic Reservation transaction:
+       BookingCancelled
+       InventoryReleased
+       StateHistory
+       Outbox
+  → async:
+       Refund/Payout adjustment
+       Search/availability update
+       External calendar update
+       Notifications
+       Audit/analytics
+```
+
+Cancellation ACK không nhất thiết chờ provider refund settle. API trả cancellation accepted cùng refund state/expectation.
+
+Mass cancellation do weather/policy incident cần:
+
+- priority queues;
+- provider rate caps;
+- batch/operator workflow;
+- customer communication;
+- refund reconciliation;
+- workload isolation khỏi new bookings.
+
+---
+
+#### 13. Luồng 9 — External calendar synchronization
+
+##### Import
+
+```text
+Provider webhook / adaptive poll
+  → Calendar Sync Ingest
+  → verify source, cursor/version and dedup
+  → normalize to property-local [start,end)
+  → ApplyExternalBlock command
+  → Reservation Authority
+      ├─ commit allowed block
+      └─ or create conflict against internal booking
+  → availability/search projection update
+```
+
+##### Export
+
+```text
+BookingConfirmed/Cancelled
+  → Calendar Export Queue
+  → provider adapter with stable key
+  → store external event ID/version
+  → retry/reconcile
+```
+
+Rules:
+
+- external event không overwrite confirmed internal booking;
+- sync lag được hiển thị/alert;
+- provider credentials mã hóa và rotate/revoke;
+- polling có jitter/adaptive interval/provider quota;
+- webhook không được tin nếu chưa verify;
+- cross-platform conflict có operator/host resolution workflow;
+- platform chỉ bảo đảm no-double-book nội bộ.
+
+---
+
+#### 14. Luồng 10 — Stay, payout và review
+
+```text
+BookingConfirmed
+  → pre-stay reminders / address/check-in disclosure
+  → IN_PROGRESS at stay start
+  → COMPLETED after checkout/reconciliation
+       ├─ payout milestone/workflow
+       └─ review eligibility window
+```
+
+Review flow:
+
+- `StayCompleted` tạo eligibility projection;
+- reviewer phải là booking participant đúng side;
+- unique booking+reviewer+side;
+- moderation/report/appeal;
+- publication/double-blind policy nếu có;
+- aggregate rating update async;
+- removed public review vẫn giữ audit evidence theo policy.
+
+Payout flow:
+
+- không dựa vào notification;
+- idempotent milestone/obligation;
+- account/property/risk holds;
+- provider webhook/reconciliation;
+- cancellation/refund/dispute adjustments;
+- finance ledger/audit controls.
+
+---
+
+#### 15. Luồng 11 — Media
+
+```text
+Host requests upload intent
+  → Media Service checks ownership/quota
+  → short-lived signed direct upload to quarantine
+  → object event / complete callback
+  → scan/checksum/metadata validation
+  → resize/transcode/moderate
+  → immutable derivatives + media manifest
+  → attach to listing version
+  → CDN delivery
+```
+
+Media failures không làm transactional booking store phình to hoặc chậm:
+
+- process async;
+- pending/failed states rõ;
+- no broken/unapproved asset in published listing;
+- orphan cleanup;
+- right-sized variants/lazy loading;
+- versioned CDN cache keys;
+- deletion/privacy/lifecycle propagation;
+- origin/egress monitoring.
+
+---
+
+#### 16. Internal events và delivery semantics
+
+Event facts đại diện:
+
+- `ListingPublished`/`ListingUpdated`/`ListingUnpublished`;
+- `PricingRulesUpdated`;
+- `ExternalAvailabilityBlockApplied`;
+- `BookingHeld`;
+- `PaymentAuthorizationRequested`;
+- `PaymentAuthorized`/`PaymentFailed`/`PaymentOutcomeUnknown`;
+- `BookingConfirmed`/`BookingExpired`/`BookingCancelled`;
+- `InventoryReleased`;
+- `RefundRequested`/`RefundCompleted`;
+- `StayCompleted`;
+- `ReviewPublished`;
+- `CalendarConflictDetected`.
+
+Mỗi event có:
+
+- event ID/type/schema version;
+- aggregate ID/version;
+- inventory/listing/booking reference cần thiết;
+- occurred time;
+- correlation/causation ID;
+- public/private payload classification;
+- no unnecessary PII/address/payment secret.
+
+Delivery:
+
+```text
+source transaction + outbox
+→ relay publishes at least once
+→ consumer inbox/dedup + conditional transition
+→ retry/DLQ/replay/reconciliation
+```
+
+Ordering không cần global. Scope phù hợp:
+
+- booking lifecycle theo `booking_id`;
+- inventory changes theo `inventory_unit_id` nếu consumer cần order;
+- payment theo `payment_id`;
+- calendar export theo connection/listing + booking version.
+
+---
+
+#### 17. Consistency model cuối cùng
+
+| Dữ liệu/operation | Model | Recovery/validation |
+|---|---|---|
+| Listing/search document | Eventual/versioned | Replay/rebuild, stale version rejection |
+| Search availability | Eventual hint | Quote/hold recheck |
+| Listing/detail cache | Eventual/versioned | TTL/event invalidation/source fallback |
+| Quote | Versioned snapshot within expiry | Reprice/confirm policy |
+| Create hold | Strong per inventory/date range | Constraint/serialized authority |
+| Booking state | Strong conditional transitions | Version/idempotency/history |
+| Payment | Eventual external saga | Webhook/query/reconciliation |
+| Calendar sync | Eventual external integration | Cursor/dedup/conflict/reconcile |
+| Notification | At-least-once logical delivery | Business dedup/status evidence |
+| Review aggregate | Eventual | Recompute from moderated reviews |
+| Audit/finance evidence | Durable/append-oriented | Restricted retention/restore |
+
+Strong consistency được dùng ở nơi business invariant cần, không ép toàn search/media/calendar thành global transaction.
+
+---
+
+#### 18. Storage mapping cuối cùng
+
+| Store | Dữ liệu | Không nên dùng cho |
+|---|---|---|
+| Relational reservation DB | Booking, holds, inventory, idempotency, state history, outbox | Media blobs, full-text geo search |
+| Listing DB | Property/listing/version/media metadata | Canonical booking decision nếu ownership tách |
+| Payment DB/ledger | Obligations, attempts, refunds, payouts | Search availability |
+| Search engine | Geo/text/filter documents và hints | Inventory/winner-like authority |
+| Redis-compatible cache | Listing/search/availability projections, rate limits | Booking/payment/audit truth |
+| Object storage | Original/derived media | Relational joins/state transitions |
+| Durable broker/queues | Committed facts và asynchronous work | Sole canonical booking record |
+| Analytics lake/warehouse | BI/fraud features/aggregates | Online booking transaction |
+| Audit/evidence store | Investigation/compliance records | Public general query |
+
+Polyglot persistence chỉ có lợi khi ownership, backup, monitoring, replay và restore của từng store được vận hành tốt.
+
+---
+
+#### 19. Scaling final design
+
+##### Search/read plane
+
+- geo/search shards và replicas;
+- query/result/listing caches;
+- precomputed denormalized documents;
+- cursor/search-after;
+- batch hydration;
+- CDN media;
+- regional read deployment;
+- optional feature degradation.
+
+##### Reservation plane
+
+- stateless booking ingress;
+- partition/route theo inventory unit;
+- one transactional/serialized authority per inventory;
+- bounded DB pools;
+- short deterministic transactions;
+- hot-inventory isolation/admission;
+- user/host lists qua read projections;
+- archive/tier old history.
+
+##### Background plane
+
+- separate queues/workers cho payment, calendar, notification, media, search indexing;
+- priority/provider/channel isolation;
+- autoscale theo oldest age/lag và downstream headroom;
+- retry/DLQ/replay;
+- coalesce search/calendar derived updates.
+
+##### Seasonal/geographic spikes
+
+- pre-scale holiday/event regions;
+- geo-shard replica capacity;
+- cache warmup;
+- payment/calendar/provider quota planning;
+- DB/AZ failure headroom;
+- load shedding optional search features;
+- mass-cancellation runbook.
+
+---
+
+#### 20. High availability và disaster recovery
+
+##### Compute
+
+- multiple instances/AZ;
+- health checks/load balancing;
+- anti-affinity;
+- rolling/canary deployment;
+- graceful drain;
+- minimum warm capacity.
+
+##### Reservation authority/data
+
+- HA relational replicas/quorum semantics;
+- acknowledged commit durability policy;
+- owner/home-region epoch và fencing;
+- automatic/manual failover boundary;
+- idempotent clients/commands;
+- backup/WAL/PITR;
+- restore and invariant verification drills.
+
+##### Search/cache/media/broker
+
+- search replicas/snapshots/rebuild;
+- cache loss/rebuild/stampede protection;
+- object storage redundancy/lifecycle;
+- replicated broker, outbox buffering, replay;
+- consumers resume from checkpoints.
+
+##### Multi-region
+
+```text
+Active-active regional reads/search/media
+Single-home authoritative booking writes per inventory
+Async versioned projection/event replication
+Fenced promotion during regional disaster
+```
+
+Phải nêu:
+
+- synchronous hay asynchronous replication;
+- RPO/RTO cho booking/payment versus search;
+- data residency;
+- failover/failback authority;
+- handling in-flight/unknown states;
+- reconciliation sau restore/promotion.
+
+Load balancer và database replication không tự tạo zero-data-loss active-active booking.
+
+---
+
+#### 21. Failure matrix
+
+| Failure | Final behavior |
+|---|---|
+| Search/cache stale | Candidate có thể cũ; quote/hold authority revalidates |
+| Search cluster unavailable | Cached/degraded browse; booking/history authority không mất |
+| Two overlapping requests | Một hold thắng, request kia conflict/unavailable |
+| Client timeout after hold | Retry same key gets same booking outcome |
+| Reservation service crashes after commit | DB state/outbox survives; event relays later |
+| Broker unavailable | Outbox accumulates within capacity; no lost fact |
+| Consumer receives duplicate | Inbox/business dedup and version check |
+| Payment provider timeout | UNKNOWN, no blind retry; reconcile |
+| Payment authorized after expiry | No invalid confirm; void/refund compensation |
+| Expiry job missed/duplicate | Overdue reconciler/idempotent command |
+| Calendar provider unavailable | Backoff/stale indicator; internal booking remains truth |
+| External event conflicts booking | Conflict evidence/alert, no overwrite |
+| Notification unavailable | Queue retry/DLQ, booking remains confirmed |
+| Redis unavailable | Rebuild/fallback; admission prevents DB stampede |
+| Media worker fails | Asset pending/failed; retry, listing avoids broken asset |
+| Database/AZ failover | Same IDs retried; committed state retained per RPO |
+| Old reservation owner resumes | Fencing epoch rejects stale write |
+| Region loss | Home promotion + replay/reconcile per DR plan |
+
+---
+
+#### 22. Security và privacy cuối cùng
+
+##### Entry/identity
+
+- WAF/DDoS/bot protection;
+- TLS;
+- OIDC authentication/OAuth delegated access;
+- token validation/rotation/revocation;
+- MFA/step-up;
+- rate limits by account/device/IP/listing.
+
+##### Domain authorization
+
+- host ownership for listing/calendar/pricing;
+- guest/host relationship for booking;
+- review eligibility from completed stay;
+- role/attribute/object checks;
+- admin privileged workflow, not broad shared access.
+
+##### Sensitive information
+
+- exact property address/check-in instructions disclosed only at allowed phase;
+- payment tokenization, no raw card data;
+- calendar credentials encrypted/revocable;
+- media signed access where private;
+- PII minimization/field encryption;
+- secrets/KMS/workload identity;
+- redacted logs/events/traces;
+- data residency/retention/deletion.
+
+##### Marketplace trust
+
+- host/property verification;
+- fraud/account takeover/velocity/device graph;
+- off-platform payment/phishing controls;
+- media/listing/review moderation;
+- dispute/refund/payout evidence;
+- no silent admin history rewrite;
+- immutable/high-integrity audit for sensitive actions.
+
+API Gateway centralizes common checks, nhưng mỗi service vẫn xác minh quyền trên current domain state. Gateway không biết đầy đủ listing owner, booking participant hoặc review eligibility.
+
+---
+
+#### 23. Observability và vận hành
+
+##### End-to-end correlation
+
+```text
+request_id
+ → quote_id/version
+ → booking_request_id
+ → booking_id/version + inventory/date range
+ → inventory hold/reserved nights
+ → outbox/event IDs
+ → payment/provider IDs
+ → calendar connection/external event IDs
+ → notification/refund/payout/review/dispute IDs
+```
+
+##### Business SLOs
+
+- search p95/p99 and availability freshness;
+- listing-detail/quote latency;
+- booking decision/commit p99;
+- overlap violations = 0;
+- conflict/idempotency/lock-wait rates;
+- hold-expiry lag/leaked inventory;
+- BookingHeld→Confirmed/Failed conversion and duration;
+- payment pending/unknown oldest age;
+- outbox/broker/consumer lag;
+- calendar last-sync age/conflict/export lag;
+- media upload→published lag;
+- notification transactional delay;
+- review eligibility/moderation lag.
+
+##### Infrastructure/cost
+
+- DB pool/IO/storage/index health;
+- hottest inventory/geohash/search shard;
+- Redis hit/hot keys/evictions;
+- search heap/CPU/queue;
+- broker queue oldest age/drain time;
+- CDN hit/egress/origin;
+- provider quota/headroom;
+- cost per search, booking attempt/confirmation and media GB.
+
+##### Runbooks/drills
+
+- hot destination/listing;
+- database failover and restore;
+- payment outage/unknown surge;
+- missed hold-expiry jobs;
+- calendar provider backlog;
+- Redis cold-cache recovery;
+- search rebuild/lag;
+- broker outage/replay;
+- media processing backlog;
+- mass cancellation;
+- regional failover/fencing/reconciliation.
+
+---
+
+#### 24. Requirement → final decision
+
+| Requirement | Final architectural decision |
+|---|---|
+| Secure identities | OIDC IdP, domain AuthZ, MFA/risk controls |
+| Host listing/media | Versioned Listing owner + direct object upload/processing/CDN |
+| Fast geo search | Dedicated denormalized geo/text index + caches/replicas |
+| Accurate price | Versioned expiring Quote with line items/currency/policy refs |
+| Availability UX | Projected calendar/hints with freshness metadata |
+| No double-book | One Reservation Authority + atomic per-night/range capacity constraint |
+| Retry safety | Stable booking ID, request hash and canonical idempotency response |
+| Payment reliability | Hold-first saga, provider idempotency, webhook and reconciliation |
+| Reliable propagation | Transactional outbox + durable broker + idempotent consumers |
+| Hold expiry | Durable due jobs + conditional expiry + overdue reconciler |
+| External calendars | Async provider adapters, cursor/dedup/quota/conflict workflow |
+| Notifications | Async priority/channel workers, not booking truth |
+| Reviews | Completed-booking eligibility + moderation/audit |
+| Read-heavy scalability | Search/Redis/CDN/read projections isolated from reservation writes |
+| Seasonal scale | Pre-scaling, workload pools, downstream-aware autoscaling |
+| Global architecture | Regional reads + inventory home authority + fenced DR |
+| Security/privacy | WAF/TLS/IAM/KMS/tokenization/address/calendar/media controls |
+| Operability | OpenTelemetry/correlation/business SLOs/runbooks/restore drills |
+
+---
+
+#### 25. Bottleneck → final control
+
+| Bottleneck | Final control |
+|---|---|
+| Geo/filter search | Specialized index, geo shards/replicas, cache, search-after |
+| Search hydration fan-out | BFF, batching, precomputed views, timeout/degradation |
+| Search availability lag | Version/as-of/freshness SLO + quote/hold recheck |
+| Hot inventory/date | Partition/owner, atomic constraint, admission/isolation |
+| Long stay/night writes | Range/per-night model, deterministic short transaction |
+| Duplicate booking retry | Idempotency record + request hash/canonical response |
+| Hold leak/expiry race | Durable TTL job, versioned command, reconciler |
+| Payment latency/outage | Hold saga, no DB lock during call, unknown/reconcile |
+| Calendar polling/quota | Webhook/cursor/adaptive polling/jitter/provider pools |
+| Calendar cross-platform conflict | Conflict evidence/host resolution, no overwrite |
+| Projection write amplification | Outbox, batch/coalesce consumers, priority/isolation |
+| Redis stampede | TTL jitter/single-flight/local cache/admission |
+| Media storage/processing | Object storage, async variants/moderation/lifecycle |
+| Media delivery cost | CDN, right-sized formats, lazy load, origin shielding |
+| Multi-AZ/region failure | HA data, warm capacity, home authority epoch/fencing |
+| Observability overload | Cardinality/redaction/retention and telemetry budgets |
+
+---
+
+#### 26. Những điểm hiệu chỉnh so với final diagram đơn giản
+
+| Transcript/sơ đồ đơn giản hóa | Final production-oriented design |
+|---|---|
+| API Gateway làm authn/authz | Gateway xử lý common auth; services vẫn object-authorize current state |
+| Availability Service track calendar, Booking Service reserve | Read availability projection tách khỏi one transactional Reservation Authority |
+| Booking gọi Availability rồi Payment rồi finalize | Hold/inventory commit trước; payment/confirmation là versioned saga |
+| Search “checks availability” | Search dùng hint; quote/hold revalidate canonical inventory |
+| Mỗi service có database riêng | Logical ownership bắt buộc; physical isolation là evolution choice |
+| Service không biết implementation của nhau | Vẫn cần contracts, schema/version, SLO, retry và domain ownership |
+| Background work dùng queue | Cần outbox/inbox, idempotency, ordering, DLQ/replay/reconcile |
+| Payment event xử lý async | Cần obligation, attempt, unknown outcome và hold-expiry compensation |
+| Redis serve frequent data | Cache only, không booking/idempotency/payment truth |
+| CDN giao media | Cần upload quarantine, scan, derivatives, moderation, lifecycle/privacy |
+| Calendar sync giữ availability đúng | Eventual sync không thể cam kết no cross-platform double-book |
+| Review Service xử lý feedback | Eligibility phải xuất phát từ completed booking và moderation policy |
+| Microservices tạo scale/reliability | Wrong boundaries tăng distributed failure; modular monolith có thể tốt hơn |
+| Central analytics/logging cho visibility | Cần traces, business invariants, freshness, correlation, privacy và runbooks |
+
+---
+
+#### 27. Trade-offs cuối cùng
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Search index/read projections | Fast global discovery | Staleness, rebuild and ops |
+| Availability hints | Filter large corpus | False positives/negatives |
+| Expiring quote | Price/policy clarity | Storage/version/reprice UX |
+| Transactional reservation authority | Strong no-overlap invariant | Hot inventory and home-region latency |
+| Short booking hold | Safe payment coordination | Inventory temporarily unavailable |
+| Per-night rows | Clear capacity/calendar | Write amplification |
+| Range exclusion | Compact interval representation | DB-specific contention/complexity |
+| Outbox/event-driven side effects | Reliable loose coupling | Lag, duplicates, schema/operations |
+| Third-party payment/calendar | Faster capability | Outage/quota/unknown/reconcile |
+| Redis/CDN acceleration | Low latency/origin protection | Staleness/eviction/egress cost |
+| Multi-region read, home-region write | Global reads + clear correctness | Remote booking latency and DR work |
+| Microservices | Independent scale/deploy | Network/on-call/data consistency complexity |
+
+Một triển khai nhỏ vẫn có thể dùng modular monolith + PostgreSQL + outbox/jobs + Redis + managed search + object storage/CDN. Service boundaries không đồng nghĩa phải deploy hàng chục services ngay.
+
+---
+
+#### 28. Cách trình bày final design trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. Web/mobile đi qua global edge/CDN/WAF và API Gateway/BFF; gateway route/rate-limit nhưng domain services vẫn authorize.
+2. Listing Service sở hữu versioned property content; media direct-upload, scan/transform/moderate rồi serve qua CDN.
+3. Search Service dùng geo/text denormalized index cùng Redis/cache và projected price/availability hints.
+4. Search chỉ trả candidates; Quote Service tạo versioned expiring price/policy snapshot.
+5. Booking command route theo inventory unit tới Reservation Authority.
+6. Authority atomically commit BookingHold, inventory nights/range, idempotency response, history và outbox.
+7. Per-night capacity, range exclusion hoặc serialized owner bảo đảm không double-book.
+8. Payment Service consume BookingHeld, gọi provider ngoài database lock và xử lý immediate/webhook/unknown outcomes.
+9. PaymentAuthorized và ExpireHold cạnh tranh bằng canonical booking version; late payment được void/refund nếu hold mất.
+10. BookingConfirmed phát qua outbox tới notification, search/calendar projections, payout, audit và analytics.
+11. Calendar Sync dùng webhook/cursor/adaptive polling, không overwrite internal booking khi conflict.
+12. Cancellation atomically release inventory rồi refund/calendar/notification xử lý async.
+13. Reviews chỉ dành cho completed booking participants; address/payment/calendar/media data có privacy boundaries.
+14. Relational store giữ booking truth; search, Redis và availability query là rebuildable projections.
+15. Regional reads scale active-active, nhưng mỗi inventory có home authority; failover dùng replication, epoch/fencing và reconciliation.
+16. Observability đo search freshness, conflict/lock, hold leakage, payment unknown, calendar lag và business correlation.
+
+Deep dives nên chuẩn bị:
+
+- two guests booking overlapping dates;
+- per-night versus range constraint;
+- idempotency after timeout;
+- hold/payment/expiry race;
+- quote expiry/repricing;
+- search availability projection;
+- cancellation/amendment;
+- calendar conflict and stale feed;
+- media pipeline;
+- hot destination/listing;
+- multi-region reservation authority/DR.
+
+---
+
+#### 29. Final checklist
+
+- [ ] Scope/inventory model: entire unit hay room quantity?
+- [ ] Property, Listing, InventoryUnit và local-date semantics?
+- [ ] Discovery versus Reservation planes tách rõ?
+- [ ] API Gateway versus domain AuthZ boundary?
+- [ ] Listing/content/media ownership và versioning?
+- [ ] Search geo/filter/index/pagination/cache/rebuild/freshness?
+- [ ] Search availability được ghi rõ là hint?
+- [ ] Quote version/expiry/line items/FX/policy refs?
+- [ ] Reservation Authority là single mutation boundary?
+- [ ] Per-night/range/owner no-overlap strategy?
+- [ ] Stable booking request ID/request hash/canonical response?
+- [ ] Booking hold TTL và state/version?
+- [ ] Atomic booking/inventory/idempotency/history/outbox commit?
+- [ ] Provider call nằm ngoài inventory transaction?
+- [ ] Payment obligation/attempt/action-required/unknown/webhook/reconcile?
+- [ ] Payment-versus-expiry race và void/refund compensation?
+- [ ] Durable hold timer + overdue reconciler?
+- [ ] Cancellation/amendment/refund/payout workflow?
+- [ ] Outbox/inbox/event schema/order/retry/DLQ/replay?
+- [ ] Search/calendar/notification projection consumers idempotent?
+- [ ] External calendar cursor/webhook/polling/quota/conflict handling?
+- [ ] Internal confirmed booking không bị external event overwrite?
+- [ ] Review eligibility/moderation/audit?
+- [ ] Media quarantine/scan/variants/CDN/lifecycle/deletion?
+- [ ] Redis only cache/soft state và cold-cache plan?
+- [ ] Relational pool/index/partition/HA/PITR/restore?
+- [ ] Hot inventory/geohash/workload isolation/admission?
+- [ ] Autoscaling dùng p99/lag/queue age/provider headroom?
+- [ ] Multi-AZ warm headroom và provider/broker failure plans?
+- [ ] Multi-region home authority, replication mode, RPO/RTO/fencing?
+- [ ] OIDC/object AuthZ/WAF/TLS/IAM/KMS/tokenization/PII controls?
+- [ ] Correlation/business SLOs/privacy/cardinality/runbooks?
+- [ ] Unit costs và ADR/evolution triggers?
+
+---
+
+#### 30. Ý chính cần nhớ
+
+- Final design tách eventual discovery khỏi strongly consistent reservation.
+- Search, Redis, availability view và CDN là acceleration/projections, không booking truth.
+- Search có thể stale; booking authority luôn revalidate inventory.
+- Quote là versioned expiring contract snapshot, không phải inventory hold.
+- Reservation Authority sở hữu cả canonical booking hold và inventory mutation.
+- Availability Query và Reservation Authority có read/write responsibilities khác nhau.
+- No-double-book phải được enforce trong transaction/constraint/serialized owner.
+- Stable request ID giúp retry sau timeout trả cùng logical booking.
+- Booking hold, inventory, idempotency, state history và outbox commit cùng boundary.
+- Payment provider call không nằm trong inventory transaction.
+- Payment/booking phối hợp bằng saga và explicit pending/unknown states.
+- PaymentAuthorized và ExpireHold phải dùng conditional versioned transitions.
+- Late authorization sau expiry được void/refund, không tái chiếm inventory.
+- Outbox bảo đảm committed booking fact được phát; consumers vẫn idempotent.
+- `BookingHeld`, `BookingConfirmed` và `BookingCancelled` tốt hơn `BookingCreated` mơ hồ.
+- Notifications, search indexing và calendar export không nằm trên confirmation critical path.
+- External calendar synchronization eventual và không bảo đảm cross-platform atomicity.
+- Cancellation release inventory atomically, rồi refund/calendar/notification chạy async.
+- Media là upload/scan/transform/moderate/object/CDN pipeline độc lập.
+- Reviews bắt nguồn từ completed-stay eligibility, không chỉ user identity.
+- API Gateway không thay service-level object authorization.
+- “Database per service” là ownership principle trước khi là physical deployment rule.
+- Multi-region reads có thể active-active; booking writes cần inventory home authority.
+- Replication phải đi cùng RPO/RTO, fencing và tested recovery.
+- Observability đo freshness, contention, leakage và unknown outcomes, không chỉ CPU/logs.
+- Có thể bắt đầu modular monolith nếu vẫn giữ domain/transaction boundaries đúng.
+- Kiến trúc tốt nối **discover approximately → quote explicitly → reserve atomically → pay/reconcile externally → confirm durably → project asynchronously**.
+
+#### Công thức ghi nhớ
+
+> **Final Rental Platform = global cached geo-discovery + versioned quote + transactional date-range Reservation Authority + idempotent hold/payment/expiry saga + outbox-driven search/calendar/notification projections + object-media CDN + fenced observable multi-region recovery.**
+
+---
+
+## Phần 19 — Design a Cloud Storage Solution (Google Drive, Dropbox)
+
+### Bài 98. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần giải quyết
+
+Thiết kế một cloud file storage platform nơi người dùng có thể:
+
+- upload/download file thuộc nhiều loại nội dung;
+- tổ chức file trong folders/tags;
+- truy cập và đồng bộ từ nhiều thiết bị;
+- chia sẻ file/folder với quyền chi tiết;
+- xem và khôi phục version cũ;
+- đưa file vào trash rồi restore hoặc xóa vĩnh viễn;
+- tin rằng dữ liệu vẫn an toàn khi máy, service hoặc storage node gặp lỗi.
+
+Luồng khái niệm:
+
+```text
+Local file/device
+   ↓ resumable chunk upload
+Upload session + immutable content objects
+   ↓ atomic version commit
+Metadata namespace / FileVersion
+   ↓ durable change event
+Sync journal → other devices
+   ↓
+Download/preview/share under current authorization
+```
+
+Điểm khó không chỉ là lưu bytes. Hệ thống phải phối hợp:
+
+> **immutable content storage + mutable metadata namespace + atomic version publication + multi-device change propagation + revocable authorization + lifecycle/garbage collection.**
+
+---
+
+#### 2. Scope cần làm rõ: cloud drive không đồng nghĩa collaborative editor
+
+Google Drive có thể chứa Google Docs với real-time co-editing; Dropbox có thể tích hợp editor. Tuy nhiên, đó là bài toán khác binary file synchronization.
+
+##### In scope
+
+- arbitrary binary files, tối đa 5 GB theo transcript;
+- web/mobile/desktop upload và download;
+- resumable multipart/chunk upload;
+- folders, nested hierarchy và tags;
+- rename, move, copy;
+- file version history;
+- trash/restore/permanent deletion;
+- multi-device sync với target dưới 5 giây cho online devices;
+- private sharing, shared folders và link sharing;
+- owner/editor/viewer permissions;
+- quota và storage usage;
+- integrity validation;
+- search theo metadata cơ bản nếu product yêu cầu;
+- audit/security/observability.
+
+##### Out of scope ban đầu
+
+- character-level simultaneous document editing bằng OT/CRDT;
+- rich office suite/editor;
+- full content indexing/OCR mọi file type;
+- video streaming/transcoding chuyên sâu;
+- enterprise DLP/eDiscovery/legal hold đầy đủ;
+- end-to-end encryption nơi server không thể đọc content;
+- unlimited file size;
+- peer-to-peer synchronization.
+
+Nếu interviewer mở rộng real-time co-editing, cần một collaboration service và conflict model khác; không nên giả vờ file-version upload giải quyết được character-level merge.
+
+---
+
+#### 3. Actors và systems liên quan
+
+| Actor/system | Mục tiêu | Hành động | Yêu cầu/rủi ro |
+|---|---|---|---|
+| File owner | Lưu và quản lý dữ liệu | Upload, organize, version, share, delete | Durability, quota, privacy |
+| Collaborator | Truy cập nội dung được chia sẻ | View/download/edit theo quyền | Revocation và least privilege |
+| Device/Sync client | Giữ local state hội tụ | Watch local changes, upload/download deltas | Offline, retries, conflicts |
+| Web/mobile client | Truy cập không cần local mirror đầy đủ | Browse, upload, preview, share | Network/mobile lifecycle |
+| Identity provider | Cấp danh tính/token | Authenticate, token/key lifecycle | Availability, compromise |
+| Storage platform | Lưu content objects | Put/get/range/delete/replicate | Durability, cost, integrity |
+| Administrator/Security | Vận hành và bảo vệ | Abuse response, recovery, audit | Privileged access/audit |
+| Malware/content scanner | Kiểm tra upload | Scan/quarantine/classify | Queue lag, false positives |
+| Notification service | Báo sharing/change/quota | Email/push/in-app | Best effort, privacy |
+
+Authentication có thể do service bên ngoài xử lý, nhưng storage platform vẫn chịu trách nhiệm authorization trên từng file/folder/version/share link.
+
+---
+
+#### 4. Mental model: namespace tách khỏi content
+
+Không nên lưu một file như một row chứa cả đường dẫn và bytes.
+
+```text
+Metadata namespace                           Content plane
+
+FileEntry                                    Immutable Chunk/Blob objects
+  file_id                                      chunk_hash/object_id
+  parent_folder_id                              bytes
+  name                                         checksum
+  current_version_id       ───────────────>   storage location
+  owner/security metadata
+                         FileVersion
+                           version_id
+                           ordered chunk/blob manifest
+                           size/content hash
+                           created_by/time
+```
+
+Lợi ích:
+
+- rename/move không copy lại bytes;
+- upload dở không xuất hiện như committed file;
+- một file có nhiều immutable versions;
+- resume chỉ tải chunks còn thiếu;
+- sync truyền metadata change/version reference;
+- restore version chỉ đổi current-version pointer bằng transition mới;
+- object storage và metadata database scale độc lập;
+- delayed physical deletion/garbage collection an toàn hơn.
+
+Đây là mô hình khái niệm; implementation có thể dùng whole-object multipart thay chunk store riêng.
+
+---
+
+#### 5. Functional requirements — Upload
+
+- tạo upload session;
+- khai báo file name, target parent, size và optional checksum;
+- hỗ trợ tối đa 5 GB;
+- upload theo chunks/parts;
+- parts retry độc lập;
+- query/resume session đã upload tới đâu;
+- direct upload tới object storage nếu phù hợp;
+- integrity checksum từng part và toàn file/version;
+- idempotent complete/commit;
+- conflict precondition theo base version;
+- quota check/reservation;
+- malware scan/quarantine policy;
+- cancel/expire abandoned sessions;
+- không publish partial file;
+- cleanup orphan parts.
+
+Luồng:
+
+```text
+CreateUploadSession
+  → reserve quota/metadata intent
+  → upload N parts, retry independently
+  → CompleteUpload(manifest/checksums/base_version)
+  → validate parts/integrity/authorization/quota
+  → atomic FileVersion + current pointer + change event commit
+  → asynchronous scan/index/notification as policy allows
+```
+
+Nếu malware scan phải hoàn tất trước visibility/download, version ở `QUARANTINED/PENDING_SCAN` cho tới khi pass. Nếu cho owner thấy sớm, quyền download/share phải theo security policy rõ.
+
+---
+
+#### 6. Functional requirements — Download
+
+- tải current hoặc version cụ thể;
+- authorize tại request time;
+- support HTTP range/resume;
+- signed short-lived download URL/token;
+- integrity metadata/ETag/content length;
+- CDN cho public/large/hot content nếu policy cho phép;
+- conditional GET/cache validation;
+- bandwidth/quota/rate control;
+- filename/content-disposition an toàn;
+- download audit cho sensitive/shared content;
+- revocation behavior rõ.
+
+Flow đại diện:
+
+```text
+Client GET metadata/download intent
+  → service authorizes current ACL/share state
+  → returns short-lived scoped signed URL
+  → client downloads bytes directly from object storage/CDN
+```
+
+Signed URL expiry tạo một revocation window. Link dài hạn không nên trực tiếp là permanent object-store URL; request phải qua share/access policy rồi đổi thành short-lived content access.
+
+---
+
+#### 7. Functional requirements — Namespace và organization
+
+- root folder cho mỗi personal/team space;
+- create/rename/move/copy files/folders;
+- nested folders;
+- tags/star/recent;
+- list children với cursor pagination;
+- search theo name/type/tag/owner/time;
+- breadcrumbs/path resolution;
+- case-sensitivity/unicode normalization policy;
+- duplicate-name policy;
+- prevent moving folder into itself/descendant;
+- atomic rename/move metadata transition;
+- stable object/file IDs independent of path;
+- concurrent folder mutation conflict handling.
+
+Cần chốt namespace semantics:
+
+```text
+Unique(parent_folder_id, normalized_name, active_state)?
+```
+
+Một số products cho duplicate display names; một số không. Windows/macOS/Linux còn khác nhau về case, reserved names và unicode, nên desktop sync client cần normalization/conflict policy rõ.
+
+---
+
+#### 8. Functional requirements — Multi-device synchronization
+
+- mỗi device đăng ký/định danh;
+- initial bootstrap/snapshot;
+- incremental changes từ sync cursor;
+- online update target dưới 5 giây;
+- offline catch-up sau reconnect;
+- local changes upload với base version/precondition;
+- delete/rename/move/share changes đồng bộ;
+- dedup events;
+- phát hiện missing sequence/gap;
+- retry/resume;
+- backpressure/pagination cho backlog lớn;
+- conflict resolution;
+- device reset/revoke.
+
+Sync không chỉ là server push:
+
+```text
+Push notification/WebSocket/long poll = wake-up/fast hint
+Durable change journal + cursor       = correctness/recovery
+```
+
+Nếu device bỏ lỡ realtime event, nó dùng cursor lấy mọi committed changes sau checkpoint. Event push không phải source of truth.
+
+---
+
+#### 9. Concurrent edit và conflict policy
+
+Tình huống:
+
+```text
+Device A offline at version 10
+Device B commits version 11
+Device A edits local version 10 and uploads
+```
+
+Cần policy explicit:
+
+##### Option A — Last writer wins
+
+Đơn giản nhưng có thể âm thầm mất thay đổi.
+
+##### Option B — Reject stale base
+
+Server trả conflict; client/user chọn overwrite, download newest hoặc save copy.
+
+##### Option C — Conflict copy/branch
+
+Giữ cả hai versions:
+
+```text
+report.docx
+report (Device A conflicted copy).docx
+```
+
+##### Option D — Application-aware merge
+
+Chỉ khả thi cho loại file có merge semantics; binary arbitrary files không merge chung được.
+
+Giả định phù hợp cho case study:
+
+> Complete upload phải gửi `base_version_id`; nếu current đã đổi, hệ thống không âm thầm ghi đè mà tạo conflict response/copy theo product policy, đồng thời giữ cả content versions.
+
+Real-time collaborative text editing vẫn out of scope.
+
+---
+
+#### 10. Functional requirements — Version history
+
+- mỗi successful content commit tạo immutable `FileVersion`;
+- version có author/device/time/size/checksum/manifest;
+- current version pointer cập nhật atomically;
+- list/download/restore old version;
+- restore tạo một **new version/state transition**, không rewrite history;
+- retention theo account tier/policy;
+- version count/size quota semantics;
+- garbage collection chỉ sau retention/grace/reference checks;
+- malware/ransomware recovery;
+- audit history;
+- optional version labels/comments.
+
+Metadata changes như rename/move/share có thể nằm trong change journal riêng, không nhất thiết tạo content version. Cần phân biệt:
+
+```text
+Content version history
+Metadata/namespace change history
+Access/audit history
+```
+
+---
+
+#### 11. Functional requirements — Trash và deletion
+
+Delete thường là logical:
+
+```text
+ACTIVE → TRASHED → PURGE_PENDING → PHYSICALLY_DELETED
+```
+
+Yêu cầu:
+
+- trash item và subtree theo product semantics;
+- restore về parent cũ hoặc conflict-safe destination;
+- trash retention/expiry;
+- permanent-delete authorization/confirmation;
+- folder/share behavior khi owner deletes;
+- tombstone trong sync journal để devices xóa local copy;
+- reference/share/version checks;
+- legal hold/admin retention nếu scope;
+- delayed asynchronous garbage collection;
+- deletion audit/evidence;
+- quota release timing rõ.
+
+Không xóa object bytes ngay trong API request. Bytes có thể còn được referenced bởi version khác, dedup record, active download, retention policy hoặc backup.
+
+---
+
+#### 12. Functional requirements — Sharing và collaboration
+
+##### Direct sharing
+
+- share với user/group;
+- roles: owner/editor/commenter/viewer theo scope;
+- file hoặc folder;
+- inheritance/override rules;
+- list/update/revoke access;
+- transfer ownership nếu product cho phép;
+- notify recipient;
+- audit access changes.
+
+##### Link sharing
+
+- private/invite-only, organization-only hoặc anyone-with-link;
+- view/edit/upload-only capability tùy scope;
+- expiry/password/domain restrictions;
+- download disabled/allowed policy;
+- rotate/revoke link secret;
+- abuse/rate monitoring;
+- link never exposes raw object key.
+
+##### Shared folder semantics
+
+Cần chốt:
+
+- permission inheritance khi child move vào/ra folder;
+- owner versus editor delete/rename rights;
+- collaborator storage quota ownership;
+- access to previous versions/trash;
+- what happens when parent permission revoked;
+- re-sharing allowed hay không;
+- cycle/link relationships if shortcuts supported.
+
+Authorization phải đánh giá current file/folder/share state. Metadata cache có thể hỗ trợ nhưng revocation cần freshness/invalidation phù hợp.
+
+---
+
+#### 13. Functional requirements — Quota và usage
+
+- per-user/team logical quota;
+- current files + retained versions + trash counting policy;
+- reserved quota cho active upload sessions;
+- release on abort/purge;
+- prevent concurrent uploads vượt quota;
+- shared content charged to owner/team policy;
+- bandwidth/API limits;
+- usage view có thể eventual nhưng admission phải authoritative enough;
+- upgrade/grace/read-only state khi quota exceeded;
+- reconciliation giữa metadata accounting và physical bytes.
+
+Dedup làm logical bytes khác physical bytes:
+
+```text
+Logical usage = bytes charged theo account/product policy
+Physical usage = unique stored objects × replicas/erasure overhead
+```
+
+Không để user vượt quota bằng cách mở nhiều upload sessions song song rồi complete đồng thời.
+
+---
+
+#### 14. Functional requirements — Search, preview và activity
+
+Scope tối thiểu:
+
+- metadata search theo name/type/tag/owner/modified time;
+- recent/starred/shared-with-me;
+- activity feed;
+- thumbnail/preview cho supported file types;
+- preview generation async;
+- safe rendering/sandboxing;
+- content indexing chỉ nếu privacy/product cho phép;
+- indexing version/tombstone để stale result không lộ deleted/revoked file.
+
+Search result không cấp quyền download. Mỗi open/download vẫn authorize current state; index có thể stale.
+
+---
+
+#### 15. File lifecycle/state machines
+
+##### Upload session
+
+```text
+CREATED → UPLOADING → ASSEMBLING/VERIFYING
+                    → COMMITTED
+                    → ABORTED/EXPIRED/FAILED
+```
+
+##### File entry
+
+```text
+ACTIVE → TRASHED → PURGE_PENDING → PURGED
+   ↑         │
+   └─ RESTORED
+```
+
+##### File version
+
+```text
+PENDING_UPLOAD → PENDING_SCAN → AVAILABLE
+                                ├→ QUARANTINED/BLOCKED
+                                └→ RETENTION_EXPIRED → GC_ELIGIBLE
+```
+
+##### Share link
+
+```text
+ACTIVE → EXPIRED/REVOKED/ROTATED
+```
+
+Mỗi transition cần:
+
+- actor/device/request ID;
+- precondition/version token;
+- idempotency;
+- metadata/content/quota effect;
+- durable change event/outbox;
+- compensation/cleanup;
+- audit reason.
+
+---
+
+#### 16. Core invariants
+
+1. Mỗi committed `FileVersion` tham chiếu một complete, verified content manifest/object set.
+2. Partial/abandoned upload không được trở thành current visible version.
+3. Complete upload retry cùng session/request không tạo nhiều logical versions.
+4. Current version pointer chỉ trỏ tới committed version thuộc đúng file.
+5. File/folder ID ổn định qua rename/move; path không phải identity.
+6. Folder hierarchy không có cycle và mọi active child có parent hợp lệ theo namespace policy.
+7. Name uniqueness/case normalization tuân rule nhất quán nếu product yêu cầu.
+8. Metadata mutation và durable sync change event không bị dual-write gap.
+9. Sync cursor chỉ tiến lên; device có thể replay/dedup và hội tụ từ journal.
+10. Stale base-version write không âm thầm phá content mới hơn.
+11. Mọi read/download/share mutation được authorize theo current effective access.
+12. Share-link revoke/expire chặn việc cấp **download capability mới**; signed URLs cũ chỉ sống trong bounded TTL.
+13. Trash/restore/version retention không xóa bytes còn referenced.
+14. Physical GC chỉ xóa object khi không còn live reference/retention/legal hold và grace period đã qua.
+15. Quota reservation/commit/release không double-count hoặc cho concurrent complete vượt giới hạn.
+16. ACK committed version chỉ sau metadata và content durability boundary đã thỏa.
+17. Audit không chứa secret link/token nhưng đủ reconstruct action.
+
+---
+
+#### 17. Consistency boundaries
+
+| Operation/data | Consistency cần | Lý do |
+|---|---|---|
+| Upload chunks | Idempotent/eventual per part | Retry/resume độc lập |
+| Complete file version | Strong atomic metadata commit | Không publish partial/inconsistent version |
+| Rename/move/delete | Strong within namespace/item scope | Tránh lost update/cycle/name conflict |
+| Folder listing | Read-after-write hoặc versioned eventual theo product | UX/sync correctness |
+| Multi-device sync | Eventual convergence <5s target online | Network/device có thể offline |
+| Change journal | Durable ordered scope + replay | Correct catch-up/gap repair |
+| Permission/share changes | Strong mutation, bounded cache invalidation | Security/revocation |
+| Object bytes | Immutable, highly durable | Content integrity/versioning |
+| Search index/preview | Eventual | Derived/rebuildable |
+| Quota admission | Strong/conditional enough | Không vượt quota qua concurrency |
+| Usage display | Eventual/reconciled | Derived accounting |
+| Trash/GC | Eventual background after logical delete | Safety/recovery/cost |
+
+“Sync dưới 5 giây” là freshness SLO, không phải mọi device nhìn trạng thái giống nhau tại mọi nanosecond.
+
+---
+
+#### 18. Non-functional requirements — Scalability
+
+- millions users/devices;
+- billions file entries/versions;
+- petabytes physical content;
+- high object count;
+- small-file metadata-heavy traffic và large-file bandwidth-heavy traffic;
+- burst uploads/downloads/shares;
+- hot shared files/folders;
+- large folders và deep hierarchies;
+- device reconnect/catch-up storm;
+- content scanning/preview/index pipelines;
+- account/team tenant isolation;
+- horizontal partitioning metadata và content independently.
+
+Một system “petabyte scale” không chỉ là storage capacity. Metadata QPS, namespace hot spots, sync fan-out, small-object overhead và egress có thể là bottleneck trước raw disk.
+
+---
+
+#### 19. Non-functional requirements — Durability, availability và recoverability
+
+##### Durability
+
+- acknowledged committed file version có xác suất mất cực thấp;
+- object replication/erasure coding/checksum/scrubbing;
+- metadata database replication/backups/PITR;
+- corruption detection và repair;
+- no single object location in metadata without recovery plan;
+- version/trash retention;
+- restore/recovery drills;
+- disaster-copy strategy theo RPO.
+
+“Multiple nines” phải ghi rõ là bao nhiêu, đo trên object hay toàn version, và time horizon nào. Durability của object store không tự bảo vệ metadata namespace khỏi accidental delete/corruption.
+
+##### Availability
+
+- upload session và metadata APIs có SLO riêng;
+- download có thể tiếp tục trực tiếp từ object/CDN khi control plane tạm chậm nếu capability còn hợp lệ;
+- multiple instances/AZ;
+- graceful degradation: preview/search/notification có thể chậm, committed content/metadata không được sai;
+- client retry/resume;
+- region/provider dependency isolation.
+
+##### Recoverability
+
+- restore metadata point-in-time;
+- rebuild search/preview/sync projections;
+- reconcile object manifests/references;
+- recover orphan/missing chunks;
+- replay journal/outbox;
+- regional failover/failback;
+- ransomware/mass-delete recovery.
+
+---
+
+#### 20. Non-functional requirements — Performance
+
+Cần SLO riêng:
+
+| Operation | Metric cần xác định |
+|---|---|
+| List folder | p95/p99 theo typical/large folder |
+| Metadata mutation | p95/p99 commit latency |
+| Create upload session | p95/p99 control-plane latency |
+| Upload/download | throughput, time-to-first-byte, completion rate |
+| Complete upload | validation + version visibility latency |
+| Online sync | commit-to-device-visible p95/p99, target <5s |
+| Offline catch-up | changes/s và time to converge |
+| Share/revoke | mutation latency + authorization-cache convergence |
+| Search/preview | latency + freshness |
+
+Không thể nói chung “low latency” cho file 1 KB và video 5 GB. Large transfer experience phụ thuộc throughput, resume, parallel parts và retry; small file experience phụ thuộc metadata/control-plane overhead.
+
+---
+
+#### 21. Non-functional requirements — Security và privacy
+
+Threats:
+
+- account takeover;
+- leaked public links;
+- IDOR/broken object-level authorization;
+- malicious uploads/malware;
+- ransomware/mass encryption/delete;
+- object-key enumeration;
+- insider/admin abuse;
+- metadata leakage;
+- share escalation/inheritance bug;
+- replay/stolen signed URL;
+- supply-chain/client compromise;
+- denial-of-wallet via storage/egress.
+
+Controls:
+
+- external OIDC authentication + device/session security;
+- object/folder/share-level authorization;
+- least privilege service IAM;
+- TLS and encryption at rest;
+- managed keys/KMS and rotation;
+- optional customer-managed keys by tier;
+- unguessable IDs plus AuthZ—not security by obscurity;
+- short-lived scoped signed URLs;
+- link expiry/password/domain/revocation;
+- malware scanning/quarantine;
+- rate/quota/abuse controls;
+- sensitive logs redaction;
+- audit for share/download/delete/admin recovery;
+- anomaly detection and bulk-operation confirmation;
+- version/trash/ransomware recovery;
+- privacy/retention/data residency policy.
+
+Fine-grained access control làm authorization latency và invalidation phức tạp hơn, nhưng không thể bỏ qua vì performance.
+
+---
+
+#### 22. Non-functional requirements — Cost efficiency
+
+Cost drivers:
+
+- physical content bytes × replication/erasure overhead;
+- old versions/trash retention;
+- small-object metadata overhead;
+- cross-region replication;
+- upload/download/CDN egress;
+- preview/transcode/scan compute;
+- sync notifications/fan-out;
+- metadata/search/cache databases;
+- backups/snapshots/audit;
+- orphaned multipart uploads;
+- hot/cold storage tier mismatch.
+
+Cost controls:
+
+- object lifecycle hot/cool/archive tiers;
+- old-version/trash retention policies;
+- chunk/whole-file dedup only after privacy/security analysis;
+- delta sync/upload if complexity pays off;
+- compression only for suitable types;
+- abort incomplete multipart uploads;
+- CDN/range/caching;
+- metadata compaction/tiering;
+- per-tenant quotas;
+- unit-cost dashboards;
+- garbage collection with safety grace.
+
+Dedup có privacy risk: cross-user content-hash existence/timing có thể leak information; encryption also complicates dedup. Không mặc định bật global dedup chỉ để giảm cost.
+
+---
+
+#### 23. Observability requirements
+
+##### Upload/content
+
+- upload sessions created/completed/expired;
+- part retry/error/checksum mismatch;
+- bytes/s, completion time và resume success;
+- finalize/scan/visibility lag;
+- corrupt/missing object detection;
+- orphan bytes và GC backlog.
+
+##### Metadata/namespace
+
+- folder list/mutation p99;
+- version conflict rate;
+- rename/move/delete error;
+- hot folders/accounts/partitions;
+- quota reservation/reconciliation mismatch;
+- DB replication/lock/transaction health.
+
+##### Sync
+
+- commit-to-device-visible p50/p95/p99;
+- journal/outbox lag;
+- devices behind/cursor age;
+- reconnect/bootstrap/catch-up rate;
+- gap/replay/dedup/conflict copy rate;
+- push delivery versus pull recovery.
+
+##### Sharing/security
+
+- authorization denials/errors/latency;
+- share link create/revoke/access;
+- public-link abuse/download spikes;
+- bulk download/delete/ransomware signals;
+- malware scan queue/result;
+- admin/recovery actions.
+
+##### Storage/cost
+
+- logical versus physical bytes;
+- version/trash bytes;
+- object count/size distribution;
+- egress and cache hit;
+- replication/repair/scrub status;
+- cost/user, file, active TB, download GB.
+
+---
+
+#### 24. Data entities cần nhận diện
+
+```text
+User / Account / Workspace / Device
+
+NamespaceNode
+  ├── FolderEntry
+  └── FileEntry
+         ├── FileVersion
+         │      └── ContentManifest
+         │             └── Chunk/ObjectReference[]
+         ├── Tag
+         └── Trash/Tombstone state
+
+UploadSession
+  └── UploadPart[]
+
+ACL / PermissionGrant / GroupMembership
+ShareLink / Capability
+
+ChangeJournalEntry / SyncCursor / DeviceCheckpoint
+
+QuotaReservation / UsageLedger
+
+PreviewAsset / SearchDocument
+MalwareScanResult
+AuditEvent / RetentionPolicy / GCJob
+NotificationIntent
+```
+
+Phân biệt:
+
+- `FileEntry`: identity/namespace hiện tại;
+- `FileVersion`: một revision content bất biến;
+- `ContentManifest`: danh sách/whole-object reference cấu thành bytes;
+- `UploadSession`: state tạm trước commit;
+- `ChangeJournalEntry`: mutation durable để devices sync;
+- `ObjectReference`: physical storage reference, không phải public permission.
+
+---
+
+#### 25. API contract sơ bộ
+
+##### Namespace
+
+```http
+POST  /v1/folders
+GET   /v1/folders/{folder_id}/children?cursor=...
+PATCH /v1/nodes/{node_id}
+POST  /v1/nodes/{node_id}/move
+POST  /v1/nodes/{node_id}/copy
+DELETE /v1/nodes/{node_id}
+POST  /v1/trash/{node_id}/restore
+DELETE /v1/trash/{node_id}/permanent
+```
+
+##### Upload
+
+```http
+POST /v1/upload-sessions
+GET  /v1/upload-sessions/{session_id}
+PUT  /v1/upload-sessions/{session_id}/parts/{part_number}
+POST /v1/upload-sessions/{session_id}/complete
+DELETE /v1/upload-sessions/{session_id}
+```
+
+Create request:
+
+```json
+{
+  "parent_folder_id": "fld_123",
+  "name": "report.pdf",
+  "size_bytes": 104857600,
+  "content_type": "application/pdf",
+  "base_version_id": "ver_10",
+  "client_request_id": "stable-device-id"
+}
+```
+
+Complete request:
+
+```json
+{
+  "parts": [
+    {"part_number": 1, "etag": "...", "checksum": "..."}
+  ],
+  "whole_file_checksum": "...",
+  "expected_entry_version": 10
+}
+```
+
+##### Download/version
+
+```http
+POST /v1/files/{file_id}/download-intents
+GET  /v1/files/{file_id}/versions?cursor=...
+POST /v1/files/{file_id}/versions/{version_id}/restore
+```
+
+##### Sharing
+
+```http
+GET    /v1/nodes/{node_id}/permissions
+POST   /v1/nodes/{node_id}/permissions
+PATCH  /v1/nodes/{node_id}/permissions/{grant_id}
+DELETE /v1/nodes/{node_id}/permissions/{grant_id}
+POST   /v1/nodes/{node_id}/share-links
+DELETE /v1/share-links/{link_id}
+```
+
+##### Sync
+
+```http
+POST /v1/devices
+GET  /v1/sync/changes?cursor=...&limit=...
+POST /v1/sync/ack
+GET  /v1/sync/bootstrap?cursor=...
+```
+
+Mọi mutation dùng idempotency/request ID và expected metadata/base version khi cần. IDs không thay authorization.
+
+---
+
+#### 26. Failure scenarios cần đưa vào scope
+
+| Sự cố | Hành vi mong muốn |
+|---|---|
+| Mạng rớt giữa upload 5 GB | Resume missing parts, không upload lại toàn bộ |
+| Same part upload retry | Idempotent overwrite/dedup theo session+part |
+| Complete request timeout sau commit | Retry trả same FileVersion/result |
+| Metadata commit nhưng sync event mất | Transactional outbox/journal không để dual-write gap |
+| Object uploaded nhưng metadata never committed | Orphan session/object cleanup sau grace |
+| Manifest trỏ missing/corrupt part | Không publish/serve; verify/repair/alert |
+| Hai devices edit same base | Conflict response/copy/version, không silent loss |
+| Device bỏ lỡ push | Cursor-based durable journal catch-up |
+| Device offline nhiều tháng | Paginated catch-up hoặc fresh bootstrap snapshot |
+| Folder rename concurrent move | Version/precondition conflict/retry |
+| Share permission revoked | New access denied; short-lived issued capability expires soon |
+| File trashed on one device | Tombstone sync; bytes retained until purge/GC |
+| GC worker runs twice | Reference/eligibility check + idempotent delete |
+| Metadata DB outage | Writes pause/retry; content bytes remain durable, no partial publication |
+| Object store region failure | Replica/DR/failover per durability/RTO policy |
+| Malware scanner backlog | File quarantined/pending; visibility policy explicit |
+| Ransomware mass changes | Rate/anomaly alert, versions/trash, bulk restore workflow |
+| Quota reservation leaked | Expiry/reconciler releases it |
+
+---
+
+#### 27. Các điểm hiệu chỉnh từ transcript đơn giản
+
+| Transcript đơn giản hóa | Cách hiểu production-oriented |
+|---|---|
+| Upload/download file “mọi loại” | Content type tùy ý nhưng size limit 5 GB và policy/malware restrictions |
+| Chia file thành chunks vì request lớn | Cần upload session, checksum, idempotent parts, atomic complete và orphan cleanup |
+| Đồng bộ thay đổi nhanh trên mọi device | Realtime chỉ wake-up; durable journal/cursor bảo đảm catch-up/convergence |
+| Các devices “consistent” | Eventual convergence; offline/concurrent edits cần version/conflict semantics |
+| Store bytes ở object storage | Metadata/manifest/version/reference/GC/durability vẫn phải thiết kế |
+| Authentication ở service khác | Storage vẫn phải authorize từng object/share action |
+| Fine-grained access control | Phải định nghĩa inheritance, link capability, revocation và cache freshness |
+| Version history để rollback | Versions immutable; restore tạo new current version, retention/GC/quota rõ |
+| Trash giúp restore | Logical delete/tombstone trước, physical GC sau reference/retention/grace checks |
+| Durability nhiều nines | Nêu exact target/scope/time horizon và bảo vệ cả metadata lẫn content |
+| Sync latency dưới 5 giây | Gắn percentile, online conditions, commit-to-visible boundary và backlog recovery |
+| Cost-efficient storage | Tính versions, trash, object overhead, replication, egress, scan, orphan và metadata |
+| Secure sharing | Public link không phải raw object URL; capability ngắn hạn và current ACL checks |
+
+---
+
+#### 28. Trade-offs cần chốt
+
+| Decision | Benefit | Cost/trade-off |
+|---|---|---|
+| Whole-file object per version | Simple manifest/download/GC | Re-upload/storage amplification cho small edits |
+| Chunk-level content store | Resume/delta/dedup | Metadata/object count, GC, privacy, complexity |
+| Last-write-wins | Simple UX/implementation | Silent lost updates |
+| Conflict copies | Preserve data | User clutter/manual merge |
+| Strong namespace consistency | Predictable rename/move/share | Cross-region latency/availability trade-off |
+| Eventual sync | Global/offline scalability | Temporary device divergence |
+| Folder ACL inheritance | Easy bulk sharing | Move/revoke/effective-permission complexity |
+| Short-lived signed downloads | Scalable direct transfer | Bounded revocation window |
+| Long version/trash retention | Recovery/ransomware safety | Storage cost/privacy |
+| Global dedup | Physical storage savings | Side-channel/privacy/encryption/GC complexity |
+| CDN for downloads | Low latency/origin protection | Cache invalidation/access/egress cost |
+| Server-side encryption | Manageable search/preview/sharing | Provider/admin trust model |
+| End-to-end encryption | Strong content privacy | Search/preview/dedup/sharing/recovery complexity |
+
+---
+
+#### 29. Các câu hỏi làm rõ trong phỏng vấn
+
+##### File/content
+
+- Max file size chỉ 5 GB hay cần lớn hơn?
+- Average/median/p95 file sizes và type distribution?
+- Whole-file versions hay chunk/delta sync?
+- Preview/thumbnails/content search nằm trong scope?
+- Malware scan trước hay sau owner visibility?
+
+##### Namespace/sync
+
+- Duplicate names/case sensitivity/unicode policy?
+- Multiple roots/team drives/shared spaces?
+- Rename/move atomic scope?
+- Online sync target <5 giây là p95 hay p99?
+- Realtime transport nào và offline backlog retention?
+- Conflict policy cho concurrent edits/deletes/moves?
+- Có đồng bộ selective/offline files không?
+
+##### Sharing/security
+
+- Roles và folder inheritance?
+- Public links, password/expiry/domain restrictions?
+- Link revoke phải có hiệu lực nhanh tới mức nào?
+- Address book/group/org support?
+- E2EE hay server-managed encryption?
+- Audit/download history/data residency/compliance?
+
+##### Versioning/deletion/quota
+
+- Version retention/count và trash period?
+- Versions/trash tính quota thế nào?
+- Shared file charged cho ai?
+- Dedup scope: within account, tenant hay global?
+- Legal hold/bulk restore/ransomware recovery?
+- Physical delete and backup retention guarantees?
+
+##### Scale/SLO
+
+- Users/DAU/devices/user?
+- Total files/versions, bytes, object size distribution?
+- Upload/download/sync operations/day and peak?
+- Hot shared files/folders?
+- Durability/availability/RTO/RPO targets?
+- Regions/egress/cost constraints?
+
+---
+
+#### 30. Cách trình bày bước 1 trong phỏng vấn
+
+Recap khoảng 90 giây:
+
+1. Tôi thiết kế binary cloud drive, không gồm character-level collaborative editor; max file size là 5 GB.
+2. Core features là resumable upload/download, namespace folders/tags, multi-device sync, sharing, versions và trash.
+3. Metadata/FileEntry tách khỏi immutable FileVersion content stored in object storage.
+4. Upload dùng session/parts/checksums; version chỉ visible sau atomic complete commit.
+5. File identity dùng stable ID, không dùng path; rename/move chỉ đổi metadata.
+6. Sync correctness dựa trên durable change journal + cursor; push chỉ giúp latency dưới 5 giây.
+7. Concurrent offline edits dùng base-version precondition và conflict copy/rejection, không silent overwrite.
+8. ACL/share links có role, inheritance, expiry/revoke; mỗi download được authorize trước khi cấp short-lived URL.
+9. Delete là tombstone/trash; physical GC chỉ sau retention/reference/grace checks.
+10. Versions immutable; restore tạo version mới và quota/retention policy rõ.
+11. Object bytes và metadata đều cần replication/checksum/backup/recovery; object-store durability một mình chưa đủ.
+12. NFRs gồm petabyte scale, multiple-nines durability, high availability, large-transfer throughput, security, cost và observability.
+13. Bước tiếp theo sẽ ước lượng users/devices, file/object count, upload/download bytes, sync fan-out, version/trash amplification và metadata QPS.
+
+---
+
+#### 31. Scope checklist
+
+- [ ] Binary file sync versus real-time document collaboration?
+- [ ] File size limit, type policy và malware scanning?
+- [ ] Whole-object multipart hay independent chunk store?
+- [ ] FileEntry/FileVersion/ContentManifest separation?
+- [ ] Upload session, part checksum, resume, complete idempotency?
+- [ ] Partial upload visibility và orphan cleanup?
+- [ ] Stable node IDs independent of paths?
+- [ ] Folder/name/case/unicode/cycle semantics?
+- [ ] Rename/move/copy/delete atomic/precondition rules?
+- [ ] Device registration/bootstrap/cursor/catch-up/gap repair?
+- [ ] <5s sync SLO percentile và measurement boundary?
+- [ ] Concurrent edit/delete/move conflict policy?
+- [ ] Direct user/group roles and folder inheritance?
+- [ ] Public/private link scope, expiry, password and revocation?
+- [ ] Short-lived signed content access and authorization freshness?
+- [ ] Immutable versions, restore-as-new-version and retention?
+- [ ] Trash/tombstone/purge/GC/legal-hold semantics?
+- [ ] Logical/physical usage and quota reservation?
+- [ ] Object references/refcount/GC grace/integrity repair?
+- [ ] Encryption/key management/E2EE choice?
+- [ ] Search/preview/content indexing scope/privacy?
+- [ ] Durability/availability/RTO/RPO exact targets?
+- [ ] Multi-region/data residency/egress strategy?
+- [ ] Ransomware/bulk recovery/admin audit?
+- [ ] Metrics cover upload, sync, AuthZ, corruption and cost?
+
+---
+
+#### 32. Ý chính cần nhớ
+
+- Cloud storage không chỉ lưu bytes; nó quản lý namespace, versions, sync, sharing và lifecycle.
+- Binary file synchronization khác real-time document co-editing.
+- FileEntry metadata và immutable FileVersion content phải tách nhau.
+- Path/name không phải identity; stable file ID giúp rename/move/sync.
+- Upload 5 GB cần session, resumable parts, checksum và atomic completion.
+- Partial upload không được trở thành visible current version.
+- Complete retry phải trả same logical version/result.
+- Object storage giữ content; metadata database giữ namespace, version và access relationships.
+- Multi-device sync correctness dựa trên durable journal/cursor, không chỉ push.
+- Target dưới 5 giây là freshness SLO, không phải instantaneous global consistency.
+- Offline/concurrent edits cần base version và conflict policy.
+- Last-write-wins có nguy cơ mất dữ liệu; conflict copy bảo toàn nội dung tốt hơn.
+- Content versions immutable; restore tạo một version/current transition mới.
+- Delete là logical tombstone/trash trước khi asynchronous physical GC.
+- GC phải kiểm tra references, retention, legal hold và grace period.
+- Fine-grained ACL cần inheritance, override, revoke và move semantics.
+- Share link không nên lộ permanent object URL.
+- Signed URL ngắn hạn scale download nhưng tạo bounded revocation window.
+- Authentication bên ngoài không thay object-level authorization của storage platform.
+- Quota cần reservation để concurrent uploads không vượt giới hạn.
+- Logical storage khác physical storage khi có versions, trash hoặc dedup.
+- Global dedup có privacy/security trade-off, không chỉ lợi ích cost.
+- Durability phải bao phủ content lẫn metadata/manifest.
+- Small files gây metadata/object-count load; large files gây bandwidth/resume load.
+- Observability cần đo sync lag, checksum/corruption, orphan/GC, access và unit cost.
+- Kiến trúc tốt nối **resumable immutable content ingest → atomic metadata publication → durable change journal → authorized device convergence → retention-safe garbage collection**.
+
+#### Công thức ghi nhớ
+
+> **Cloud Storage = immutable versioned content objects + strongly governed metadata namespace + resumable integrity-checked transfers + cursor-based device convergence + revocable ACL/link capabilities + trash/retention-aware garbage collection.**
+
+---
+
+### Bài 99. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của capacity estimation
+
+Cloud storage có ít nhất bốn đơn vị tải khác nhau:
+
+```text
+File operations/s     → metadata/control plane
+Bytes/s               → content/data plane
+Change deliveries/s   → sync/fan-out plane
+Objects/references    → object storage, manifest và GC
+```
+
+Chỉ nói “5 tỷ files” hoặc “10 PB” chưa đủ. Cần biết:
+
+- file-size distribution, không chỉ average;
+- current files versus retained versions;
+- upload starts, parts và successful commits;
+- download bytes và hot-link skew;
+- metadata reads/writes per user action;
+- change commits versus recipient-device deliveries;
+- permissions/shared-folder amplification;
+- trash/orphan/dedup/redundancy overhead;
+- regional traffic và peak duration.
+
+Quy trình:
+
+```text
+Business assumptions
+      ↓
+Logical files / operations / bytes
+      ↓
+Amplification: parts + versions + devices + ACL + replicas + retries
+      ↓
+Average versus peak versus hot tenant/object
+      ↓
+Per-plane/per-shard capacity
+      ↓
+Bottlenecks, SLOs, cost và degradation
+```
+
+---
+
+#### 2. Các assumptions từ transcript
+
+| Thông số | Giá trị | Ý nghĩa |
+|---|---:|---|
+| Active users | 10 triệu | Chưa rõ DAU, MAU hay tổng active accounts |
+| Average current files/user | 500 | Namespace/file-entry cardinality |
+| Current files | Khoảng 5 tỷ | `10M × 500` |
+| Average current file size | 2 MB | Content byte estimate, nhưng distribution rất quan trọng |
+| Logical current content | Khoảng 10 PB | `5B × 2 MB` theo decimal units |
+| Peak upload starts/commits | Khoảng 2.000/s | Transcript chưa nói start hay completed uploads |
+| Sync events | Khoảng 10.000/s | Chưa rõ committed changes hay device deliveries |
+| Maximum file size | 5 GB | Từ Bài 98, cần resumable multipart |
+| Online sync freshness target | Dưới 5 giây | Cần gắn percentile và measurement boundary |
+
+Các assumptions còn thiếu:
+
+- average uploads/downloads/day và peak duration;
+- devices/user, active concurrent devices;
+- upload success/abort/retry rate;
+- file-size p50/p95/p99/max;
+- average retained versions/file;
+- percentage content in trash;
+- retention windows;
+- download-to-upload ratio và bytes;
+- share/public-link traffic distribution;
+- average folder size/depth;
+- permissions/grants per node/workspace;
+- change fan-out recipients;
+- part/chunk size;
+- compression/dedup ratio;
+- replication/erasure coding overhead;
+- metadata row/index sizes;
+- multi-region/data residency scope.
+
+---
+
+#### 3. Kiểm tra phép tính cốt lõi
+
+##### File count
+
+```text
+10.000.000 users × 500 files/user
+= 5.000.000.000 current files
+= 5 tỷ FileEntry records
+```
+
+Phép tính đúng nếu 500 là average trên cùng 10 triệu accounts. Tuy nhiên “active users” và total storage accounts cần làm rõ: inactive accounts vẫn chiếm storage.
+
+##### Current logical content
+
+```text
+5.000.000.000 files × 2 MB/file
+= 10.000.000.000 MB
+≈ 10 PB decimal
+```
+
+Đây chỉ là bytes của **current logical file versions**. Không gồm:
+
+- old versions;
+- trash;
+- multipart temporary parts;
+- previews/thumbnails;
+- object metadata;
+- replicas/erasure coding;
+- backups/DR copy;
+- encryption framing;
+- dedup/compression effects;
+- orphan/GC lag.
+
+---
+
+#### 4. Average file size che giấu hai workload cực khác
+
+Ví dụ cùng 2 MB average có thể là:
+
+```text
+Phần lớn file rất nhỏ + một số video rất lớn
+hoặc
+Đa số file gần 2 MB
+```
+
+Hai distributions tạo bottleneck khác nhau:
+
+| Workload | Driver chính | Bottleneck thường gặp |
+|---|---|---|
+| Nhiều file nhỏ | Operations/object count/metadata | DB QPS, request overhead, indexes, small-object cost |
+| Ít file lớn | Bytes/concurrency/duration | Network, multipart state, retry, egress |
+| Nhiều versions nhỏ | Metadata/journal/GC | Version rows, manifest/refcount, sync events |
+| Large shared file | Download egress/hot object | CDN/origin, access checks, denial-of-wallet |
+
+Cần ít nhất:
+
+- p50/p90/p95/p99/max size;
+- files và bytes theo type;
+- count versus byte-weighted distribution;
+- upload/download completion duration;
+- object-store requests/GB.
+
+---
+
+#### 5. Peak upload bandwidth
+
+Nếu peak 2.000 uploads/s và average file tại peak vẫn 2 MB:
+
+```text
+2.000 × 2 MB
+= 4.000 MB/s
+≈ 4 GB/s
+≈ 32 Gbit/s logical ingress
+```
+
+Chưa gồm:
+
+- TLS/protocol overhead;
+- retries;
+- replication;
+- checksum/scan traffic;
+- client-to-edge và edge-to-object-store path;
+- multipart request overhead.
+
+Điểm quan trọng: transcript không nói 2.000/s là upload **start**, **complete** hay metadata commit. Với large uploads, ba rates khác nhau theo thời gian.
+
+Nếu 2.000 uploads/s được duy trì 24 giờ:
+
+```text
+2.000 × 86.400 = 172,8M files/day
+172,8M × 2 MB = 345,6 TB/day logical ingest
+```
+
+Tức hơn 126 PB/năm nếu giữ nguyên cả ngày. Vì tổng current content chỉ 10 PB, 2.000/s rõ ràng nên được xem là **peak burst** trừ khi platform có delete/dedup cực lớn hoặc dữ liệu tăng rất nhanh. Cần average/duty cycle để forecast growth.
+
+---
+
+#### 6. Upload concurrency theo Little’s Law
+
+Upload duration kéo dài làm concurrent sessions lớn dù start rate cố định:
+
+```text
+Concurrent uploads
+≈ upload starts/s × average upload duration(s)
+```
+
+Ví dụ minh họa:
+
+| Starts/s | Avg duration | Concurrent sessions |
+|---:|---:|---:|
+| 2.000 | 10 s | 20.000 |
+| 2.000 | 100 s | 200.000 |
+| 2.000 | 800 s | 1.600.000 |
+
+Một file 5 GB trên đường truyền 50 Mbit/s mất lý tưởng khoảng:
+
+```text
+5 GB × 8 / 50 Mbit/s
+≈ 800 giây
+≈ 13,3 phút
+```
+
+Chưa tính retry/latency. Upload service phải quản lý nhiều sessions/parts đồng thời hơn completions/s.
+
+State cần scale:
+
+- session create/read/heartbeat/expiry;
+- quota reservations;
+- part status/checksums;
+- signed part URLs;
+- complete validation;
+- abandoned session cleanup.
+
+---
+
+#### 7. Chunk/part request amplification
+
+Giả sử part size 8 MiB:
+
+```text
+5 GiB / 8 MiB = 640 parts
+```
+
+Một max-size upload có thể tạo:
+
+- 1 create-session request;
+- 640 part uploads;
+- retries cho failed parts;
+- optional list-parts/resume requests;
+- 1 complete request;
+- checksum/scan/manifest work;
+- 1 metadata version commit;
+- sync events.
+
+Formula:
+
+```text
+part upload requests/s
+≈ uploaded bytes/s / part size × retry factor
+```
+
+Nếu logical ingress là 4 GB/s và part 8 MiB:
+
+```text
+4.000 MB/s / 8 MiB
+≈ khoảng 500 part requests/s
+```
+
+Nhưng average file 2 MB nhỏ hơn part size, nên mỗi file vẫn tạo một object/part request; theo object count, 2.000 small-file uploads/s có thể tạo khoảng 2.000 content PUT/s. Cần size distribution để lấy giá trị đúng.
+
+Part size trade-off:
+
+- nhỏ: resume tốt, delta/granularity tốt, nhưng nhiều requests/metadata/objects;
+- lớn: ít overhead, nhưng retry tốn bytes và parallelism kém hơn;
+- adaptive part size theo file size có thể hợp lý.
+
+---
+
+#### 8. Daily metadata commit volume
+
+Không nên annualize peak, nhưng có thể biểu diễn theo average committed uploads `U_avg`:
+
+```text
+new file versions/day
+= U_avg × 86.400
+```
+
+Mỗi committed upload tạo tối thiểu:
+
+```text
+1 FileEntry create hoặc current-version update
+1 FileVersion
+1 ContentManifest/whole-object reference
+1 quota usage transition
+1 namespace/change-journal entry
+1 outbox event
+N audit/index/preview/scan derived records
+```
+
+Một logical save có thể tạo 5–10+ metadata/event writes trước replication/indexes. Rename, move, share, delete và restore còn tạo change events mà không upload content.
+
+Do đó:
+
+```text
+sync/metadata change rate
+≠ file upload completion rate
+```
+
+---
+
+#### 9. Metadata storage estimate
+
+##### File entries
+
+Nếu một `FileEntry` raw record trung bình 0,5–1 KB:
+
+```text
+5B × 0,5–1 KB
+= 2,5–5 TB raw
+```
+
+##### File versions
+
+Nếu average retained versions/file = `V` và một version/manifest metadata record trung bình 0,5 KB:
+
+```text
+version metadata raw
+= 5B × V × 0,5 KB
+```
+
+Ví dụ `V=2`:
+
+```text
+10B versions × 0,5 KB = 5 TB raw
+```
+
+Chưa gồm:
+
+- folder nodes;
+- ACL/grants/share links;
+- upload sessions/parts;
+- change journal;
+- tags/search documents;
+- device cursors;
+- trash/tombstones;
+- quota/audit;
+- indexes/replicas/backups/tombstones.
+
+Tổng metadata footprint dễ lên hàng chục TB trước search/analytics. “Metadata nhỏ” ở cấp một row nhưng không nhỏ ở 5–10 tỷ records.
+
+---
+
+#### 10. Content storage amplification
+
+Một capacity formula hữu ích:
+
+```text
+Physical content bytes
+≈ current logical bytes
+× version/trash factor
+× compression/dedup factor
+× durability overhead
++ temporary/orphan/preview bytes
+```
+
+Trong đó:
+
+- version/trash factor `≥1`;
+- compression/dedup factor có thể `<1`, `=1` hoặc gần `>1` do framing/inefficiency;
+- durability overhead có thể khoảng 1,3–3× tùy erasure coding/replication/DR;
+- temporary/preview tách riêng.
+
+Ví dụ minh họa:
+
+##### Full replication 3×, không versions/dedup
+
+```text
+10 PB × 3 = 30 PB physical
+```
+
+##### Retained content factor 1,5× và erasure overhead 1,5×
+
+```text
+10 PB × 1,5 × 1,5 = 22,5 PB
+```
+
+Các số này không phải lựa chọn cuối; chúng cho thấy “10 PB” không phải dung lượng cần provision.
+
+---
+
+#### 11. Versioning và trash amplification
+
+Để sizing cần đo:
+
+```text
+version byte factor
+= total live version bytes / current-version bytes
+
+trash byte factor
+= trash bytes / current-version bytes
+```
+
+Version count average không đủ vì:
+
+- một video lớn có thể có ít versions nhưng chiếm nhiều bytes;
+- document nhỏ có nhiều versions nhưng chủ yếu metadata/objects;
+- whole-file versioning nhân bytes nhiều hơn chunk/delta storage;
+- retention khác theo account tier;
+- conflict copies làm tăng entries lẫn content.
+
+Metrics cần byte-weighted:
+
+- current bytes;
+- previous-version bytes;
+- trash bytes;
+- pending/quarantine bytes;
+- orphan multipart bytes;
+- preview/derived bytes;
+- GC-eligible bytes;
+- dedup saved bytes;
+- physical redundancy bytes.
+
+---
+
+#### 12. Sync: change rate khác delivery rate
+
+Transcript nói 10.000 sync events/s nhưng cần định nghĩa:
+
+```text
+Committed changes/s        = journal facts created
+Delivery attempts/s        = change notifications sent to device sessions
+Applied changes/s          = clients successfully process
+Catch-up reads/s           = cursor pages fetched after gap/offline
+```
+
+Fan-out:
+
+```text
+sync deliveries/s
+≈ committed changes/s
+× target active devices/collaborators per change
+× retry factor
+```
+
+Ví dụ, 2.000 committed file changes/s và trung bình 5 online target devices/connections:
+
+```text
+2.000 × 5 = 10.000 deliveries/s
+```
+
+Điều này có thể giải thích assumptions, nhưng shared folders/hot files làm distribution lệch mạnh.
+
+Một share permission change ở root folder có thể ảnh hưởng hàng triệu descendants/users về **effective access**, dù không nên phát một journal event riêng cho mọi file nếu có cách version/inheritance khác.
+
+---
+
+#### 13. Device count và connection pressure
+
+Nếu mỗi user có trung bình 3 registered devices:
+
+```text
+10M users × 3 = 30M devices
+```
+
+Không phải tất cả online. Nếu 10% simultaneously connected:
+
+```text
+3M active sync connections
+```
+
+Nếu mỗi connection gửi heartbeat 30 giây/lần:
+
+```text
+3M / 30 ≈ 100.000 heartbeats/s
+```
+
+Đây là scenario minh họa. Nó cho thấy không được đánh đồng “10k change events/s” với toàn sync infrastructure load.
+
+Capacity gồm:
+
+- long-poll/WebSocket connections;
+- TLS handshakes/reconnects;
+- heartbeats;
+- subscription/device registry;
+- push notification provider calls;
+- cursor page reads;
+- initial bootstrap;
+- local acknowledgements;
+- slow/offline device backlog.
+
+Mobile clients có thể dùng push wake-up + incremental pull thay vì giữ socket liên tục; desktop sync agents có thể giữ long-lived channel.
+
+---
+
+#### 14. Reconnect và catch-up storm
+
+Nếu 300.000 devices mất connection do regional incident và reconnect trong 60 giây:
+
+```text
+300.000 / 60 = 5.000 reconnects/s
+```
+
+Mỗi reconnect có thể tạo:
+
+- token/device validation;
+- cursor lookup;
+- change-page reads;
+- metadata fetches;
+- download intents/content transfers;
+- local conflict checks.
+
+Nếu mỗi device thiếu 100 changes:
+
+```text
+300.000 × 100 = 30M changes cần catch up
+```
+
+Controls:
+
+- exponential backoff + jitter;
+- resumable cursors;
+- batched/paginated changes;
+- snapshot/bootstrap when journal gap quá lớn;
+- regional recovery capacity;
+- admission/fair scheduling;
+- separate realtime and catch-up pools;
+- compression/coalescing where semantics allow;
+- per-device/account quotas.
+
+---
+
+#### 15. Sync freshness budget
+
+Target `<5s` cần phân bổ:
+
+```text
+Metadata/version commit
+→ outbox/journal publication
+→ broker/fan-out dispatch
+→ push/connection delivery
+→ client fetch/apply
+```
+
+Ví dụ budget minh họa:
+
+| Stage | Budget |
+|---|---:|
+| Commit + journal | 500 ms |
+| Outbox/broker | 500 ms |
+| Device notification | 1 s |
+| Fetch/apply | 2 s |
+| Headroom | 1 s |
+
+Không phải target chính thức. Cần đo p95/p99 `commit-to-device-visible` cho online healthy devices và tách:
+
+- same-region versus cross-region;
+- small metadata change versus large content download;
+- notified versus fully downloaded;
+- online versus waking mobile device;
+- shared versus private item.
+
+“File được sync” có thể nghĩa metadata/version change đã biết hoặc bytes đã download xong; phải định nghĩa.
+
+---
+
+#### 16. Backlog drain time
+
+Nếu committed change rate là 10.000/s và pipeline chỉ xử lý bền vững 10.000/s, backlog không bao giờ giảm.
+
+```text
+Drain time
+= backlog
+/ (sustainable processing rate - new incoming rate)
+```
+
+Ví dụ:
+
+```text
+backlog = 1.000.000 deliveries
+capacity = 15.000/s
+incoming = 10.000/s
+
+drain = 1.000.000 / 5.000 = 200 giây
+```
+
+Cần headroom cho:
+
+- normal peak;
+- AZ/consumer loss;
+- reconnect catch-up;
+- hot shared item;
+- deploy/rebalance;
+- downstream metadata/content throttling.
+
+Queue depth một mình không đủ; theo dõi oldest change age, lag theo account/partition/device class và estimated drain time.
+
+---
+
+#### 17. Metadata access amplification
+
+Một file download có thể tạo:
+
+```text
+resolve FileEntry/current version
+evaluate effective ACL/share link
+read manifest/object locations
+issue short-lived capability
+update audit/activity/access counters
+```
+
+Một folder listing có thể tạo:
+
+- list child nodes;
+- resolve sharing/ownership/status;
+- current version summary;
+- sort/pagination;
+- thumbnail/preview references;
+- starred/recent state;
+- effective permission.
+
+Một upload complete tạo:
+
+- idempotency lookup;
+- session/parts validation;
+- namespace conflict check;
+- FileVersion/manifest/current pointer;
+- quota transition;
+- journal/outbox;
+- audit/search/preview/scan work.
+
+Do đó metadata ops/s có thể lớn hơn user-visible API QPS nhiều lần. Cache/index/batching cần thiết, nhưng write invariants và access revocation không được dựa trên stale cache.
+
+---
+
+#### 18. Folder listing và namespace hotspots
+
+Metadata partition thường theo user/account/workspace/namespace để giữ locality. Nhưng hotspots gồm:
+
+- team workspace có hàng triệu nodes;
+- folder có hàng triệu children;
+- shared root với nhiều collaborators;
+- bulk rename/move/delete;
+- viral shared folder;
+- migration/import client;
+- ransomware mass modifications.
+
+Không dùng recursive path làm primary identity vì rename ancestor sẽ rewrite descendants. Stable node ID + parent ID giảm write amplification.
+
+Controls:
+
+- cursor pagination;
+- index `(workspace_id, parent_folder_id, sort_key)`;
+- per-folder/account rate/fairness;
+- subtree mutation jobs/tombstones nếu semantics cho phép;
+- cached materialized path/breadcrumb projection;
+- cycle checks;
+- shard large tenants deliberately;
+- bulk-operation limits/async workflows;
+- anomaly detection.
+
+“Partition metadata horizontally” cần nói rõ key và hot-tenant strategy; hash user ID chỉ giải quyết average distribution.
+
+---
+
+#### 19. Permission-check amplification
+
+Effective access có thể phụ thuộc:
+
+```text
+file direct grants
++ inherited folder grants
++ group/team membership
++ share-link capability
++ tenant policy
++ item state/trash/quarantine
++ device/session/risk context
+```
+
+Bottlenecks:
+
+- walk ancestor chain cho mỗi request;
+- huge group membership;
+- ACL fan-out/invalidation;
+- moving subtree changes inherited permissions;
+- revoke must apply quickly;
+- shared-link hot cache;
+- authz database becomes central dependency.
+
+Controls:
+
+- effective-permission cache with policy/version key;
+- bounded hierarchy depth;
+- group membership/version cache;
+- ancestor/security descriptor references;
+- current AuthZ check before signed URL issuance;
+- short capability TTL;
+- revoke event/invalidation;
+- deny-sensitive operations on stale/uncertain policy;
+- batch authorization for folder list;
+- audit sampled by policy without leaking secret.
+
+Precompute every user × descendant permission can explode combinatorially. Chọn inheritance/materialization strategy theo read/write/revoke trade-off.
+
+---
+
+#### 20. Shared/public-link hotspots
+
+Một 100 MB file được tải 10.000 lần tạo:
+
+```text
+100 MB × 10.000 = 1 TB logical egress
+```
+
+Một link viral có thể gây:
+
+- metadata/AuthZ QPS spike;
+- signed-URL generation spike;
+- CDN/object egress;
+- origin misses;
+- audit/event volume;
+- bandwidth cost/denial-of-wallet;
+- malware/abuse/legal response.
+
+Controls:
+
+- CDN/origin shielding;
+- current link-state cache with fast revoke/version;
+- short-lived scoped download URLs;
+- rate/bandwidth quota;
+- hot-object replication/cache;
+- abuse detection/challenge;
+- link expiry/password/domain policy;
+- per-owner spending/traffic alerts;
+- prevent cache from bypassing access classification.
+
+Anonymous public access vẫn cần policy/capability validation; “không đăng nhập” không có nghĩa “không authorization”.
+
+---
+
+#### 21. Download bandwidth chưa được cho
+
+Download traffic thường chi phối egress/cost nhưng transcript không cung cấp volume.
+
+Formula:
+
+```text
+download bytes/day
+= downloads/day × average bytes/downloaded
+```
+
+Phải tách:
+
+- full downloads;
+- range/resume;
+- device synchronization downloads;
+- previews/thumbnails;
+- CDN cache hits;
+- origin reads;
+- cross-region replication;
+- shared/public versus private traffic.
+
+Metrics:
+
+- downloads/file/user/share link;
+- bytes/s p95/peak by region;
+- time-to-first-byte/completion;
+- range-request ratio;
+- CDN hit and origin egress;
+- failed/resumed bytes;
+- top hot objects;
+- cost/GB and cost/account.
+
+Không thể chốt architecture cost nếu chỉ biết stored PB mà không biết egress PB/month.
+
+---
+
+#### 22. Object-store request amplification
+
+Object storage capacity không chỉ theo bytes:
+
+```text
+PUT/GET/HEAD/LIST/DELETE requests
+object count
+average object size
+part count
+manifest reads
+replication/repair traffic
+```
+
+Chunk-level architecture có thể biến 5 tỷ files thành hàng chục/hàng trăm tỷ chunk references/objects. Với 2 MB average và chunk 8 MB, đa số files chỉ một chunk; nhưng content-defined chunking nhỏ hơn lại tăng object count.
+
+Small-object overhead:
+
+- request cost cao trên mỗi GB;
+- namespace/list operations;
+- metadata/index entries;
+- GC/refcount;
+- compaction/packing opportunity;
+- tail latency.
+
+Không dùng object-store `LIST` để xây user folder listing. Folder namespace nằm trong metadata database/index; object keys là storage implementation detail.
+
+---
+
+#### 23. Garbage collection và reference bottleneck
+
+GC candidates:
+
+- aborted/expired upload parts;
+- old versions hết retention;
+- permanently deleted/trash-expired files;
+- replaced previews;
+- orphan manifests/objects;
+- deduplicated chunks hết reference;
+- failed/quarantined content theo policy.
+
+GC risks:
+
+- delete object còn được version/share/reference sử dụng;
+- refcount update mất/duplicate;
+- metadata/content race;
+- delayed event/retry tạo late reference;
+- object-store delete throttling;
+- huge backlog tăng cost;
+- legal hold/backup retention;
+- cross-region replicas không đồng bộ.
+
+Safe pattern:
+
+```text
+logical delete/tombstone
+→ retention and GC grace
+→ mark/sweep or reference reconciliation
+→ re-check eligibility/version
+→ idempotent physical delete
+→ audit/metrics
+```
+
+Theo dõi:
+
+- GC-eligible bytes/objects;
+- oldest eligible age;
+- orphan bytes;
+- delete rate/provider quota;
+- refcount/reconciliation mismatch;
+- restore-after-delete incidents phải bằng 0;
+- cost of delayed GC.
+
+---
+
+#### 24. Version/dedup trade-off bottleneck
+
+Whole-file versioning:
+
+- fewer manifest/chunk operations;
+- easy immutable object lifecycle;
+- poor storage efficiency for small edits to large files.
+
+Fixed/content-defined chunking:
+
+- reuse unchanged chunks/delta upload;
+- resume/dedup savings;
+- many objects/references;
+- chunk index/memory/GC complexity;
+- encryption/key rotation complexity;
+- cross-user dedup side-channel risk;
+- reconstruction/download amplification.
+
+Capacity metrics để quyết định:
+
+- fraction uploads modifying existing file;
+- bytes changed/version;
+- average versions/file;
+- dedup hit ratio within account/tenant;
+- chunk lookup/object request cost;
+- saved physical bytes versus metadata/compute cost;
+- privacy/compliance requirements.
+
+Không chọn chunk-level dedup chỉ vì 10 PB nghe lớn; object storage tiering/erasure coding có thể đơn giản và rẻ hơn operational complexity.
+
+---
+
+#### 25. Metadata database bottlenecks
+
+Critical operations:
+
+- create/update FileEntry/FileVersion;
+- list folder;
+- resolve current version;
+- namespace rename/move/delete;
+- ACL/share evaluation;
+- journal append/cursor read;
+- upload session/idempotency/quota;
+- trash/version history.
+
+Bottlenecks:
+
+- single shard/primary;
+- hot account/folder;
+- secondary-index write amplification;
+- deep hierarchy joins;
+- large folder pagination/sort;
+- cross-shard move/share;
+- transaction/lock contention;
+- replication lag;
+- change-journal growth;
+- high-cardinality cache invalidation.
+
+Controls:
+
+- shard by workspace/user with directory mapping;
+- co-locate namespace subtree where possible;
+- stable IDs and parent-based indexes;
+- separate query projections/search;
+- bounded transactions and optimistic versions;
+- hot-tenant isolation;
+- cursor pagination;
+- archive/tier journal/version history;
+- read replicas only for permissible stale reads;
+- outbox/journal in same commit;
+- backups/PITR and reshard tooling.
+
+Một “distributed metadata service” không tự giải quyết cross-shard namespace semantics; partition key và migration protocol mới quyết định.
+
+---
+
+#### 26. Hot paths và cold paths
+
+##### Hot control path
+
+- create/complete upload session;
+- current file metadata;
+- folder list;
+- sync cursor/change pages;
+- permission checks;
+- share-link resolution;
+- rename/move/delete.
+
+##### Hot data path
+
+- chunk/part PUT;
+- file/range GET;
+- viral shared download;
+- device sync content fetch.
+
+##### Background/warm path
+
+- malware scan;
+- preview/thumbnail;
+- search indexing;
+- push notification;
+- usage reconciliation;
+- replication/scrubbing;
+- version/trash expiry;
+- GC.
+
+##### Cold but critical
+
+- old versions;
+- trash/restore history;
+- audit/security evidence;
+- backups/DR copy;
+- legal retention;
+- ransomware bulk recovery.
+
+Cold data có thể chuyển storage tier nhưng vẫn cần known restore latency và integrity.
+
+---
+
+#### 27. Bottleneck map
+
+| Bottleneck | Driver | Symptom | Control chính |
+|---|---|---|---|
+| Metadata DB | 5B entries + all operations | p99/locks/shard saturation | Workspace sharding, indexes, cache, projections |
+| Hot folder/workspace | Large/shared namespace | One shard/partition overload | Pagination, quotas, isolation, subtree strategy |
+| Upload session state | Long large transfers | Session/part store growth | Partition, TTL, compact state, cleanup |
+| Upload bandwidth | 2k/s × bytes | Network/object PUT saturation | Direct multipart, regional ingress, rate/admission |
+| Part amplification | Small chunks/retries | Request cost/metadata overhead | Adaptive size, parallelism limits, batching |
+| Atomic finalization | Parts+quota+namespace/version | Tail latency/conflict | Short metadata transaction, idempotency |
+| Sync fan-out | Change × devices/collaborators | Broker/push overload | Journal, partitioned fan-out, coalesced hints |
+| Reconnect catch-up | Device/network outage | Journal/read/download storm | Backoff, pages, snapshots, recovery pools |
+| AuthZ checks | Inheritance/groups/links | Metadata latency | Versioned effective cache, batch AuthZ, short links |
+| Viral share link | Anonymous download burst | Egress/AuthZ/origin cost | CDN, rate/abuse, scoped capability, hot replication |
+| Object count | Billions/chunks/versions | Request/GC/index pressure | Whole-object/chunk trade-off, object layout |
+| Version/trash growth | Retention/conflicts | Physical bytes/cost | Tiering, policies, usage metrics, GC |
+| GC/refcount | Deletes/orphans/dedup | Backlog or unsafe delete | Tombstone, grace, mark/sweep/reconcile |
+| Search/preview/scan | Derived processing | Visibility/index lag | Queues, priority, autoscale, quarantine |
+| Cross-region | Replication/sync/egress | Latency/cost/RPO | Home region, replicas, stated DR policy |
+| Ransomware/bulk change | Account compromise | Massive versions/deletes/events | Rate/anomaly, versioning, bulk restore/isolation |
+
+---
+
+#### 28. Isolation và degradation order
+
+```text
+Tier 0: committed metadata/content integrity + authorization
+Tier 1: upload complete/download intent + durable change journal
+Tier 2: incremental sync notification/catch-up
+Tier 3: folder/search/preview/shared activity views
+Tier 4: thumbnails, analytics, noncritical notifications, GC optimization
+```
+
+Khi quá tải:
+
+1. trì hoãn analytics/optional previews;
+2. coalesce push hints nhưng giữ journal entries;
+3. cache/degrade search/activity views;
+4. throttle bulk imports/public-link traffic/noisy tenants;
+5. limit upload parallelism/new sessions để bảo vệ object store/metadata;
+6. ưu tiên current metadata/AuthZ/download of existing committed content;
+7. không bỏ checksum, permission, atomic version commit hoặc durability ACK.
+
+GC có thể chậm tạm thời và tăng cost; xóa nhầm dữ liệu không thể chấp nhận để đạt latency.
+
+---
+
+#### 29. Capacity/SLO metrics
+
+##### Files/content
+
+- current FileEntries/versions/manifests/chunks;
+- logical current/version/trash bytes;
+- physical/replica/temp/orphan/preview bytes;
+- size distribution;
+- object PUT/GET/HEAD/DELETE rates;
+- checksum/corruption/repair.
+
+##### Upload/download
+
+- sessions/parts active;
+- starts/completes/aborts/expiries;
+- bytes/s by region;
+- part retry/checksum failure;
+- finalize p95/p99;
+- download TTFB/throughput/completion/resume;
+- CDN hit/origin/egress.
+
+##### Metadata/namespace/AuthZ
+
+- QPS by operation;
+- folder list/mutation p99;
+- shard/hot-account load;
+- DB pool/lock/index/replication;
+- permission evaluation latency/cache hit/revoke convergence;
+- share-link resolution/abuse.
+
+##### Sync
+
+- journal commits/s;
+- deliveries/applies/catch-up reads/s;
+- commit-to-device-visible p95/p99;
+- cursor lag/oldest device/change;
+- reconnect/bootstrap rate;
+- conflict copies/gaps/dedup;
+- queue oldest age/drain time.
+
+##### Lifecycle/cost
+
+- version/trash factors;
+- quota reservations/leaks/reconcile mismatch;
+- GC eligible/backlog/oldest age;
+- scan/preview/search lag;
+- cost per active user, current TB, version TB, upload/download GB và file operation.
+
+---
+
+#### 30. Load-test scenarios
+
+1. **Small-file storm:** nhiều file 1–100 KB làm nóng metadata/object requests.
+2. **Large uploads:** hàng nghìn 5 GB multipart sessions với network loss/resume.
+3. **Complete retry:** response mất sau version commit, same request must dedup.
+4. **Hot folder:** hàng triệu children, concurrent list/rename/move.
+5. **Hot shared file:** viral public link và TB egress.
+6. **Shared-folder ACL revoke:** nhiều descendants/collaborators, authorization phải hội tụ.
+7. **Offline device conflict:** stale base uploads sau current version đổi.
+8. **Reconnect storm:** hàng trăm nghìn devices cursor catch-up đồng thời.
+9. **Broker/push outage:** journal correct, notification lag then recovery.
+10. **Metadata shard failover:** idempotent retries, no duplicate version.
+11. **Object-store partial outage:** manifest/content integrity behavior.
+12. **Scanner backlog:** quarantine grows without unsafe visibility.
+13. **Mass delete/ransomware:** event/version/trash surge and bulk restore.
+14. **GC backlog/retry:** no live object deletion, cost/drain metrics.
+15. **Region loss:** metadata/content replication, cursor and signed-link recovery.
+
+Correctness checks sau test:
+
+- no partial version visible;
+- current pointer references complete manifest;
+- same complete retry creates one logical version;
+- devices converge from journal;
+- stale edits do not silently erase content;
+- revoked access cannot obtain new capability;
+- trash/version restore remains possible within retention;
+- GC never deletes referenced object;
+- quota accounting reconciles;
+- checksums match reconstructed bytes.
+
+---
+
+#### 31. Cách trình bày bước 2 trong phỏng vấn
+
+Recap khoảng hai phút:
+
+1. 10 triệu users × 500 current files tạo khoảng 5 tỷ FileEntries.
+2. 5 tỷ × 2 MB tạo 10 PB current logical content; physical capacity còn nhân versions/trash và durability overhead.
+3. Nếu FileEntry 0,5–1 KB, raw entries đã khoảng 2,5–5 TB trước indexes/replicas/ACLs/journal.
+4. Peak 2.000 uploads/s × 2 MB tương đương khoảng 4 GB/s hay 32 Gbit/s logical ingress nếu peak size distribution giữ nguyên.
+5. Không annualize peak: duy trì 2.000/s sẽ tạo 172,8M files và khoảng 346 TB/ngày.
+6. Upload concurrency bằng start rate × duration; 2.000/s × 800 giây có thể là 1,6M active sessions.
+7. File 5 GiB với 8 MiB parts có 640 parts, nên chunk/object request amplification cần được sizing.
+8. 10.000 sync events/s phải tách journal changes khỏi device deliveries; fan-out bằng changes × active target devices.
+9. Nếu 30M registered devices và 10% online, connection/heartbeat traffic có thể lớn hơn change rate nhiều lần.
+10. Reconnect storm còn tạo cursor reads, metadata fetch và content downloads; cần backoff, paging và recovery pools.
+11. Viral 100 MB file tải 10.000 lần tạo 1 TB egress, nên public-link skew/CDN/rate limits quan trọng.
+12. Versioning, trash, quarantine, previews, orphan parts và redundancy làm 10 PB logical thành physical footprint lớn hơn.
+13. Metadata bottlenecks gồm hot folders/tenants, namespace moves, journal, ACL inheritance và quota—not only row count.
+14. Pub/sub giúp wake-up/fan-out nhưng durable journal/cursor mới bảo đảm sync correctness.
+15. Capacity phải theo file-size/device/share distribution, hot shard/object và failure recovery, không chỉ averages.
+
+---
+
+#### 32. Checklist ước lượng
+
+- [ ] Active versus total storage accounts và retention sau inactivity?
+- [ ] Files/user distribution và total current FileEntries?
+- [ ] File-size p50/p95/p99/max, count- versus byte-weighted?
+- [ ] Upload starts/completes/aborts/retries average và peak duration?
+- [ ] Peak ingress bytes/s và concurrent upload sessions?
+- [ ] Part size, parts/file, object requests/s và adaptive sizing?
+- [ ] Downloads/day, ranges, previews, sync fetches và egress bytes?
+- [ ] CDN hit/origin/cross-region egress and hot-link distribution?
+- [ ] Average versions/file and byte-weighted version factor?
+- [ ] Trash/quarantine/orphan/preview bytes and retention?
+- [ ] Compression/dedup and durability overhead?
+- [ ] Metadata row sizes for entries/versions/manifests/ACLs/journal?
+- [ ] Index/replica/backup/tombstone amplification?
+- [ ] Folder size/depth and hot workspace distribution?
+- [ ] Namespace/read/write/AuthZ operations per API action?
+- [ ] Devices/user, online ratio, connection/heartbeat/reconnect rate?
+- [ ] Committed changes versus sync deliveries/applies/catch-up reads?
+- [ ] Target devices/collaborators per change and shared-folder skew?
+- [ ] Journal retention/cursor lag/bootstrap threshold?
+- [ ] Permission grants/groups/inheritance depth/revoke SLO?
+- [ ] Quota reservation/leak/reconciliation rates?
+- [ ] Scan/preview/search queues and backlog drain time?
+- [ ] GC candidate bytes/objects, grace, delete quota and safety checks?
+- [ ] Regional/data-residency/RPO/RTO and replication traffic?
+- [ ] Load tests include small files, large sessions, viral links, reconnect and ransomware?
+
+---
+
+#### 33. Ý chính cần nhớ
+
+- Cloud storage capacity có bốn đơn vị: file ops, bytes, change deliveries và object/reference count.
+- 10M users × 500 files = 5B current FileEntries.
+- 5B × 2 MB = 10 PB current logical content.
+- 10 PB chưa gồm versions, trash, temp, previews, redundancy và DR.
+- Average file size che giấu small-file metadata load và large-file bandwidth load.
+- 2.000 uploads/s × 2 MB = khoảng 4 GB/s logical peak ingress.
+- Peak 2.000/s không được dùng làm annual average nếu chưa có duration/duty cycle.
+- Concurrent upload sessions bằng start rate × transfer duration.
+- 5 GiB/8 MiB tạo 640 parts; chunk size quyết định request/resume trade-off.
+- One logical upload tạo nhiều metadata, journal, outbox và derived operations.
+- 5B FileEntry rows có thể chiếm 2,5–5 TB raw ở 0,5–1 KB/row.
+- Version metadata và ACL/journal/indexes dễ đẩy metadata lên hàng chục TB.
+- Physical content = logical × retention/version × dedup/compression × durability overhead + temporary data.
+- Sync change rate khác notification delivery và client apply rates.
+- 2k changes/s × 5 target devices có thể tạo 10k deliveries/s.
+- Device connections, heartbeats và reconnects có thể lớn hơn sync event traffic.
+- Realtime push chỉ wake-up; durable journal/cursor bảo đảm catch-up.
+- Sync <5s cần stage latency budget và percentile/online definition.
+- Backlog drain cần spare capacity, không chỉ ngang incoming rate.
+- Metadata reads bị khuếch đại bởi namespace, ACL, manifest, quota và audit.
+- Partition theo user/workspace cần strategy cho hot folder/tenant.
+- ACL inheritance/precomputation có read-versus-write/revoke trade-off.
+- Viral shared link gây AuthZ, CDN/origin, egress và denial-of-wallet hotspot.
+- Download/egress volume là input bắt buộc nhưng transcript chưa cung cấp.
+- Chunk dedup có thể tiết kiệm bytes nhưng tăng object/reference/GC/privacy complexity.
+- GC phải tombstone, wait grace, reconcile references rồi mới delete.
+- Cold versions/audit vẫn critical cho recovery/compliance.
+- Capacity planning phải kiểm tra invariant dưới retry, reconnect, failover và ransomware.
+
+#### Công thức ghi nhớ
+
+> **Cloud-storage scale = users × files × versions × bytes × durability overhead + uploads × parts + changes × target devices + namespace/AuthZ amplification; hãy thiết kế theo file-size distribution, hot shares/tenants và recovery bursts—not averages alone.**
+
+---
+
+### Bài 100. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của high-level design
+
+Sau khi đã xác định yêu cầu và quy mô, ta chia cloud storage thành các thành phần có trách nhiệm rõ ràng. Kiến trúc phải hỗ trợ bốn luồng chính:
+
+```text
+Upload content  → kiểm tra integrity → publish metadata/version
+Download        → authorize → cấp đường dẫn/range tới content
+Metadata change → commit → append change journal → đồng bộ devices
+Share/access    → resolve capability/ACL → authorize → audit
+```
+
+Hai mặt phẳng cần được tách biệt:
+
+| Mặt phẳng | Chịu trách nhiệm | Đặc điểm tải |
+|---|---|---|
+| **Control/metadata plane** | Namespace, owner, ACL, versions, upload session, change journal | Nhiều request nhỏ, cần consistency và transaction |
+| **Content/data plane** | Upload/download bytes, chunks/objects, CDN | Băng thông lớn, cần streaming và horizontal scaling |
+
+API server không nên chuyển tiếp toàn bộ bytes của file lớn nếu object storage có thể nhận dữ liệu trực tiếp bằng signed URL. Tách hai mặt phẳng giúp metadata và content scale độc lập.
+
+---
+
+#### 2. Các service chính
+
+##### 2.1. API Gateway
+
+Là cửa vào chung cho web, mobile và desktop clients:
+
+- xác thực access token ở mức cơ bản;
+- routing và API versioning;
+- rate limit theo user, tenant, IP và operation;
+- request-size/header validation;
+- correlation ID, logging và metrics;
+- chống abuse trước khi request vào service nội bộ.
+
+Gateway không nên chứa toàn bộ business authorization. Quyền truy cập một file vẫn phải được kiểm tra bởi service sở hữu resource/policy.
+
+##### 2.2. Upload Service
+
+Quản lý vòng đời upload:
+
+- tạo upload session;
+- chọn part/chunk size;
+- cấp signed URLs hoặc upload tokens;
+- theo dõi part đã nhận;
+- xác minh checksum, size và thứ tự/manifest;
+- resume, retry và abort;
+- complete upload theo cách idempotent;
+- chuyển orphaned sessions sang quy trình cleanup.
+
+Upload Service xử lý **control flow**. Với file lớn, bytes nên đi trực tiếp:
+
+```text
+Client ──initiate──> Upload Service
+Client ──PUT parts──> Object Storage
+Client ──complete──> Upload Service
+Upload Service ──validate/commit──> Metadata + Change Journal
+```
+
+Nhờ vậy application servers không trở thành bandwidth bottleneck.
+
+##### 2.3. Metadata/Namespace Service
+
+Quản lý mọi thông tin ngoài content bytes:
+
+- stable `file_id`/`folder_id`;
+- tên, parent, owner/workspace;
+- folder hierarchy và listing;
+- current version pointer;
+- size, MIME type, hash và timestamps;
+- trạng thái active, quarantined, trash hoặc deleted;
+- share/permission references;
+- search/indexing attributes.
+
+Đây thường là thành phần nhạy cảm nhất về consistency. Các invariant quan trọng:
+
+- một tên không được trùng trái policy trong cùng parent;
+- current version phải trỏ tới version đã commit;
+- move/rename không làm mất node;
+- quota và ownership không bị cập nhật nửa chừng;
+- không để metadata hiển thị content chưa hoàn tất.
+
+##### 2.4. Authorization Service
+
+Quyết định principal có được thực hiện action trên resource hay không:
+
+```text
+authorize(subject, action, resource, context) → allow | deny
+```
+
+Nó có thể xét:
+
+- direct ACL;
+- quyền kế thừa từ folder/workspace;
+- group membership và role;
+- link capability;
+- trạng thái file, tenant policy và legal hold;
+- device/session risk và thời hạn truy cập.
+
+Authentication trả lời **ai đang gọi**; authorization trả lời **được làm gì trên resource nào**. Với thao tác quan trọng, resource service phải thực thi quyết định và ghi audit.
+
+##### 2.5. Storage Service
+
+Đóng gói tương tác với object storage:
+
+- tạo object/part identifiers không đoán được;
+- multipart upload và complete/abort;
+- range read/download;
+- checksum/integrity verification;
+- encryption/key metadata;
+- storage class/lifecycle;
+- replication, repair và deletion workflow.
+
+Object key nội bộ không phải quyền truy cập. Client chỉ nhận signed capability ngắn hạn sau khi đã authorize.
+
+##### 2.6. Sync Service
+
+Giúp các thiết bị hội tụ về cùng trạng thái:
+
+- đọc durable change journal;
+- duy trì cursor/checkpoint theo device;
+- đẩy wake-up notification qua WebSocket/long polling;
+- cung cấp API lấy delta theo cursor;
+- hỗ trợ reconnect/catch-up và pagination;
+- xử lý retry, duplicate và out-of-order delivery.
+
+Push chỉ báo rằng “có thay đổi”. Source of truth phải là journal/delta API; nếu WebSocket mất event, client vẫn catch up từ cursor.
+
+##### 2.7. Versioning Service
+
+Quản lý lịch sử file:
+
+- tạo immutable `version_id`;
+- nối version với content manifest;
+- cập nhật current-version pointer;
+- list, restore và purge versions;
+- áp dụng retention, trash và legal-hold policy;
+- hỗ trợ optimistic concurrency bằng `base_version_id`.
+
+Không nên overwrite content object cũ tại chỗ. Phiên bản mới được publish, còn version cũ tồn tại theo retention policy.
+
+##### 2.8. Deduplication Service
+
+Phát hiện content/chunk giống nhau để tái sử dụng physical bytes:
+
+- hash whole file hoặc chunks;
+- tra content-addressed object;
+- quản lý manifests và reference counts;
+- phối hợp GC khi reference cuối cùng biến mất.
+
+Dedup có trade-off lớn:
+
+- chunk-level dedup tiết kiệm tốt hơn nhưng tăng manifest/object/GC load;
+- hash collision phải được phòng bằng strong digest, size và verification;
+- cross-user dedup có thể rò rỉ sự tồn tại của dữ liệu qua timing/quota side channel;
+- encryption theo user làm dedup khó hơn;
+- không được báo “file đã tồn tại” trước khi client chứng minh sở hữu content.
+
+Vì vậy nhiều hệ thống chỉ dedup trong cùng tenant hoặc thực hiện server-side sau upload.
+
+##### 2.9. Các worker phụ trợ
+
+Các tác vụ không nên chặn đường trả lời người dùng:
+
+- malware/content-policy scanning;
+- thumbnail/preview generation;
+- search indexing;
+- notifications;
+- audit export;
+- lifecycle tiering;
+- orphan cleanup và physical GC.
+
+Các worker consume event, retry idempotently và đưa poison messages vào DLQ.
+
+---
+
+#### 3. API design tổng quan
+
+API dưới đây chỉ là contract minh họa; production API cần pagination, idempotency, conditional request và error model thống nhất.
+
+##### 3.1. Resumable upload
+
+**Khởi tạo session**
+
+```http
+POST /v1/files/uploads
+Idempotency-Key: 86c...
+
+{
+  "parent_id": "folder_123",
+  "name": "report.pdf",
+  "size": 5242880000,
+  "content_type": "application/pdf",
+  "content_hash": "sha256:...",
+  "base_version_id": null
+}
+```
+
+Response:
+
+```json
+{
+  "upload_id": "upl_456",
+  "part_size": 8388608,
+  "expires_at": "...",
+  "uploaded_parts": []
+}
+```
+
+**Upload part**
+
+```http
+PUT /v1/uploads/upl_456/parts/17
+Content-Length: 8388608
+X-Part-Checksum: sha256:...
+
+<bytes>
+```
+
+Trong data-plane-direct design, endpoint trên được thay bằng signed object-store URL.
+
+**Kiểm tra session/resume**
+
+```http
+GET /v1/uploads/upl_456
+```
+
+**Complete**
+
+```http
+POST /v1/uploads/upl_456/complete
+Idempotency-Key: complete-upl_456
+
+{
+  "parts": [
+    {"part_number": 1, "etag": "...", "checksum": "..."}
+  ]
+}
+```
+
+**Abort**
+
+```http
+DELETE /v1/uploads/upl_456
+```
+
+##### 3.2. Metadata và namespace
+
+```http
+GET    /v1/files/{file_id}
+GET    /v1/folders/{folder_id}/children?cursor=...
+POST   /v1/folders
+PATCH  /v1/files/{file_id}
+POST   /v1/files/{file_id}:move
+DELETE /v1/files/{file_id}
+POST   /v1/files/{file_id}:restore
+```
+
+Rename/move/update nên hỗ trợ precondition:
+
+```http
+If-Match: "metadata-revision-42"
+```
+
+Nếu revision đã đổi, server trả conflict/precondition failure thay vì silently overwrite thay đổi mới hơn.
+
+##### 3.3. Download
+
+```http
+POST /v1/files/{file_id}:download
+```
+
+Sau authorization, server có thể trả:
+
+- HTTP redirect tới signed URL ngắn hạn;
+- download token dùng một lần;
+- streaming response cho trường hợp cần kiểm soát chặt;
+- metadata hỗ trợ `Range`, ETag và resume.
+
+Không trả raw permanent object URL vì nó bỏ qua revoke, audit và policy enforcement.
+
+##### 3.4. Versioning
+
+```http
+GET  /v1/files/{file_id}/versions?cursor=...
+GET  /v1/files/{file_id}/versions/{version_id}
+POST /v1/files/{file_id}/versions/{version_id}:restore
+```
+
+Restore thường tạo **một version mới** có nội dung từ version cũ, thay vì xóa lịch sử ở giữa.
+
+##### 3.5. Sharing
+
+```http
+POST   /v1/files/{file_id}/shares
+PATCH  /v1/shares/{share_id}
+DELETE /v1/shares/{share_id}
+GET    /v1/shared-links/{capability_token}
+```
+
+Share policy có thể gồm:
+
+- audience: user/group/anyone-with-link;
+- role: viewer/commenter/editor;
+- expiry;
+- password/challenge;
+- download allowed/blocked;
+- tenant/domain restriction.
+
+Token phải có entropy cao, có thể revoke và không chứa raw storage key.
+
+##### 3.6. Sync/delta
+
+```http
+GET /v1/changes?cursor=opaque_cursor&limit=500
+```
+
+Response:
+
+```json
+{
+  "changes": [
+    {
+      "sequence": 98127,
+      "resource_id": "file_123",
+      "type": "version_committed",
+      "revision": 43
+    }
+  ],
+  "next_cursor": "opaque_cursor_2",
+  "has_more": false
+}
+```
+
+Cursor phải opaque, monotonic trong scope và chỉ được advance sau khi client đã lưu/apply an toàn.
+
+---
+
+#### 4. Luồng upload end-to-end
+
+```text
+1. Client → Gateway/AuthZ: xin tạo upload trong folder
+2. Upload Service: validate name, size, quota và base version
+3. Upload Service: tạo session + reservation + signed part URLs
+4. Client → Object Storage: upload chunks song song, retry riêng từng chunk
+5. Object Storage: verify per-part checksum
+6. Client → Upload Service: complete với manifest
+7. Upload Service: verify đủ parts, total size/hash và session state
+8. Storage: finalize multipart/object manifest
+9. Metadata transaction: create immutable version + update current pointer
+10. Cùng transaction/outbox: append FileVersionCommitted event
+11. Response thành công cho client
+12. Workers: sync, scan, preview, index, audit, dedup/lifecycle
+```
+
+Điểm commit nhìn thấy đối với người dùng là bước 9, không phải lúc part cuối vừa được upload.
+
+##### Invariant của complete upload
+
+```text
+Upload session chưa complete → content không xuất hiện trong active namespace
+Metadata đã publish         → content manifest phải đọc được
+Retry complete              → trả lại cùng kết quả, không tạo duplicate version
+Concurrent update          → so sánh base_version_id/revision
+```
+
+Để tránh trạng thái metadata và event lệch nhau, có thể dùng transactional outbox/change journal trong cùng database transaction với metadata commit.
+
+---
+
+#### 5. Luồng download end-to-end
+
+```text
+1. Client yêu cầu download theo stable file_id/version_id
+2. Gateway xác thực identity và rate limit
+3. Metadata Service resolve node, current version và trạng thái
+4. Authorization Service xét ACL/link capability/policy
+5. Nếu allow, Download/Storage Service cấp signed URL ngắn hạn
+6. Client tải bytes từ CDN/object storage bằng range requests
+7. Access event được ghi audit bất đồng bộ
+```
+
+CDN key nên gắn với immutable content/version hash. Nếu cache theo tên file mutable, việc đổi version dễ trả stale content. Với private files, dùng signed URL/cookie, TTL ngắn và cache policy phù hợp.
+
+---
+
+#### 6. Luồng đồng bộ đa thiết bị
+
+```text
+Metadata commit
+   ↓
+Transactional outbox / durable change journal
+   ↓
+Broker partitions theo workspace/user
+   ↓
+Sync Service cập nhật subscriptions
+   ↓
+WebSocket gửi wake-up: "cursor đã tiến"
+   ↓
+Client GET /changes?cursor=...
+   ↓
+Client fetch metadata/content cần thiết, apply và persist cursor
+```
+
+Các nguyên tắc:
+
+- delivery thường là at-least-once, nên client apply phải idempotent;
+- ordering chỉ cần có ý nghĩa trong cùng file/workspace partition;
+- reconnect phải đọc journal, không tin rằng push history còn nguyên;
+- tombstone phải được sync để thiết bị xóa local state;
+- event chỉ nên chứa identifier/revision, tránh nhét toàn bộ content;
+- slow client cần pagination, backpressure và cursor retention policy;
+- nếu cursor quá cũ đã hết retention, client thực hiện full reconciliation snapshot.
+
+---
+
+#### 7. Chunking cho file lớn
+
+Ví dụ part size 5 MiB:
+
+```text
+5 GiB / 5 MiB = 1.024 parts
+```
+
+Part size ảnh hưởng:
+
+| Part nhỏ | Part lớn |
+|---|---|
+| Resume mất ít dữ liệu hơn | Ít request/manifest entries hơn |
+| Parallelism linh hoạt | Giảm object-store request cost |
+| Nhiều checksum/request/state | Retry lại nhiều bytes hơn |
+
+Client không nên upload vô hạn parts song song. Cần giới hạn concurrency để tránh nghẽn mạng, memory và request throttling.
+
+Mỗi part cần tối thiểu:
+
+```text
+(upload_id, part_number, byte_range, size, checksum, storage_etag, status)
+```
+
+Server phải xác minh:
+
+- parts không thiếu hoặc overlap sai;
+- tổng size khớp khai báo;
+- checksum từng part và/hoặc whole content đúng;
+- upload session chưa hết hạn/abort/complete;
+- principal vẫn còn quyền và quota reservation hợp lệ.
+
+“Assemble” không nhất thiết là copy lại toàn bộ file. Native multipart-complete hoặc immutable chunk manifest thường tránh một lần đọc–ghi khổng lồ.
+
+---
+
+#### 8. Versioning và conflict handling
+
+Mỗi file có identity ổn định, còn content thay đổi qua immutable versions:
+
+```text
+FileEntry(file_id, parent_id, name, current_version_id, revision, ...)
+FileVersion(version_id, file_id, content_manifest_id, size, hash, created_at, ...)
+```
+
+Khi client upload bản cập nhật:
+
+```text
+base_version_id == current_version_id → commit version mới
+base_version_id != current_version_id → conflict policy
+```
+
+Conflict policy có thể:
+
+- reject và yêu cầu refresh;
+- tạo conflict copy;
+- branch thành version song song;
+- merge nếu định dạng hỗ trợ semantic merge.
+
+Hash giống nhau có thể tránh tạo content object mới, nhưng vẫn có thể cần metadata event nếu rename, permissions hoặc business state đã đổi. “Không tạo version khi hash không đổi” là policy sản phẩm, không phải quy luật tuyệt đối.
+
+Retention policy nên quy định:
+
+- số version hoặc số ngày giữ;
+- version pinned/legal hold;
+- trash window;
+- restore semantics;
+- lúc nào physical bytes đủ điều kiện GC.
+
+---
+
+#### 9. Storage strategy
+
+Không chọn database chỉ theo nhãn SQL/NoSQL; chọn theo invariant và access pattern.
+
+| Dữ liệu | Lựa chọn điển hình | Lý do |
+|---|---|---|
+| File/chunk content | Object storage | Dung lượng lớn, durability cao, range/multipart/lifecycle |
+| Namespace/current pointer | Transactional SQL hoặc strongly consistent KV | Move/rename/version/ACL cần invariant rõ |
+| Upload-part state | KV/NoSQL hoặc object-store multipart state | Cardinality và write rate cao, TTL tự nhiên |
+| Change journal | Partitioned log + durable cursor store | Ordering theo scope, replay và fan-out |
+| ACL/group membership | Transactional policy store | Revoke và authorization correctness |
+| Search documents | Search index | Full-text/filter; chỉ là derived view |
+| Audit/access events | Append-only log/columnar store | Write-heavy, retention và analytics |
+| Preview/thumbnail | Object storage | Derived immutable blobs |
+
+`NoSQL` không mặc nhiên nhanh hơn hoặc scale tốt hơn cho mọi metadata. Nếu namespace transaction là yêu cầu trung tâm, SQL phân vùng hoặc distributed SQL có thể phù hợp hơn một eventual-consistent document store.
+
+Mỗi derived store cần có source of truth và quy trình rebuild rõ ràng.
+
+---
+
+#### 10. Caching strategy
+
+##### Metadata cache
+
+Có thể cache:
+
+- `file_id → immutable/basic metadata`;
+- folder pages theo revision;
+- group membership/policy decisions với TTL ngắn;
+- quota snapshot;
+- share-link resolution.
+
+Cache-aside thường phù hợp, nhưng cần:
+
+- versioned cache keys hoặc revision validation;
+- invalidation event sau commit;
+- chống stampede bằng request coalescing/lock;
+- negative-cache TTL ngắn;
+- không fail-open khi cache authorization lỗi.
+
+##### Content/CDN cache
+
+Nên cache theo immutable `version_id` hoặc content hash:
+
+```text
+/content/{immutable_version_or_hash}
+```
+
+Lợi ích:
+
+- không cần invalidate bytes khi current pointer đổi;
+- cache hit an toàn hơn;
+- CDN phục vụ range/large downloads gần người dùng;
+- origin và egress liên vùng giảm.
+
+Tuy nhiên CDN không thay authorization. Private content cần signed access, TTL và cache-key isolation phù hợp.
+
+##### Consistency quan trọng hơn “xóa cache bằng event”
+
+Event invalidation có thể trễ hoặc mất. Với quyền truy cập nhạy cảm:
+
+- TTL ngắn;
+- policy revision/version trong cache key;
+- synchronous recheck cho action nguy hiểm;
+- revoke epoch hoặc denylist cho share tokens;
+- default deny khi không xác minh được.
+
+---
+
+#### 11. Communication patterns
+
+| Tương tác | Pattern | Vì sao |
+|---|---|---|
+| Gateway → metadata/authz | REST/gRPC đồng bộ | Cần quyết định trước khi trả lời |
+| Client → object storage | HTTPS streaming/signed URL | Tránh proxy bytes qua app servers |
+| Metadata commit → downstream | Transactional outbox + broker | Không mất event giữa DB commit và publish |
+| Sync wake-up | WebSocket/long polling | Near-real-time notification |
+| Sync recovery | Cursor-based pull API | Replay, catch-up và correctness |
+| Scan/preview/index/audit | Queue/pub-sub | Background, retry độc lập |
+| Bulk transfer | Multipart/range requests | Resume và parallelism có kiểm soát |
+
+Không dùng distributed transaction cho mọi service. Synchronous path giữ ngắn; side effects sử dụng durable events, idempotency và reconciliation.
+
+---
+
+#### 12. Sơ đồ kiến trúc tổng quát
+
+```text
+ Web / Mobile / Desktop Clients
+              |
+       CDN / API Gateway
+              |
+   +----------+-----------+
+   |          |           |
+ Upload    Metadata    Share/AuthZ
+ Service   Namespace     Service
+   |          |           |
+   |      SQL / Strong KV |
+   |          |           |
+   +---- transactional ---+
+             outbox
+               |
+        Broker / Change Log
+       /       |        \
+    Sync     Version   Background Workers
+   Service   Policy    scan/preview/index/GC
+      |
+ WebSocket + Delta API
+
+ Client ===== signed multipart/range ===== Object Storage
+                                      |
+                                CDN edge cache
+```
+
+`Versioning` là domain capability quanh metadata/content references, không nhất thiết phải tách thành network microservice ngay từ đầu. Tương tự, dedup có thể là worker/library trước khi lưu lượng đủ lớn để cần service độc lập.
+
+---
+
+#### 13. Các lỗi thiết kế thường gặp
+
+1. **Proxy mọi file bytes qua API servers**  
+   Làm application tier chịu băng thông, connection và memory pressure không cần thiết.
+
+2. **Coi chunk upload thành file đã tồn tại**  
+   Chỉ publish metadata sau atomic complete và integrity verification.
+
+3. **Dual write DB rồi broker**  
+   DB commit thành công nhưng event publish thất bại sẽ làm sync/index sai; dùng outbox/CDC.
+
+4. **WebSocket là source of truth**  
+   Push có thể mất; cần durable change journal và cursor.
+
+5. **Cache authorization quá lâu hoặc fail-open**  
+   Revoke sẽ chậm hoặc bị bypass.
+
+6. **Dùng object-store LIST làm folder listing**  
+   Object keys không thay được transactional namespace, stable IDs và ACL.
+
+7. **Overwrite object/version tại chỗ**  
+   Gây race, cache inconsistency và khó phục hồi.
+
+8. **Dedup cross-user trước khi chứng minh sở hữu**  
+   Có thể tạo information side channel và abuse.
+
+9. **Tách quá nhiều microservices ngay từ đầu**  
+   Service boundary là logical responsibility; chỉ tách deployment khi có nhu cầu scale/ownership/failure isolation thật.
+
+10. **SQL cho consistency, NoSQL cho scale như một quy tắc cứng**  
+    Cả hai họ database có nhiều consistency/scaling model; phải bắt đầu từ invariant và query pattern.
+
+---
+
+#### 14. Cách trình bày trong phỏng vấn
+
+Một câu trả lời tốt có thể đi theo thứ tự:
+
+1. Tách metadata plane khỏi content plane.
+2. Vẽ upload session → direct multipart upload → atomic metadata commit.
+3. Nêu durable change journal và cursor-based sync.
+4. Mô tả download qua AuthZ rồi signed URL/CDN.
+5. Giải thích immutable versions, conflict policy và trash/GC.
+6. Chọn storage theo data type và invariant.
+7. Thêm cache, broker, workers, observability và failure handling.
+8. Nêu trade-off của part size, dedup, cache consistency và service decomposition.
+
+Các câu hỏi nên chủ động trả lời:
+
+- Điểm nào xác định upload đã thành công?
+- Retry complete có tạo version trùng không?
+- DB commit thành công nhưng broker hỏng thì sao?
+- Device offline lâu catch up thế nào?
+- Hai devices sửa cùng base version xử lý ra sao?
+- Revoke shared link mất bao lâu để có hiệu lực?
+- Chunk/object không còn reference được xóa an toàn thế nào?
+- Hot folder hoặc viral link scale ra sao?
+
+---
+
+#### 15. Ý chính cần nhớ
+
+- Tách metadata/control plane khỏi content/data plane.
+- Upload Service quản lý session; object storage nhận bytes trực tiếp khi có thể.
+- Multipart upload cần checksum, resume, bounded parallelism và idempotent complete.
+- File chỉ xuất hiện sau atomic metadata/version commit.
+- Transactional outbox nối metadata commit với event publication.
+- Sync đúng đắn dựa trên durable journal và cursor; WebSocket chỉ giảm độ trễ phát hiện.
+- Metadata Service giữ stable IDs, namespace và current-version pointer.
+- AuthN và AuthZ là hai bước khác nhau; resource service phải enforce quyền.
+- Download private content nên qua authorization rồi mới cấp signed URL ngắn hạn.
+- Phiên bản là immutable; concurrent update dùng base version/revision.
+- Restore thường tạo version mới, giữ nguyên lịch sử.
+- Dedup có lợi về dung lượng nhưng tăng manifest, GC, encryption và privacy complexity.
+- Chọn SQL/NoSQL theo invariant, access pattern và failure semantics—not theo khẩu hiệu.
+- Cache content theo immutable version/hash; cache quyền cần revoke-safe và default-deny.
+- Derived stores như search index phải rebuild được từ source of truth.
+- Service boundaries mô tả trách nhiệm; không phải trách nhiệm nào cũng cần một microservice riêng.
+
+#### Công thức ghi nhớ
+
+> **Cloud-storage HLD = direct resumable content transfer + atomic version/namespace commit + durable outbox/change journal + cursor-based convergence + revocable authorization + immutable content delivery + retention-safe GC.**
+
+---
+
+### Bài 101. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc: kiến trúc dẫn dắt công nghệ
+
+Ở bước này, kiến trúc logic của hệ thống đã tương đối rõ. Việc còn lại không phải là liệt kê những công nghệ phổ biến, mà là ánh xạ từng yêu cầu sang một năng lực kỹ thuật cụ thể:
+
+```text
+Requirement / constraint
+        ↓
+Architectural capability
+        ↓
+Technology candidates
+        ↓
+Trade-off: correctness, scale, operations, cost, lock-in
+        ↓
+Decision + assumption + migration trigger
+```
+
+Ví dụ:
+
+| Yêu cầu | Năng lực cần có | Lựa chọn minh họa |
+|---|---|---|
+| File tới 5 GB, mạng chập chờn | Resumable multipart upload | S3 Multipart Upload, MinIO multipart API |
+| Dung lượng hàng PB | Durable object storage | Amazon S3, GCS, Azure Blob, MinIO cluster |
+| Namespace và ACL đúng đắn | Transactional metadata store | PostgreSQL/distributed SQL/strongly consistent KV |
+| Sync gần thời gian thực | Durable log + push wake-up | Kafka/Pulsar + WebSocket gateway |
+| Download toàn cầu | Edge delivery và range cache | CloudFront/Cloudflare/Fastly |
+| Metadata đọc nhiều | In-memory cache | Redis/managed Redis |
+| Tải biến động | Independent horizontal scaling | Kubernetes HPA/KEDA hoặc managed/serverless compute |
+
+Tên sản phẩm chỉ là ví dụ. Trong phỏng vấn, điều quan trọng là giải thích được **vì sao** lựa chọn đó phù hợp và **khi nào** phải đổi.
+
+---
+
+#### 2. Kiến trúc triển khai: microservices có chủ đích
+
+Transcript đề xuất microservices để upload, metadata, sync và versioning có thể phát triển, triển khai và scale độc lập. Điều này hợp lý khi:
+
+- lưu lượng và scaling profile giữa các capability khác nhau;
+- nhiều đội cần ownership độc lập;
+- cần cô lập failure hoặc deployment;
+- domain boundaries đủ ổn định;
+- tổ chức có năng lực vận hành distributed systems.
+
+Tuy nhiên, logical service boundary không bắt buộc phải là một network microservice ngay ngày đầu. Có thể bắt đầu bằng modular monolith cho control plane và tách dần những thành phần có áp lực rõ ràng:
+
+```text
+Tách sớm hợp lý:
+- content transfer/upload gateway: bandwidth/connections khác biệt
+- sync/WebSocket fleet: rất nhiều long-lived connections
+- background workers: queue-driven, bursty
+- preview/scan/index: CPU/memory profile riêng
+
+Có thể giữ cùng deployment ban đầu:
+- namespace + version transaction
+- ACL enforcement + resource metadata
+- trash/retention policy
+```
+
+Microservices mang thêm chi phí:
+
+- network latency và partial failure;
+- service discovery, retries và circuit breakers;
+- schema/API evolution;
+- distributed tracing;
+- eventual consistency và reconciliation;
+- nhiều deployment, dashboard và on-call surface.
+
+Quyết định đúng là mức phân tách nhỏ nhất vẫn đáp ứng ownership, scale và failure isolation.
+
+---
+
+#### 3. Container và orchestration
+
+##### Docker/container image
+
+Container cung cấp artifact triển khai nhất quán:
+
+- đóng gói runtime và dependencies;
+- image version bất biến;
+- chạy giống nhau giữa môi trường;
+- hỗ trợ rolling/canary deployment;
+- đặt CPU/memory requests và limits.
+
+Container không tự tạo scalability hay high availability; đó là trách nhiệm của nền tảng điều phối và thiết kế ứng dụng.
+
+##### Kubernetes
+
+Kubernetes phù hợp khi cần:
+
+- nhiều service/worker có lifecycle khác nhau;
+- horizontal scaling độc lập;
+- rolling deployment và rollback;
+- service discovery/load balancing nội bộ;
+- liveness/readiness/startup probes;
+- workload identity, secrets integration và policy;
+- multi-zone scheduling và disruption budgets.
+
+Thiết lập quan trọng:
+
+```text
+Deployments/StatefulSets
+Services + Ingress/Gateway
+HPA/KEDA
+PodDisruptionBudget
+topologySpreadConstraints / anti-affinity
+requests + limits
+readiness/liveness/startup probes
+NetworkPolicy
+workload identity
+```
+
+Kubernetes không phải lựa chọn bắt buộc. Managed containers, serverless functions hoặc platform-as-a-service có thể giảm đáng kể operational burden cho đội nhỏ.
+
+---
+
+#### 4. Object storage cho content bytes
+
+Object storage như Amazon S3, Google Cloud Storage, Azure Blob hoặc MinIO phù hợp vì:
+
+- scale tới lượng object và bytes rất lớn;
+- durability cao;
+- multipart upload và range download;
+- lifecycle/storage tiers;
+- replication/versioning tùy nền tảng;
+- signed URLs;
+- event notifications;
+- tích hợp CDN.
+
+##### Managed cloud object storage
+
+**Ưu điểm:**
+
+- ít vận hành capacity, repair và hardware;
+- durability/availability features trưởng thành;
+- tích hợp IAM, KMS, lifecycle, audit và CDN;
+- mở rộng theo nhu cầu.
+
+**Đánh đổi:**
+
+- egress và request cost;
+- provider/API coupling;
+- data residency;
+- giới hạn/throttling theo prefix/account;
+- migration hàng PB rất chậm và tốn kém.
+
+##### MinIO/self-hosted object storage
+
+Phù hợp khi cần on-premise, data sovereignty hoặc kiểm soát hạ tầng. Đổi lại, đội vận hành phải tự chịu trách nhiệm:
+
+- capacity planning;
+- disk/node/rack failure và repair;
+- erasure coding;
+- upgrade;
+- multi-site replication;
+- monitoring và durability testing;
+- backup/DR.
+
+“S3-compatible” là tương thích API ở mức nào đó, không có nghĩa semantics, performance và operational guarantees giống Amazon S3.
+
+##### Quyết định object layout
+
+- dùng opaque object key, không nhúng trực tiếp folder path mutable;
+- content/version objects là immutable;
+- metadata DB giữ mapping `version_id → manifest/object keys`;
+- cache và CDN theo immutable version/hash;
+- lifecycle chỉ xóa khi retention và reference checks cho phép;
+- không dùng object-store LIST làm namespace listing.
+
+---
+
+#### 5. Database cho metadata
+
+##### PostgreSQL/relational database
+
+Phù hợp với:
+
+- user/account/workspace;
+- FileEntry và folder relationship;
+- current-version pointer;
+- ownership và quota ledger;
+- permissions/grants;
+- version metadata;
+- upload completion transaction;
+- outbox/change sequence.
+
+Lý do chính không chỉ là “dữ liệu có cấu trúc”, mà là các invariant và transaction giữa những record liên quan.
+
+Khi scale:
+
+- partition theo workspace/tenant;
+- read replicas cho read-only phù hợp;
+- connection pooling;
+- covering/partial indexes;
+- archive cold versions/audit;
+- shard hoặc dùng distributed SQL khi một writer/cluster không còn đủ.
+
+##### MongoDB/NoSQL
+
+Có thể phù hợp với:
+
+- dynamic/custom attributes;
+- denormalized read models;
+- high-volume operational documents;
+- dữ liệu có access pattern theo document rõ ràng.
+
+Không nên chia dữ liệu chỉ vì một số field “linh hoạt”. PostgreSQL JSONB cũng có thể lưu dynamic attributes mà vẫn giữ transaction với core metadata. Dùng thêm MongoDB tạo ra:
+
+- hai source cần vận hành;
+- consistency/reconciliation problem;
+- backup/restore phối hợp;
+- schema evolution và observability riêng.
+
+Chỉ dùng polyglot persistence khi workload thực sự cần và đã xác định source of truth.
+
+##### Một mapping thực dụng
+
+```text
+PostgreSQL / distributed SQL → authoritative namespace, versions, ACL, quota
+Redis                       → derived cache, locks/leases có kiểm soát, rate limit
+Kafka/Pulsar                → durable change/event stream
+Search engine               → derived full-text/search index
+Columnar/log store          → high-volume audit analytics
+Object storage              → file bytes, chunks, previews
+```
+
+---
+
+#### 6. Redis cho metadata cache
+
+Redis có thể cache:
+
+- file metadata theo stable ID/revision;
+- folder pages;
+- share capability resolution;
+- group membership;
+- quota snapshots;
+- upload session hints;
+- rate-limit counters.
+
+Các nguyên tắc:
+
+- cache là derived state, không phải source of truth;
+- key nên chứa tenant và revision khi phù hợp;
+- TTL theo độ nhạy dữ liệu;
+- invalidate/update sau authoritative commit;
+- chống stampede bằng single-flight hoặc distributed lease;
+- đo hit rate, stale serve và eviction;
+- thiết kế khi Redis unavailable;
+- authorization phải fail-closed, không dựa vào entry đã hết hạn.
+
+Redis cluster/sharding chỉ giải quyết một phần scale; hot folder, viral share token hoặc giant tenant vẫn có thể tạo hot key.
+
+---
+
+#### 7. CDN cho download
+
+CDN đưa content tới edge gần người dùng, giúp:
+
+- giảm download latency;
+- giảm origin/object-store GET load;
+- giảm traffic liên vùng;
+- hấp thụ viral download;
+- hỗ trợ range requests cho file lớn.
+
+Thiết kế an toàn:
+
+```text
+Client → authorize share/file → signed URL/cookie ngắn hạn
+       → CDN cache key theo immutable version/content hash
+       → origin object storage khi cache miss
+```
+
+Cần quyết định:
+
+- private versus public cache policy;
+- TTL và signed-token lifetime;
+- cache key có tách tenant/quyền hay không;
+- range caching;
+- encryption và geographic restrictions;
+- purge/revoke semantics;
+- egress cost và denial-of-wallet controls.
+
+Với immutable object, update file không cần purge content cũ; chỉ current-version pointer thay đổi. Revoke access vẫn phải được xử lý ở authorization/capability layer.
+
+---
+
+#### 8. API Gateway và edge security
+
+API Gateway cung cấp:
+
+- TLS termination/mTLS nội bộ khi cần;
+- OAuth/OIDC token validation;
+- routing và versioning;
+- user/tenant/IP rate limit;
+- request/body limits;
+- WAF và bot/abuse protection;
+- correlation ID, access logs và metrics;
+- canary routing.
+
+Gateway không nên:
+
+- chứa mọi domain logic;
+- quyết định ACL phức tạp mà không đọc resource state;
+- proxy toàn bộ large-file bytes nếu direct upload/download khả dụng;
+- tự động retry mutation không idempotent;
+- trở thành single point of failure.
+
+Triển khai gateway đa instance, đa zone; configuration và certificates phải có quy trình rollout/rollback an toàn.
+
+---
+
+#### 9. Messaging và realtime sync
+
+Mặc dù transcript không nêu tên sản phẩm, kiến trúc Bài 100 cần một durable broker/log cho:
+
+- file/version committed;
+- metadata changed;
+- ACL/share changed;
+- scan/preview/index requests;
+- sync fan-out;
+- audit/lifecycle events.
+
+Kafka hoặc Pulsar phù hợp khi cần throughput, partition ordering và replay. Managed queues/pub-sub phù hợp khi muốn giảm vận hành. Cần xác định:
+
+- partition key: thường workspace/user/file scope;
+- retention và replay window;
+- at-least-once delivery;
+- idempotent consumers;
+- DLQ và retry policy;
+- schema registry/evolution;
+- consumer lag và backlog drain capacity.
+
+WebSocket fleet là kênh wake-up realtime. Nó nên scale theo active connections/messages, còn delta API/journal bảo đảm correctness khi disconnect.
+
+---
+
+#### 10. Autoscaling theo đúng tín hiệu
+
+Không phải service nào cũng nên scale bằng CPU.
+
+| Workload | Tín hiệu scale phù hợp |
+|---|---|
+| REST/gRPC API | RPS, concurrency, CPU, p95 latency |
+| Upload control | Active sessions, initiate/complete rate |
+| Byte proxy nếu có | Active connections, network throughput |
+| WebSocket gateway | Connections/pod, messages/s, memory |
+| Queue worker | Queue depth, oldest-message age, consumer lag |
+| Preview/transcode | Backlog bytes, task duration, CPU/GPU |
+| Sync service | Change delivery rate, lag, reconnect rate |
+
+Các biện pháp tránh autoscaling instability:
+
+- headroom cho burst;
+- scale up nhanh, scale down thận trọng;
+- cooldown/stabilization window;
+- warm pool hoặc pre-provision cho slow-start service;
+- min replicas trên nhiều zones;
+- limit downstream concurrency;
+- load shedding và backpressure;
+- capacity ceiling/cost guardrail.
+
+Autoscaling application tier không làm database, broker hoặc object-store quota tự scale. Phải capacity-plan toàn bộ dependency chain.
+
+---
+
+#### 11. High availability và multi-region
+
+Một production design cần nêu failure domain:
+
+##### Trong một region
+
+- service replicas ở nhiều availability zones;
+- load balancer health checks;
+- database synchronous replication/failover phù hợp;
+- broker replication;
+- Redis replication nhưng cache loss phải chịu được;
+- object storage durability;
+- PodDisruptionBudget và topology spreading.
+
+##### Giữa nhiều region
+
+Có thể chọn:
+
+- active-passive: đơn giản hơn, RTO cao hơn;
+- active-active theo home region/tenant: scale và latency tốt, routing phức tạp;
+- metadata single-writer per shard + replicated reads;
+- content replicated/cached theo policy;
+- global traffic management và regional failover.
+
+Không nên tuyên bố “multi-region” mà thiếu:
+
+- consistency model;
+- conflict/fencing rule;
+- RPO/RTO;
+- replication lag;
+- data residency;
+- failover/failback runbook;
+- restore và DR drills.
+
+---
+
+#### 12. Security và data protection
+
+Tối thiểu cần:
+
+- TLS in transit;
+- encryption at rest bằng KMS;
+- envelope encryption và key rotation;
+- workload identity thay static credentials;
+- least-privilege IAM;
+- tenant isolation;
+- signed URL thời hạn ngắn;
+- malware/content scanning;
+- audit log chống sửa đổi;
+- secrets manager;
+- WAF/rate limit/abuse controls;
+- backup, restore và ransomware-resistant retention.
+
+Nếu dùng dedup và encryption, phải chọn scope rõ ràng:
+
+```text
+Per-user/per-tenant encryption → isolation tốt hơn, dedup thấp hơn
+Convergent/global dedup        → tiết kiệm hơn, privacy/security phức tạp hơn
+```
+
+---
+
+#### 13. Observability và SLOs
+
+##### Các SLI chính
+
+- upload initiation/part/complete success rate;
+- upload completion latency;
+- download TTFB và throughput;
+- metadata read/write p50/p95/p99;
+- commit-to-device-visible latency;
+- sync consumer lag và reconnect catch-up time;
+- checksum mismatch/corruption count;
+- authorization deny/error latency;
+- cache hit/stale/eviction rate;
+- object-store error/throttle rate;
+- orphan parts, GC debt và retention backlog;
+- cost per stored GB, uploaded GB, downloaded GB và active user.
+
+##### Tracing và correlation
+
+Một `request_id`/`upload_id`/`file_id`/`version_id` nên nối được:
+
+```text
+gateway → upload session → object parts → metadata transaction
+        → outbox event → sync delivery → client acknowledgement
+```
+
+Không log raw signed URL, access token, encryption key hoặc file content.
+
+---
+
+#### 14. Cost architecture
+
+Cloud storage cost không chỉ là `GB-month`:
+
+```text
+Total cost ≈ stored bytes × storage class
+           + PUT/GET/HEAD/LIST/DELETE requests
+           + ingress/egress/inter-region bytes
+           + CDN requests/egress
+           + database/broker/cache compute
+           + preview/scan/index compute
+           + backup/DR/observability
+```
+
+Cách tối ưu:
+
+- direct transfer tránh double bandwidth qua app tier;
+- CDN cho hot downloads;
+- lifecycle cold versions/trash;
+- dedup có giới hạn và đo được;
+- part size tránh request amplification quá mức;
+- compress metadata/logs phù hợp;
+- autoscale workers nhưng giữ headroom;
+- quota/budget/rate limit public links;
+- phân bổ chi phí theo tenant/workload.
+
+Không nên giảm durability, retention bắt buộc hoặc security chỉ để giảm chi phí.
+
+---
+
+#### 15. Managed hay self-hosted?
+
+| Tiêu chí | Managed service | Self-hosted |
+|---|---|---|
+| Vận hành | Ít hơn | Đội tự chịu trách nhiệm |
+| Kiểm soát | Ít hơn | Cao hơn |
+| Time-to-market | Nhanh | Chậm hơn |
+| Elasticity | Thường tốt | Phụ thuộc capacity đã mua |
+| Lock-in | Có thể cao | Có thể giảm API lock-in nhưng tăng ops lock-in |
+| Chi phí | Dễ bắt đầu, egress/request có thể lớn | CapEx/nhân lực/overprovisioning |
+| Data sovereignty | Tùy region/provider | Kiểm soát vị trí tốt hơn |
+| Reliability | Built-in nhưng vẫn cần thiết kế | Phải tự xây và kiểm thử |
+
+Không chỉ so giá hạ tầng; phải tính cả nhân sự on-call, nâng cấp, bảo mật, phục hồi và opportunity cost.
+
+---
+
+#### 16. Một stack tham khảo
+
+Đây là một phương án, không phải đáp án duy nhất:
+
+```text
+Edge/API             CloudFront/Cloudflare + managed API gateway/Envoy
+Identity             OAuth 2.0/OIDC + workload identity
+Services             Go/Java/.NET/Node.js containers
+Orchestration        Kubernetes/ECS/managed containers
+Authoritative data   PostgreSQL → partition/distributed SQL khi cần
+Dynamic attributes   PostgreSQL JSONB; MongoDB chỉ khi workload chứng minh cần
+Cache                 Redis
+Content               S3/GCS/Azure Blob hoặc MinIO on-prem
+Events                Kafka/Pulsar hoặc managed pub-sub/queues
+Realtime              WebSocket gateways + cursor-based delta API
+Search                OpenSearch/Elasticsearch derived index
+Observability         OpenTelemetry + metrics/logs/traces backend
+Keys/secrets          KMS + secrets manager
+```
+
+Mỗi dòng cần đi kèm owner, SLO, capacity, backup/restore và failure mode.
+
+---
+
+#### 17. Decision record nên ghi gì?
+
+Với mỗi quyết định công nghệ, ghi lại:
+
+1. Bối cảnh và workload assumptions.
+2. Requirement/invariant cần thỏa.
+3. Các phương án đã cân nhắc.
+4. Lý do chọn và trade-off chấp nhận.
+5. Failure modes và operational owner.
+6. Chi phí dự kiến.
+7. Benchmark/load-test evidence.
+8. Trigger để đánh giá lại hoặc migrate.
+
+Ví dụ:
+
+```text
+Decision: dùng PostgreSQL làm source of truth cho namespace.
+Why: atomic move/rename/version/quota/outbox invariants.
+Trade-off: write scaling khó hơn một số distributed KV.
+Scale path: partition theo workspace, connection pool, archive, shard.
+Revisit when: sustained writer saturation hoặc hot-tenant isolation không đủ.
+```
+
+---
+
+#### 18. Ý chính cần nhớ
+
+- Technology selection phải bắt đầu từ requirement và invariant.
+- Microservices hữu ích cho independent scaling/ownership nhưng tạo distributed-system cost.
+- Logical service boundary không nhất thiết là deployment boundary.
+- Containers chuẩn hóa artifact; Kubernetes cung cấp orchestration, không tự sửa kiến trúc kém.
+- Object storage phù hợp content bytes; metadata DB giữ namespace và references.
+- Managed S3-style storage giảm vận hành; MinIO/self-hosted tăng quyền kiểm soát nhưng chuyển trách nhiệm durability cho đội ngũ.
+- PostgreSQL phù hợp authoritative structured metadata vì transaction/invariant, không chỉ vì schema.
+- Chỉ thêm MongoDB/NoSQL khi access pattern và scale thật sự biện minh cho polyglot persistence.
+- Redis là cache/derived state; quyền truy cập phải revoke-safe và fail-closed.
+- CDN nên cache immutable versions và được bảo vệ bằng signed access.
+- Durable event log và WebSocket giải quyết hai việc khác nhau: correctness/replay và realtime wake-up.
+- Autoscale theo workload signal như queue lag, connections và latency—not chỉ CPU.
+- Application autoscaling không loại bỏ bottleneck ở database, broker và object store.
+- Production design cần multi-zone, DR, security, observability và cost model.
+- Managed versus self-hosted phải tính tổng chi phí vận hành, không chỉ hóa đơn tài nguyên.
+- Ghi rõ assumptions, trade-offs và migration trigger trong architecture decision record.
+
+#### Công thức ghi nhớ
+
+> **Strategic technology choice = requirement fit + correctness guarantees + scale path + failure behavior + operational maturity + total cost; product names chỉ là implementation candidates.**
+
+---
+
+### Bài 102. The Final Design — Cloud Storage System
+
+#### 1. Mục tiêu của kiến trúc cuối cùng
+
+Kiến trúc cuối cùng phải kết hợp tất cả quyết định từ Bài 98–101 để cung cấp:
+
+- upload/download file lớn có thể resume;
+- namespace gồm file và folder;
+- đồng bộ nhiều thiết bị gần thời gian thực;
+- version history, restore và trash;
+- chia sẻ có thể thu hồi quyền;
+- độ bền, tính sẵn sàng và khả năng mở rộng;
+- cache/CDN để giảm latency và backend load;
+- deduplication/lifecycle để kiểm soát storage cost;
+- audit, observability và recovery khi có sự cố.
+
+Kiến trúc nên được nhìn như ba nhóm luồng:
+
+```text
+Control plane → identity, namespace, versions, ACL, sessions, journal
+Data plane    → multipart upload, object storage, CDN, range download
+Async plane   → sync fan-out, scan, preview, index, dedup, audit, GC
+```
+
+---
+
+#### 2. Sơ đồ kiến trúc tổng thể
+
+```text
+                Web / Mobile / Desktop Clients
+                              |
+                  Global DNS / WAF / CDN
+                              |
+                    Load Balancer / API Gateway
+                              |
+        +---------------------+----------------------+
+        |                     |                      |
+   Upload Service      Metadata/Namespace       Share/AuthZ
+        |                  Service               Service
+        |                     |                      |
+        |          +----------+-----------+          |
+        |          |                      |          |
+        |      PostgreSQL /          Redis Cache     |
+        |      Strong DB                 |           |
+        |          |                     |           |
+        |     Outbox / Change Journal ---+-----------+
+        |                  |
+        |          Message Broker / Log
+        |        /       |       |       \
+        |     Sync    Scan/     Search   Version/
+        |    Service  Preview   Index    Retention/GC
+        |       |
+        |  WebSocket + Delta API
+        |
+Client ========== signed multipart upload ==========> Object Storage
+Client <========== signed range download ============ Object Storage
+                              |
+                         CDN Edge Cache
+```
+
+Các component có thể là logical modules hoặc independent deployments. Không nhất thiết tách mọi hộp thành một microservice ngay từ đầu.
+
+---
+
+#### 3. Trách nhiệm của từng thành phần
+
+| Thành phần | Trách nhiệm chính | Không nên làm |
+|---|---|---|
+| **API Gateway** | TLS, token validation, routing, rate limit, request policy | Chứa toàn bộ domain authorization hoặc proxy mọi file byte |
+| **AuthN/Identity** | Xác minh user, device và service identity | Quyết định quyền trên resource mà không biết resource state |
+| **Authorization/Share** | ACL, inherited grants, link capability, revoke | Fail-open khi policy store/cache lỗi |
+| **Upload Service** | Session, part plan, quota reservation, signed URL, complete/abort | Coi part cuối được nhận là metadata đã commit |
+| **Storage Service** | Multipart/object APIs, checksums, manifests, range access | Dùng object key như public permission |
+| **Metadata Service** | Namespace, owner, current version, move/rename, trash | Dùng object-store LIST thay database namespace |
+| **Versioning capability** | Immutable versions, restore, retention | Overwrite version cũ tại chỗ |
+| **Sync Service** | WebSocket wake-up, journal/delta delivery, cursor catch-up | Dùng volatile WebSocket event làm source of truth |
+| **Dedup Service** | Hash/reference/manifest optimization | Instant cross-user dedup gây privacy leak |
+| **Cache/CDN** | Metadata acceleration và edge content delivery | Trở thành authoritative state hoặc bỏ qua AuthZ |
+| **Broker/Log** | Durable async delivery, replay, backpressure | Thay thế database transaction cho core invariant |
+| **Background workers** | Scan, preview, index, notifications, audit, GC | Chặn critical request path nếu không bắt buộc |
+
+---
+
+#### 4. Upload flow chuẩn
+
+##### Giai đoạn A — Khởi tạo
+
+```text
+1. Client → API Gateway: initiate upload
+2. Identity được xác thực
+3. AuthZ kiểm tra quyền ghi vào parent folder
+4. Metadata/Quota kiểm tra tên, policy, dung lượng
+5. Upload Service tạo durable upload session + quota reservation
+6. Server trả upload_id, part size và signed part URLs/tokens
+```
+
+Session chứa ít nhất:
+
+```text
+upload_id, principal_id, target_parent, file_id/name,
+declared_size/hash, base_version_id, part_size,
+state, expires_at, quota_reservation
+```
+
+##### Giai đoạn B — Truyền dữ liệu
+
+```text
+7. Client chia file thành parts và upload trực tiếp tới object storage
+8. Mỗi part có checksum; retry độc lập và song song có giới hạn
+9. Object storage/Upload Service ghi nhận parts đã thành công
+10. Client có thể GET session state để resume sau disconnect
+```
+
+Application tier chỉ điều phối control flow; data bytes không cần đi vòng qua mọi microservice.
+
+##### Giai đoạn C — Complete và publish
+
+```text
+11. Client gửi complete(upload_id, ordered part manifest)
+12. Service xác minh session, quyền/quota, parts, size và checksums
+13. Object storage finalize multipart object hoặc immutable manifest
+14. Metadata transaction:
+      - tạo FileVersion
+      - tạo/cập nhật FileEntry.current_version_id
+      - consume quota reservation
+      - append outbox/change-journal record
+15. Trả success với file_id, version_id và revision
+```
+
+Điểm hiển thị file là metadata transaction ở bước 14. Complete phải idempotent: cùng `upload_id`/idempotency key không được tạo hai version.
+
+##### Giai đoạn D — Xử lý nền
+
+Sau commit, event kích hoạt:
+
+- sync notification;
+- malware/policy scan;
+- thumbnail/preview;
+- search indexing;
+- audit;
+- dedup/compaction nếu policy cho phép;
+- lifecycle/replication tasks.
+
+Một số sản phẩm yêu cầu scan **trước khi file có thể download/share**. Khi đó metadata có thể commit ở trạng thái `quarantined`, rồi chuyển sang `active` sau scan. Không được trả trạng thái mơ hồ “đã hoàn tất nhưng vẫn chưa finalized”.
+
+---
+
+#### 5. Hai chiến lược dedup trong upload
+
+Transcript mô tả dedup là background task. Có hai cách hợp lệ:
+
+##### Post-upload dedup
+
+```text
+Upload content độc lập → commit file → worker tìm duplicate
+→ atomically đổi manifest/reference → xóa duplicate sau grace period
+```
+
+**Ưu:** upload path đơn giản, ít privacy side channel.  
+**Nhược:** tạm thời lưu trùng bytes, GC/reference logic phức tạp.
+
+##### Inline/server-side dedup
+
+```text
+Upload/verify bytes → tìm content hash trong tenant scope
+→ reuse existing immutable chunks → commit manifest
+```
+
+**Ưu:** giảm bytes ngay.  
+**Nhược:** tăng latency/coordination và phải kiểm soát privacy, collision, encryption.
+
+Dedup không được xóa object chỉ vì một metadata row biến mất. Physical delete chỉ xảy ra sau reference reconciliation, retention/legal hold và GC grace period.
+
+---
+
+#### 6. Download flow
+
+```text
+1. Client → Gateway: request download(file_id, optional version_id)
+2. Metadata Service resolve node/version/status
+3. AuthZ kiểm tra ACL, inherited grants hoặc share capability
+4. Service tạo signed URL/cookie ngắn hạn cho immutable object/version
+5. Client tải từ CDN
+6. CDN miss → fetch range/object từ object storage
+7. Audit event được ghi bất đồng bộ
+```
+
+Các tính chất cần có:
+
+- hỗ trợ `Range` và resume;
+- ETag/checksum để kiểm tra integrity;
+- CDN key theo immutable version/hash;
+- signed capability có expiry, scope và audience phù hợp;
+- private object không public trực tiếp;
+- revoke policy rõ ràng;
+- rate limit/quota cho public hoặc viral links.
+
+Nếu quyền vừa bị thu hồi nhưng signed URL còn hiệu lực, thời gian hiệu lực token chính là revoke lag tối đa trừ khi dùng online check/revoke epoch.
+
+---
+
+#### 7. Metadata operation flow
+
+Ví dụ rename/move:
+
+```text
+Client → Gateway → Metadata Service
+                    |
+                    +→ AuthZ trên source và destination
+                    +→ validate name/cycle/quota/policy
+                    +→ conditional transaction theo metadata revision
+                    +→ append journal/outbox
+                    +→ invalidate/update cache
+                    +→ async sync/index/audit
+```
+
+Với move folder, cần ngăn tạo cycle và xác định semantics của inherited ACL. Không nên đổi object key của toàn bộ descendants chỉ vì folder path đổi; stable IDs giữ cho operation là metadata-only.
+
+---
+
+#### 8. Sync flow đa thiết bị
+
+```text
+Authoritative metadata commit
+          ↓
+Durable journal/outbox sequence
+          ↓
+Broker partition theo workspace/user
+          ↓
+Sync Service
+     ├─ WebSocket wake-up tới online devices
+     └─ Delta API cho pull/replay
+          ↓
+Client fetch changes từ cursor
+          ↓
+Apply idempotently + persist next_cursor
+```
+
+Ví dụ thiết bị A cập nhật file:
+
+1. Version mới commit trên server.
+2. Journal có `version_committed(file_id, revision=43)`.
+3. Thiết bị B nhận wake-up.
+4. B gọi `/changes?cursor=...`.
+5. B nhận metadata revision mới.
+6. B chỉ tải content khi cần, có thể dùng delta/chunks nếu hỗ trợ.
+7. B apply và lưu cursor mới.
+
+Nếu thiết bị B offline:
+
+- không cần giữ WebSocket messages vô hạn;
+- lúc reconnect, B đọc journal từ cursor;
+- nếu cursor hết retention, B thực hiện full snapshot/reconciliation;
+- duplicate/out-of-order delivery không được làm hỏng state.
+
+---
+
+#### 9. Sharing flow
+
+##### Chia sẻ trực tiếp
+
+```text
+Owner/editor → create grant(user/group, role)
+             → metadata/policy transaction
+             → policy revision tăng
+             → journal event
+             → cache invalidation + recipient sync/notification
+```
+
+##### Link sharing
+
+```text
+Creator → generate high-entropy capability token
+        → store hashed token + scope + expiry + policy
+Recipient → present token
+          → resolve share + authorize current policy
+          → receive metadata/download capability
+```
+
+Revoke phải:
+
+- vô hiệu link hoặc grant authoritative;
+- tăng policy revision/revoke epoch;
+- invalidate cache;
+- chặn tạo signed download URL mới;
+- ghi audit;
+- xác định rõ các signed URLs đã cấp còn sống trong bao lâu.
+
+---
+
+#### 10. Storage và dữ liệu
+
+##### Authoritative data
+
+```text
+User / Workspace
+FileEntry / FolderEntry
+FileVersion / ContentManifest
+ACL / ShareGrant / LinkCapability
+UploadSession / QuotaReservation
+ChangeJournal / TransactionalOutbox
+Retention / Trash / LegalHold state
+```
+
+##### Content data
+
+```text
+Immutable whole objects hoặc chunks
+Preview/thumbnail objects
+Temporary multipart parts
+Replicas/erasure-coded fragments
+Cold versions và archive tiers
+```
+
+##### Derived data
+
+```text
+Redis metadata cache
+Search index
+CDN edge copies
+Analytics aggregates
+Presence/subscription state
+```
+
+Derived data phải rebuild được. Backup và DR ưu tiên authoritative metadata cùng content manifests/objects; cache không phải backup.
+
+---
+
+#### 11. Consistency model theo từng capability
+
+Không cần một consistency level duy nhất cho toàn hệ thống:
+
+| Capability | Consistency mong muốn |
+|---|---|
+| Upload complete/current version | Strong/transactional trong namespace scope |
+| Rename/move | Strong với conditional revision |
+| ACL/revoke | Strong tại source of truth; cache bounded-staleness rất ngắn |
+| Folder listing sau mutation | Read-your-writes cho initiator |
+| Cross-device sync | Eventual nhưng có durable replay và SLO |
+| Search index | Eventual |
+| Preview/thumbnail | Eventual |
+| Audit ingestion | Durable at-least-once, query có thể eventual |
+| CDN immutable content | Strong identity theo version; access capability có bounded lifetime |
+
+Phân loại này tránh trả giá của strong consistency trên mọi đường đi nhưng vẫn bảo vệ invariant quan trọng.
+
+---
+
+#### 12. Failure handling
+
+##### Upload bị ngắt
+
+- resume từ parts đã xác nhận;
+- retry với exponential backoff và jitter;
+- session expiry;
+- abort/cleanup parts mồ côi;
+- quota reservation được release an toàn.
+
+##### Object finalize thành công nhưng metadata commit thất bại
+
+- object chưa có authoritative reference nên chưa visible;
+- retry complete idempotently;
+- orphan scanner/GC xử lý sau grace period.
+
+##### Metadata commit thành công nhưng broker tạm hỏng
+
+- outbox row vẫn nằm trong cùng transaction;
+- publisher retry tới khi event vào broker;
+- sync có thể trễ nhưng không mất thay đổi.
+
+##### Cache lỗi
+
+- fallback về source of truth với load protection;
+- request coalescing/rate limit chống stampede;
+- không bỏ qua authorization.
+
+##### Sync consumer chậm
+
+- theo dõi consumer lag/oldest event age;
+- autoscale theo backlog;
+- partition lại hot workspace khi cần;
+- degrade previews/index trước core sync;
+- giữ spare capacity để drain backlog.
+
+##### Region lỗi
+
+- global routing chuyển region theo runbook;
+- fence writer cũ trước khi promote writer mới;
+- chấp nhận RPO/RTO đã công bố;
+- reconcile sau failback;
+- kiểm thử DR định kỳ.
+
+---
+
+#### 13. Scaling từng thành phần
+
+| Thành phần | Cách scale chính | Bottleneck cần theo dõi |
+|---|---|---|
+| Gateway/API | Stateless horizontal replicas | RPS, p99, connections |
+| Upload control | Horizontal theo active sessions | complete rate, session store |
+| Object storage | Native horizontal capacity | bytes/s, request throttles, repair |
+| Metadata DB | Partition/shard theo workspace | write leader, index, hot tenant |
+| Redis | Shard/replica | hot keys, memory, eviction |
+| Broker | Partitions/consumers | lag, ordering, hot partition |
+| Sync/WebSocket | Shard connections theo user | connections, messages/s, reconnect storm |
+| Workers | Queue-driven autoscaling | queue age, CPU/GPU, downstream quota |
+| CDN | Distributed edge | hit ratio, origin load, egress |
+
+Scale-out không loại bỏ skew. Hot folder, giant tenant, public link hoặc reconnect storm phải có thiết kế riêng.
+
+---
+
+#### 14. Caching trong kiến trúc cuối
+
+##### Redis metadata cache
+
+- cache-aside cho read-heavy metadata;
+- key theo tenant/resource/revision;
+- invalidate qua commit event;
+- TTL ngắn hơn với permissions;
+- negative cache thận trọng;
+- single-flight chống stampede;
+- fail-closed cho AuthZ.
+
+##### CDN content cache
+
+- immutable version/hash làm cache key;
+- range support;
+- signed URLs/cookies;
+- origin shield nếu có;
+- giới hạn public link abuse;
+- đo hit ratio và egress.
+
+Cache invalidation event có thể trễ; correctness của core metadata không được phụ thuộc duy nhất vào việc mọi cache đã xóa ngay lập tức.
+
+---
+
+#### 15. Bảo mật nhiều lớp
+
+```text
+Edge       → DDoS/WAF/bot defense/rate limit/TLS
+Identity   → OAuth/OIDC/MFA/device/session controls
+Service    → workload identity/mTLS/least privilege
+Resource   → ACL/ABAC/share capability/default deny
+Data       → encryption at rest/KMS/checksum/malware scan
+Network    → segmentation/private endpoints/egress control
+Audit      → immutable security and access trail
+Recovery   → backups/version retention/ransomware protection
+```
+
+Centralized Auth Service không có nghĩa “chỉ kiểm tra một lần ở gateway”. Mỗi sensitive resource operation vẫn phải enforce authorization với resource state hiện tại.
+
+---
+
+#### 16. Reliability và graceful degradation
+
+Ưu tiên phục vụ:
+
+```text
+Tier 0: metadata/content integrity, authentication và authorization
+Tier 1: upload completion, download intent, journal durability
+Tier 2: sync delivery/catch-up
+Tier 3: folder browsing, sharing notifications, search
+Tier 4: preview, analytics, dedup compaction, nonurgent GC
+```
+
+Khi quá tải:
+
+- hoãn preview/index/dedup;
+- giảm notification không thiết yếu;
+- giới hạn public-link traffic;
+- bảo vệ DB bằng concurrency limits;
+- queue async work có durable backpressure;
+- không hy sinh integrity hoặc AuthZ.
+
+---
+
+#### 17. Observability end-to-end
+
+Một upload phải trace được qua:
+
+```text
+request_id → upload_id → part/object IDs → file_id → version_id
+           → journal sequence → sync delivery → device cursor
+```
+
+Dashboard tối thiểu:
+
+- initiate/part/complete upload success và latency;
+- bytes/s, active sessions và retry rate;
+- metadata DB p95/p99, locks và replication lag;
+- cache hit/eviction/stale indicators;
+- broker lag và oldest event age;
+- commit-to-device-visible latency;
+- WebSocket connections/reconnects;
+- object checksum/throttle/errors;
+- scan/index/preview backlog;
+- orphan parts và GC debt;
+- download TTFB/throughput/CDN hit ratio;
+- authorization errors và suspicious sharing;
+- cost per user/GB/request.
+
+Alert phải gắn với SLO và user impact, không chỉ CPU cao.
+
+---
+
+#### 18. Requirements-to-components traceability
+
+| Requirement | Thành phần/quyết định đáp ứng |
+|---|---|
+| Large resumable upload | Upload session + multipart parts + checksum |
+| Low-latency download | CDN + range request + immutable object |
+| Durable content | Object storage replication/erasure coding |
+| Correct namespace | Transactional metadata store + stable IDs |
+| Version restore | Immutable FileVersion + retention policy |
+| Multi-device sync | Change journal + broker + WebSocket + cursor API |
+| Secure sharing | ACL/capability + policy revision + audit |
+| Scale độc lập | Stateless services, partitions và queue-driven workers |
+| High availability | Multi-zone replicas, load balancing và failover |
+| Lower storage cost | Lifecycle tiers + scoped dedup + GC |
+| Fast metadata reads | Redis cache với revision/invalidation |
+| Operational recovery | Outbox, retries, reconciliation, backups và DR drills |
+
+Một component chỉ đáng tồn tại khi chỉ ra được requirement, bottleneck hoặc failure mode mà nó xử lý.
+
+---
+
+#### 19. Những điểm cần hiệu chỉnh từ transcript
+
+##### “Upload Service nhận file chunks”
+
+Đúng về trách nhiệm logic, nhưng production data path nên ưu tiên client → object storage trực tiếp bằng signed capability để application service không chịu double bandwidth.
+
+##### “Metadata được ghi cùng lúc trong khi upload”
+
+Có thể ghi upload-session/progress metadata, nhưng active FileEntry/current version chỉ nên publish sau successful complete. Nếu publish sớm, người dùng có thể thấy file không tải được.
+
+##### “Versioning và dedup chạy qua queue sau upload”
+
+- Core version metadata/current pointer là một phần của atomic publish, không nên hoàn toàn dựa vào eventual worker.
+- Dedup optimization có thể chạy nền.
+- Sync notification/index/preview/audit có thể async sau durable outbox.
+
+##### “Background dedup trước khi upload fully finalized”
+
+Cần định nghĩa rõ hai mốc:
+
+```text
+Content complete → parts/manifests đã integrity-check
+Metadata publish → version visible và journaled
+Post-processing complete → scan/preview/index/dedup đã hội tụ
+```
+
+Không nên giữ response upload vô hạn chỉ để chờ optional optimization. Nếu scan là bắt buộc, dùng trạng thái `quarantined` rõ ràng.
+
+##### “Centralized authorization”
+
+Central policy giúp nhất quán, nhưng enforcement vẫn ở mỗi resource operation; gateway authentication không thay thế file-level AuthZ.
+
+---
+
+#### 20. Cách trình bày final design trong phỏng vấn
+
+Trong 5–7 phút, có thể nói theo trình tự:
+
+1. “Tôi tách control plane khỏi data plane.”
+2. Vẽ Gateway, Upload, Metadata/AuthZ, Object Storage, Journal/Broker và Sync.
+3. Đi qua upload: initiate → signed multipart → atomic complete → outbox.
+4. Đi qua download: authorize → signed immutable URL → CDN/object storage.
+5. Giải thích sync: durable cursor pull + WebSocket wake-up.
+6. Nêu immutable version, conflict handling, trash/retention/GC.
+7. Nêu partition key, cache, hot tenant/link và autoscaling signals.
+8. Kết thúc bằng failure scenario và trade-off.
+
+Một câu trả lời mạnh không chỉ mô tả happy path mà còn trả lời:
+
+- retry ở đâu và có idempotent không;
+- source of truth là gì;
+- event có thể mất không;
+- stale permission xử lý thế nào;
+- object mồ côi được dọn ra sao;
+- khi một region hoặc dependency hỏng thì điều gì còn hoạt động;
+- bottleneck tiếp theo xuất hiện ở đâu khi scale.
+
+---
+
+#### 21. Ý chính cần nhớ
+
+- Kiến trúc cuối gồm control plane, data plane và async plane.
+- API Gateway là entry point nhưng không chứa toàn bộ business logic.
+- Client nên upload/download large content trực tiếp qua signed capabilities.
+- Chunking cung cấp resume, checksum và bounded parallelism.
+- File chỉ visible sau atomic version/namespace commit.
+- Core version creation là synchronous correctness boundary; preview/index/dedup có thể async.
+- Transactional outbox bảo đảm metadata commit không mất downstream event.
+- Object content/version là immutable; metadata giữ current pointer.
+- Sync dùng durable journal/cursor cho correctness và WebSocket cho latency.
+- Authorization phải được enforce theo resource; cache quyền phải revoke-safe.
+- Redis/CDN là derived acceleration layers, không phải source of truth.
+- Dedup cần scope, privacy policy, reference accounting và safe GC.
+- Consistency được chọn theo capability, không áp một mức cho toàn hệ thống.
+- Scale theo workload-specific metrics và xử lý hot tenants/links/folders.
+- Failure handling cần idempotency, retry, fencing, reconciliation và graceful degradation.
+- Traceability từ requirement tới component giúp loại bỏ những hộp không có lý do tồn tại.
+
+#### Công thức ghi nhớ
+
+> **Final Cloud Storage = authorized control plane + direct resumable data plane + atomic immutable-version publication + durable change journal + cursor-based device convergence + cache/CDN acceleration + policy-aware retention and GC.**
+
+---
+
+## Phần 20 — Design a Video Sharing Platform (YouTube)
+
+### Bài 103. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần giải quyết
+
+Thiết kế một nền tảng chia sẻ video quy mô lớn, nơi người dùng có thể:
+
+- upload video một cách tin cậy;
+- chờ hệ thống xử lý và mã hóa video;
+- xem video với chất lượng thích ứng theo mạng và thiết bị;
+- tìm kiếm và khám phá nội dung;
+- tương tác qua like, comment, share, view và subscription;
+- nhận home feed/recommendations được cá nhân hóa.
+
+Đây không chỉ là một hệ thống “upload file rồi download lại”. Một video phải đi qua nhiều giai đoạn:
+
+```text
+Upload source
+    ↓
+Integrity verification
+    ↓
+Security/policy inspection
+    ↓
+Transcode nhiều codec/resolution/bitrate
+    ↓
+Segment + package + generate manifest
+    ↓
+Publish metadata/search/feed
+    ↓
+CDN distribution + adaptive playback
+    ↓
+Engagement, analytics, moderation, retention
+```
+
+Mỗi workflow có workload khác nhau:
+
+| Workflow | Đặc điểm tải chính |
+|---|---|
+| Upload | File lớn, kết nối dài, retry/resume |
+| Processing | CPU/GPU-intensive, async, bursty |
+| Playback | Read/bandwidth-heavy, latency và rebuffer-sensitive |
+| Search | Full-text/filter/ranking, index eventual consistency |
+| Recommendation | Data/ML-intensive, online serving latency thấp |
+| Engagement | Nhiều small writes, hot videos và counter aggregation |
+| Moderation | Automated + human review, policy/audit correctness |
+
+Mục tiêu của bước 1 là chốt rõ user experience và scope trước khi chọn database, CDN hay message queue.
+
+---
+
+#### 2. Bốn workflow cốt lõi
+
+##### 2.1. Upload video
+
+Upload video khác upload request thông thường:
+
+- file có thể rất lớn;
+- mạng của creator có thể chập chờn;
+- transfer kéo dài và dễ timeout;
+- retry toàn bộ file gây lãng phí;
+- upload xong chưa có nghĩa video đã phát được.
+
+Do đó cần:
+
+- resumable/multipart upload;
+- checksum từng part và toàn file;
+- retry riêng phần lỗi;
+- upload progress và session expiry;
+- idempotent completion;
+- asynchronous processing pipeline;
+- trạng thái processing rõ ràng cho creator.
+
+```text
+Client → initiate session → upload parts → complete source upload
+      → processing queued → transcode/package/moderate → publish
+```
+
+##### 2.2. Xem video
+
+Playback là trải nghiệm quan trọng nhất. Hệ thống phải:
+
+- bắt đầu phát nhanh;
+- hạn chế rebuffering;
+- tự đổi chất lượng khi bandwidth thay đổi;
+- hỗ trợ seek;
+- phục vụ người xem trên nhiều thiết bị và khu vực;
+- không kéo nguyên file trước khi phát.
+
+Video thường được chia thành các media segments. Client tải một manifest mô tả nhiều bitrate/resolution rồi tự chọn segment phù hợp theo thời điểm.
+
+```text
+Player lấy manifest
+   ↓
+Ước lượng bandwidth/buffer/device
+   ↓
+Chọn rendition thích hợp
+   ↓
+Tải từng segment qua CDN
+   ↓
+Điều chỉnh rendition khi điều kiện đổi
+```
+
+Đây là **adaptive bitrate streaming (ABR)**.
+
+##### 2.3. Search và discovery
+
+Search phải hỗ trợ:
+
+- title, description và tags;
+- category/language;
+- channel/creator;
+- freshness và popularity;
+- policy/visibility/region filters;
+- typo, stemming hoặc semantic relevance tùy scope.
+
+Search và recommendation là hai bài toán khác nhau:
+
+- **Search:** user thể hiện intent qua query.
+- **Recommendation/home feed:** hệ thống dự đoán nội dung phù hợp dựa trên user/context/history.
+
+Cả hai đều không nên query trực tiếp raw video storage.
+
+##### 2.4. Engagement
+
+Bao gồm:
+
+- like/unlike;
+- comment/reply;
+- share;
+- subscribe/unsubscribe channel;
+- view/watch events;
+- view count và engagement counters.
+
+Mỗi operation nhỏ nhưng tổng lưu lượng rất lớn. Viral video tạo hot key/hot partition. Vì vậy:
+
+- user action cần idempotent;
+- view count không nhất thiết increment một row đồng bộ cho mỗi request;
+- raw events có thể append/aggregate bất đồng bộ;
+- public counters có thể eventual consistent;
+- anti-spam/fraud phải phân biệt genuine và synthetic engagement.
+
+---
+
+#### 3. Actors chính
+
+| Actor | Mục tiêu |
+|---|---|
+| **Viewer** | Xem, tìm kiếm, khám phá và tương tác với video |
+| **Creator/Uploader** | Upload, chỉnh metadata, theo dõi processing và quản lý video/channel |
+| **Subscriber** | Theo dõi channel và nhận feed/notification phù hợp |
+| **Moderator/Trust & Safety** | Review nội dung, xử lý report và thực thi policy |
+| **Administrator/Operator** | Quan sát hệ thống, xử lý incident, capacity và abuse |
+| **System** | Encode/package, distribute, recommend, aggregate và enforce lifecycle/policy |
+| **Advertiser/Rights holder** | Có thể tồn tại trong sản phẩm thật, nhưng nằm ngoài scope cơ bản nếu không được yêu cầu |
+
+Một user có thể đồng thời là viewer và creator.
+
+---
+
+#### 4. Functional requirements
+
+##### 4.1. User identity
+
+- đăng ký, đăng nhập và đăng xuất;
+- quản lý profile/channel;
+- bảo vệ upload, comment và subscription theo identity;
+- hỗ trợ account recovery và security controls.
+
+##### 4.2. Video upload
+
+- upload file lớn theo chunks/parts;
+- pause/resume/retry;
+- hiển thị progress;
+- metadata ban đầu: title, description, tags, visibility;
+- xác minh file type, size và checksum;
+- báo trạng thái processing/failure;
+- cancel/retry processing theo policy.
+
+##### 4.3. Video processing
+
+- đọc source/mezzanine upload;
+- trích xuất duration, dimensions, codec và audio tracks;
+- transcode thành nhiều renditions;
+- tạo thumbnail/preview;
+- segment và package thành streaming format;
+- sinh playback manifest;
+- kiểm tra malware, policy/copyright/content safety;
+- publish khi đạt readiness policy.
+
+##### 4.4. Playback
+
+- phát video theo ABR;
+- seek/pause/resume;
+- captions/subtitles nếu trong scope;
+- lựa chọn audio/language nếu có;
+- playback authorization cho private/unlisted/restricted video;
+- ghi watch/session/QoE events.
+
+##### 4.5. Metadata management
+
+- title, description, tags và category;
+- creator/channel;
+- visibility: public, unlisted, private;
+- processing/publication state;
+- thumbnails, duration và available renditions;
+- timestamps, language, restrictions và moderation status.
+
+##### 4.6. Engagement
+
+- like/unlike;
+- comments và replies;
+- view/watch event;
+- share;
+- channel subscription;
+- aggregate counters.
+
+##### 4.7. Search
+
+- tìm theo keyword, category và tags;
+- lọc theo visibility/policy/region;
+- rank theo relevance, freshness và popularity;
+- pagination ổn định;
+- loại nội dung deleted/blocked khỏi kết quả trong thời gian policy cho phép.
+
+##### 4.8. Personalized home feed
+
+- lấy candidates từ subscriptions, history, trends và similarity;
+- rank theo user/context;
+- filter nội dung không được phép xem;
+- đa dạng hóa feed;
+- ghi impression/click/watch feedback.
+
+Recommendation là một hệ thống lớn riêng. Trong case study này, có thể coi nó là một service với candidate/ranking pipeline thay vì thiết kế chi tiết mô hình ML.
+
+##### 4.9. Moderation và reporting
+
+Transcript nhắc abuse prevention; để đầy đủ, platform cần:
+
+- report video/comment/user;
+- automated scanning/classification;
+- copyright/fingerprint checks tùy scope;
+- quarantine/block/age/region restriction;
+- human-review queue;
+- appeal và audit trail;
+- takedown propagation tới search, feed, CDN và caches.
+
+---
+
+#### 5. Video lifecycle và state machine
+
+Không nên dùng một cờ Boolean `is_ready`. Video có nhiều trạng thái nghiệp vụ:
+
+```text
+CREATED
+   ↓
+UPLOADING ──cancel/expire──> ABORTED
+   ↓
+UPLOADED
+   ↓
+VALIDATING ──invalid──> REJECTED
+   ↓
+PROCESSING ──retryable failure──> PROCESSING_RETRY
+   │              └─terminal──> FAILED
+   ↓
+READY_PARTIAL hoặc READY
+   ↓
+PUBLISHED
+   ├─policy action──> BLOCKED/QUARANTINED
+   ├─creator delete──> DELETED/TOMBSTONED
+   └─reprocess──> PROCESSING_NEW_VERSION
+```
+
+Điểm cần quyết định:
+
+- Có publish ngay khi rendition đầu tiên đủ phát, hay chờ mọi resolution?
+- Creator có được xem bản preview khi chưa public không?
+- Processing failure có retry tự động không?
+- Metadata update có cần re-encode không?
+- Takedown có phải chặn playback ngay không?
+
+Không nhất thiết đợi mọi resolution tới 4K. Có thể publish `READY_PARTIAL` khi một tập rendition tối thiểu đã sẵn sàng, rồi bổ sung chất lượng cao hơn bất đồng bộ. Đây là trade-off giữa time-to-first-publish và completeness.
+
+---
+
+#### 6. Non-functional requirements
+
+##### 6.1. Playback latency và QoE
+
+“Low latency” cần được chuyển thành metrics:
+
+- video startup time/TTFF;
+- rebuffer ratio;
+- rebuffer events per playback;
+- playback failure rate;
+- average delivered bitrate;
+- seek latency;
+- CDN hit ratio;
+- manifest/segment p95/p99 latency.
+
+Với pre-recorded video, mục tiêu chính là startup nhanh và playback ổn định—not live glass-to-glass latency.
+
+##### 6.2. High availability
+
+- playback của video đã publish phải có availability cao nhất;
+- metadata read/search/feed có thể degrade độc lập;
+- upload có thể retry/resume khi một node lỗi;
+- processing backlog có thể tăng mà không làm playback ngừng;
+- không để một failed rendition chặn toàn hệ thống;
+- multi-zone và regional failure phải có chiến lược.
+
+##### 6.3. Scalability
+
+Scale độc lập theo các đơn vị:
+
+```text
+uploads/s và ingress bytes/s
+transcode minutes/s, CPU/GPU queue
+stored source + rendition bytes
+play starts/s, segment requests/s và egress bytes/s
+search QPS
+feed QPS
+engagement writes/events/s
+concurrent viewers/sessions
+```
+
+“Millions of users” chưa đủ để capacity plan; Bài 104 cần định lượng từng đơn vị trên.
+
+##### 6.4. Storage efficiency
+
+Storage amplification đến từ:
+
+- source/mezzanine file;
+- nhiều codec/resolution/bitrate;
+- audio tracks và captions;
+- segments/manifests;
+- thumbnails/previews;
+- temporary processing artifacts;
+- replication/erasure coding;
+- backups/DR;
+- retention của deleted/blocked content.
+
+Cần lifecycle tiers, retention và xóa an toàn thay vì chỉ “dùng object storage”.
+
+##### 6.5. Global delivery
+
+- CDN/edge locations gần viewers;
+- origin shielding;
+- regional manifests/authorization;
+- cache immutable segments;
+- multi-CDN hoặc failover nếu scale/risk cần;
+- data residency và content restrictions theo region;
+- chống viral-origin collapse.
+
+##### 6.6. Security và abuse prevention
+
+- account takeover protection;
+- upload authorization và quota;
+- signed playback URL/token cho content không public;
+- encryption in transit/at rest;
+- malware/file-format validation;
+- spam/bot/fake views/fake likes;
+- DDoS và scraping/hotlink protection;
+- copyright/policy enforcement;
+- moderation audit và privacy controls.
+
+##### 6.7. Durability và correctness
+
+- uploaded source không bị mất sau acknowledged completion;
+- rendition/manifest phải khớp nhau;
+- metadata không publish path không tồn tại;
+- deleted/blocked content phải biến mất khỏi playback/search/feed theo SLO;
+- counters có thể eventual, nhưng ownership/visibility/entitlement cần đúng.
+
+##### 6.8. Observability
+
+Cần quan sát theo pipeline, không chỉ server:
+
+```text
+upload session → source commit → queue wait → transcode stages
+→ package/manifest → publish → CDN fill → playback QoE
+```
+
+Mỗi video/job/rendition cần correlation IDs và trạng thái có thể truy vết.
+
+---
+
+#### 7. Assumptions của case study
+
+| Assumption | Ý nghĩa kiến trúc |
+|---|---|
+| Video chủ yếu dài tối đa khoảng 15 phút | Giới hạn baseline upload size và transcode time |
+| Chỉ pre-recorded video | Không cần live ingest, real-time transcoding hay ultra-low-latency delivery |
+| Mỗi video có nhiều resolutions tới 4K | Tạo compute/storage amplification và ABR ladder |
+| Video delivery qua CDN | Origin không trực tiếp phục vụ mọi segment request |
+| Metadata nhỏ hơn nhiều so với media | Tách metadata/control plane khỏi video/data plane |
+| Users toàn cầu | Cần edge delivery và regional strategy |
+
+Assumption cần làm rõ thêm:
+
+- codec đầu vào/đầu ra và container formats;
+- average source bitrate/file size;
+- retention source file sau transcode;
+- public/private/unlisted ratio;
+- upload success/abort rate;
+- DAU, concurrent viewers và watch hours;
+- upload-to-watch ratio;
+- average viewing duration/completion rate;
+- target processing time;
+- minimum renditions để publish;
+- captions, DRM, ads, live, download offline có trong scope không;
+- geographic/data-residency constraints;
+- moderation/copyright SLO.
+
+---
+
+#### 8. Constraints và thách thức chính
+
+##### 8.1. Storage tăng liên tục
+
+Video bytes hiếm khi giảm tự nhiên. Mỗi source tạo nhiều output. Chi phí physical storage phụ thuộc:
+
+```text
+Physical bytes ≈ source bytes
+               + Σ encoded rendition bytes
+               + thumbnails/captions/manifests
+               + temporary artifacts
+               + durability/DR overhead
+               − compression/dedup/lifecycle savings
+```
+
+##### 8.2. Processing pipeline
+
+Một video có thể fan-out thành nhiều jobs:
+
+```text
+probe/validate
+transcode(codec × resolution × bitrate)
+audio extraction/normalization
+segment/package
+thumbnail/preview
+captions
+moderation/fingerprint
+quality validation
+publish
+```
+
+Phải quản lý dependency DAG, retries, duplicate jobs, poison input, resource scheduling và backlog.
+
+##### 8.3. Adaptive playback
+
+Các rendition phải:
+
+- được segment tại boundaries tương thích;
+- có codec/container được device hỗ trợ;
+- xuất hiện đúng trong manifest;
+- chỉ publish khi segment/object sẵn sàng;
+- phục vụ qua CDN với immutable URLs.
+
+##### 8.4. Metadata và media availability phải đồng bộ
+
+Không để search/feed hiển thị video mà playback manifest chưa sẵn sàng. Một publication transaction/workflow cần điều phối:
+
+```text
+Required outputs verified
+        ↓
+Video state → READY/PUBLISHED
+        ↓
+Outbox events → search index + feeds + notifications
+```
+
+Search/feed là derived views. Nếu index trước publication event, user có thể gặp broken playback.
+
+##### 8.5. Viral traffic và skew
+
+Traffic không phân phối đều. Một video mới viral có thể tạo:
+
+- hàng triệu segment requests;
+- cache fill đồng thời ở nhiều regions;
+- hot metadata/counter keys;
+- comment/like spikes;
+- recommendation fan-out;
+- origin egress và cost spike.
+
+CDN, origin shield, request collapsing, sharded counters và load shedding phải tính tới skew—not chỉ average.
+
+##### 8.6. Abuse và policy
+
+- spam uploads tiêu tốn ingress, storage và transcode compute;
+- malformed files có thể tấn công parser/transcoder;
+- copyrighted/inappropriate content cần detection và takedown;
+- bots làm giả views/likes/subscriptions;
+- re-upload có thể né enforcement;
+- public links có thể bị hotlink hoặc scrape.
+
+Rate limit, quota, sandboxed processing, moderation và trust signals là phần của architecture.
+
+##### 8.7. Cost
+
+Ba cost drivers lớn thường là:
+
+```text
+Storage bytes × retention/renditions
+Transcode compute × video minutes/codecs
+CDN/egress bytes × watch time/bitrate
+```
+
+Phải tối ưu theo unit economics, không chỉ server utilization.
+
+---
+
+#### 9. In scope và out of scope
+
+##### In scope
+
+- account/channel cơ bản;
+- resumable upload;
+- asynchronous VOD processing;
+- multiple renditions tới 4K;
+- ABR streaming qua CDN;
+- metadata;
+- likes/comments/views/subscriptions;
+- search;
+- personalized home feed ở mức service boundary;
+- moderation/abuse controls cơ bản;
+- observability và cost-awareness.
+
+##### Out of scope mặc định
+
+- live streaming;
+- real-time video conferencing;
+- detailed ad auction/insertion;
+- creator monetization/payout;
+- full ML training architecture;
+- studio-grade collaborative editing;
+- offline download/DRM chi tiết;
+- rights management/Content ID đầy đủ;
+- short-video editing/effects pipeline;
+- exact multi-CDN traffic optimization.
+
+Nếu interviewer yêu cầu, chọn 1–2 nhánh để mở rộng; không cố thiết kế toàn bộ YouTube trong một buổi.
+
+---
+
+#### 10. Những câu hỏi cần hỏi interviewer
+
+##### Product scope
+
+- Chỉ VOD hay có live streaming?
+- Video tối đa bao lâu/dung lượng bao nhiêu?
+- Có private/unlisted/premium/region-restricted content không?
+- Có comments, subscriptions, search và recommendations tới mức nào?
+- Có captions, DRM, ads hoặc offline download không?
+
+##### Scale
+
+- DAU/MAU và concurrent viewers?
+- Uploads/ngày, average source size và duration?
+- Watch starts/ngày và average watch time?
+- Tỷ lệ read/write và viral skew?
+- Regions và CDN coverage?
+
+##### SLO
+
+- Upload completion success?
+- Time-to-first-publish?
+- Playback startup/rebuffer targets?
+- Availability của playback versus upload/search?
+- Takedown/revoke propagation time?
+
+##### Consistency
+
+- View/like counters có thể trễ bao lâu?
+- Creator cần read-your-writes với metadata không?
+- Publish cần tất cả renditions hay minimum playable set?
+- Khi processing một rendition lỗi thì retry, degrade hay block?
+
+##### Cost/policy
+
+- Có giữ source file vĩnh viễn không?
+- Retention deleted videos?
+- Moderation và copyright scope?
+- Data residency?
+- Managed cloud hay self-hosted constraint?
+
+---
+
+#### 11. SLO gợi ý để định hướng thiết kế
+
+Các con số sau chỉ là ví dụ cần xác nhận, không phải chuẩn bắt buộc:
+
+| SLI | SLO minh họa |
+|---|---|
+| Playback API/manifest availability | 99,99% |
+| Upload control-plane availability | 99,9%–99,95% |
+| Playback startup time | p95 dưới 2 giây ở network được hỗ trợ |
+| Rebuffer ratio | p95 dưới ngưỡng sản phẩm xác định |
+| Video publish time | p95 theo duration/resolution class |
+| Metadata read | p95 dưới 100–200 ms |
+| Search freshness | Phút, tùy loại update |
+| View/like count freshness | Giây đến phút |
+| Policy takedown propagation | Giây/phút theo mức độ nghiêm trọng |
+| Source durability sau acknowledged upload | Gắn với durability objective của storage |
+
+Processing time nên normalized theo video duration, chẳng hạn “p95 time-to-playable cho video 15 phút”, thay vì một SLO chung cho mọi kích cỡ và codec.
+
+---
+
+#### 12. Core entities ban đầu
+
+```text
+User(user_id, ...)
+Channel(channel_id, owner_id, ...)
+Video(video_id, channel_id, title, visibility, state, ...)
+VideoSource(source_id, video_id, object_key, checksum, ...)
+Rendition(rendition_id, video_id, codec, resolution, bitrate, state, ...)
+Segment/Manifest(video_id, rendition_id, object references, ...)
+UploadSession(upload_id, video_id, parts, state, expires_at, ...)
+Comment(comment_id, video_id, user_id, parent_id, ...)
+Reaction(video_id, user_id, type, ...)
+Subscription(user_id, channel_id, ...)
+WatchEvent(user_id/session_id, video_id, position, QoE, ...)
+ModerationDecision(video_id, policy, state, ...)
+```
+
+Video metadata, media bytes, search documents, recommendation features và engagement events không nhất thiết nằm trong cùng một database.
+
+---
+
+#### 13. Functional và non-functional requirements liên hệ nhau
+
+| Functional requirement | NFR chi phối | Hệ quả kiến trúc sơ bộ |
+|---|---|---|
+| Upload video lớn | Reliability, scalability | Multipart/resumable direct upload |
+| Encode nhiều resolutions | Throughput, cost | Async DAG, queue và elastic workers |
+| Streaming | Low latency, availability | ABR segments + CDN |
+| Search | Query latency, freshness | Derived search index |
+| Recommendations | Personalization latency, scale | Offline/stream features + online ranker boundary |
+| Likes/views/comments | High write volume, abuse | Event log, aggregation, sharded counters |
+| Subscriptions/feed | Fan-out, freshness | Feed service và async distribution |
+| Moderation | Security, correctness | Quarantine, policy state và takedown propagation |
+| Global users | Latency, residency | Regional edges/origins and routing |
+
+---
+
+#### 14. Những lỗi scope thường gặp
+
+1. **Nói “thiết kế YouTube” mà không chốt live hay VOD.**  
+   Hai hệ thống ingest/latency hoàn toàn khác nhau.
+
+2. **Coi upload xong là video phát được.**  
+   Còn validation, transcoding, packaging, moderation và publication.
+
+3. **Chỉ nói nhiều resolutions mà không nói manifests/segments/ABR.**
+
+4. **Gộp search và recommendation.**  
+   Query intent và personalized ranking có pipeline khác nhau.
+
+5. **Increment view count đồng bộ trên một row.**  
+   Viral video gây contention; counting còn cần anti-fraud semantics.
+
+6. **Nêu CDN nhưng bỏ qua cache key, origin fill, signed access và egress cost.**
+
+7. **Không có video lifecycle/state machine.**  
+   Dễ publish broken, blocked hoặc partially processed content.
+
+8. **Không đưa moderation vào scope.**  
+   Upload platform không thể vận hành an toàn nếu thiếu abuse/content controls.
+
+9. **Thiết kế mọi feature của YouTube cùng lúc.**  
+   Hãy chốt core VOD path trước, rồi mở rộng một bottleneck cụ thể.
+
+---
+
+#### 15. Ý chính cần nhớ
+
+- Video platform có upload, processing, playback, discovery và engagement workloads rất khác nhau.
+- Upload source chỉ là đầu vào của asynchronous media pipeline.
+- Playback cần segmented adaptive bitrate streaming qua CDN.
+- Search xử lý explicit query; recommendation dự đoán personalized content.
+- Engagement là nhiều small writes nhưng viral skew tạo hot keys và counters.
+- Metadata và media bytes phải tách thành control plane và data plane.
+- Video cần lifecycle/state machine, không chỉ `ready=true/false`.
+- Có thể publish khi minimum playable renditions sẵn sàng rồi bổ sung 4K sau.
+- Search/feed chỉ index video sau authoritative publication event.
+- View/like counters có thể eventual; ownership, visibility và takedown cần correctness cao hơn.
+- Scope mặc định là pre-recorded VOD tối đa khoảng 15 phút, không gồm live streaming.
+- Capacity planning phải đo upload bytes, transcode minutes, storage amplification, segment requests và CDN egress.
+- Storage, transcoding và bandwidth là ba cost drivers lớn.
+- Moderation, copyright, spam và fake engagement là constraints kiến trúc, không phải phần thêm sau.
+- Mỗi component sau này phải truy ngược được về workflow, requirement hoặc bottleneck cụ thể.
+
+#### Công thức ghi nhớ
+
+> **Video Sharing Platform = resumable source ingest + asynchronous validated media DAG + multi-rendition segmented packaging + authoritative publication state + global ABR delivery + searchable/recommendable metadata + abuse-aware engagement.**
+
+---
+
+### Bài 104. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của capacity estimation
+
+Các con số không cần chính xác tuyệt đối, nhưng phải:
+
+- nhất quán về đơn vị;
+- nêu rõ average, peak và peak duration;
+- phân biệt video count, video minutes, watch hours và bytes;
+- tính amplification do renditions, segments, events, indexes và durability;
+- chỉ ra component nào chịu tải;
+- dẫn tới quyết định kiến trúc có thể giải thích được.
+
+Video platform có nhiều đơn vị capacity đồng thời:
+
+```text
+Upload starts/s và ingress bytes/s
+Source video-minutes/s
+Transcode output-minutes/s hoặc compute-seconds/s
+Stored source/rendition bytes
+Playback starts/s và concurrent viewers
+Segment requests/s và CDN egress bits/s
+Metadata/search QPS
+Engagement/watch events/s
+Processing/index/moderation queue lag
+```
+
+Không thể suy ra kiến trúc chỉ từ “100 triệu users”.
+
+---
+
+#### 2. Assumptions từ transcript
+
+| Thông số | Giá trị | Cần làm rõ |
+|---|---:|---|
+| Registered users | 100 triệu | Không phải DAU hay concurrent users |
+| Uploads/day | 10 triệu | Peak factor và geographic distribution |
+| Video plays/day | 500 triệu | Start hay completed view; watch duration chưa rõ |
+| Engagements/day | 100 triệu | Likes, comments, shares; chưa gồm watch telemetry |
+| Average video duration | 10 phút | Distribution và max khoảng 15 phút theo Bài 103 |
+| Average source size | 50 MB | Tương đương bitrate nguồn khá thấp; cần xác nhận |
+| Metadata/video | 1 KB | Có thể chỉ là core row, chưa gồm index/ACL/assets |
+| Engagement event | Vài trăm bytes | Chưa gồm broker/index/replica/log overhead |
+| Output variants | 4 quality levels | Codec/bitrate/size từng rendition chưa rõ |
+| Encoded footprint | Khoảng 3× source | Transcript coi đây là tổng outputs; cần nói có gồm source không |
+| Source retention | 30 ngày | Sau đó xóa hay archive; legal/moderation policy |
+| Average stream bitrate | 1 Mbps | ABR distribution thực tế thay đổi theo device/network |
+| Peak concurrent viewers | 10 triệu | Duration và regional split |
+| Transcript outbound | 135 PB/day | Ngầm giả định khoảng 300M watch-hours/day |
+
+Các assumptions này là điểm khởi đầu, không phải facts về YouTube thật.
+
+---
+
+#### 3. Chuyển daily counts thành throughput
+
+Một ngày có:
+
+```text
+24 × 60 × 60 = 86.400 giây
+```
+
+##### Upload rate
+
+```text
+10.000.000 uploads/day ÷ 86.400
+≈ 115,7 uploads/s average
+```
+
+Nếu peak/average ratio là 5×:
+
+```text
+Peak upload starts ≈ 579/s
+```
+
+Nhưng upload session kéo dài nhiều phút, nên concurrent sessions lớn hơn starts/s rất nhiều:
+
+```text
+Concurrent uploads ≈ upload starts/s × average transfer duration
+```
+
+Ví dụ average upload mất 5 phút:
+
+```text
+115,7/s × 300s ≈ 34.700 concurrent uploads average
+```
+
+##### Playback starts
+
+```text
+500.000.000 plays/day ÷ 86.400
+≈ 5.787 play starts/s average
+```
+
+Play starts/s không phải segment requests/s và cũng không phải concurrent viewers.
+
+##### Engagement writes
+
+```text
+100.000.000 engagements/day ÷ 86.400
+≈ 1.157 events/s average
+```
+
+Viral content và geographic time zones có thể đẩy peak cao hơn nhiều lần.
+
+##### Metadata creations
+
+```text
+10.000.000 metadata records/day ÷ 86.400
+≈ 116 video creates/s average
+```
+
+Nếu mỗi core record đúng 1 KB:
+
+```text
+10M × 1 KB ≈ 10 GB/day raw
+≈ 3,65 TB/year raw
+```
+
+Đây chưa gồm secondary indexes, descriptions dài, translations, moderation data, replicas, backups, renditions, thumbnails và search documents.
+
+---
+
+#### 4. Ingress bandwidth
+
+##### Source bytes mỗi ngày
+
+```text
+10.000.000 videos/day × 50 MB/video
+= 500.000.000 MB/day
+≈ 500 TB/day decimal
+```
+
+##### Average ingress throughput
+
+```text
+500 TB/day ÷ 86.400s
+≈ 5,79 GB/s
+≈ 46,3 Gbps average
+```
+
+Với peak factor 5×:
+
+```text
+≈ 28,9 GB/s
+≈ 231,5 Gbps peak ingress
+```
+
+Thực tế phải cộng:
+
+- retry bytes;
+- multipart overhead;
+- failed/aborted uploads;
+- TLS/network overhead;
+- cross-region transfer nếu upload không đi tới regional ingest gần nhất.
+
+Do đó client nên upload trực tiếp tới object storage/regional ingest bằng resumable signed upload, thay vì proxy 500 TB/ngày qua application servers.
+
+---
+
+#### 5. Raw/source storage — sửa lỗi trong transcript
+
+Transcript tính đúng daily source:
+
+```text
+10M × 50 MB = 500 TB/day
+```
+
+Nhưng phép nhân retention bị sai đơn vị:
+
+```text
+500 TB/day × 30 days
+= 15.000 TB
+= 15 PB
+```
+
+Kết quả đúng là **15 PB rolling source storage**, không phải 15 TB.
+
+Đây mới là logical source bytes. Physical source capacity còn chịu:
+
+- replication/erasure-coding overhead;
+- multipart temporary parts;
+- orphaned uploads;
+- moderation/legal-hold extension;
+- backup hoặc cross-region copy;
+- metadata và encryption overhead.
+
+Nếu source được archive thay vì xóa sau 30 ngày, cumulative storage tiếp tục tăng; retention policy phải được định nghĩa rõ.
+
+---
+
+#### 6. Encoded/rendition storage
+
+Transcript giả định bốn quality variants có tổng kích thước khoảng 3× source:
+
+```text
+500 TB source/day × 3
+= 1.500 TB/day
+= 1,5 PB encoded outputs/day
+```
+
+Trong 30 ngày:
+
+```text
+1,5 PB/day × 30 = 45 PB encoded outputs
+```
+
+Trong 365 ngày, nếu giữ toàn bộ encoded content:
+
+```text
+1,5 PB/day × 365 ≈ 547,5 PB/year logical
+```
+
+Nếu “3×” chỉ là encoded outputs và source vẫn giữ 30 ngày, sau tháng đầu logical storage gần đúng là:
+
+```text
+Cumulative encoded outputs + rolling source
+= 45 PB + 15 PB
+= 60 PB
+```
+
+Sau một năm:
+
+```text
+547,5 PB encoded + 15 PB rolling source
+≈ 562,5 PB logical
+```
+
+Chưa gồm:
+
+- AV1/H.264/H.265 codec ladders song song;
+- audio-only tracks;
+- captions;
+- segments/manifests;
+- thumbnails/previews;
+- processing intermediates;
+- deleted-video retention;
+- physical durability overhead.
+
+##### Công thức tổng quát
+
+```text
+Daily encoded bytes
+= uploads/day × avg duration × Σ rendition bitrate ÷ 8
+```
+
+Tính theo bitrate ladder đáng tin hơn một multiplier “3×” cố định.
+
+---
+
+#### 7. File-size và duration distribution quan trọng hơn average
+
+Average 10 phút và 50 MB che giấu hai nhóm tải:
+
+| Nhóm | Bottleneck chính |
+|---|---|
+| Nhiều video ngắn/nhỏ | Upload sessions, metadata, queue messages, object/request count |
+| Video dài/4K/lớn | Ingress bytes, multipart duration, transcode compute, storage, egress |
+
+Cần thu thập:
+
+- duration p50/p95/p99/max;
+- source size p50/p95/p99/max;
+- input codec/container distribution;
+- source resolution/bitrate/frame rate;
+- uploads theo region và hour;
+- success, retry và abort ratios.
+
+Một malformed hoặc extremely expensive codec có thể chiếm tài nguyên gấp nhiều lần video cùng thời lượng.
+
+---
+
+#### 8. Processing/transcoding capacity
+
+##### Source video minutes
+
+```text
+10M uploads/day × 10 minutes
+= 100M source video-minutes/day
+```
+
+Để không tăng backlog, pipeline phải xử lý trung bình:
+
+```text
+100M ÷ 1.440 minutes/day
+≈ 69.444 source-video-minutes mỗi wall-clock minute
+```
+
+Nói cách khác, nếu một encoder xử lý đúng 1× realtime và mỗi video chỉ qua một pass, cần khoảng **69.444 equivalent concurrent encoders** chỉ để theo kịp average ingest.
+
+Với bốn independent renditions cùng tốc độ 1×:
+
+```text
+≈ 69.444 × 4
+≈ 277.778 equivalent concurrent rendition encoders
+```
+
+Con số thực tế phụ thuộc:
+
+- codec và resolution;
+- CPU/GPU/ASIC acceleration;
+- encoder speed so với realtime;
+- one-pass/two-pass encoding;
+- số bitrate/rendition;
+- thumbnail, audio, captions và moderation jobs;
+- retry/failure rate.
+
+##### Job rate
+
+Nếu mỗi upload fan-out thành 4 rendition jobs:
+
+```text
+10M × 4 = 40M rendition jobs/day
+≈ 463 rendition jobs/s average
+```
+
+Nếu mỗi job chạy trung bình 10 phút:
+
+```text
+463 starts/s × 600s
+≈ 277.800 concurrent jobs
+```
+
+Khớp với phép tính equivalent encoders ở trên.
+
+##### Backlog drain
+
+```text
+Drain time = backlog work ÷ (processing capacity − incoming work)
+```
+
+Nếu capacity chỉ bằng incoming rate, pipeline không bao giờ giải phóng backlog sau outage. Cần headroom, priority và admission control.
+
+---
+
+#### 9. Time-to-playable và scheduling
+
+Không phải tất cả jobs có cùng độ ưu tiên:
+
+```text
+Priority 0: validate/security gate
+Priority 1: minimum playable renditions + manifest
+Priority 2: common HD renditions
+Priority 3: 4K/expensive codecs
+Priority 4: preview, deep analysis, archive optimization
+```
+
+Để giảm time-to-playable:
+
+- publish minimum playable set trước;
+- transcode renditions song song có kiểm soát;
+- ưu tiên creator-visible/video mới;
+- dùng workload class theo duration/resolution;
+- isolate malformed/very expensive jobs;
+- autoscale theo queued video-minutes và oldest-job age, không chỉ job count.
+
+Job count gây hiểu sai: 1.000 video 10 giây khác hoàn toàn 1.000 video 15 phút 4K.
+
+---
+
+#### 10. Bandwidth — kiểm tra các con số
+
+##### Dữ liệu trên mỗi giờ xem ở 1 Mbps
+
+```text
+1 Mbps ÷ 8 = 0,125 MB/s
+0,125 MB/s × 3.600s
+= 450 MB/hour
+≈ 0,45 GB/hour decimal
+```
+
+Phép tính này đúng.
+
+##### 135 PB/day ngầm yêu cầu bao nhiêu watch hours?
+
+```text
+135 PB/day ÷ 0,45 GB/hour
+= 300M watch-hours/day
+```
+
+Với 500M play starts/day:
+
+```text
+300M hours ÷ 500M plays
+= 0,6 hour/play
+= 36 minutes/play
+```
+
+Điều này không nhất quán với assumption video trung bình dài 10 phút nếu mỗi play chỉ tương ứng một video. Vì vậy **135 PB/day không thể suy ra từ các assumptions đã nêu nếu thiếu một assumption riêng về watch hours**.
+
+##### Nếu mỗi trong 500M plays xem đủ video 10 phút
+
+```text
+500M × 10 minutes
+= 5B watch-minutes/day
+= 83,33M watch-hours/day
+```
+
+Ở 1 Mbps:
+
+```text
+83,33M hours × 0,45 GB/hour
+≈ 37,5 PB/day
+```
+
+Đây là một kịch bản nhất quán hơn với average video duration, nhưng vẫn giả định 100% completion và một bitrate cố định.
+
+##### Công thức đúng nên dùng
+
+```text
+Daily egress bytes
+= daily watch seconds × average delivered bitrate ÷ 8
+```
+
+`Average delivered bitrate` phải được đo theo ABR mix, không phải maximum rendition bitrate.
+
+---
+
+#### 11. Peak concurrent streaming bandwidth
+
+Transcript giả định 10 triệu concurrent viewers ở 1 Mbps:
+
+```text
+10.000.000 × 1 Mbps
+= 10.000.000 Mbps
+= 10 Tbps
+```
+
+Phép tính đúng.
+
+Nếu average delivered bitrate đổi:
+
+| Average bitrate | Bandwidth cho 10M viewers |
+|---:|---:|
+| 0,5 Mbps | 5 Tbps |
+| 1 Mbps | 10 Tbps |
+| 2,5 Mbps | 25 Tbps |
+| 5 Mbps | 50 Tbps |
+
+Phải cộng overhead cho TLS/HTTP/container, retries, manifests, audio/subtitles và cache misses.
+
+Đây là edge/CDN egress. Origin bandwidth phụ thuộc cache-hit ratio và content skew.
+
+---
+
+#### 12. CDN hit ratio và origin load
+
+Với kịch bản 37,5 PB/day:
+
+| CDN byte hit ratio | Origin bytes/day gần đúng |
+|---:|---:|
+| 90% | 3,75 PB |
+| 95% | 1,875 PB |
+| 99% | 375 TB |
+| 99,9% | 37,5 TB |
+
+Chỉ 1% miss của một workload hàng chục PB vẫn là hàng trăm TB/ngày. Với 135 PB/day, 1% miss là **1,35 PB/day**.
+
+Ngoài byte hit ratio, cần đo:
+
+- request hit ratio;
+- regional hit ratio;
+- origin shield hit ratio;
+- cold-start/cache-fill traffic;
+- cache eviction;
+- long-tail content hit rate;
+- signed URL/cache-key fragmentation;
+- range-request efficiency.
+
+Popular content cache tốt; long-tail content có thể có hit ratio thấp. Một average toàn cầu che giấu region/origin hotspot.
+
+---
+
+#### 13. Segment request amplification
+
+Giả sử video dài 10 phút và segment dài 4 giây:
+
+```text
+10 minutes × 60 ÷ 4
+= 150 segments/rendition cho một lượt xem đầy đủ
+```
+
+Nếu 500M full plays/day:
+
+```text
+500M × 150
+= 75B segment GETs/day
+≈ 868.000 segment GETs/s average
+```
+
+Với 10M concurrent viewers:
+
+```text
+10M viewers ÷ 4s/segment
+≈ 2,5M segment GETs/s
+```
+
+Chưa gồm:
+
+- master/media manifest requests;
+- audio segments riêng;
+- subtitles;
+- seeks và abandoned playback;
+- retries;
+- ABR switching;
+- ad segments nếu có.
+
+Segment nhỏ giảm seek/startup granularity nhưng tăng request/TLS/header/cache-index cost. Segment lớn giảm request count nhưng retry nhiều bytes và phản ứng ABR chậm hơn.
+
+---
+
+#### 14. Storage request và object-count amplification
+
+Mỗi video tạo nhiều objects:
+
+```text
+1 source object hoặc nhiều upload parts
++ renditions × segments
++ manifests
++ audio tracks
++ thumbnails/previews
++ captions
++ temporary outputs
+```
+
+Với 4 renditions và 150 segments/rendition:
+
+```text
+≈ 600 video segments/video
+```
+
+Cho 10M uploads/day:
+
+```text
+≈ 6B rendition segment objects/day
+```
+
+Con số này rất lớn và còn chưa tính audio, manifests, images. Trong thực tế packaging/container/object layout có thể gom hoặc tổ chức khác; cần capacity-plan object count, request rate, listing/indexing và lifecycle deletion—not chỉ bytes.
+
+Không dùng object-store LIST để phục vụ video catalog; metadata DB giữ authoritative references.
+
+---
+
+#### 15. Metadata scale và access amplification
+
+Core metadata 1 KB/video là estimate tối giản. Một video page có thể cần:
+
+```text
+video metadata
++ channel/profile
++ visibility/entitlement/moderation state
++ available rendition/manifest reference
++ aggregated views/likes
++ comments page
++ recommendations
++ ads/policy/region data
+```
+
+Một playback start có thể gây nhiều reads dù chỉ trả một trang. Cần:
+
+- cache immutable/stable metadata;
+- compose response có kiểm soát;
+- tránh fan-out synchronous không giới hạn;
+- versioned/cacheable video metadata;
+- separate counters và derived views;
+- hot-video key sharding.
+
+10M new rows/day cũng có nghĩa:
+
+- 116 create transactions/s average;
+- search indexing 116 docs/s average trước amplification;
+- nhiều policy/moderation/rendition state updates cho mỗi video;
+- backup, compaction và retention load tăng liên tục.
+
+---
+
+#### 16. Engagement và watch telemetry amplification
+
+100M likes/comments/shares/day chỉ khoảng 1.157/s average, nhưng chưa gồm:
+
+- playback start;
+- impression;
+- progress heartbeat;
+- pause/resume/seek;
+- completion;
+- QoE metrics;
+- recommendation exposure/click;
+- ad events.
+
+Ví dụ 500M plays/day, mỗi playback gửi 10 progress/QoE events:
+
+```text
+500M × 10 = 5B telemetry events/day
+≈ 57.870 events/s average
+```
+
+Vì vậy analytics/watch-event pipeline có thể lớn hơn explicit engagements hàng chục lần.
+
+Một engagement có nhiều consumers:
+
+```text
+Durable user action
+   ├─ counter aggregation
+   ├─ notification
+   ├─ recommendation features
+   ├─ trending
+   ├─ fraud detection
+   ├─ creator analytics
+   └─ audit/moderation
+```
+
+Đây là fan-out amplification; message broker, retention và consumer lag phải được capacity-plan.
+
+---
+
+#### 17. Counter bottlenecks
+
+Không nên làm:
+
+```sql
+UPDATE videos SET view_count = view_count + 1 WHERE video_id = ?;
+```
+
+cho mỗi view của viral video trên một row duy nhất.
+
+Thay vào đó:
+
+- append raw/validated view events;
+- partition theo `video_id + bucket` hoặc time shard;
+- aggregate theo cửa sổ;
+- periodically compact vào durable totals;
+- cache approximate public counters;
+- deduplicate events theo playback/session semantics;
+- lọc bot/fraud trước hoặc sau provisional aggregation.
+
+Need not equal instant: public view count có thể eventual consistent, còn “user đã like chưa” cần per-user idempotent state chính xác hơn.
+
+---
+
+#### 18. Search indexing bottleneck
+
+10M new videos/day chỉ là baseline. Mỗi video còn có nhiều updates:
+
+- processing state;
+- title/description/tags;
+- visibility;
+- moderation status;
+- popularity signals;
+- language/category;
+- deletion/takedown.
+
+Nếu mỗi video trung bình tạo 5 index mutations:
+
+```text
+10M × 5 = 50M index updates/day
+≈ 579 updates/s average
+```
+
+Viral popularity signals không nên re-index search document theo từng view. Dùng batched/stream aggregates và cập nhật theo cadence.
+
+Search freshness cần ưu tiên correctness:
+
+```text
+Published → có thể index
+Private/blocked/deleted → phải filter hoặc remove theo policy SLO
+Processing → không trả trong public search
+```
+
+Search index là derived store; source of truth vẫn là video metadata/policy state.
+
+---
+
+#### 19. Recommendation/feed scale
+
+Recommendation thường tạo tải ở hai phần:
+
+##### Offline/nearline
+
+- ingest impressions, clicks, watches và engagements;
+- build user/video features;
+- train/update models;
+- generate candidate sets;
+- compute embeddings/similarity.
+
+##### Online serving
+
+- fetch candidates;
+- fetch features;
+- rank/filter;
+- apply safety/visibility/diversity;
+- return feed trong latency budget.
+
+Với 100M registered users, cần biết DAU và feed opens/day. Nếu 20M DAU mở feed 10 lần/ngày:
+
+```text
+200M feed requests/day
+≈ 2.315 QPS average
+```
+
+Mỗi request có thể fan-out tới candidate stores, feature stores, rankers và policy filters. Cache/precompute hybrid thường cần thiết.
+
+---
+
+#### 20. Multi-tier storage implication
+
+Không nên giữ mọi video ở cùng storage class:
+
+| Tier | Dữ liệu phù hợp | Trade-off |
+|---|---|---|
+| Hot | Video mới/phổ biến, common renditions | Latency thấp, chi phí cao |
+| Warm | Long-tail vẫn được xem | Cân bằng chi phí và access |
+| Cold/archive | Source cũ, hiếm truy cập, policy retention | Rẻ hơn, restore latency/cost cao |
+| Temporary | Multipart/intermediate outputs | TTL ngắn, GC bắt buộc |
+
+Lifecycle decision nên dựa trên:
+
+- recent view frequency;
+- reprocessing probability;
+- source retention/policy;
+- codec migration needs;
+- restore latency target;
+- legal hold;
+- retrieval/egress cost—not chỉ GB-month.
+
+Không archive một rendition đang được CDN miss thường xuyên nếu retrieval fee/latency làm tổng chi phí cao hơn.
+
+---
+
+#### 21. Bottleneck map
+
+| Plane/stage | Bottleneck tiềm năng | Tín hiệu cần đo |
+|---|---|---|
+| Upload edge | Connections, ingress bandwidth, retry storm | Active sessions, Gbps, retry/abort rate |
+| Multipart state | Hot partition, session writes | Part commits/s, session latency |
+| Source storage | PUT limits, capacity, orphan parts | PUT/s, bytes, throttling, GC debt |
+| Job creation | Fan-out và duplicate jobs | Jobs/video, enqueue errors |
+| Transcoding | CPU/GPU/codec saturation | Queued video-minutes, speed factor, oldest job |
+| Packaging | Segment/object explosion | Objects/s, manifest errors |
+| Moderation | Scanner/review backlog | Time-to-decision, quarantine age |
+| Publication | Metadata transaction/outbox | Publish latency, stuck states |
+| Search | Index/write/query contention | Freshness lag, p99 QPS |
+| CDN | Regional misses/evictions | Byte/request hit ratio, origin load |
+| Origin | Cache-fill storm, egress | Gbps, concurrent range GETs |
+| Playback API | Hot metadata, AuthZ fan-out | p99, cache hit, dependency calls |
+| Engagement | Hot counters/partitions | Events/s, skew, aggregation lag |
+| Analytics | Telemetry volume | Broker lag, drop/duplicate rate |
+| Recommendation | Feature/ranker fan-out | p99, feature freshness, timeout rate |
+
+---
+
+#### 22. Peak, burst và recovery scenarios
+
+Average capacity không đủ. Cần mô hình hóa:
+
+##### Viral release
+
+- một video nhận phần lớn global traffic;
+- CDN cold ở nhiều regions;
+- origin fill và metadata counter spike;
+- comments/likes/follows tăng đột biến.
+
+##### Regional reconnect/cache flush
+
+- edge cache bị mất/evict;
+- hàng loạt viewers đánh vào parent/origin;
+- signed-token/auth services tăng tải.
+
+##### Processing outage
+
+- uploads vẫn tiếp tục;
+- queued video-minutes tích lũy;
+- khi workers trở lại, cần spare capacity để drain.
+
+##### Creator/spam upload burst
+
+- many small uploads tạo session/job/object amplification;
+- malicious large files tiêu tốn transcode;
+- quota/admission control bảo vệ pipeline.
+
+##### Takedown khẩn cấp
+
+- block playback;
+- purge/deny CDN;
+- remove search/feed;
+- stop recommendation;
+- preserve evidence theo policy;
+- xử lý cache propagation và in-flight tokens.
+
+---
+
+#### 23. Backlog và drain-time calculation
+
+Giả sử transcode pipeline nhận 100M source-minutes/day:
+
+```text
+Incoming work ≈ 69.444 source-minutes/wall-clock minute
+```
+
+Nếu outage 30 phút:
+
+```text
+Backlog ≈ 69.444 × 30
+≈ 2,08M source-video-minutes
+```
+
+Nếu sau khi phục hồi capacity là 1,5× incoming:
+
+```text
+Spare capacity = 0,5 × 69.444
+≈ 34.722 source-minutes/minute
+
+Drain time ≈ 2,08M ÷ 34.722
+≈ 60 phút
+```
+
+Nếu capacity chỉ 1,1× incoming, drain mất khoảng 300 phút. Headroom là yêu cầu phục hồi, không phải lãng phí đơn thuần.
+
+---
+
+#### 24. Cost model sơ bộ
+
+```text
+Daily cost ≈ source PUT + source bytes retained
+           + transcode compute per source minute/rendition
+           + encoded object PUT + encoded bytes retained
+           + CDN requests + egress bytes
+           + metadata/search/cache/broker compute
+           + moderation/ML/observability
+           + cross-region replication/DR
+```
+
+Unit economics hữu ích:
+
+- cost per uploaded minute;
+- cost per encoded minute by codec/resolution;
+- cost per stored video-month;
+- cost per watch hour;
+- CDN cost per delivered GB;
+- origin cost per cache miss;
+- moderation cost per upload;
+- cost per active creator/viewer.
+
+Một codec mới có thể giảm egress/storage nhưng tăng transcode compute và device compatibility complexity. Phải so tổng vòng đời.
+
+---
+
+#### 25. Những assumptions còn thiếu cần hỏi
+
+- 100M registered users tương ứng bao nhiêu DAU/MAU?
+- 10M uploads/day có peak factor và regional split thế nào?
+- Average/p95/p99 duration và source size?
+- Source bitrate/codecs/resolutions?
+- Retain source 30 ngày rồi xóa hay archive?
+- “3×” gồm encoded outputs hay cả source?
+- Average watch duration/completion rate?
+- 500M “videos served” là play starts hay full views?
+- Watch hours/day là bao nhiêu?
+- Average delivered ABR bitrate theo geography/device?
+- Segment duration và audio packaging?
+- CDN byte hit ratio mục tiêu?
+- Public/private/unlisted mix?
+- Time-to-playable SLO theo video class?
+- View count semantics và fraud filtering?
+- Search freshness/takedown SLO?
+- Feed requests/user/day?
+- Replication/erasure coding và DR factor?
+
+Nếu chưa có câu trả lời, nêu assumption rõ ràng rồi kiểm tra sensitivity thay vì che giấu bằng một con số duy nhất.
+
+---
+
+#### 26. Load tests cần chạy
+
+1. 5× peak upload starts với multipart retries.
+2. Nhiều small videos gây session/job/object storm.
+3. Video 4K/max duration gây transcode saturation.
+4. Poison/malformed input làm worker crash hoặc retry loop.
+5. 30–60 phút transcode outage rồi recovery drain.
+6. Viral video khi CDN hoàn toàn cold ở nhiều regions.
+7. Regional CDN/origin failure và traffic shift.
+8. 10M concurrent viewers với ABR/seek/range mix.
+9. Hot comment/like/view partitions.
+10. Search index lag trong upload burst.
+11. Emergency takedown propagation.
+12. Broker outage sau publication commit.
+13. Duplicate engagement/watch events.
+14. Object-store throttling hoặc elevated latency.
+15. Source/rendition corruption and repair.
+16. Lifecycle/GC backlog hàng tỷ objects.
+
+Mỗi test phải kiểm tra user SLO, invariant, backlog drain và chi phí—not chỉ throughput tối đa.
+
+---
+
+#### 27. Cách trình bày trong phỏng vấn
+
+Một trình tự rõ ràng:
+
+1. Nêu assumptions và phân biệt registered/active/concurrent.
+2. Tính average upload/play/engagement rates.
+3. Tính ingress bytes và sửa lỗi retention units.
+4. Tính encoded storage theo bitrate ladder/multiplier.
+5. Tính source video-minutes và transcode concurrency.
+6. Tính watch hours → egress; không suy từ view count khi thiếu watch duration.
+7. Tính concurrent bandwidth và segment request amplification.
+8. Nêu CDN hit ratio ảnh hưởng origin.
+9. Tính metadata/events/search amplification.
+10. Chỉ ra bottlenecks và kiến trúc mà chúng bắt buộc.
+
+Nếu có hai assumptions mâu thuẫn, hãy nói thẳng:
+
+> “135 PB/day tương ứng 300M watch-hours/day ở 1 Mbps. Với 500M plays và video trung bình 10 phút, full-play upper estimate chỉ khoảng 83,3M hours hay 37,5 PB/day. Tôi sẽ dùng watch-hours làm authoritative input và xác nhận lại với interviewer.”
+
+Đây là tư duy capacity planning tốt hơn việc cố bảo vệ một con số sai.
+
+---
+
+#### 28. Ý chính cần nhớ
+
+- 10M uploads/day tương đương khoảng 116 upload starts/s average.
+- 500M plays/day tương đương khoảng 5.787 play starts/s average.
+- 100M engagements/day tương đương khoảng 1.157 events/s average.
+- 10M × 50 MB = 500 TB source ingest/day.
+- 500 TB/day tương đương khoảng 46,3 Gbps average ingress trước retry/overhead.
+- 30 ngày source retention cần 15 PB, không phải 15 TB.
+- Outputs bằng 3× source tạo 1,5 PB/day và 45 PB/30 ngày.
+- Nếu giữ encoded outputs một năm, logical size khoảng 547,5 PB trước overhead.
+- 100M source-video-minutes/day cần khoảng 69.444 equivalent real-time processing streams cho một pass.
+- Bốn rendition jobs ở 1× có thể cần khoảng 277.778 concurrent-equivalent encoders.
+- 1 Mbps tương đương khoảng 0,45 GB/watch-hour.
+- 135 PB/day ngầm giả định 300M watch-hours/day và không khớp trực tiếp với 500M plays × 10 phút.
+- 500M full 10-minute plays ở 1 Mbps tương đương khoảng 37,5 PB/day.
+- 10M concurrent viewers × 1 Mbps = 10 Tbps edge bandwidth.
+- 1% CDN miss của 37,5 PB vẫn tạo 375 TB/day origin traffic.
+- 4-second segments và 10M concurrent viewers tạo khoảng 2,5M segment GETs/s.
+- Watch telemetry có thể lớn hơn explicit engagement hàng chục lần.
+- Processing capacity phải tính bằng video-minutes/compute, không chỉ job count.
+- Multi-tier storage, CDN, async processing, sharded counters và distributed search là hệ quả trực tiếp của scale.
+- Average không phản ánh viral video, hot region, cache flush, retry storm hoặc recovery backlog.
+
+#### Công thức ghi nhớ
+
+> **Video scale = uploads × source bytes × rendition amplification + source minutes × processing factor + watch seconds × delivered bitrate + viewers ÷ segment duration + metadata/actions × downstream fan-out; luôn kiểm tra units, peak skew và recovery headroom.**
+
+---
+
+### Bài 105. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của high-level design
+
+Ở bước này, ta chuyển requirements và scale estimates thành các component có trách nhiệm rõ ràng. Kiến trúc phải hỗ trợ bốn đường đi khác nhau:
+
+```text
+Ingest path      → tạo video + upload source an toàn
+Processing path  → validate/transcode/package/moderate/publish
+Playback path    → authorize + manifest + CDN segments + QoE events
+Discovery/social → metadata + search/feed + comments/reactions/subscriptions
+```
+
+Ba plane chính:
+
+| Plane | Dữ liệu/công việc | Đặc tính |
+|---|---|---|
+| **Control plane** | Video state, metadata, ownership, visibility, ACL, jobs | Request nhỏ, cần invariant và transaction |
+| **Media/data plane** | Source, renditions, segments, manifests, thumbnails | Bytes/request volume rất lớn, immutable và CDN-heavy |
+| **Event/analytics plane** | Processing events, watch telemetry, engagement fan-out | Async, replayable, throughput cao, eventual projections |
+
+Không nên cho media bytes đi qua tất cả application services. Client upload trực tiếp tới regional object storage và player tải segments qua CDN khi có thể.
+
+---
+
+#### 2. Kiến trúc tổng quát
+
+```text
+                     Web / Mobile / TV Clients
+                                |
+                     DNS / WAF / API Gateway
+                         /              \
+                 Control APIs        CDN Edge
+                     |                   |
+   +-----------------+----------------+  | manifests/segments
+   |          |          |           |  |
+ Upload    Metadata   Playback    User/Auth
+ Service   Service     Service      Service
+   |          |          |           |
+   |       Metadata DB --+---- Redis Cache
+   |          |
+   |    Transactional Outbox
+   |          |
+   |      Event Bus / Durable Log
+   |     /       |        |        \
+   | Processing Search  Engagement  Analytics/
+   | Scheduler  Indexer  Consumers  Recommendation
+   |     |
+   |  CPU/GPU Worker Pools
+   |     |
+Client === signed multipart ===> Object Storage <=== CDN/Origin Shield
+                                  source/renditions/
+                                  manifests/thumbnails
+```
+
+Search, comments, moderation và recommendation có thể là service/cluster riêng tùy quy mô. Sơ đồ thể hiện logical ownership, không bắt buộc mỗi hộp là một microservice ngay ngày đầu.
+
+---
+
+#### 3. API Gateway
+
+API Gateway là entry point của control APIs:
+
+- TLS termination;
+- access-token validation;
+- routing và API versioning;
+- rate limit/quota theo user, creator, tenant, IP và endpoint;
+- request-size/header validation;
+- WAF, bot/abuse filtering sơ bộ;
+- correlation ID, access log và metrics;
+- canary/traffic routing.
+
+Gateway không nên:
+
+- proxy toàn bộ video source hoặc playback segments;
+- chứa file/video-level authorization phức tạp;
+- tự động retry non-idempotent mutations;
+- trở thành single point of failure;
+- chứa recommendation/search business logic.
+
+---
+
+#### 4. User, Identity và Channel Service
+
+Trách nhiệm:
+
+- accounts, profiles và channel ownership;
+- authentication/session/device state;
+- preferences cơ bản;
+- channel membership/roles;
+- privacy, block và account state;
+- hỗ trợ authorization context cho service khác.
+
+Transcript gom subscriptions vào User Service. Ở quy mô lớn, follow/subscription graph có workload khác account data và có thể tách thành **Subscription/Graph Service**:
+
+- subscribe/unsubscribe idempotently;
+- list channel subscriptions;
+- list subscribers với pagination;
+- tạo signal cho feed/notifications;
+- shard theo subscriber hoặc channel tùy query chính;
+- xử lý celebrity channel/hot partition.
+
+Authentication trả lời “ai”; Video/Metadata/Playback services vẫn phải enforce visibility và entitlement của resource.
+
+---
+
+#### 5. Upload & Ingestion Service
+
+Trách nhiệm control-plane:
+
+- tạo `video_id` ổn định;
+- validate creator quota, filename/type/declared size;
+- tạo resumable upload session;
+- chọn part size/regional upload target;
+- cấp signed multipart URLs/tokens;
+- theo dõi parts/progress;
+- verify checksum và complete idempotently;
+- commit source asset reference;
+- phát `VideoSourceCommitted` qua transactional outbox;
+- expire/abort và cleanup orphan uploads.
+
+Luồng nên là:
+
+```text
+Client → initiate → Upload Service
+Client → PUT parts trực tiếp → Regional Object Storage
+Client → complete → Upload Service
+Upload Service → verify/finalize → metadata transaction + outbox
+```
+
+Upload Service không encode video và thường không nên proxy source bytes. Điều này tách connection/bandwidth scale khỏi application compute.
+
+---
+
+#### 6. Metadata/Video Service
+
+Là source of truth cho:
+
+- creator/channel ownership;
+- title, description, tags, category, language;
+- visibility: private/unlisted/public;
+- lifecycle state;
+- source asset reference;
+- required/available renditions;
+- playback manifest reference;
+- thumbnails;
+- moderation/restriction state;
+- timestamps và metadata revision.
+
+Các invariant quan trọng:
+
+- chỉ owner/authorized editor được sửa metadata;
+- `PUBLISHED` chỉ khi publication policy đạt;
+- manifest được publish phải tham chiếu assets đọc được;
+- blocked/deleted video không được cấp playback mới;
+- state transition hợp lệ và idempotent;
+- metadata update dùng optimistic concurrency/ETag;
+- outbox event commit cùng authoritative state.
+
+---
+
+#### 7. Encoding & Processing Pipeline
+
+Đây không nên là một service đồng bộ duy nhất. Nó là DAG được điều phối:
+
+```text
+VideoSourceCommitted
+        ↓
+Probe + validate container/codec/checksum
+        ↓
+Security scan / policy precheck
+        ↓
+Fan-out rendition jobs
+   ├─ 360p H.264
+   ├─ 720p H.264
+   ├─ 1080p H.264/other codec
+   └─ 4K/advanced codec if eligible
+        ↓
+Audio normalize/transcode
+        ↓
+Segment + package + manifest
+        ↓
+Thumbnail/preview/caption/moderation branches
+        ↓
+Quality validation
+        ↓
+Publication Coordinator
+```
+
+##### Processing Orchestrator/Scheduler
+
+- nhận source-committed event;
+- tạo job DAG và dependency state;
+- priority theo minimum playable, duration, tier và creator policy;
+- retry với bounded attempts/backoff;
+- lease/fencing để tránh hai worker cùng commit output;
+- track queued video-minutes và oldest-job age;
+- mark terminal failure/quarantine;
+- phát progress events cho creator.
+
+##### Worker pools
+
+- CPU/GPU/accelerator pools theo codec/resolution;
+- pull job từ queue;
+- sandbox untrusted media parser/transcoder;
+- đọc immutable source;
+- ghi output vào temporary object key;
+- verify checksum/duration/codec;
+- atomically register successful asset;
+- chịu duplicate delivery bằng idempotent output key/job ID.
+
+##### Publication Coordinator
+
+Không để từng worker tự chuyển video thành public. Coordinator xác minh:
+
+```text
+required security checks passed
++ minimum playable renditions ready
++ manifests valid
++ ownership/visibility/policy still permit publish
+= authoritative READY/PUBLISHED transition
+```
+
+Sau transaction, outbox phát sự kiện cho search, feed, notifications, cache warming và analytics.
+
+---
+
+#### 8. Object Storage và media asset model
+
+Object storage giữ:
+
+- original/mezzanine source;
+- rendition segments;
+- audio segments;
+- master/media manifests;
+- thumbnails/previews;
+- captions;
+- temporary outputs và quarantine artifacts.
+
+Media objects nên immutable. Metadata tham chiếu qua asset/version IDs:
+
+```text
+VideoSource(source_id, video_id, object_key, checksum, ...)
+Rendition(rendition_id, video_id, codec, resolution, bitrate, state, ...)
+MediaSegment(rendition_id, sequence, object_key, duration, checksum, ...)
+PlaybackManifest(manifest_id, video_id, version, object_key, state, ...)
+```
+
+Không nhúng title hay mutable video path trực tiếp vào object key làm identity. Rename video không nên copy hàng trăm segment objects.
+
+Storage lifecycle tách hot/warm/cold, source retention và temporary-object TTL. Replication hỗ trợ availability/durability nhưng không thay thế backup, legal retention hay DR plan.
+
+---
+
+#### 9. Playback Service
+
+Playback Service xử lý control request trước khi media đi qua CDN:
+
+- resolve `video_id` và lifecycle state;
+- kiểm tra public/private/unlisted, age/region/premium/policy restrictions;
+- chọn manifest phù hợp device capability;
+- cấp signed manifest URL/token nếu cần;
+- trả playback session/config;
+- tạo `playback_session_id` cho QoE/watch semantics;
+- enforce geo/entitlement/rate limits.
+
+Playback Service không stream mọi segment qua chính nó. Sau authorize:
+
+```text
+Player → CDN → Origin Shield → Object Storage
+```
+
+Với public video, platform có thể dùng stable CDN URLs kết hợp cache policy/anti-hotlink controls. Với private, unlisted hoặc premium content, dùng signed URLs/cookies/tokens có TTL và scope ngắn.
+
+---
+
+#### 10. CDN và adaptive playback flow
+
+```text
+1. Client GET /videos/{id}/playback
+2. Playback Service authorize và trả master manifest URL/token
+3. Player tải manifest từ CDN
+4. Player chọn rendition theo bandwidth/buffer/device
+5. Player tải media/audio segments tuần tự từ CDN
+6. CDN hit → trả ngay từ edge
+7. CDN miss → origin shield/object storage fill
+8. Player đổi rendition khi điều kiện mạng đổi
+9. Client gửi sampled/batched QoE và watch events
+```
+
+Cache key phải gắn với immutable manifest/segment version. Publication nên tạo manifest version mới; không mutate một object đang được CDN cache nếu có thể tránh.
+
+Các cơ chế bảo vệ origin:
+
+- origin shield;
+- request collapsing;
+- pre-warm có chọn lọc cho dự kiến viral release;
+- multi-tier cache;
+- cache immutable long TTL;
+- per-region routing;
+- multi-CDN/failover nếu yêu cầu;
+- load shedding cho optional metadata trước media.
+
+---
+
+#### 11. Engagement Service
+
+Quản lý:
+
+- reaction/like state;
+- comments/replies;
+- reports;
+- view/watch event ingestion;
+- aggregate counters;
+- moderation hooks.
+
+##### Không phải mọi engagement đều “fire-and-forget”
+
+Ví dụ like:
+
+```text
+Client → PUT /videos/{id}/like
+      → authoritative idempotent user-video reaction write
+      → trả liked=true
+      → outbox async: counter, recommendation, notification, analytics
+```
+
+User cần biết like đã được ghi nhận; chỉ các derived effects chạy nền.
+
+Ví dụ comment:
+
+```text
+Create comment → validate/auth/rate limit/moderation state
+               → authoritative comment write
+               → return comment/status
+               → async notification/index/counter/deeper moderation
+```
+
+Comment có thể ở `PENDING_REVIEW` thay vì public ngay.
+
+View/watch telemetry phù hợp append bất đồng bộ hơn, nhưng phải định nghĩa mất mát chấp nhận được, batching, duplicate handling và anti-fraud.
+
+---
+
+#### 12. Search & Discovery Service
+
+Search endpoint là synchronous với user; indexing là asynchronous:
+
+```text
+VideoPublished/MetadataChanged/Blocked/Deleted events
+                     ↓
+                Indexer pipeline
+                     ↓
+             Distributed search index
+
+Client query → Search Service → query/filter/rank → results
+```
+
+Search document có thể chứa:
+
+- normalized title/description/tags;
+- language/category;
+- channel fields;
+- publish time;
+- visibility/policy fields cần filter;
+- batched popularity signals;
+- thumbnail/reference;
+- metadata revision.
+
+Search index là derived store. Result cần policy filtering/late validation để stale index không làm lộ private/blocked content.
+
+Viral view không nên update search index trên từng event; popularity được aggregate theo cửa sổ.
+
+---
+
+#### 13. Recommendation Engine
+
+High-level boundary gồm:
+
+```text
+Event ingestion → feature pipelines → candidate generation
+               → online/offline feature stores
+               → ranking → policy/diversity filters → feed response
+```
+
+Sources có thể gồm:
+
+- subscriptions;
+- watch history;
+- impressions/clicks;
+- likes/comments/shares;
+- similar videos/embeddings;
+- trending/context/language/region.
+
+Online request:
+
+```text
+GET /v1/feed?cursor=...
+→ fetch/precomputed candidates
+→ hydrate features
+→ rank
+→ remove watched/blocked/private/ineligible videos
+→ diversify
+→ return page + impression tokens
+```
+
+Recommendation availability không nên làm playback video cụ thể thất bại. Khi ranker lỗi, degrade sang subscriptions, popular hoặc cached feed.
+
+---
+
+#### 14. API design
+
+##### 14.1. Khởi tạo upload
+
+```http
+POST /v1/videos
+Idempotency-Key: create-video-...
+
+{
+  "title": "System Design 101",
+  "description": "...",
+  "visibility": "private",
+  "source_size": 52428800,
+  "source_checksum": "sha256:...",
+  "content_type": "video/mp4"
+}
+```
+
+Response:
+
+```json
+{
+  "video_id": "vid_123",
+  "upload_id": "upl_456",
+  "part_size": 8388608,
+  "expires_at": "...",
+  "part_upload_urls": "generated-on-demand"
+}
+```
+
+##### 14.2. Upload parts/resume/complete
+
+```http
+POST /v1/video-uploads/{upload_id}/parts:sign
+GET  /v1/video-uploads/{upload_id}
+POST /v1/video-uploads/{upload_id}:complete
+DELETE /v1/video-uploads/{upload_id}
+```
+
+Complete request mang ordered part list/checksums và idempotency key.
+
+##### 14.3. Processing status và metadata
+
+```http
+GET   /v1/videos/{video_id}
+PATCH /v1/videos/{video_id}
+GET   /v1/videos/{video_id}/processing-status
+POST  /v1/videos/{video_id}:publish
+DELETE /v1/videos/{video_id}
+```
+
+`PATCH` dùng `If-Match`/metadata revision. `publish` có thể chỉ đặt desired visibility; actual public transition vẫn qua readiness/policy gate.
+
+##### 14.4. Playback
+
+```http
+POST /v1/videos/{video_id}/playback-sessions
+```
+
+Response minh họa:
+
+```json
+{
+  "playback_session_id": "pbs_789",
+  "manifest_url": "https://cdn.example/...token...",
+  "expires_at": "...",
+  "captions": [],
+  "restrictions": {}
+}
+```
+
+##### 14.5. Search/feed
+
+```http
+GET /v1/search/videos?q=system+design&cursor=...
+GET /v1/feed?cursor=...
+GET /v1/channels/{channel_id}/videos?cursor=...
+```
+
+##### 14.6. Engagement
+
+```http
+PUT    /v1/videos/{video_id}/reactions/like
+DELETE /v1/videos/{video_id}/reactions/like
+POST   /v1/videos/{video_id}/comments
+GET    /v1/videos/{video_id}/comments?cursor=...
+DELETE /v1/comments/{comment_id}
+PUT    /v1/channels/{channel_id}/subscriptions/me
+DELETE /v1/channels/{channel_id}/subscriptions/me
+POST   /v1/playback-sessions/{id}/events:batch
+POST   /v1/videos/{video_id}/reports
+```
+
+Use `PUT/DELETE` cho per-user like/subscription giúp idempotency tự nhiên. Comments dùng idempotency key để retry không tạo bản sao.
+
+---
+
+#### 15. Synchronous versus asynchronous communication
+
+| Tương tác | Pattern | Lý do |
+|---|---|---|
+| Client → Gateway/API | HTTPS synchronous | Cần response/error rõ |
+| Gateway → User/Metadata/AuthZ | REST/gRPC synchronous | Quyết định request path |
+| Client → object storage | Signed HTTPS multipart | Data-plane direct transfer |
+| Source commit → processing | Outbox + durable event | Long-running, replayable |
+| Orchestrator → workers | Queue/lease | Elastic pools và retry |
+| Worker → asset registration | Idempotent sync call/transaction | Output correctness |
+| Publication → search/feed | Event stream | Derived views eventual |
+| Like/comment authoritative write | Synchronous mutation | User cần confirmation |
+| Counter/notification/recommendation effects | Async events | Fan-out và burst absorption |
+| Player → CDN | HTTPS manifests/segments | High-volume data plane |
+| Player QoE/watch events | Batched async ingest | Throughput và sampling |
+
+Quy tắc “sync nếu cần ngay, async nếu làm nền” là khởi đầu tốt nhưng chưa đủ. Cần thêm:
+
+- source of truth;
+- delivery semantics;
+- ordering scope;
+- idempotency;
+- retry và timeout;
+- freshness/SLO;
+- reconciliation khi event mất/trễ/trùng.
+
+---
+
+#### 16. Event model
+
+Các event quan trọng:
+
+```text
+VideoCreated
+VideoSourceCommitted
+VideoValidationFailed
+RenditionRequested
+RenditionCompleted
+RenditionFailed
+MinimumPlayableSetReady
+VideoPublished
+VideoMetadataChanged
+VideoVisibilityChanged
+VideoBlocked
+VideoDeleted
+ReactionChanged
+CommentCreated/Moderated
+SubscriptionChanged
+WatchEventBatchReceived
+```
+
+Event envelope nên có:
+
+```text
+event_id
+event_type + schema_version
+occurred_at
+producer
+aggregate_id (video_id/user_id/...)
+aggregate_revision
+correlation_id / causation_id
+payload tối thiểu cần thiết
+```
+
+Partition processing/publication events theo `video_id` để giữ ordering trong một video. Consumer phải idempotent vì delivery thường at-least-once.
+
+---
+
+#### 17. Storage strategy
+
+| Data | Store điển hình | Access/consistency |
+|---|---|---|
+| Source/renditions/segments/manifests | Object storage | Immutable, high durability, range/GET-heavy |
+| Video/user/channel authoritative metadata | SQL/distributed SQL/strong KV | Invariants và conditional transactions |
+| Upload/job state | KV/SQL + durable queue | High churn, TTL, leases |
+| Reactions | Partitioned SQL/KV | Unique `(user_id, video_id, type)` |
+| Comments | Partitioned relational/document/wide-column | Query theo video/time/thread |
+| Subscriptions | Graph-oriented adjacency in KV/SQL | Query by subscriber/channel |
+| Search | Search engine/index | Derived, eventual |
+| Watch/engagement events | Durable log + data lake/columnar | Append-heavy, analytics |
+| Aggregated counters | Stream aggregation + KV/cache | Eventual public values |
+| Recommendation features | Feature/embedding/candidate stores | Online low latency + offline scale |
+| Sessions/hot metadata | Redis/cache | Derived/ephemeral |
+
+“Structured thì SQL, flexible thì NoSQL” là cách giải thích quá đơn giản. Chọn store theo:
+
+- query/access pattern;
+- invariant/transaction boundary;
+- partition key/skew;
+- write/read amplification;
+- retention;
+- rebuildability;
+- consistency và failure semantics.
+
+---
+
+#### 18. Caching strategy
+
+##### Metadata cache
+
+Cache:
+
+- popular video metadata;
+- channel/profile summary;
+- playback policy decisions có TTL ngắn;
+- aggregate counters;
+- feed/search result pages có chọn lọc.
+
+Cần:
+
+- cache keys theo revision;
+- event-driven invalidation;
+- TTL;
+- single-flight chống stampede;
+- hot-key replication/local caches;
+- negative cache ngắn;
+- default deny cho stale/unknown authorization.
+
+##### CDN cache
+
+Cache:
+
+- immutable segments;
+- versioned manifests;
+- thumbnails/previews;
+- captions nếu policy cho phép.
+
+Không nên cache private response chung giữa users nếu cache key/auth policy không tách đúng. Signed URL query parameters cũng có thể fragment cache; CDN cần cấu hình cache key cẩn thận.
+
+##### Recommendation/search cache
+
+- cached/precomputed candidate sets;
+- popular/trending fallbacks;
+- short TTL query results;
+- không để cached feed tiếp tục hiển thị blocked/private content mà thiếu policy filter.
+
+---
+
+#### 19. Conceptual schema
+
+##### Core entities
+
+```text
+User(
+  user_id PK,
+  account_state,
+  profile_fields,
+  created_at,
+  ...
+)
+
+Channel(
+  channel_id PK,
+  owner_user_id,
+  name,
+  state,
+  ...
+)
+
+Video(
+  video_id PK,
+  channel_id,
+  title,
+  description,
+  visibility,
+  lifecycle_state,
+  moderation_state,
+  current_manifest_id,
+  metadata_revision,
+  created_at,
+  published_at,
+  ...
+)
+
+UploadSession(
+  upload_id PK,
+  video_id,
+  source_size,
+  expected_checksum,
+  state,
+  expires_at,
+  ...
+)
+
+VideoAsset(
+  asset_id PK,
+  video_id,
+  asset_type,
+  codec,
+  resolution,
+  bitrate,
+  object_key,
+  checksum,
+  state,
+  ...
+)
+```
+
+##### Engagement entities
+
+```text
+Reaction(
+  user_id,
+  video_id,
+  reaction_type,
+  created_at,
+  PRIMARY KEY(user_id, video_id, reaction_type)
+)
+
+Comment(
+  comment_id PK,
+  video_id,
+  user_id,
+  parent_comment_id,
+  body,
+  moderation_state,
+  created_at,
+  ...
+)
+
+Subscription(
+  subscriber_user_id,
+  channel_id,
+  created_at,
+  PRIMARY KEY(subscriber_user_id, channel_id)
+)
+
+VideoAggregate(
+  video_id PK,
+  validated_view_count,
+  like_count,
+  comment_count,
+  share_count,
+  aggregate_revision,
+  ...
+)
+```
+
+##### Watch history và analytics
+
+Không nên giả định một `WatchHistory` row cho mọi progress event. Tách:
+
+```text
+Raw WatchEvent stream
+       ↓
+stream processing/fraud/QoE
+       ├─ compact per-user WatchProgress
+       ├─ per-video aggregates
+       ├─ recommendation features
+       └─ analytics warehouse/lake
+```
+
+`WatchProgress(user_id, video_id, last_position, last_watched_at, ...)` phục vụ resume/history. Raw events phục vụ analytics và có retention riêng.
+
+---
+
+#### 20. Publication consistency
+
+Publication là ranh giới quan trọng nhất:
+
+```text
+Required media assets verified
++ security/moderation gate passed
++ desired visibility permits publish
+        ↓
+Metadata transaction:
+  state = PUBLISHED
+  current_manifest_id = versioned manifest
+  published_at = now
+  outbox(VideoPublished)
+        ↓
+Async projections:
+  search index
+  subscription feed
+  notification
+  recommendation candidates
+  CDN prewarm optional
+```
+
+Nếu search index cập nhật trước publication transaction, user có thể thấy video không phát được. Nếu metadata commit thành công nhưng event bus lỗi, transactional outbox retry bảo đảm projections cuối cùng hội tụ.
+
+Đối với takedown, playback path phải kiểm tra authoritative/bounded-stale policy; không chỉ chờ search/CDN invalidation.
+
+---
+
+#### 21. Consistency theo workload
+
+| Operation | Consistency cần thiết |
+|---|---|
+| Upload complete/source reference | Strong/idempotent |
+| Video lifecycle transition | Strong per video |
+| Visibility/ownership/entitlement | Strong hoặc bounded-staleness rất chặt |
+| Playback asset/manifest identity | Immutable/versioned |
+| Like state của chính user | Read-your-writes/idempotent |
+| Public like/view count | Eventual |
+| Comment creation | Durable acknowledgement; publication có thể moderated |
+| Search index | Eventual nhưng takedown có SLO/filter |
+| Recommendation features/feed | Eventual |
+| Watch history progress | Eventual/read-your-recent-write tùy UX |
+| Creator processing status | Near-real-time, replayable state |
+
+Không cố dùng một consistency model cho mọi dữ liệu.
+
+---
+
+#### 22. Failure handling
+
+##### Upload interrupted
+
+- resume parts;
+- retry với backoff/jitter;
+- complete idempotently;
+- expire session và cleanup orphan parts.
+
+##### Source commit nhưng processing event chưa publish
+
+- transactional outbox giữ event;
+- publisher retry;
+- reconciler tìm video ở `UPLOADED` quá lâu.
+
+##### Worker chết giữa transcode
+
+- job lease hết hạn;
+- retry trên worker khác;
+- temporary output không được publish;
+- deterministic/idempotent asset key;
+- poison input chuyển quarantine/DLQ.
+
+##### Một rendition lỗi
+
+- retry theo policy;
+- nếu minimum playable set đã đủ, có thể publish partial;
+- 4K/high-cost rendition tiếp tục nền;
+- manifest chỉ liệt kê output verified.
+
+##### CDN/origin lỗi
+
+- multiple origins/regions;
+- origin shield/failover;
+- cached segments tiếp tục phục vụ;
+- playback API degrade optional features;
+- multi-CDN nếu business SLO yêu cầu.
+
+##### Search/recommendation lỗi
+
+- playback direct URL vẫn hoạt động;
+- search có thể dùng cache/limited mode;
+- feed fallback sang subscriptions/trending;
+- không ảnh hưởng upload/media durability.
+
+##### Event duplicate/out-of-order
+
+- consumer lưu processed event/revision;
+- aggregate transitions conditional;
+- partition ordering theo video khi cần;
+- rebuild derived views từ durable log/source.
+
+---
+
+#### 23. Security và abuse controls trong HLD
+
+```text
+Upload:
+  auth + creator quota + signed part URLs + checksum
+  file/container validation + sandboxed processing
+  malware/policy/copyright checks
+
+Playback:
+  visibility/entitlement/region/age checks
+  signed access when required
+  hotlink/scraping/rate controls
+
+Engagement:
+  auth + idempotency + rate limit
+  spam/toxicity/fake-view detection
+  moderation state and audit
+
+Internal:
+  workload identity + least privilege
+  private object-store access + KMS
+  secrets management + network segmentation
+```
+
+Processing workers chạy untrusted media nên có sandbox, resource limits, patched codecs và restricted network/credentials.
+
+---
+
+#### 24. Observability
+
+Correlation chain:
+
+```text
+video_id → upload_id → source_id → processing_run_id
+         → job_id → rendition_id → manifest_id
+         → publication revision → playback_session_id
+```
+
+Metrics chính:
+
+- upload start/complete/abort/retry;
+- ingress bytes và active sessions;
+- queued video-minutes, oldest job, encode speed/failure;
+- time-to-playable/publish;
+- stuck lifecycle states;
+- manifest/asset integrity failures;
+- CDN request/byte hit ratio và origin Gbps;
+- TTFF, rebuffer ratio, playback failure;
+- metadata/search/feed p95/p99;
+- publication-to-search freshness;
+- engagement and watch-event lag;
+- counter reconciliation error;
+- moderation/takedown latency;
+- unit cost per uploaded minute/watch hour.
+
+Log không được chứa access tokens, signed URLs nguyên vẹn hoặc private media content.
+
+---
+
+#### 25. Các lỗi thiết kế thường gặp
+
+1. **Upload Service nhận rồi chuyển tiếp toàn bộ bytes.**  
+   Làm app tier chịu double bandwidth; ưu tiên direct signed multipart upload.
+
+2. **Upload complete gọi Encoding Service đồng bộ.**  
+   Transcoding kéo dài; dùng source commit + durable event + orchestrator.
+
+3. **Worker nào xong cũng tự publish video.**  
+   Cần publication coordinator kiểm tra minimum asset/policy set.
+
+4. **Message broker publish bằng một lệnh riêng sau DB commit.**  
+   Có thể mất event; dùng transactional outbox/CDC.
+
+5. **Mọi like/comment chỉ đưa queue rồi trả thành công.**  
+   User action có thể mất; authoritative write trước, side effects async.
+
+6. **View count increment trực tiếp một row.**  
+   Viral video tạo hotspot; dùng event aggregation và sharded counters.
+
+7. **Search query trực tiếp metadata DB.**  
+   Full-text/ranking và write/read scale cần derived search index.
+
+8. **Tin search index để authorize.**  
+   Index có thể stale; playback/detail phải enforce policy.
+
+9. **Signed URL cho mọi public segment mà không xét cache key.**  
+   Token query có thể phá CDN hit ratio; cấu hình cache-key/token strategy.
+
+10. **Dùng một database cho tất cả dữ liệu vì schema trông đơn giản.**  
+    Media, metadata, comments, events, search và features có access patterns khác nhau.
+
+11. **Replication được coi là backup.**  
+    Corruption/delete có thể replicate; cần backup/retention/restore tests riêng.
+
+12. **Recommendation dependency nằm trong playback critical path.**  
+    Feed failure không được làm video cụ thể không phát được.
+
+---
+
+#### 26. Cách trình bày trong phỏng vấn
+
+Trình tự gọn và logic:
+
+1. Tách control, media và event planes.
+2. Vẽ direct multipart upload tới object storage.
+3. Sau source commit, đi qua outbox → processing DAG → publication gate.
+4. Vẽ playback service authorize rồi player lấy manifest/segments qua CDN.
+5. Nêu metadata DB, Redis và immutable asset model.
+6. Tách engagement authoritative writes khỏi async derived effects.
+7. Nêu search index và recommendation boundary.
+8. Giải thích consistency, idempotency và failure recovery.
+9. Chỉ ra bottleneck: transcode backlog, CDN miss, hot counters và stale policy.
+
+Các câu hỏi nên chủ động trả lời:
+
+- Upload thành công ở mốc nào?
+- Processing event không được publish thì sao?
+- Hai worker encode cùng rendition thì sao?
+- Khi nào video được public?
+- 4K lỗi có chặn 360p/720p không?
+- Private/deleted video có thể còn trong CDN/search bao lâu?
+- View count có chính xác tức thời không?
+- Search/recommendation hỏng thì playback có còn hoạt động không?
+
+---
+
+#### 27. Ý chính cần nhớ
+
+- Tách ingest, processing, playback và discovery/social paths.
+- Control plane, media plane và event plane có scaling/failure profiles khác nhau.
+- API Gateway không nên proxy large media bytes hoặc chứa mọi AuthZ logic.
+- Upload Service quản lý session; client upload trực tiếp tới object storage khi có thể.
+- Source completion phải idempotent và tạo processing event qua transactional outbox.
+- Video processing là DAG với orchestrator, priority, retry, leases và worker pools.
+- Publication Coordinator là cổng duy nhất chuyển video sang READY/PUBLISHED.
+- Minimum playable renditions có thể publish trước; 4K tiếp tục nền.
+- Object assets và manifests nên immutable/versioned.
+- Playback Service authorize rồi player tải qua CDN; service không stream từng segment.
+- Signed access phụ thuộc visibility/entitlement và phải tương thích CDN cache strategy.
+- Like/comment cần authoritative acknowledgement; counters/notifications/features chạy async.
+- Watch telemetry được batch vào durable event pipeline.
+- Search endpoint synchronous nhưng indexing asynchronous; index không phải source of truth cho policy.
+- Recommendation có offline/nearline feature pipeline và online ranker, với fallback khi lỗi.
+- Chọn storage theo access pattern, invariant và rebuildability—not chỉ structured/flexible.
+- Consistency được chọn theo operation; counters/feed có thể eventual, ownership/visibility phải chặt.
+- Outbox, idempotent consumers và reconciliation bảo vệ các ranh giới DB–event.
+- Replication không phải backup; cần retention, restore và DR tests.
+
+#### Công thức ghi nhớ
+
+> **Video HLD = direct resumable ingest + atomic source commit/outbox + prioritized idempotent media DAG + authoritative publication gate + authorized CDN ABR playback + durable social events + derived search/recommendation projections.**
+
+---
+
+### Bài 106. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc lựa chọn
+
+Công nghệ phải được chọn sau kiến trúc:
+
+```text
+Requirement + workload + invariant
+              ↓
+Capability cần có
+              ↓
+Candidates + benchmark
+              ↓
+Trade-off: correctness / scale / operations / cost / lock-in
+              ↓
+Decision + owner + migration trigger
+```
+
+Không có một “YouTube stack” duy nhất. Các lựa chọn dưới đây là phương án đại diện:
+
+| Nhu cầu | Capability | Ví dụ công nghệ |
+|---|---|---|
+| Web UI động | Component UI + media player | React/Vue + HLS/DASH-capable player |
+| Control APIs | Concurrent I/O, typed contracts | Node.js, Go, Java, .NET |
+| Video processing | Codec/probe/package + CPU/GPU workers | FFmpeg-based workers, managed media services |
+| Authoritative metadata | Transactions/indexes | PostgreSQL, MySQL, distributed SQL |
+| Media bytes | Durable object storage | S3, GCS, Azure Blob, MinIO |
+| Global playback | Edge cache/routing | CloudFront, Cloudflare, Fastly, multi-CDN |
+| Async jobs/events | Queue hoặc replayable log | SQS/RabbitMQ, Kafka/Pulsar, managed Pub/Sub |
+| Hot metadata/counters | In-memory cache/KV | Redis/Memcached |
+| Full-text search | Distributed inverted index | OpenSearch/Elasticsearch/Solr |
+| Analytics/features | Stream processing + lake/warehouse | Kafka/Flink/Spark + object/data warehouse |
+| Workload orchestration | Containers, autoscaling, GPU scheduling | Kubernetes/ECS/managed batch/serverless |
+
+---
+
+#### 2. Front-end và playback client
+
+React hoặc Vue phù hợp cho web application vì:
+
+- component model;
+- state/UI management;
+- upload progress và resumable workflow;
+- dynamic metadata/comments/feed;
+- ecosystem lớn.
+
+Tuy nhiên video platform còn cần player layer:
+
+- HLS/DASH manifest parsing;
+- Media Source Extensions/native playback tùy browser;
+- ABR selection;
+- buffering và seek;
+- captions/audio tracks;
+- DRM nếu trong scope;
+- QoE instrumentation;
+- retry và CDN failover.
+
+Các quyết định front-end quan trọng hơn tên framework:
+
+- server-side rendering/caching cho public pages và SEO;
+- lazy loading thumbnails/comments/recommendations;
+- upload chunks trong Web Worker nếu phù hợp;
+- backpressure và bounded upload concurrency;
+- playback event sampling/batching;
+- accessibility;
+- TV/mobile/native client compatibility.
+
+Frontend framework không quyết định chất lượng streaming; player logic, media format, CDN và QoE feedback mới là phần cốt lõi.
+
+---
+
+#### 3. Backend application stack
+
+##### Node.js/Express
+
+Phù hợp với:
+
+- API Gateway/BFF;
+- metadata APIs;
+- upload-session control;
+- engagement endpoints;
+- WebSocket hoặc event I/O;
+- service orchestration nhẹ.
+
+Lý do là event loop xử lý nhiều I/O-bound requests hiệu quả. Nhưng Node.js không nên trực tiếp encode video trên event loop. Transcoding là CPU/GPU-heavy và phải chạy ở isolated worker process/pool hoặc dịch vụ chuyên biệt.
+
+##### Các lựa chọn khác
+
+- **Go:** concurrency/network efficiency, binary gọn, startup nhanh.
+- **Java/Kotlin:** ecosystem backend trưởng thành, throughput, typed domain, JVM tooling.
+- **.NET:** async I/O tốt, typed services và tooling mạnh.
+- **Python:** phù hợp ML/data orchestration và một số control services; media compute vẫn gọi native/GPU tools.
+- **Rust/C++:** hữu ích ở performance-critical media/network components nhưng tăng development complexity.
+
+Chọn theo:
+
+- đội ngũ và operational maturity;
+- latency/throughput benchmark;
+- library/media ecosystem;
+- memory/CPU cost;
+- observability/security support;
+- deployment model;
+- maintainability.
+
+Không cần dùng một ngôn ngữ cho toàn bộ platform, nhưng polyglot runtime quá sớm làm tăng build, security patch và on-call burden.
+
+---
+
+#### 4. Media processing stack
+
+Transcript chỉ nói background processing; production design cần technology cho probe, encode và package.
+
+##### FFmpeg-based workers
+
+Có thể dùng FFmpeg hoặc media libraries tương đương để:
+
+- probe input codec/container/duration;
+- transcode audio/video;
+- scale resolution/frame rate;
+- generate thumbnails;
+- segment/package HLS/DASH;
+- verify output.
+
+Yêu cầu vận hành:
+
+- pin/version codec builds;
+- sandbox untrusted input;
+- CPU/memory/time/file-size limits;
+- restricted network/IAM;
+- deterministic job/output IDs;
+- progress metrics;
+- hardware acceleration validation;
+- regression tests về quality và compatibility.
+
+##### CPU, GPU hoặc specialized encoders
+
+| Loại | Ưu điểm | Đánh đổi |
+|---|---|---|
+| CPU software encoding | Chất lượng/tùy biến tốt | Chậm và compute-expensive |
+| GPU/hardware encoding | Throughput cao, time-to-playable thấp | Chi phí/availability/quality tuning |
+| Managed transcoding | Ít vận hành, elasticity | Cost, limits và provider lock-in |
+
+Không gán mọi rendition vào cùng instance type. Scheduler nên route theo codec, resolution, duration và priority.
+
+##### HLS và MPEG-DASH
+
+- **HLS:** phổ biến rộng, native support tốt trong Apple ecosystem.
+- **MPEG-DASH:** chuẩn adaptive streaming linh hoạt ở nhiều môi trường.
+
+Có thể tạo CMAF/fMP4 segments dùng chung khi device/CDN/DRM compatibility cho phép để giảm storage duplication. Đây là quyết định media compatibility, không chỉ format preference.
+
+---
+
+#### 5. Relational database cho authoritative metadata
+
+PostgreSQL hoặc MySQL phù hợp với:
+
+- users/channels;
+- videos và lifecycle state;
+- ownership/visibility;
+- upload/source asset commit;
+- rendition/manifest registration;
+- reactions có unique constraint;
+- comments cơ bản;
+- subscriptions ở giai đoạn đầu;
+- transactional outbox.
+
+Lý do quan trọng là transaction và invariant, không chỉ “dữ liệu có cấu trúc”. Ví dụ publication cần atomically cập nhật state, manifest pointer và outbox event.
+
+Scale path:
+
+```text
+indexes + query tuning
+connection pooling
+read replicas cho safe read workloads
+partition/archive events/comments
+shard theo video/channel/user access pattern
+distributed SQL hoặc specialized stores khi thật sự cần
+```
+
+Read replica không bảo đảm read-your-writes nếu replication async. Creator vừa sửa metadata có thể cần đọc primary hoặc session-consistent path.
+
+---
+
+#### 6. NoSQL: dùng khi workload biện minh
+
+Transcript đề xuất MongoDB cho preferences/recommendation data vì schema linh hoạt. Điều này có thể phù hợp, nhưng “schema linh hoạt” không đủ để thêm database thứ hai.
+
+NoSQL/document/KV/wide-column có thể dùng cho:
+
+- high-volume comments theo video/time partition;
+- user watch progress/history;
+- feed/candidate lists;
+- dynamic profile/preferences;
+- feature/counter stores;
+- processing state có TTL;
+- denormalized read models.
+
+Phải xác định:
+
+- partition key;
+- query chính;
+- hot-key strategy;
+- consistency cần thiết;
+- TTL/retention;
+- item/document size;
+- secondary-index cost;
+- backup/restore;
+- source of truth và rebuild path.
+
+PostgreSQL JSONB có thể đủ cho flexible fields trong authoritative metadata. Thêm MongoDB chỉ khi access pattern, scale hoặc organizational ownership thật sự tạo lợi ích lớn hơn operational cost.
+
+---
+
+#### 7. Object storage
+
+S3, GCS, Azure Blob hoặc MinIO phù hợp cho:
+
+- source/mezzanine video;
+- renditions và segments;
+- manifests;
+- thumbnails/previews;
+- captions;
+- temporary processing artifacts;
+- backup/export datasets.
+
+Năng lực cần kiểm tra:
+
+- multipart upload;
+- range GET;
+- checksums;
+- signed URLs;
+- object versioning/lifecycle;
+- event notifications;
+- replication/erasure coding;
+- per-prefix/account request limits;
+- storage classes/retrieval costs;
+- regional availability và data residency.
+
+Object keys nên opaque, immutable và version-aware. Metadata database giữ mapping từ video/rendition tới keys.
+
+##### Managed versus self-hosted
+
+- Managed object storage giảm capacity/repair/upgrade burden.
+- MinIO/self-hosted tăng kiểm soát và on-premise support nhưng đội ngũ chịu durability, disk repair, capacity, upgrades và DR.
+- “S3-compatible” không đồng nghĩa giống hoàn toàn về semantics, limits hay durability.
+
+Ở hàng trăm PB, egress, request count, lifecycle retrieval và migration cost phải được đánh giá từ đầu.
+
+---
+
+#### 8. CDN strategy
+
+CloudFront, Cloudflare, Fastly hoặc CDN khác cung cấp edge delivery. Lựa chọn theo:
+
+- geographic coverage;
+- sustained/peak Tbps capacity;
+- HLS/DASH/range support;
+- origin shield/request collapse;
+- signed URL/cookie/token integration;
+- cache key control;
+- purge/takedown speed;
+- logs/QoE visibility;
+- DDoS/hotlink protection;
+- price theo region/commit/egress;
+- multi-CDN steering support.
+
+Kiến trúc:
+
+```text
+Player → nearest CDN edge
+       → parent/origin shield on miss
+       → regional object origin
+```
+
+Segments immutable nên có TTL dài. Manifests cũng nên versioned để tránh invalidation phức tạp.
+
+##### Multi-CDN
+
+Có thể cần khi:
+
+- traffic toàn cầu rất lớn;
+- một CDN không phủ tốt mọi region;
+- cần vendor resilience;
+- muốn cost/performance steering.
+
+Đổi lại:
+
+- cache bị phân mảnh;
+- routing/measurement phức tạp;
+- signed access và logs khác nhau;
+- takedown/purge phải lan tới nhiều vendor;
+- commit pricing và operations tăng.
+
+Không thêm multi-CDN nếu SLO/scale chưa biện minh.
+
+---
+
+#### 9. Redis hoặc Memcached
+
+##### Redis
+
+Phù hợp khi cần thêm data structures, counters, streams/leases hoặc replication features:
+
+- hot video metadata;
+- channel/profile summary;
+- aggregate counters;
+- rate limits;
+- short-lived playback/session policy;
+- recommendation candidates;
+- distributed single-flight/lease có kiểm soát.
+
+##### Memcached
+
+Đơn giản cho disposable key-value cache, ít tính năng hơn và có thể phù hợp nếu chỉ cần cache thuần.
+
+Nguyên tắc:
+
+- cache không phải source of truth;
+- thiết kế cache miss/failure;
+- revisioned keys và TTL;
+- chống stampede;
+- replication/sharding và hot-key handling;
+- không fail-open authorization;
+- không dùng Redis như durable event log nếu data-loss semantics không phù hợp.
+
+---
+
+#### 10. Search engine
+
+OpenSearch/Elasticsearch/Solr là ví dụ cho:
+
+- full-text inverted index;
+- filters và faceting;
+- language analyzers;
+- relevance ranking;
+- distributed query/sharding;
+- autocomplete tùy scope.
+
+Indexing pipeline:
+
+```text
+VideoPublished/Changed/Blocked/Deleted
+        ↓
+durable event + indexer
+        ↓
+versioned/idempotent index mutation
+```
+
+Search cluster cần capacity cho:
+
+- 10M new docs/day cùng metadata updates;
+- query QPS;
+- index refresh/merge;
+- popularity signal batches;
+- hot queries;
+- shard count/size;
+- reindex khi schema/analyzer đổi.
+
+Search index là derived; authoritative visibility check vẫn nằm ở metadata/policy path.
+
+---
+
+#### 11. Kafka, SQS và queue semantics
+
+Transcript nêu Kafka hoặc SQS, nhưng chúng không hoàn toàn tương đương.
+
+##### Kafka/Pulsar-style durable log
+
+Phù hợp khi cần:
+
+- high-throughput event stream;
+- partition ordering;
+- nhiều independent consumer groups;
+- retention và replay;
+- watch/engagement telemetry;
+- rebuild search/features/aggregates.
+
+Đổi lại, cần quản lý partitions, consumer lag, retention, schema và hot keys; managed Kafka giảm một phần ops.
+
+##### SQS/RabbitMQ-style work queue
+
+Phù hợp khi cần:
+
+- phân phối task tới một worker group;
+- ack/visibility timeout;
+- retry/DLQ;
+- autoscale workers theo queue depth/age;
+- managed operational simplicity với SQS.
+
+Không mạnh bằng replayable log cho nhiều consumer histories độc lập.
+
+##### Kết hợp thực dụng
+
+```text
+Domain/analytics events → Kafka/Pulsar/managed event stream
+Transcode work dispatch → SQS/RabbitMQ/managed task queue
+```
+
+Hoặc dùng một nền tảng nếu constraints cho phép, nhưng phải nói rõ delivery, replay, ordering và retention semantics.
+
+---
+
+#### 12. OAuth 2.0, OpenID Connect và JWT
+
+Điểm cần hiệu chỉnh:
+
+- **OAuth 2.0** là authorization framework.
+- **OpenID Connect (OIDC)** thêm identity/authentication layer.
+- **JWT** là token format, không tự tạo security.
+
+Một phương án:
+
+```text
+User authenticates qua OIDC provider
+→ client nhận short-lived access token
+→ API Gateway/service validate issuer, audience, expiry, signature, scope
+→ resource service kiểm tra ownership/visibility/entitlement
+```
+
+Cần:
+
+- Authorization Code + PKCE cho public clients;
+- short-lived access tokens;
+- refresh-token rotation/protection;
+- key rotation và JWKS caching;
+- issuer/audience/algorithm validation;
+- revoke/session invalidation strategy;
+- không đặt sensitive data quá mức trong JWT;
+- workload identity cho service-to-service, không tái dùng user token tùy tiện.
+
+“Đăng nhập một lần rồi không gửi credentials nữa” nên hiểu là client gửi access token, không gửi lại password; token vẫn phải đi cùng protected request hoặc session mechanism tương đương.
+
+---
+
+#### 13. Kubernetes và workload orchestration
+
+Kubernetes có thể điều phối:
+
+- stateless control APIs;
+- upload-session services;
+- processing orchestrators;
+- CPU/GPU transcode worker pools;
+- indexers/aggregators;
+- recommendation serving;
+- scheduled reconciliation jobs.
+
+Các cấu hình cần thiết:
+
+```text
+requests/limits
+readiness/liveness/startup probes
+PodDisruptionBudget
+topology spreading/anti-affinity
+node pools and taints/tolerations for GPU
+HPA/KEDA/custom metrics
+workload identity
+NetworkPolicy
+rolling/canary deployment
+priority classes and quotas
+```
+
+Không chạy stateful database/object storage trên Kubernetes chỉ vì “mọi thứ đều ở Kubernetes” nếu đội ngũ không có năng lực vận hành tương ứng. Managed data services thường giảm risk.
+
+Serverless/batch managed processing có thể hợp với bursty jobs; Kubernetes phù hợp khi cần control, sustained utilization hoặc specialized scheduling.
+
+---
+
+#### 14. Autoscaling theo workload
+
+| Component | Scale signal tốt |
+|---|---|
+| API services | RPS, concurrency, p95 latency, CPU |
+| Upload control | Active sessions, initiate/complete rate |
+| Transcode workers | Queued video-minutes by class, oldest-job age |
+| GPU pools | Pending GPU-minutes, utilization, queue SLO |
+| Packagers/indexers | Queue age/lag và output rate |
+| Engagement consumers | Kafka consumer lag/events/s |
+| Search | Query/index latency, CPU/heap, shard pressure |
+| Recommendation serving | QPS, p99, feature-fetch latency |
+
+Queue depth một mình có thể gây sai vì jobs khác duration/resolution. Dùng weighted work units như video-minutes × codec cost factor.
+
+Autoscaling controls:
+
+- minimum warm capacity;
+- rapid scale-up, conservative scale-down;
+- stabilization/cooldown;
+- maximum concurrency tới object storage/database;
+- admission control;
+- backpressure/load shedding;
+- regional capacity quotas;
+- cost ceilings;
+- reserved/on-demand/spot mix.
+
+Spot/preemptible instances phù hợp retryable transcode jobs nếu checkpoint/job idempotency tốt, không phù hợp duy nhất cho critical control-plane replicas.
+
+---
+
+#### 15. Cloud và regional topology
+
+AWS/GCP/Azure có thể cung cấp managed compute, storage, databases, queues và CDN. Thiết kế region:
+
+```text
+Global traffic management
+      ↓
+Regional control APIs + upload ingress
+      ↓
+Regional object origin / replicated assets
+      ↓
+Global CDN
+```
+
+Metadata strategies:
+
+- single home region per user/channel/video for writes;
+- replicas cho read;
+- sharding theo creator/video ID;
+- cross-region events cho derived views;
+- active-passive hoặc active-active có fencing rõ.
+
+Cần xác định:
+
+- RPO/RTO;
+- source/rendition replication;
+- data residency;
+- failover/failback;
+- global ID generation;
+- event replication;
+- CDN/origin failover;
+- regional quota/capacity.
+
+“Chạy trên cloud” không tự động tạo HA. Phải deploy đa zone, loại single points of failure và diễn tập DR.
+
+---
+
+#### 16. Backup, durability và disaster recovery
+
+##### Media
+
+- object storage durability/replication;
+- source retention hoặc archive policy;
+- cross-region replication theo criticality;
+- manifest/checksum inventory;
+- repair/corruption detection;
+- deletion protection/legal hold.
+
+##### Metadata
+
+- point-in-time recovery;
+- regular immutable backups;
+- cross-region backup copy;
+- restore test;
+- transactionally consistent references/outbox;
+- schema/config/key backups.
+
+Replication không phải backup: accidental delete, corruption hoặc bad mutation có thể replicate. Backup cũng vô ích nếu chưa đo restore time và kiểm tra content/metadata references sau restore.
+
+---
+
+#### 17. Observability stack
+
+Một stack có thể gồm:
+
+- OpenTelemetry cho traces/metrics/log correlation;
+- Prometheus-compatible metrics;
+- Grafana/dashboards;
+- centralized logs;
+- distributed tracing backend;
+- data-quality/QoE analytics pipeline.
+
+Không phụ thuộc tên công cụ; cần telemetry semantic nhất quán:
+
+```text
+video_id, upload_id, processing_run_id,
+job_id, rendition_id, manifest_id,
+publication_revision, playback_session_id,
+region, CDN, device/player version
+```
+
+Alert theo SLO:
+
+- time-to-playable;
+- queued video-minutes;
+- publication stuck rate;
+- playback failures/TTFF/rebuffering;
+- CDN origin load;
+- search/takedown lag;
+- event consumer lag;
+- per-unit cost anomalies.
+
+Không gắn user PII/token/signed URL trực tiếp vào high-cardinality logs/metrics.
+
+---
+
+#### 18. Security infrastructure
+
+- WAF, DDoS và bot controls ở edge;
+- OIDC/OAuth token validation;
+- resource-level authorization;
+- KMS/envelope encryption;
+- secrets manager;
+- workload identity và least privilege;
+- private object storage origins;
+- short-lived signed access;
+- sandboxed transcode workers;
+- malware/content moderation pipeline;
+- immutable audit logs;
+- network segmentation/private endpoints;
+- dependency/image scanning và patching;
+- rate limits/quota theo creator và costly operation.
+
+Transcode là nơi xử lý input không tin cậy và dùng native codecs; đây là attack surface quan trọng cần isolation mạnh hơn API worker thông thường.
+
+---
+
+#### 19. Cost strategy
+
+Các cost driver:
+
+```text
+Source + rendition storage
+Object PUT/GET/LIST/lifecycle requests
+Transcode CPU/GPU/accelerator minutes
+CDN request + egress bytes
+Origin/cross-region transfer
+Database/search/cache/broker compute
+Analytics/ML/moderation/observability
+Backup/DR
+```
+
+Tối ưu:
+
+- bitrate ladder theo content/device demand;
+- efficient codecs khi tổng lifecycle cost hợp lý;
+- minimum playable first, expensive renditions later/on demand;
+- source retention tiers;
+- immutable long-lived CDN caching;
+- origin shield;
+- right-size segment duration;
+- spot capacity cho retryable jobs;
+- autoscale theo weighted video work;
+- sample/batch telemetry có chủ đích;
+- archive cold data;
+- enforce creator quotas và abuse prevention.
+
+Ví dụ codec AV1 có thể giảm delivered bytes nhưng tăng encode compute và không được mọi thiết bị hỗ trợ. Phải so:
+
+```text
+compute tăng + storage thêm + compatibility complexity
+versus
+CDN/egress tiết kiệm trong lifetime watch traffic
+```
+
+Popular videos có thể đáng encode codec hiệu quả; long-tail video ít xem có thể không hoàn vốn compute.
+
+---
+
+#### 20. Stack tham khảo
+
+Một phương án minh họa:
+
+```text
+Web UI/player       React/Vue + HLS/DASH-capable player
+API services        Node.js/Go/Java/.NET
+Media workers       FFmpeg-based CPU/GPU containers
+API edge            Managed gateway/Envoy/Nginx + WAF
+Identity            OIDC provider + OAuth 2.0 access tokens
+Metadata            PostgreSQL/distributed SQL
+Flexible read data  KV/document store khi workload yêu cầu
+Cache               Redis/Memcached
+Media storage       S3/GCS/Azure Blob/MinIO
+Delivery            CloudFront/Cloudflare/Fastly/multi-CDN
+Task queues         SQS/RabbitMQ/managed queues
+Event streaming     Kafka/Pulsar/managed Pub/Sub
+Search              OpenSearch/Elasticsearch/Solr
+Analytics           Object data lake + stream/batch processing
+Orchestration       Kubernetes/managed containers/batch
+Observability       OpenTelemetry + metrics/logs/traces backend
+Keys/secrets        KMS + secrets manager + workload identity
+```
+
+Mỗi dòng phải đi kèm:
+
+- owner;
+- SLO;
+- scaling metric;
+- backup/restore;
+- failure mode;
+- security boundary;
+- cost model;
+- migration trigger.
+
+---
+
+#### 21. Decision examples
+
+##### Kafka hay SQS cho transcode?
+
+```text
+Nếu cần task distribution đơn giản, ack, visibility timeout và DLQ
+→ SQS/work queue phù hợp.
+
+Nếu cùng source event cần nhiều consumers, retention và replay
+→ Kafka/event log phù hợp.
+
+Có thể dùng cả hai:
+source event trên log, concrete transcode tasks trên work queues.
+```
+
+##### PostgreSQL hay MongoDB cho video metadata?
+
+```text
+Core lifecycle/ownership/publication/outbox cần transaction
+→ PostgreSQL làm source of truth.
+
+Một denormalized flexible read model có workload độc lập
+→ document store có thể làm projection.
+```
+
+##### Kubernetes hay managed batch?
+
+```text
+Sustained workload + custom GPU scheduling + đội platform mạnh
+→ Kubernetes có thể hiệu quả.
+
+Bursty jobs + muốn giảm operations
+→ managed batch/transcoding service có thể tốt hơn.
+```
+
+##### Một CDN hay multi-CDN?
+
+```text
+SLO/coverage một vendor đủ
+→ một CDN đơn giản và cache-efficient hơn.
+
+Massive global traffic + resilience/region gaps
+→ multi-CDN, chấp nhận routing/purge/log complexity.
+```
+
+---
+
+#### 22. Architecture Decision Record
+
+Mỗi lựa chọn quan trọng nên ghi:
+
+1. Context và assumptions.
+2. Requirement/invariant.
+3. Candidates đã cân nhắc.
+4. Benchmark/cost evidence.
+5. Quyết định và lý do.
+6. Trade-off chấp nhận.
+7. Operational/security owner.
+8. Failure/recovery plan.
+9. Migration trigger.
+
+Ví dụ:
+
+```text
+Decision: dùng task queue cho rendition jobs.
+Why: mỗi task thuộc một worker group, cần visibility timeout, retry và DLQ.
+Trade-off: không dùng queue này làm analytics replay log.
+Companion: VideoPublished và WatchEvents đi qua durable event stream.
+Revisit: khi cần multi-consumer replay hoặc ordering semantics rộng hơn.
+```
+
+---
+
+#### 23. Các lỗi lựa chọn công nghệ thường gặp
+
+1. **Node.js “xử lý upload” nên cho bytes đi qua Node process.**  
+   Upload control khác data transfer; direct-to-object storage vẫn tốt hơn.
+
+2. **Node.js async nên dùng để encode video.**  
+   Encoding là CPU/GPU-heavy, cần isolated worker/native tooling.
+
+3. **Schema linh hoạt nên mọi preferences/features vào MongoDB.**  
+   Cần access pattern và operational benefit rõ ràng.
+
+4. **Kafka và SQS là hai brand thay thế ngang hàng.**  
+   Event log/replay và work queue/ack có semantics khác nhau.
+
+5. **OAuth 2.0 tự giải quyết đăng nhập.**  
+   Dùng OIDC cho identity; validate JWT đầy đủ nếu chọn JWT.
+
+6. **Kubernetes tự tạo scalability.**  
+   App phải stateless/idempotent, metrics đúng và downstream có capacity.
+
+7. **CDN giải quyết mọi bandwidth/cost vấn đề.**  
+   Long-tail miss, token fragmentation, origin fill, egress và purge vẫn cần thiết kế.
+
+8. **Object storage durability nghĩa là không cần backup/DR.**
+
+9. **Redis dùng cho critical truth vì nhanh.**  
+   Cache loss/eviction phải chịu được; authoritative state ở durable store.
+
+10. **Chọn codec chất lượng nhất cho mọi video.**  
+    Compute/storage/device/lifetime views quyết định ROI.
+
+---
+
+#### 24. Ý chính cần nhớ
+
+- Công nghệ là implementation candidate của architectural capability.
+- React/Vue xử lý UI; player/ABR/CDN quyết định phần lớn streaming experience.
+- Node.js phù hợp I/O-bound control APIs nhưng không nên encode media trên event loop.
+- Transcoding cần isolated CPU/GPU workers, scheduler và media tooling như FFmpeg.
+- PostgreSQL/MySQL phù hợp authoritative metadata nhờ transaction/invariant—not chỉ structured schema.
+- Chỉ thêm MongoDB/NoSQL khi query, partition và scale requirements biện minh operational cost.
+- Object storage giữ immutable media; metadata database giữ lifecycle và references.
+- CDN lựa chọn theo global coverage, capacity, cache control, purge, security và cost.
+- Multi-CDN tăng resilience/coverage nhưng phân mảnh cache và tăng vận hành.
+- Redis/Memcached là acceleration layers, không phải source of truth.
+- Search index là derived store và không được dùng làm authoritative permission state.
+- Kafka phù hợp replayable multi-consumer streams; SQS/RabbitMQ phù hợp work dispatch/ack semantics.
+- OAuth 2.0 là authorization; OIDC cung cấp authentication; JWT chỉ là token format.
+- Kubernetes phù hợp independent workloads/GPU pools nhưng không bắt buộc cho mọi đội.
+- Autoscale transcode theo weighted queued video-minutes và age—not chỉ CPU/job count.
+- Cloud không tự tạo HA; cần multi-zone, RPO/RTO, fencing và DR tests.
+- Replication không thay backup.
+- Security phải cô lập native media processing và untrusted input.
+- Tối ưu codec/rendition dựa trên lifecycle unit economics.
+- Mỗi quyết định cần owner, SLO, failure plan, cost và migration trigger.
+
+#### Công thức ghi nhớ
+
+> **Strategic video stack = workload-fit runtime + transactional metadata truth + immutable object media + replayable events/work queues by semantics + global CDN + isolated elastic codec compute + measured security, recovery and unit economics.**
+
+---
+
+### Bài 107. The Final Design — Video Sharing Platform
+
+#### 1. Kiến trúc cuối cùng giải quyết điều gì?
+
+Final design kết hợp toàn bộ quyết định của Bài 103–106 để hỗ trợ:
+
+- resumable source upload;
+- asynchronous video processing;
+- nhiều codec/resolution/bitrate renditions;
+- segmented adaptive playback;
+- global delivery qua CDN;
+- metadata, search và personalized recommendations;
+- likes, comments, views và subscriptions;
+- moderation, takedown và abuse prevention;
+- scaling độc lập, failure isolation và observability;
+- kiểm soát storage, compute và egress cost.
+
+Ba plane vẫn là cách nhìn quan trọng nhất:
+
+```text
+Control plane → identity, video metadata/state, AuthZ, upload sessions, publication
+Media plane   → source, renditions, manifests, segments, thumbnails, CDN
+Event plane   → processing jobs, search/feed projections, engagement, telemetry, analytics
+```
+
+---
+
+#### 2. Sơ đồ kiến trúc tổng thể
+
+```text
+                    Web / Mobile / TV / Creator Clients
+                                  |
+                       Global DNS / WAF / Routing
+                           /                  \
+                  API Gateway              CDN Edges
+                      |                        |
+     +----------------+----------------+       | manifests/segments
+     |                |                |       |
+ User/Auth       Video Metadata    Playback Service
+     |                |                |
+     |           Metadata DB ------ Redis Cache
+     |                |
+     |        Transactional Outbox
+     |                |
+     |          Durable Event Log
+     |        /        |        |       \
+     |   Processing  Search   Engagement  Recommendation/
+     |  Orchestrator Indexer  Consumers   Analytics
+     |       |
+     |  Priority Work Queues
+     |       |
+     |  CPU/GPU Processing Workers
+     |       |
+     +-------+--------- Object Storage --------+
+                           ^              |
+                           |              +→ Origin Shield → CDN
+Creator === signed multipart source upload
+
+Separate social/control services:
+Comments • Reactions • Subscriptions • Moderation • Notifications
+```
+
+API Gateway là entry point cho control requests, không phải đường đi của mọi media byte. Client tải source trực tiếp tới object storage bằng signed upload; player tải manifests/segments từ CDN.
+
+---
+
+#### 3. Video lifecycle end-to-end
+
+```text
+CREATED
+  ↓ initiate/resumable upload
+UPLOADING
+  ↓ source complete + integrity check
+UPLOADED
+  ↓ durable outbox event
+VALIDATING / QUARANTINED
+  ↓ valid + security gate
+PROCESSING
+  ↓ minimum playable assets verified
+READY_PARTIAL
+  ↓ publication policy and desired visibility
+PUBLISHED
+  ↓ optional high-quality renditions continue
+READY_COMPLETE
+
+Policy/delete branches:
+PUBLISHED → BLOCKED / PRIVATE / DELETED / REPROCESSING
+```
+
+Không nên mô hình hóa toàn bộ lifecycle bằng `processed=true`.
+
+---
+
+#### 4. Upload flow
+
+##### 4.1. Khởi tạo
+
+```text
+1. Creator → API Gateway → Upload Service
+2. Identity được xác thực
+3. Service kiểm tra channel ownership, quota, type và declared size
+4. Video Metadata Service tạo video ở trạng thái CREATED/UPLOADING
+5. Upload Service tạo upload session, part plan và regional target
+6. Client nhận signed multipart URLs/tokens
+```
+
+##### 4.2. Data transfer
+
+```text
+7. Creator client upload parts trực tiếp tới regional object storage
+8. Mỗi part có checksum; failed parts retry độc lập
+9. Client query session để resume sau disconnect
+```
+
+##### 4.3. Complete source
+
+```text
+10. Client gửi complete(upload_id, ordered part manifest)
+11. Upload Service verify identity/session/parts/size/checksums
+12. Object storage finalize immutable source object
+13. Metadata transaction:
+      - register VideoSource
+      - state = UPLOADED
+      - consume quota reservation
+      - append VideoSourceCommitted vào outbox
+14. Trả upload success + video_id + processing status
+```
+
+Complete phải idempotent. Retry không được tạo hai source assets hoặc hai processing runs ngoài dự kiến.
+
+##### Hiệu chỉnh transcript
+
+Transcript nói Upload Service “nhận file, lưu tạm rồi lập tức enqueue”. Ở scale này, thiết kế tốt hơn là:
+
+- Upload Service sở hữu workflow nhưng object storage nhận bytes trực tiếp;
+- chỉ enqueue sau khi source object đã finalize và metadata commit;
+- dùng outbox để không mất event giữa database và queue;
+- temporary/incomplete parts không được coi là video source hợp lệ.
+
+---
+
+#### 5. Processing flow
+
+```text
+1. Outbox publisher đưa VideoSourceCommitted vào durable event stream
+2. Processing Orchestrator tạo DAG và processing_run_id
+3. Probe/validation worker đọc source metadata/content
+4. Security/moderation prechecks chạy trong sandbox
+5. Orchestrator fan-out jobs theo codec/resolution/bitrate
+6. CPU/GPU workers encode, segment và ghi temporary outputs
+7. Worker verify output rồi register immutable VideoAsset/Rendition
+8. Packager tạo versioned manifests
+9. Thumbnail/caption/deeper moderation branches hoàn tất theo policy
+10. Publication Coordinator kiểm tra minimum playable set
+11. Authoritative transaction chuyển state và ghi VideoPublished outbox event
+12. Search/feed/notification/recommendation projections cập nhật async
+13. 4K/advanced codec renditions có thể tiếp tục nền
+```
+
+##### Invariants
+
+```text
+Source chưa commit         → không có processing run authoritative
+Temporary output           → không xuất hiện trong manifest
+Unverified rendition       → không được player lựa chọn
+Manifest đã publish        → mọi referenced segment phải đọc được
+Processing event bị trùng  → không tạo duplicate logical assets
+Worker mất lease           → không được commit output mới
+Video bị block trong lúc encode → không tự publish khi jobs hoàn tất
+```
+
+---
+
+#### 6. Publication flow
+
+Video không “trở nên available” chỉ vì encode cuối cùng vừa xong. Publication cần một cổng rõ ràng:
+
+```text
+required checks passed
++ minimum playable renditions ready
++ manifest validated
++ creator still wants public/unlisted visibility
++ moderation/rights/region policy permits
+        ↓
+Atomic metadata transition:
+  lifecycle_state = PUBLISHED
+  current_manifest_id = manifest_version
+  publication_revision += 1
+  outbox(VideoPublished)
+```
+
+Search, feed và recommendations chỉ nhận video thông qua publication event hoặc projection tương đương. Điều này ngăn user khám phá video mà player chưa phát được.
+
+Nếu chỉ 360p/720p đã sẵn sàng, platform có thể publish `READY_PARTIAL`; manifest version mới được công bố khi 1080p/4K hoàn tất.
+
+---
+
+#### 7. Playback flow
+
+```text
+1. Viewer mở video page
+2. Metadata API trả title/channel/state/counters/thumbnail
+3. Client POST /videos/{id}/playback-sessions
+4. Playback Service kiểm tra:
+      visibility + ownership/entitlement
+      moderation + age + region policy
+      device/player capabilities
+5. Service trả versioned manifest URL/token
+6. Player tải manifest từ CDN
+7. Player chọn rendition theo bandwidth/buffer/device
+8. Player tải audio/video segments từ CDN
+9. CDN miss đi qua origin shield tới object storage
+10. Player chuyển rendition khi mạng thay đổi
+11. Client batch watch/QoE events về telemetry ingest
+```
+
+Playback critical path phải ngắn. Recommendation, comments và analytics lỗi không được làm video đã biết không phát được.
+
+##### Public versus protected video
+
+- Public content có thể dùng cache-friendly stable/versioned CDN URL.
+- Private/unlisted/premium content dùng signed URL/cookie/token ngắn hạn.
+- Playback Service vẫn kiểm tra policy trước khi cấp capability.
+- CDN cache key phải tránh bị fragment bởi token không cần thiết.
+- Takedown/revoke cần chặn cấp capability mới và có cơ chế purge/deny phù hợp.
+
+---
+
+#### 8. Search flow
+
+```text
+VideoPublished / MetadataChanged / VideoBlocked / VideoDeleted
+                         ↓
+                    Durable events
+                         ↓
+                    Search Indexer
+                         ↓
+              Distributed Search Index
+
+Viewer query → API Gateway → Search Service
+             → text/filter/rank query
+             → policy-aware result validation
+             → paginated results
+```
+
+Search index chứa denormalized searchable fields và batched popularity signals. Nó là derived store, không phải authoritative nguồn về visibility.
+
+Publication-to-search có thể eventual. Takedown cần nhanh hơn ordinary metadata freshness và có thể dùng deny filter trước khi index removal hội tụ.
+
+---
+
+#### 9. Recommendation/home-feed flow
+
+```text
+Watch + impression + reaction + subscription events
+                     ↓
+     Stream/batch feature pipelines
+        ↓                 ↓
+Candidate stores      Feature stores
+        \                 /
+          Online ranker
+                ↓
+      policy + diversity filters
+                ↓
+        personalized feed
+```
+
+Online request:
+
+1. Fetch cached/precomputed candidates.
+2. Bổ sung subscription/trending/context candidates.
+3. Hydrate fresh features.
+4. Rank trong latency budget.
+5. Loại private, blocked, region-ineligible và already-hidden items.
+6. Diversify creator/topic.
+7. Trả cursor và impression tokens.
+
+Fallback khi recommendation lỗi:
+
+- cached feed;
+- subscriptions;
+- regional trending;
+- popular recent content.
+
+Feed quality có thể giảm nhưng availability của playback không bị kéo theo.
+
+---
+
+#### 10. Engagement flow
+
+##### Like/unlike
+
+```text
+Client → idempotent reaction API
+       → authoritative unique user-video reaction write
+       → outbox ReactionChanged
+       → trả liked state
+       → async counter/features/notification/analytics
+```
+
+##### Comment
+
+```text
+Client → auth/rate limit/input validation
+       → durable comment write với moderation state
+       → trả comment hoặc pending-review status
+       → async moderation, notification, index và counter
+```
+
+##### View/watch
+
+```text
+Player batches playback events
+→ telemetry ingest
+→ durable log
+→ fraud/dedup/session semantics
+→ time-sharded aggregates
+→ public counters + creator analytics + recommendations
+```
+
+Không increment một global row cho mỗi view. Public count có thể eventual; per-user like state cần read-your-writes tốt hơn.
+
+---
+
+#### 11. Storage layout
+
+##### Authoritative metadata
+
+```text
+User / Channel
+Video / Visibility / Lifecycle / Moderation
+UploadSession / VideoSource
+Rendition / MediaAsset / PlaybackManifest
+Reaction / Comment / Subscription
+TransactionalOutbox
+```
+
+##### Immutable media
+
+```text
+Source/mezzanine objects
+Rendition audio/video segments
+Versioned manifests
+Thumbnails/previews/captions
+Temporary/quarantine artifacts
+```
+
+##### Derived stores
+
+```text
+Redis metadata/counter cache
+Search index
+CDN edge copies
+Recommendation candidates/features
+Analytics lake/warehouse
+Public aggregate views
+```
+
+Derived stores phải rebuild được từ authoritative state hoặc durable events.
+
+---
+
+#### 12. Caching layers
+
+| Cache | Dữ liệu | Chính sách chính |
+|---|---|---|
+| Browser/player | Manifests/segments/thumbnails | Versioned URLs, client cache control |
+| CDN edge | Immutable media | Long TTL, range support, signed access nếu cần |
+| Origin shield | Regional/global misses | Request collapse, protect object origin |
+| Redis | Hot metadata/counters/policy hints | Revision/TTL/invalidation, fail-safe |
+| Local service cache | Config/schema/stable data | Bounded TTL và versioning |
+| Search/feed result cache | Popular queries/candidates | Short TTL + policy late filter |
+
+Cache invalidation event có thể trễ. Visibility/takedown correctness không được phụ thuộc duy nhất vào việc mọi cache đã xóa ngay lập tức.
+
+---
+
+#### 13. Communication patterns
+
+| Luồng | Giao tiếp |
+|---|---|
+| Client control requests | HTTPS REST/GraphQL nếu phù hợp |
+| Nội bộ cần response ngay | gRPC/REST với timeout, retry budget và circuit breaker |
+| Source/segment bytes | Signed HTTPS trực tiếp tới object storage/CDN |
+| Metadata commit → events | Transactional outbox/CDC |
+| Domain/telemetry fan-out | Durable partitioned event log |
+| Transcode task dispatch | Work queues với lease/visibility timeout/DLQ |
+| Processing progress | Events + creator status polling/push |
+| Search/feed projection | Async idempotent consumers |
+| QoE/watch telemetry | Batched async ingestion |
+
+Không dùng distributed transaction xuyên mọi service. Core invariant nằm trong local authoritative transaction; cross-service state hội tụ bằng durable events, idempotency và reconciliation.
+
+---
+
+#### 14. Scaling và isolation
+
+| Tình huống | Thành phần chịu tải | Cách cô lập/scale |
+|---|---|---|
+| Upload spike | Upload sessions, object PUT, processing queue | Regional ingest, direct upload, admission control |
+| Transcode backlog | CPU/GPU pools, scheduler | Weighted queue, priority, autoscale, headroom |
+| Viral video | CDN, origin shield, playback metadata, counters | Edge cache, request collapse, hot-key sharding |
+| Comment storm | Comment partitions/moderation | Per-video partition, rate limit, queue moderation |
+| Search spike | Search cluster | Query cache, shard replicas, load shed expensive queries |
+| Feed spike | Candidate/ranker/feature stores | Precompute/cache/fallback feed |
+| CDN region failure | Other CDN/regions/origin | Global routing, failover, cached content |
+| Broker consumer lag | Derived projections | Independent consumer groups, autoscale, degrade optional jobs |
+
+Không scale toàn hệ thống đồng đều. Mỗi workload dùng metric riêng:
+
+- control APIs: QPS/concurrency/p99;
+- transcode: weighted queued video-minutes/age;
+- CDN: Gbps/requests/cache hit;
+- engagement: events/s/hot partition/lag;
+- search: query/index latency;
+- recommendation: p99/feature freshness/timeouts.
+
+---
+
+#### 15. Failure scenarios
+
+##### Upload part hoặc connection lỗi
+
+- retry riêng part;
+- resume session;
+- checksum;
+- expire/abort;
+- cleanup orphan parts.
+
+##### Source commit thành công nhưng queue lỗi
+
+- outbox giữ event;
+- retry publisher;
+- reconciler tìm source ở `UPLOADED` quá lâu.
+
+##### Transcode worker chết
+
+- lease timeout;
+- task giao lại;
+- output temporary không publish;
+- deterministic asset key;
+- attempts bounded và poison input vào DLQ/quarantine.
+
+##### Một rendition không thành công
+
+- minimum playable outputs có thể publish;
+- failed rendition retry nền;
+- manifest không tham chiếu asset lỗi;
+- creator thấy processing status chính xác.
+
+##### Publication event bị xử lý trùng
+
+- index/feed consumers dùng video revision/event ID;
+- upsert idempotently;
+- counter/notification side effect có dedup key.
+
+##### Search hoặc recommendation outage
+
+- direct video playback vẫn chạy;
+- cached results/fallback feeds;
+- derived projection bắt kịp từ event log sau recovery.
+
+##### Metadata DB unavailable
+
+- CDN có thể tiếp tục phục vụ một số cached public media;
+- không cấp quyền mới cho private content nếu không verify được;
+- mutations dừng/fail rõ ràng;
+- failover theo RPO/RTO và fencing.
+
+##### Emergency takedown
+
+- authoritative block state;
+- deny playback sessions mới;
+- push deny/purge tới CDN;
+- remove/filter search/feed;
+- stop recommendation/notifications;
+- preserve audit/evidence theo policy;
+- đo time-to-takedown.
+
+---
+
+#### 16. Security model
+
+```text
+Edge:
+  DDoS + WAF + bot controls + rate limit + TLS
+
+Identity:
+  OIDC/OAuth + MFA/session protection + token validation
+
+Resource:
+  ownership + visibility + entitlement + age/region/policy
+
+Upload/processing:
+  quota + signed upload + checksum + sandbox + malware/policy scan
+
+Media delivery:
+  private origin + signed access when required + hotlink controls
+
+Internal:
+  workload identity + least privilege + network segmentation + KMS
+
+Social:
+  spam/fake engagement/toxicity/report/moderation
+
+Audit/recovery:
+  immutable logs + backups + retention + restore drills
+```
+
+Gateway authentication không thay resource-level authorization. Native media codecs xử lý untrusted input nên được sandbox và hạn chế quyền mạnh.
+
+---
+
+#### 17. Reliability và graceful degradation
+
+Ưu tiên:
+
+```text
+Tier 0: ownership/visibility/policy correctness + media integrity
+Tier 1: playback manifest/segment delivery
+Tier 2: source upload completion + publication durability
+Tier 3: metadata page + search + basic subscriptions
+Tier 4: recommendations + comments/notifications
+Tier 5: deep analytics + preview + expensive optional renditions
+```
+
+Khi quá tải:
+
+- trì hoãn 4K/advanced codec và preview;
+- giảm telemetry sampling có kiểm soát;
+- fallback recommendation;
+- rate-limit comments/public APIs;
+- ưu tiên minimum playable jobs;
+- bảo vệ origin và metadata DB bằng concurrency limits;
+- không bỏ qua AuthZ, integrity hoặc moderation gate.
+
+---
+
+#### 18. Observability end-to-end
+
+Trace lineage:
+
+```text
+video_id
+  ├─ upload_id → source_id/checksum
+  ├─ processing_run_id → job_ids → rendition_ids
+  ├─ manifest_id/publication_revision
+  ├─ search/feed projection revisions
+  └─ playback_session_id → CDN/QoE/watch events
+```
+
+Dashboard cần:
+
+- upload success/retry/abort và ingress Gbps;
+- queued weighted video-minutes và oldest job;
+- encode speed/failure/cost theo codec/rendition;
+- time-to-playable/time-to-publish;
+- stuck lifecycle states;
+- media integrity/manifest failures;
+- CDN request/byte hit, origin Gbps và egress;
+- TTFF, rebuffer ratio, playback failure và bitrate mix;
+- metadata/search/feed p95/p99;
+- publication-to-search freshness;
+- engagement/watch-event lag và fraud rejection;
+- takedown propagation time;
+- cost per uploaded minute/watch hour.
+
+Metrics cần phân tách region, CDN, codec, device/player version và video class nhưng tránh uncontrolled cardinality.
+
+---
+
+#### 19. Requirements-to-components traceability
+
+| Requirement | Component/decision |
+|---|---|
+| Reliable large upload | Multipart session + direct object upload + checksums |
+| Fast upload response | Async processing after source commit |
+| Multiple resolutions | Processing DAG + CPU/GPU worker pools |
+| Quick time-to-playable | Priority minimum rendition set + partial readiness |
+| Smooth playback | HLS/DASH ABR + versioned manifests/segments |
+| Global scale | CDN + origin shield + regional routing |
+| Durable media | Object storage + integrity + lifecycle/replication |
+| Search | Publication-driven distributed index |
+| Personalization | Event/feature/candidate/ranking pipeline |
+| Likes/comments/views | Authoritative social writes + async aggregates |
+| High availability | Independent services, queues, multi-zone/failover |
+| Security | OIDC/AuthZ, signed access, sandbox, policy/moderation |
+| Cost efficiency | Storage tiers, CDN caching, codec/rendition ROI |
+| Recovery | Outbox, retries, idempotency, backups và reconciliation |
+
+Mỗi component phải trả lời được: nó giải quyết requirement, bottleneck hoặc failure mode nào?
+
+---
+
+#### 20. Những điểm cần hiệu chỉnh từ transcript
+
+##### “Mọi request đều qua API Gateway”
+
+Đúng với control APIs. Source upload parts và playback segments nên đi trực tiếp qua object storage/CDN data plane sau khi nhận signed capability hoặc public access policy phù hợp.
+
+##### “Upload Service nhận file và lưu tạm”
+
+Ở quy mô lớn, Upload Service điều phối session; bytes nên vào regional object storage trực tiếp. Temporary upload state/parts vẫn tồn tại nhưng không nằm trong app server filesystem.
+
+##### “Ngay lập tức đặt encoding request vào queue”
+
+Chỉ enqueue sau successful source finalize + authoritative metadata commit. Dùng outbox để không tạo job cho incomplete source hoặc mất job sau commit.
+
+##### “Encoding complete thì video available”
+
+Availability cần publication gate gồm minimum renditions, valid manifest, security/moderation và desired visibility. Không phải mọi processing output đều bắt buộc hoàn tất trước first publish.
+
+##### “Engagement Service ghi likes/comments/views”
+
+- Like/comment/subscription cần durable authoritative mutation.
+- Counters, notifications, features và analytics có thể async.
+- Watch events có semantics, batching, fraud filtering và aggregation riêng.
+
+##### “CDN giảm traffic từ storage”
+
+Đúng, nhưng origin load vẫn phụ thuộc byte hit ratio, cold fills, token/cache-key strategy và long-tail distribution. 1% miss ở quy mô hàng chục PB/ngày vẫn rất lớn.
+
+---
+
+#### 21. Cách trình bày final design trong phỏng vấn
+
+Trong vài phút:
+
+1. Tách control/media/event planes.
+2. Đi upload: initiate → signed multipart → source commit + outbox.
+3. Đi processing: orchestrator → queues → CPU/GPU workers → assets/manifest.
+4. Nêu publication coordinator và minimum playable set.
+5. Đi playback: AuthZ → manifest → CDN segments → QoE events.
+6. Nêu metadata DB, Redis, object storage và search index.
+7. Nêu engagement authoritative write + async aggregates.
+8. Nêu recommendation boundary/fallback.
+9. Chọn một failure scenario: worker death, broker outage, CDN cold hoặc takedown.
+10. Kết thúc bằng scale/cost trade-off.
+
+Câu hỏi cần trả lời được:
+
+- Upload được xem là thành công ở đâu?
+- Source commit nhưng queue lỗi thì sao?
+- Worker encode trùng có tạo duplicate asset không?
+- Điều kiện publish là gì?
+- 4K lỗi có chặn playback không?
+- CDN miss 1% tạo origin load bao nhiêu?
+- View counter chịu viral traffic thế nào?
+- Private/takedown content bị chặn ở những lớp nào?
+- Search/recommendation hỏng có ảnh hưởng playback không?
+- Backlog sau outage được drain như thế nào?
+
+---
+
+#### 22. Ý chính cần nhớ
+
+- Final design có control, media và event planes độc lập.
+- API Gateway phục vụ control plane; không proxy mọi source/segment byte.
+- Upload Service quản lý resumable session và signed direct upload.
+- Chỉ phát processing event sau atomic source commit bằng outbox.
+- Encoding là prioritized idempotent DAG chạy trên isolated CPU/GPU workers.
+- Publication Coordinator kiểm tra minimum assets, manifest, visibility và policy.
+- Có thể publish quality thấp trước rồi bổ sung 1080p/4K bằng manifest version mới.
+- Object media immutable; metadata giữ lifecycle và current manifest pointer.
+- Playback Service authorize; CDN/object storage thực hiện high-volume delivery.
+- ABR player chọn rendition theo bandwidth, buffer và device.
+- Search/feed/recommendation là derived projections sau publication.
+- Search index stale không được làm lộ private/blocked video.
+- Like/comment cần authoritative acknowledgement; derived effects async.
+- Watch telemetry đi qua durable log, fraud processing và sharded aggregation.
+- Viral upload, viral playback và comment storm tác động các component khác nhau.
+- Failure isolation cho phép search/feed degrade mà playback vẫn hoạt động.
+- Outbox, idempotency, leases, fencing, DLQ và reconciliation tạo resilience.
+- CDN, transcoding và storage phải được tối ưu theo unit economics.
+- Requirements drive architecture; architecture drive technology choices.
+
+#### Công thức ghi nhớ
+
+> **Final Video Platform = signed resumable source ingest + atomic outbox handoff + sandboxed elastic media DAG + policy-aware publication gate + immutable ABR assets over global CDN + authoritative social writes + replayable discovery/analytics projections.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -39895,3 +63083,372 @@ Deep dives nên chuẩn bị:
 | **Channel isolation** | Tách queues, workers, quotas và failure domains giữa email, SMS, push và in-app. |
 | **Delivery evidence** | Bằng chứng quan sát được về các mốc accepted, provider accepted, delivered, bounced, displayed hoặc read. |
 | **Effectively-once logical delivery** | Hành vi hạn chế một logical delivery dù processing có thể lặp, nhờ idempotency, dedup và reconciliation. |
+| **Client message ID** | Stable identifier do sending device tạo trước request để server nhận biết retry của cùng logical message. |
+| **Conversation sequence** | Monotonic order value trong phạm vi một conversation, dùng để sắp xếp, paginate và phát hiện gaps. |
+| **Presence lease** | Soft-state record có TTL được connection/device gia hạn để biểu diễn online status gần đúng. |
+| **Device delivery** | Trạng thái/message fan-out gắn với một recipient device cụ thể thay vì chỉ logical user. |
+| **Read receipt** | Client-reported event/watermark cho biết user/device đã đọc tới message hoặc sequence nào theo product semantics. |
+| **Local outbox** | Durable queue cục bộ trên client giữ pending messages để retry an toàn khi mạng gián đoạn. |
+| **Conversation membership** | Versioned relationship quy định user, role và khoảng thời gian được tham gia/gửi/nhận trong conversation. |
+| **Message gap** | Khoảng thiếu sequence/events mà client phát hiện và phải đồng bộ bù từ authoritative history. |
+| **End-to-end encryption (E2EE)** | Mã hóa để chỉ các endpoint/devices được ủy quyền giữ content decryption keys, còn server chủ yếu route/store ciphertext. |
+| **Connection churn** | Tần suất connections liên tục mở, đóng và reconnect do mobile network, app lifecycle hoặc failures. |
+| **Connection routing registry** | Ephemeral mapping từ user/device tới gateway/region/connection epoch để route realtime deliveries. |
+| **Message-weighted group-size distribution** | Phân bố số recipients được weighting theo messages thực sự gửi, phản ánh fan-out cost tốt hơn average group size. |
+| **Hot conversation** | Conversation/group tạo lượng message, sequence, fan-out hoặc receipt traffic không cân xứng trên một partition/owner. |
+| **Slow client** | Client đọc dữ liệu chậm khiến outbound buffer ở gateway tăng và cần backpressure/disconnect policy. |
+| **Prekey** | Public key material được device đăng trước để sender có thể thiết lập encrypted session khi recipient đang offline. |
+| **Conversation owner** | Region/partition/process có authoritative quyền gán order và commit writes cho một conversation trong epoch hiện tại. |
+| **Cumulative ACK** | Acknowledgement xác nhận mọi message/event liên tục tới một sequence, giảm số receipt writes so với ACK từng item. |
+| **Connection epoch** | Version tăng khi device thiết lập connection mới, dùng để fence stale socket/routes từ connection cũ. |
+| **Device sync cursor** | Opaque/versioned checkpoint cho biết device đã đồng bộ tới vị trí nào và dùng để lấy missing events sau reconnect. |
+| **Realtime delivery router** | Thành phần route device-delivery jobs tới gateway đang giữ active connection, với offline/sync fallback khi route không tồn tại. |
+| **Server accepted** | Trạng thái server đã validate và commit message qua durability boundary, khác recipient delivered/read. |
+| **Conversation delivery watermark** | Highest contiguous sequence đã được giao cho một recipient user/device trong conversation. |
+| **Live-sync merge** | Client hợp nhất realtime events với catch-up/history pages theo ID/sequence để tránh duplicate và sửa gaps. |
+| **WebSocket-aware load balancer** | Load balancer hỗ trợ upgrade, long-lived connections, idle timeout và draining phù hợp với WebSocket traffic. |
+| **SignalR** | ASP.NET Core realtime framework cung cấp Hub/connection/client abstractions nhưng không thay durable messaging, ordering hoặc E2EE. |
+| **KEDA** | Kubernetes Event-driven Autoscaling component scale workloads dựa trên Kafka lag, queue depth hoặc external event metrics. |
+| **OpenID Connect (OIDC)** | Identity/authentication layer xây trên OAuth 2.0, thường dùng để xác minh user và nhận identity claims. |
+| **Conversation summary projection** | Derived per-user read model chứa last message, unread/read state và metadata để liệt kê conversations nhanh. |
+| **SignalR group** | Tập active SignalR connections dùng để broadcast realtime, khác authoritative chat-group membership. |
+| **Connection plane** | Lớp quản lý long-lived sessions, routing và ephemeral realtime signals, có thể rebuild sau disconnect/failure. |
+| **Message plane** | Lớp authoritative xử lý AuthZ, ordering, durable message commit, fan-out, receipts và offline sync. |
+| **Media plane** | Lớp quản lý encrypted large-object upload, metadata, object storage, CDN và lifecycle tách khỏi message path. |
+| **Push hint** | Best-effort APNs/FCM notification dùng để đánh thức/báo client rồi client đồng bộ canonical messages. |
+| **Recipient-device fan-out** | Mở rộng một logical message thành deliveries tới các authorized devices của recipients và sender. |
+| **Ordered conversation log** | Durable append-only stream/history có stable per-conversation sequence làm canonical message order. |
+| **Conversation home region** | Region có authoritative owner chịu trách nhiệm order và commit writes cho conversation trong epoch hiện tại. |
+| **Reserve price** | Mức giá tối thiểu seller chấp nhận để bán; auction có thể có highest bid nhưng vẫn unsold nếu chưa đạt reserve. |
+| **Minimum bid increment** | Khoảng tăng tối thiểu mà bid mới phải vượt theo current price/rule của auction. |
+| **Auction lifecycle** | State machine từ draft/scheduled/active tới closing, ended, sold hoặc unsold và các hậu xử lý liên quan. |
+| **Authoritative close boundary** | Mốc thời gian và admission rule tại auction authority quyết định bid còn hợp lệ hay đã muộn. |
+| **Bid request ID** | Stable idempotency identifier của một logical bid, cho phép retry trả lại cùng kết quả mà không tạo bid mới. |
+| **Auction sequence** | Số thứ tự tăng đơn điệu trong phạm vi một auction, biểu diễn order authoritative của accepted bids/events. |
+| **Auction authority** | Owner/leader/transaction boundary duy nhất có quyền phân xử bid và state transition của auction trong epoch hiện tại. |
+| **Auction fencing token** | Epoch/version ngăn owner cũ tiếp tục ghi sau khi quyền xử lý auction đã failover sang owner mới. |
+| **Effectively-once bid effect** | Một logical bid chỉ ảnh hưởng auction một lần nhờ idempotency và conditional commit dù request/event có thể được xử lý lặp. |
+| **Soft close** | Rule gia hạn effective end time khi có bid gần deadline nhằm giảm sniping; cần được commit và version hóa. |
+| **Auction sniping** | Đặt bid ở thời điểm rất sát hard deadline để giảm cơ hội đối thủ phản ứng. |
+| **Proxy bidding** | User đặt maximum willingness-to-pay bí mật; hệ thống tự tăng bid theo increment cho tới giới hạn đó. |
+| **Auction result ID** | Identifier duy nhất cho final outcome, dùng để idempotently tạo payment/order và phục vụ audit. |
+| **Bid decision latency** | Thời gian từ lúc bid request vào hệ thống tới khi authority trả quyết định durable accepted/rejected. |
+| **Commit-to-visible lag** | Độ trễ từ accepted bid commit tới khi trạng thái tương ứng hiển thị cho watcher/client. |
+| **Hot auction** | Auction nhận tỷ lệ bids/watchers/fan-out quá lớn so với phần còn lại và tạo hotspot cục bộ. |
+| **Bid attempt rate** | Tổng request đặt bid gồm legitimate logical bids, retries, duplicates, rejected requests và có thể cả bot traffic. |
+| **Accepted-bid rate** | Số bid được auction authority xác thực và durable commit thành công trong một đơn vị thời gian. |
+| **Realtime fan-out amplification** | Hệ số một state change được nhân thành nhiều deliveries tới các watchers/connections. |
+| **Closing storm** | Burst lifecycle/finalization work khi nhiều auctions có end time tập trung trong cùng một khoảng ngắn. |
+| **Close-finalization lag** | Độ trễ từ authoritative deadline tới khi final result được durable materialize. |
+| **Auction subscription index** | Ephemeral mapping từ auction tới các gateway/connection shards đang có watchers để fan-out hiệu quả. |
+| **Auction command lag** | Thời gian command bid/close chờ trước khi được authority của auction phân xử. |
+| **Auction workload skew** | Mức độ traffic tập trung không đều vào một số ít auctions, owners, partitions hoặc cache keys. |
+| **Display-update coalescing** | Gộp các realtime UI updates gần nhau để giảm fan-out nhưng không xóa canonical bid records. |
+| **Effective end time** | Deadline hiện hành sau khi áp rule/version, bao gồm phần gia hạn nếu auction dùng soft close. |
+| **Auction Control Service** | Service nhận các control-plane operation như tạo, schedule hoặc cancel auction rồi chuyển mutation tới authority. |
+| **Bid Ingress Service** | Stateless entry service validate request sơ bộ, áp quota và route bid command tới đúng auction authority. |
+| **Auction aggregate** | Consistency boundary gom lifecycle, rules, current bid state, version và result của một auction. |
+| **Auction owner epoch** | Version của quyền sở hữu command processor hiện tại, dùng cùng fencing để chặn stale writer. |
+| **Auction query projection** | Read model tối ưu cho snapshot/detail/history được dẫn xuất từ authoritative auction state/events. |
+| **Auction realtime gateway** | Gateway giữ WebSocket connections/subscriptions và chuyển versioned auction updates tới clients. |
+| **Auction state-change event** | Public-safe derived event mô tả version/current state mới sau canonical auction commit. |
+| **Overdue auction reconciler** | Safety worker tìm auction đã quá effective deadline nhưng chưa finalized và phát lại close command. |
+| **Timer index** | Durable hoặc rebuildable index tổ chức auction deadlines để tìm và kích hoạt work đến hạn hiệu quả. |
+| **AuctionFinalized** | Event xác nhận final result của auction đã được durable commit, có thể khởi động order/payment workflow. |
+| **Snapshot-subscribe race** | Khoảng hở khiến client có thể bỏ lỡ event giữa lúc đọc snapshot và hoàn tất realtime subscription. |
+| **Public auction channel** | Realtime channel chỉ chứa trạng thái công khai đã lọc, không lộ bidder identity hoặc reserve/proxy secrets. |
+| **Payment obligation** | Nghĩa vụ thanh toán nội bộ được tạo từ unique auction result trước khi user/provider thực hiện payment steps. |
+| **Durable job table** | Bảng lưu background work/timer state có thể retry và khôi phục sau process failure. |
+| **Auction database of record** | Transactional store giữ canonical auction, bid, result và evidence thay vì cache hoặc read projection. |
+| **Auction row contention** | Nhiều bid commands cạnh tranh lock/version trên cùng auction row hoặc aggregate và làm tăng wait/retry latency. |
+| **Bid connection pool** | Tập kết nối database được giới hạn cho bid path để tái sử dụng an toàn và tránh làm cạn database connections. |
+| **Cache-aside** | Ứng dụng đọc cache trước, miss thì đọc source store và nạp lại cache với TTL/version phù hợp. |
+| **Cache stampede** | Nhiều requests cùng lúc miss/hết TTL một hot key rồi đồng loạt đánh xuống backend. |
+| **Auction home authority** | Owner/region có quyền authoritative order và commit commands của một auction trong epoch hiện tại. |
+| **Scheduled pre-scaling** | Tăng capacity chủ động trước một close wave đã biết thay vì chỉ chờ reactive autoscaling. |
+| **Warm capacity** | Tài nguyên đã chạy, kết nối và sẵn sàng xử lý ngay, không phải chờ provision/cold start. |
+| **Downstream-aware autoscaling** | Scale workers có giới hạn dựa trên sức chứa database, broker hoặc provider để tránh đẩy bottleneck xuống dưới. |
+| **Auction unit cost** | Chi phí trên một đơn vị kinh doanh như active auction, accepted bid, watcher-hour hoặc completed sale. |
+| **Auction ADR** | Bản ghi quyết định kiến trúc nêu context, lựa chọn, alternatives, hậu quả, metrics và review trigger. |
+| **Review trigger** | Ngưỡng SLO, tải, chi phí hoặc yêu cầu khiến một quyết định kiến trúc phải được đánh giá lại. |
+| **Private bid field** | Dữ liệu như reserve price, proxy maximum hoặc risk signal chỉ dành cho authority/authorized workflows. |
+| **Auction display event** | Derived public/private realtime update cho UI, có thể coalesce và phục hồi từ authoritative versioned snapshot. |
+| **Auction decision plane** | Lớp authoritative serialize và durable commit bid/lifecycle/result decisions cho từng auction. |
+| **Auction query plane** | Lớp cache, search và read projections tối ưu browse/snapshot nhưng không quyết định winner. |
+| **Auction event plane** | Outbox, broker và consumers truyền committed facts tới realtime, payment, notification và projections. |
+| **Auction mailbox** | Ordered queue/command stream tại owner chứa các bid, close, extend và control commands của một auction. |
+| **Close command** | At-least-once yêu cầu authority thử finalizing auction; bản thân timer/command chưa phải final result. |
+| **Auction result projection** | Read-optimized view của final outcome được dẫn xuất từ unique authoritative AuctionResult. |
+| **Bid versus close race** | Cạnh tranh giữa bid cuối và close command, phải được phân xử trong cùng authoritative order boundary. |
+| **Auction recovery hierarchy** | Thứ tự ưu tiên khi quá tải: bảo vệ authority/finalization trước realtime trung gian và background work. |
+| **Result-driven payment saga** | Payment workflow chỉ khởi động từ unique auction result và hội tụ bằng idempotency, webhook cùng reconciliation. |
+| **Auction final-state event** | Versioned realtime/domain event cho biết auction đã ended/sold/unsold sau durable finalization. |
+| **Auction home placement** | Chọn region/partition owner cho auction trước khi active dựa trên market/audience và tránh migrate gần deadline. |
+| **Authoritative auction snapshot** | Versioned current state lấy từ authority hoặc projection có freshness guarantees đủ để repair realtime gaps. |
+| **Inventory unit** | Đơn vị tài nguyên thực sự bị giữ theo ngày, có thể là entire place, phòng cụ thể hoặc một unit trong room type. |
+| **Booking hold** | Reservation tạm thời có TTL giữ inventory trong lúc guest hoàn tất approval/payment. |
+| **Stay interval** | Khoảng ngày lưu trú thường biểu diễn dạng nửa mở `[check_in, check_out)` theo time zone của property. |
+| **Range overlap** | Hai khoảng A và B giao nhau khi `A.start < B.end` và `B.start < A.end`. |
+| **Reserved night** | Một local calendar date/đêm mà inventory đã bị hold, confirm hoặc block theo policy. |
+| **Availability projection** | Read model tối ưu search/calendar được dẫn xuất từ canonical inventory và có thể trễ nhẹ. |
+| **Authoritative availability** | Trạng thái inventory được booking authority kiểm tra atomically trước khi giữ hoặc confirm booking. |
+| **Booking request ID** | Stable idempotency identifier giúp retry cùng logical booking trả lại cùng kết quả. |
+| **Booking quote** | Versioned, expiring snapshot của nightly price, fees, taxes, currency và policy áp cho booking dự kiến. |
+| **Quote expiry** | Thời điểm quote hết hiệu lực và booking phải được tính lại hoặc user xác nhận mức giá mới. |
+| **Booking authority** | Consistency boundary duy nhất có quyền reserve/release inventory và transition canonical booking state. |
+| **Inventory conflict** | Tình huống một request muốn giữ date range đã overlap với effective reservation/block khác. |
+| **External calendar block** | Busy interval nhập từ calendar/channel bên ngoài, có độ trễ và mức tin cậy theo source policy. |
+| **Cross-platform double booking** | Hai nền tảng độc lập cùng confirm một inventory trước khi calendar/channel synchronization hội tụ. |
+| **Property-local date** | Ngày theo múi giờ của nơi ở dùng cho stay/inventory semantics, khác UTC instant dùng cho audit events. |
+| **Display currency** | Currency dùng để hiển thị ước tính cho user, có thể khác currency thực tế bị charge hoặc settle. |
+| **Charge currency** | Currency payment provider thực sự thu từ guest theo booking/payment obligation. |
+| **Settlement currency** | Currency nền tảng/provider dùng để trả tiền cho host sau conversion và fees. |
+| **Booking payment saga** | Workflow phối hợp hold, payment, confirm/release/refund qua idempotency và compensation thay vì distributed transaction. |
+| **Review eligibility** | Rule xác định participant/booking/stay nào được phép tạo review và trong khoảng thời gian nào. |
+| **Listing version** | Snapshot/version của nội dung và rules giúp booking, search, moderation hoặc dispute tham chiếu đúng trạng thái lịch sử. |
+| **Room-type inventory** | Mô hình nhiều units tương đương, nơi booking trừ quantity theo từng night thay vì khóa một phòng định danh. |
+| **Search-to-book ratio** | Tỷ lệ logical searches so với confirmed bookings trong cùng time window, dùng để thấy mức read amplification của funnel. |
+| **Booking attempt amplification** | Số quote/hold/retry/invalid booking attempts phát sinh cho mỗi confirmed booking. |
+| **Reserved-night amplification** | Một booking hoặc hold nhiều đêm tạo nhiều inventory-night mutations/records. |
+| **Listing-day cell** | Một ô trạng thái/giá/quantity cho một listing hoặc inventory unit tại một local calendar date. |
+| **Availability horizon** | Khoảng tương lai mà hệ thống lưu hoặc materialize availability, chẳng hạn 365 ngày. |
+| **Search availability false positive** | Search hiển thị listing có vẻ còn chỗ nhưng authoritative quote/booking recheck phát hiện đã unavailable. |
+| **Geo hotspot** | Thành phố/geohash/khu vực nhận tỷ lệ search hoặc booking traffic quá lớn và làm nóng shard/replica. |
+| **Hot inventory** | Inventory unit/date range nhận nhiều booking attempts đồng thời và tạo lock/conflict hotspot. |
+| **Calendar polling amplification** | Lượng external sync requests tăng theo số calendar connections chia cho polling interval. |
+| **Calendar freshness age** | Thời gian từ lần external calendar sync thành công gần nhất, dùng để thể hiện độ stale/risk conflict. |
+| **Media derivative** | Thumbnail hoặc image/video variant được tạo từ original để phù hợp thiết bị, kích thước và codec. |
+| **Media processing lag** | Độ trễ từ upload tới lúc scan/transform/moderation hoàn tất và asset sẵn sàng publish. |
+| **Booking funnel** | Chuỗi search → impression → detail → quote → hold → payment → confirmation cùng conversion/failure ở từng bước. |
+| **Hold leakage** | Hold đã hết hạn hoặc workflow thất bại nhưng inventory chưa được release và bị false unavailable. |
+| **Availability write amplification** | Một booking transition sinh nhiều night/range, cache, search, calendar, notification và audit updates. |
+| **Rental workload skew** | Traffic không đều theo region, city, season, event, listing hoặc date range. |
+| **Search freshness SLO** | Mục tiêu giới hạn độ trễ từ listing/availability change tới khi search projection phản ánh thay đổi. |
+| **Media egress per search** | Tổng bytes thumbnails/media được phân phối cho một logical search, một unit-cost quan trọng của rental platform. |
+| **Rental discovery plane** | Search, listing, media và read projections tối ưu cho read-heavy geo/filter queries với eventual consistency. |
+| **Rental reservation plane** | Booking/inventory command path giữ canonical hold, confirmation, cancellation và no-overlap invariants. |
+| **Availability Query Service** | Read service trả projected calendar/freshness cho UI/search nhưng không reserve inventory. |
+| **Reservation Authority** | Transactional/serialized boundary duy nhất commit booking hold cùng canonical inventory mutation. |
+| **Inventory hold token** | Stable reference chứng minh một hold cụ thể đã được authority tạo cho inventory/date range và TTL nhất định. |
+| **Booking idempotency record** | Durable mapping từ request key/hash tới canonical booking response, giúp retry không tạo reservation mới. |
+| **Booking outbox** | Event records được commit cùng booking/inventory state để downstream facts không bị mất do dual write. |
+| **Booking inbox** | Consumer-side dedup records ngăn cùng event tạo side effect lặp khi broker redeliver. |
+| **Per-night inventory constraint** | Constraint/conditional rule bảo đảm capacity không bị vượt trên từng inventory unit và local date. |
+| **Range exclusion constraint** | Database constraint ngăn effective reservation ranges overlap cho cùng inventory unit. |
+| **Inventory owner** | Process/partition có quyền serialize reservation commands cho một inventory unit trong epoch hiện tại. |
+| **Hold-expiry race** | Cạnh tranh giữa payment/confirmation và timer release khi booking hold gần hết TTL. |
+| **Availability-as-of** | Timestamp/version cho biết calendar/search availability projection phản ánh dữ liệu tới thời điểm nào. |
+| **Listing-detail BFF** | Backend-for-Frontend tổng hợp content, media, review, availability và price preview với timeout/degradation controls. |
+| **Calendar sync cursor** | Provider-specific checkpoint giúp chỉ lấy changes mới và tiếp tục đồng bộ sau retry/failure. |
+| **External calendar conflict** | Record/evidence khi imported busy interval overlap canonical internal booking hoặc block có priority cao hơn. |
+| **Booking compensation** | Hành động saga như release hold, void authorization hoặc refund để đưa các domain về trạng thái hợp lệ sau partial failure. |
+| **Booking read projection** | Guest/host/query-shaped view được dẫn xuất từ canonical booking events để list và đọc nhanh. |
+| **Quote reprice** | Tạo giá mới khi quote hết hạn hoặc rule/FX thay đổi, có thể yêu cầu user xác nhận lại. |
+| **Inventory home region** | Region duy nhất có quyền authoritative reserve/confirm inventory unit trong epoch hiện tại. |
+| **Reservation fencing epoch** | Monotonic owner version ngăn region/process cũ ghi inventory sau failover hoặc ownership transfer. |
+| **Rental search document** | Denormalized versioned record trong search index chứa geo, filters, ranking và availability/price hints. |
+| **Versioned search rebuild** | Tạo index version mới từ source/events rồi atomically đổi alias/routing để rebuild không downtime. |
+| **Media quarantine** | Private storage/state nhận uploads trước khi scan, validate và moderation hoàn tất. |
+| **Provider headroom** | Phần quota/concurrency external provider còn lại sau current workload, dùng để giới hạn autoscaling/dispatch. |
+| **Adaptive calendar polling** | Điều chỉnh sync interval theo activity, upcoming stays, provider support và risk thay vì poll mọi calendar như nhau. |
+| **Payment obligation store** | Canonical internal record về số tiền/currency/trạng thái mà booking cần thanh toán, tách provider attempts. |
+| **Rental workload pool** | Nhóm compute/queue/resources tách riêng cho search, reservation, payment, calendar hoặc media để isolate failure/load. |
+| **Booking unit cost** | Tổng chi phí compute, database, events, payment, notifications và support trên một booking attempt/confirmation. |
+| **Media origin shielding** | Lớp cache/bảo vệ giảm số CDN misses cùng đánh trực tiếp vào object-storage origin. |
+| **Rental DR promotion** | Quy trình chuyển authoritative reservation ownership sang region phục hồi cùng replication checks và fencing. |
+| **Search projection coalescing** | Gộp nhiều listing/availability changes gần nhau thành ít index writes hơn mà không làm mất canonical events. |
+| **Rental final architecture** | Kiến trúc hoàn chỉnh nối discovery, quote, reservation, payment, calendar, media, review và trust theo consistency phù hợp. |
+| **Canonical inventory mutation** | Authoritative atomic thay đổi giữ, xác nhận, release hoặc block inventory theo local date range. |
+| **Booking confirmation boundary** | Durability point nơi booking và inventory state trở thành CONFIRMED trước khi downstream projections chạy. |
+| **Booking provider race** | Race giữa payment authorization/webhook, hold expiry hoặc cancellation cần conditional state và compensation. |
+| **Inventory home authority** | Region/partition owner duy nhất được commit reservation commands cho inventory unit trong epoch hiện tại. |
+| **Rental projection plane** | Search, availability, guest/host booking views và caches được dẫn xuất từ canonical domain events. |
+| **Stay completion event** | Durable event xác nhận stay đủ điều kiện hoàn tất để khởi động payout/review workflows theo policy. |
+| **Address disclosure policy** | Rule quyết định thời điểm và actor nào được xem exact property address/check-in instructions. |
+| **Booking state convergence** | Quá trình booking, payment và derived views hội tụ về trạng thái hợp lệ sau retries, webhooks hoặc partial failures. |
+| **Inventory release event** | Fact xác nhận effective reservation đã được gỡ và dates có thể trở lại availability projection. |
+| **Rental business correlation** | Liên kết request, quote, booking, inventory, payment, calendar và notification IDs để vận hành/audit end-to-end. |
+| **FileEntry** | Stable metadata identity của file trong namespace, giữ name/parent/current-version/access state nhưng không chứa raw bytes. |
+| **FileVersion** | Immutable revision của content được commit cho một FileEntry cùng author/time/size/checksum/manifest. |
+| **Content manifest** | Ordered description của whole object hoặc chunks cấu thành chính xác bytes của một file version. |
+| **Upload session** | Durable temporary workflow theo dõi target, quota, parts, checksums và expiry trước khi file version được commit. |
+| **Upload part** | Chunk/part có số thứ tự, size và checksum có thể upload/retry độc lập trong một session. |
+| **Atomic upload completion** | Transition chỉ publish FileVersion sau khi mọi parts/integrity/quota checks thành công cùng metadata commit. |
+| **Cloud change journal** | Durable ordered log các content/metadata/share/delete mutations cho devices đọc incremental bằng cursor. |
+| **Cloud sync cursor** | Opaque checkpoint biểu diễn device đã xử lý journal tới đâu để catch up và repair gaps. |
+| **Conflict copy** | File/version riêng được tạo để giữ thay đổi từ stale/offline device thay vì ghi đè silent lên current version. |
+| **Base version precondition** | Yêu cầu upload/mutation nêu version đã đọc; server phát hiện current version đã đổi trước khi commit. |
+| **Namespace node** | File hoặc folder entry có stable ID, parent và name trong cây/graph namespace. |
+| **Namespace tombstone** | Logical deletion record được sync tới devices và giữ đủ metadata trước khi physical purge. |
+| **Logical deletion** | Đưa node vào trash/tombstone và ẩn khỏi active namespace nhưng chưa xóa content bytes ngay. |
+| **Physical garbage collection** | Background deletion của unreferenced content sau retention, legal-hold và safety grace checks. |
+| **GC grace period** | Khoảng trì hoãn trước physical delete để xử lý late references, retries, restore và race an toàn. |
+| **Share capability** | Token/link scope cấp quyền hạn chế tới node/action trong thời hạn/policy nhất định, khác raw object URL. |
+| **ACL inheritance** | Cơ chế child files/folders nhận quyền từ ancestor shared folder cùng override/move/revoke rules. |
+| **Quota reservation** | Tạm giữ phần quota cho upload session để concurrent completes không vượt account/team limit. |
+| **Logical storage usage** | Bytes bị tính vào quota theo file versions/trash/product policy, có thể khác physical unique bytes. |
+| **Physical storage usage** | Bytes thực lưu sau dedup, replicas/erasure coding, object overhead và temporary/orphan data. |
+| **Sync conflict** | Hai devices/users thay đổi dựa trên stale state và server phải reject, branch, merge hoặc tạo conflict copy. |
+| **Commit-to-device-visible latency** | Thời gian từ metadata/version commit tới khi online device mục tiêu nhận hoặc kéo thấy change. |
+| **Content quarantine** | Trạng thái/storage cô lập file mới cho tới khi integrity, malware và policy checks hoàn tất. |
+| **File-count amplification** | Số metadata/version/manifest/journal records phát sinh quanh mỗi logical current file. |
+| **Content-byte amplification** | Physical bytes tăng so với current logical bytes do versions, trash, previews, temporary data và durability overhead. |
+| **Upload concurrency** | Số upload sessions đồng thời, xấp xỉ start rate nhân average transfer duration. |
+| **Part-request amplification** | Một large-file upload sinh nhiều PUT/list/retry/complete operations do multipart chunking. |
+| **Sync delivery amplification** | Một committed change được nhân thành nhiều notifications/deliveries tới devices và collaborators. |
+| **Committed change rate** | Số durable metadata/content mutations được append vào change journal mỗi giây. |
+| **Sync delivery rate** | Số change notifications/events thực gửi tới device connections, thường lớn hơn committed change rate. |
+| **Sync apply rate** | Số changes clients xác nhận đã fetch/apply, khác notification delivery. |
+| **Cursor catch-up storm** | Burst journal/metadata/content reads khi nhiều devices reconnect và đồng bộ backlog cùng lúc. |
+| **Namespace shard** | Metadata partition chứa FileEntry/folder/version state của một workspace/user range. |
+| **Hot workspace** | Account/team tạo tỷ lệ namespace, sync hoặc sharing traffic quá lớn trên một shard. |
+| **Hot folder** | Folder có rất nhiều children/collaborators/mutations làm nóng listing/index/AuthZ path. |
+| **Permission-check amplification** | Một access request cần resolve direct grants, ancestors, groups, links, policy và item state. |
+| **Viral share link** | Share capability nhận lượng access/download đột biến và tạo metadata, egress, abuse hoặc cost hotspot. |
+| **Object-request amplification** | Chunking, manifests, retries, range reads, replication và GC làm số object-store requests vượt file operations. |
+| **Version byte factor** | Tỷ lệ tổng bytes của các versions còn giữ trên bytes current versions. |
+| **Trash byte factor** | Tỷ lệ bytes trong trash trên bytes current active content. |
+| **Durability overhead** | Physical storage/network tăng do replication, erasure coding, repair và DR copies. |
+| **GC debt** | Bytes/objects đã đủ điều kiện xóa nhưng vẫn tồn tại vì backlog, grace hoặc reconciliation. |
+| **Cloud storage drain time** | Thời gian xử lý hết sync/scan/GC backlog bằng capacity dư sau incoming workload mới. |
+| **Object-store request cost** | Chi phí và throughput giới hạn theo PUT/GET/HEAD/LIST/DELETE, không chỉ stored bytes. |
+| **Control plane (cloud storage)** | Mặt phẳng xử lý namespace, versions, ACL, upload sessions, journals và các quyết định metadata. |
+| **Data plane (cloud storage)** | Đường truyền và lưu content bytes qua multipart upload, range download, object storage và CDN. |
+| **Direct-to-object-storage upload** | Client tải parts trực tiếp lên object storage bằng signed capability thay vì proxy toàn bộ bytes qua app server. |
+| **Upload manifest** | Danh sách có thứ tự của parts/chunks, sizes, checksums và storage identifiers dùng khi complete upload. |
+| **Idempotent upload completion** | Retry lệnh complete trả cùng một FileVersion/result thay vì tạo nhiều phiên bản. |
+| **Current-version pointer** | Metadata reference từ FileEntry tới immutable version đang được xem là hiện hành. |
+| **Immutable content key** | Object/cache key không đổi và gắn với version/hash cụ thể, tránh stale content khi file được cập nhật. |
+| **Sync wake-up** | Push notification chỉ báo có thay đổi để client gọi delta API; không phải bản ghi thay đổi bền vững. |
+| **Full reconciliation snapshot** | Đồng bộ lại toàn bộ state khi cursor quá cũ, bị mất hoặc không còn nằm trong journal retention. |
+| **Policy revision** | Phiên bản của ACL/policy dùng để phát hiện cache quyền cũ và thực thi revoke an toàn. |
+| **Revoke epoch** | Giá trị tăng khi quyền/token bị thu hồi để cached capabilities cũ lập tức mất hiệu lực. |
+| **Content-addressed object** | Object được nhận dạng bằng hash nội dung, cho phép integrity check và deduplication. |
+| **Deduplication side channel** | Rò rỉ gián tiếp việc dữ liệu đã tồn tại qua timing, quota hoặc phản hồi instant-upload. |
+| **Derived store** | Search index, cache hoặc analytics view có thể tái tạo từ source of truth. |
+| **Conditional metadata mutation** | Rename/move/update chỉ commit nếu revision hoặc ETag vẫn khớp state client đã đọc. |
+| **Multipart complete** | Thao tác xác minh/finalize các uploaded parts thành một content object hoặc manifest có thể đọc. |
+| **Authorization fail-closed** | Từ chối truy cập khi không thể xác minh quyền, thay vì cho phép để duy trì availability. |
+| **Deployment boundary** | Ranh giới một thành phần được build, release, scale và fail độc lập; có thể khác logical service boundary. |
+| **Operational burden** | Công sức vận hành gồm provision, upgrade, patch, monitor, on-call, backup, repair và recovery. |
+| **Managed object storage** | Dịch vụ object storage do cloud provider vận hành capacity, durability và phần lớn lifecycle hạ tầng. |
+| **S3-compatible** | Triển khai hỗ trợ một phần API S3; không đảm bảo giống hoàn toàn về semantics, limits hay độ bền. |
+| **Opaque object key** | Storage identifier không phụ thuộc tên/path mutable và không tiết lộ cấu trúc namespace. |
+| **Hot key** | Cache/partition key nhận tỷ lệ traffic quá lớn và trở thành bottleneck dù cluster còn capacity. |
+| **Workload identity** | Danh tính ngắn hạn của service/workload dùng truy cập tài nguyên thay cho static credentials. |
+| **Pod disruption budget** | Chính sách Kubernetes giới hạn số pod cùng lúc bị gián đoạn bởi voluntary operations. |
+| **Topology spreading** | Phân phối replicas qua node/zone/failure domain để tránh một sự cố làm mất toàn bộ service. |
+| **KEDA** | Cơ chế autoscale Kubernetes workload theo event/queue metrics như backlog hoặc consumer lag. |
+| **Oldest-message age** | Tuổi của message lâu nhất chưa xử lý; đo mức người dùng phải chờ tốt hơn queue depth đơn thuần. |
+| **Autoscaling stabilization window** | Khoảng quan sát giúp autoscaler tránh tăng giảm replicas liên tục do metric dao động. |
+| **Warm pool** | Capacity đã khởi động hoặc chuẩn bị sẵn để hấp thụ burst nhanh hơn cold provisioning. |
+| **Data residency** | Yêu cầu dữ liệu phải được lưu hoặc xử lý trong vùng pháp lý/địa lý nhất định. |
+| **Home-region sharding** | Mỗi tenant/shard có một region ghi chính nhằm đơn giản hóa consistency trong multi-region. |
+| **Envelope encryption** | Mã hóa dữ liệu bằng data key rồi bảo vệ data key bằng key-encryption key trong KMS. |
+| **Unit cost** | Chi phí trên một đơn vị sản phẩm như active user, stored GB, uploaded GB hoặc downloaded GB. |
+| **Migration trigger** | Ngưỡng đo được khiến đội ngũ phải đánh giá lại công nghệ hoặc kiến trúc hiện tại. |
+| **Architecture Decision Record (ADR)** | Bản ghi bối cảnh, lựa chọn, lý do, trade-off và điều kiện xem xét lại một quyết định kiến trúc. |
+| **Operations lock-in** | Sự phụ thuộc vào quy trình, nhân lực và hệ thống tự vận hành dù không bị khóa vào một cloud API. |
+| **Atomic file publication** | Chỉ làm file/version visible sau khi content manifest hợp lệ và metadata transaction commit thành công. |
+| **Post-upload processing** | Scan, preview, index, audit, dedup hoặc lifecycle work chạy sau content/metadata commit. |
+| **Quarantined file state** | File đã được ghi nhận nhưng chưa được download/share cho tới khi security hoặc policy checks đạt yêu cầu. |
+| **Orphan object** | Content object hoặc multipart parts tồn tại nhưng không có authoritative metadata reference hợp lệ. |
+| **Reference reconciliation** | Đối chiếu metadata/manifests/reference counts trước khi physical GC để tránh xóa content còn được sử dụng. |
+| **Signed download capability** | URL, cookie hoặc token ngắn hạn cho phép tải một immutable object/version trong scope xác định. |
+| **Revoke lag** | Khoảng từ lúc quyền bị thu hồi tới khi mọi cache/token/capability cũ ngừng cho phép truy cập. |
+| **Content complete** | Mốc mọi parts và integrity checks đã hoàn tất nhưng chưa nhất thiết file đã được metadata publish. |
+| **Metadata publish** | Mốc FileVersion/current pointer và journal record được commit, làm phiên bản visible theo policy. |
+| **Post-processing complete** | Mốc các derived jobs bắt buộc hoặc tùy chọn đã hoàn tất/hội tụ sau upload. |
+| **Failure fencing** | Ngăn writer/leader cũ tiếp tục ghi sau failover để tránh split-brain và divergent state. |
+| **Requirement traceability** | Khả năng liên kết mỗi component/quyết định với requirement, bottleneck hoặc failure mode cụ thể. |
+| **Async plane** | Nhóm event-driven jobs như sync fan-out, scan, preview, index, audit, dedup và GC. |
+| **Video on demand (VOD)** | Video được xử lý/lưu trước và phát khi người xem yêu cầu, khác live streaming. |
+| **Mezzanine video** | Bản nguồn chất lượng cao dùng làm đầu vào chuẩn cho transcoding và tạo các renditions. |
+| **Transcoding** | Giải mã rồi mã hóa video/audio sang codec, resolution hoặc bitrate khác. |
+| **Rendition** | Một biến thể video cụ thể theo codec, resolution, bitrate và đôi khi audio/language. |
+| **Bitrate ladder** | Tập các renditions được sắp theo chất lượng/bitrate để ABR lựa chọn. |
+| **Adaptive bitrate streaming (ABR)** | Player đổi rendition theo bandwidth, buffer, device và playback conditions. |
+| **Media segment** | Đoạn video/audio ngắn được player tải tuần tự hoặc khi seek trong segmented streaming. |
+| **Playback manifest** | Tệp mô tả renditions, segments và thông tin cần thiết để player phát ABR. |
+| **Video packaging** | Chia encoded media thành segments và tạo manifest theo streaming format. |
+| **Time to first frame (TTFF)** | Thời gian từ lúc bắt đầu playback request đến khi frame đầu tiên hiển thị. |
+| **Rebuffer ratio** | Tỷ lệ thời gian playback bị đứng chờ buffer trên tổng thời gian xem. |
+| **Playback QoE** | Quality of Experience tổng hợp startup, buffering, failures, bitrate và responsiveness. |
+| **Time to playable** | Thời gian từ source upload completion đến khi có tập rendition tối thiểu đủ phát. |
+| **Ready partial** | Trạng thái video đã có minimum playable outputs nhưng chưa hoàn tất mọi rendition/derived asset. |
+| **Publication event** | Sự kiện durable xác nhận video được phép xuất hiện trong playback, search, feed hoặc notification. |
+| **Video processing DAG** | Đồ thị phụ thuộc giữa validate, transcode, package, thumbnail, moderation và publish jobs. |
+| **Origin shield** | Lớp cache trung gian gom CDN misses để giảm nhiều edge cùng đánh vào origin. |
+| **Viral origin collapse** | Origin quá tải khi nội dung viral gây nhiều cache misses/fills đồng thời. |
+| **Watch event** | Sự kiện mô tả playback, progress, impression hoặc QoE dùng cho analytics và recommendation. |
+| **Fake engagement** | Views, likes, comments hoặc subscriptions được tạo tự động/thao túng thay vì hành vi thật. |
+| **Takedown propagation** | Quá trình lan truyền quyết định chặn/xóa tới playback, CDN, search, feed và caches. |
+| **Streaming storage amplification** | Dung lượng tăng do source, nhiều renditions, segments, thumbnails, temporary artifacts và durability copies. |
+| **Content hotlinking** | Website/client bên ngoài nhúng hoặc tải media trực tiếp, gây egress và vượt kiểm soát truy cập. |
+| **Minimum playable set** | Tập rendition/manifest tối thiểu phải sẵn sàng trước khi video được publish. |
+| **Source video-minute** | Một phút media nguồn; đơn vị workload hữu ích hơn số lượng video cho transcoding. |
+| **Equivalent realtime encoder** | Capacity xử lý một luồng video ở tốc độ bằng thời lượng phát thực tế. |
+| **Encoding speed factor** | Tỷ lệ tốc độ encode so với realtime, ví dụ 2× xử lý 10 phút video trong khoảng 5 phút. |
+| **Queued video-minutes** | Tổng thời lượng media đang chờ xử lý, phản ánh backlog tốt hơn job count. |
+| **Rendition amplification** | Một source video sinh nhiều output jobs/bytes theo codec, resolution và bitrate ladder. |
+| **Watch-hour** | Một giờ video thực tế được người dùng xem; đầu vào chính để ước lượng streaming egress. |
+| **Average delivered bitrate** | Bitrate trung bình thực sự được ABR player nhận trên toàn bộ watch time. |
+| **Segment request amplification** | Một playback tạo nhiều manifest, video, audio, subtitle và retry requests theo segment duration. |
+| **CDN byte hit ratio** | Tỷ lệ content bytes được edge/cache phục vụ mà không cần lấy từ origin. |
+| **CDN request hit ratio** | Tỷ lệ số request được cache phục vụ; có thể khác byte hit ratio do object sizes khác nhau. |
+| **Origin fill** | Lần CDN lấy content từ origin để điền cache sau miss. |
+| **Cold-cache event** | Tình huống cache trống/evict/failover khiến origin traffic tăng đột biến. |
+| **Watch telemetry amplification** | Một playback tạo nhiều impression, progress, QoE, seek và completion events. |
+| **Time-sharded counter** | Counter được chia theo time buckets/partitions để tránh mọi update dồn vào một hot row. |
+| **Processing headroom** | Phần compute dư trên incoming media work dùng hấp thụ burst và giải phóng backlog sau outage. |
+| **Video unit economics** | Chi phí theo uploaded minute, encoded minute, stored video-month, watch-hour hoặc delivered GB. |
+| **Time-to-takedown** | Thời gian từ quyết định policy tới lúc playback, search, feed và cache ngừng phục vụ nội dung. |
+| **Media control plane** | Plane quản lý video state, ownership, visibility, assets, processing và publication decisions. |
+| **Media data plane** | Plane truyền source/rendition/segment/manifest bytes qua object storage và CDN. |
+| **Processing orchestrator** | Thành phần tạo, theo dõi và điều phối dependency DAG của các media jobs. |
+| **Processing lease** | Quyền xử lý job có thời hạn, cho phép worker khác tiếp quản khi worker hiện tại chết. |
+| **Deterministic asset key** | Output identifier suy ra ổn định từ video/job/rendition/version để retry không tạo asset logic trùng. |
+| **Publication coordinator** | Thành phần xác minh assets và policy rồi thực hiện authoritative READY/PUBLISHED transition. |
+| **Publication gate** | Tập điều kiện bắt buộc về media readiness, security, moderation và visibility trước khi công bố video. |
+| **Playback session** | Context có ID riêng cho authorization, manifest access, watch semantics và QoE telemetry. |
+| **Playback entitlement** | Quyền xem dựa trên visibility, subscription/payment, region, age hoặc business policy. |
+| **Manifest versioning** | Tạo manifest immutable/versioned mới khi asset set đổi thay vì mutate cache object hiện hành. |
+| **Late authorization filtering** | Kiểm tra policy gần thời điểm trả detail/playback để chặn result stale từ search/feed/cache. |
+| **Engagement authoritative write** | Bản ghi bền vững xác nhận hành động like/comment/subscription trước khi xử lý các side effects. |
+| **Derived engagement effect** | Counter, notification, feature hoặc analytics update được tạo bất đồng bộ từ user action đã commit. |
+| **Playback fallback** | Chế độ tiếp tục phát video trực tiếp dù search, feed hoặc recommendation đang suy giảm. |
+| **Processing reconciler** | Job định kỳ tìm video/asset mắc kẹt hoặc event thất lạc và đưa workflow về trạng thái đúng. |
+| **Asset registration** | Commit metadata xác nhận output object đã được kiểm tra và có thể tham gia rendition/manifest. |
+| **Poison media input** | File malformed hoặc đặc biệt khiến parser/transcoder liên tục lỗi, treo hoặc tiêu tốn quá nhiều tài nguyên. |
+| **HLS** | HTTP Live Streaming, giao thức adaptive streaming dựa trên manifest và media segments. |
+| **MPEG-DASH** | Chuẩn Dynamic Adaptive Streaming over HTTP cho playback nhiều renditions. |
+| **CMAF** | Common Media Application Format, định dạng fragmented media có thể hỗ trợ dùng chung segments giữa streaming protocols. |
+| **Hardware-accelerated encoding** | Encode bằng GPU/ASIC/media engine để tăng throughput, với trade-off về quality, cost và availability. |
+| **Codec cost factor** | Trọng số compute của codec/resolution/profile dùng quy đổi queued video-minutes thành work units. |
+| **Task visibility timeout** | Khoảng một queued task tạm ẩn sau khi worker nhận; hết hạn sẽ được giao lại nếu chưa ack. |
+| **Replayable event log** | Log giữ events theo retention để nhiều consumer groups đọc lại độc lập. |
+| **Work queue** | Queue phân phối mỗi task cho một worker group xử lý, thường có ack, retry và DLQ. |
+| **GPU node pool** | Nhóm compute nodes có GPU và scheduling policy riêng cho workload tăng tốc phần cứng. |
+| **Taint and toleration** | Cơ chế Kubernetes hạn chế pod nào được schedule lên node chuyên biệt như GPU nodes. |
+| **Priority class** | Chính sách Kubernetes xác định thứ tự ưu tiên scheduling/preemption giữa workload classes. |
+| **Multi-CDN steering** | Chọn CDN theo region, health, performance hoặc cost và chuyển traffic khi cần. |
+| **Cache-key fragmentation** | Cùng content bị chia thành nhiều cache entries do query/token/header khác nhau, làm giảm hit ratio. |
+| **Codec lifecycle ROI** | So sánh encode/storage/compatibility cost với egress savings trong toàn bộ lượt xem dự kiến. |
+| **Point-in-time recovery (PITR)** | Khôi phục database về một thời điểm cụ thể bằng backup và transaction logs. |
+| **JWKS** | Tập public keys ở dạng JSON dùng để xác minh chữ ký token và hỗ trợ key rotation. |
+| **PKCE** | Cơ chế bảo vệ OAuth Authorization Code flow cho public clients khỏi code interception. |
+| **Refresh-token rotation** | Cấp refresh token mới khi sử dụng và vô hiệu token cũ để giảm replay risk. |
+| **Media lineage** | Chuỗi liên kết từ source upload qua processing jobs, renditions, manifest đến playback sessions. |
+| **Processing run** | Một lần thực thi có ID của toàn bộ media DAG cho một source/version cụ thể. |
+| **Publication revision** | Version tăng dần của authoritative publication state/manifest giúp projections xử lý đúng thứ tự. |
+| **Desired visibility** | Trạng thái public/unlisted/private creator mong muốn, tách khỏi actual readiness/publication state. |
+| **Verified rendition** | Rendition đã hoàn thành encode, integrity/quality checks và asset registration. |
+| **Temporary media output** | Output worker chưa được verify/register nên không được đưa vào playback manifest. |
+| **Media origin** | Storage/service nguồn mà CDN lấy manifest hoặc segment khi cache miss. |
+| **Regional ingest** | Điểm upload gần creator dùng giảm latency và phân tán ingress bandwidth. |
+| **Weighted processing work** | Work unit kết hợp video-minutes với codec/resolution/complexity để schedule và autoscale chính xác hơn. |
+| **Playback critical path** | Chuỗi dependency tối thiểu từ playback request tới manifest/segment delivery. |
+| **Media graceful degradation** | Trì hoãn quality/features ít quan trọng để bảo vệ integrity, authorization và core playback. |
+| **Projection revision check** | Consumer chỉ apply event mới hơn state đã có để chống duplicate hoặc out-of-order update. |
+| **Creator processing status** | Trạng thái chi tiết cho uploader về validation, transcode, publication, failure và retry. |
+| **Takedown deny path** | Cơ chế chặn playback/search/feed ngay cả khi CDN hay derived indexes chưa purge hoàn toàn. |
