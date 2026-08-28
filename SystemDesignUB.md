@@ -61953,6 +61953,14236 @@ Câu hỏi cần trả lời được:
 
 ---
 
+## Phần 21 — Design a Search Engine (Google)
+
+### Bài 108. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần giải quyết
+
+Thiết kế một search engine ở quy mô Internet có khả năng:
+
+- khám phá và crawl hàng tỷ web pages;
+- tải, chuẩn hóa và hiểu nội dung cơ bản của pages;
+- xây dựng searchable index;
+- nhận keyword query và tìm candidates trong milliseconds;
+- xếp hạng để đưa kết quả phù hợp nhất lên đầu;
+- cập nhật hoặc loại bỏ documents khi web thay đổi;
+- cung cấp dữ liệu cho analytics và cải thiện chất lượng tìm kiếm.
+
+Pipeline tổng quát:
+
+```text
+Discover URLs
+     ↓
+Schedule politely
+     ↓
+Fetch public pages
+     ↓
+Parse + normalize + canonicalize
+     ↓
+Deduplicate + extract text/links/metadata
+     ↓
+Build index + link/ranking signals
+     ↓
+Publish immutable index segments
+     ↓
+Query → retrieve candidates → rank → return top results
+     ↓
+Logs/feedback → quality analytics và model/rule improvements
+```
+
+Search engine không chỉ là database chứa HTML. Nó là sự phối hợp giữa hai hệ thống lớn:
+
+```text
+Offline/nearline ingestion plane → crawl, process, index, compute signals
+Online serving plane            → parse query, retrieve, rank, return results
+```
+
+Hai plane có workload, consistency và latency hoàn toàn khác nhau.
+
+---
+
+#### 2. Actors chính
+
+| Actor | Mục tiêu |
+|---|---|
+| **Searcher** | Nhận kết quả nhanh, liên quan, an toàn và đáng tin cậy |
+| **Website owner/publisher** | Nội dung được crawl/index đúng policy; có thể kiểm soát bằng standards/takedown channels |
+| **Crawler** | Khám phá và tải pages có trách nhiệm, không gây quá tải websites |
+| **Indexer** | Biến raw documents thành structures tối ưu cho retrieval |
+| **Ranking system** | Chọn và sắp xếp kết quả tốt nhất cho query |
+| **Internal analytics/search-quality team** | Phân tích queries, clicks, failures và relevance để cải thiện hệ thống |
+| **Trust, safety và legal operations** | Chống spam/malware, xử lý removal và policy enforcement |
+| **System operator/SRE** | Vận hành crawling, indexing và serving theo SLO/cost |
+
+Trong scope này, mọi user nhận cùng ranking cho cùng query/context cơ bản; chưa có personalization theo profile.
+
+---
+
+#### 3. Năm capability cốt lõi
+
+##### 3.1. Web crawling
+
+Crawler cần:
+
+- nhận seed URLs;
+- tải public web pages;
+- trích xuất outgoing links;
+- canonicalize URLs;
+- loại duplicate URLs/content;
+- tôn trọng `robots.txt` và crawl-delay/politeness policy nội bộ;
+- giới hạn concurrency/rate theo host;
+- retry transient failures có kiểm soát;
+- phát hiện redirects và redirect loops;
+- lên lịch recrawl theo change probability/value;
+- ghi fetch status, content hash và next fetch time.
+
+Crawler không được coi Internet là một queue không giới hạn. Cần URL frontier có priority, per-host scheduling và seen-URL state.
+
+##### 3.2. Document processing và indexing
+
+Raw HTML không phù hợp cho millisecond search. Pipeline phải:
+
+- parse HTML an toàn;
+- loại boilerplate/navigation khi phù hợp;
+- extract visible text, title, headings và links;
+- detect language/encoding;
+- tokenize và normalize terms;
+- tạo document ID và canonical URL;
+- deduplicate exact/near-duplicate content;
+- tính term/document statistics;
+- xây inverted index;
+- tạo stored fields/snippet inputs;
+- publish index segments cho serving.
+
+##### 3.3. Keyword search
+
+Khi user gửi query:
+
+- parse/normalize query;
+- lookup posting lists;
+- intersect/union candidates;
+- áp dụng filters;
+- lấy top-K candidates;
+- rank/re-rank;
+- tạo title/URL/snippet;
+- trả results và pagination token.
+
+Không quét toàn bộ documents tại query time.
+
+##### 3.4. Ranking
+
+Ranking kết hợp nhiều signals:
+
+- lexical relevance như TF-IDF/BM25-style score;
+- term proximity, fields và anchor text;
+- link authority/PageRank-style signals;
+- freshness;
+- language/location/context cơ bản nếu trong scope;
+- document quality và spam/safety;
+- query-independent và query-dependent signals.
+
+PageRank không tự trả lời relevance cho query; nó là một authority signal. TF-IDF cũng không phải toàn bộ ranking system.
+
+##### 3.5. Recrawling và re-indexing
+
+Web thay đổi liên tục. Hệ thống phải:
+
+- ưu tiên recrawl pages thay đổi nhanh hoặc quan trọng;
+- phát hiện content change qua hash/validators;
+- cập nhật index khi nội dung đổi;
+- xử lý redirect/canonical changes;
+- tombstone pages trả 404/410 hoặc bị removal;
+- loại kết quả spam/malware theo policy;
+- giữ index serving khả dụng trong lúc build phiên bản mới.
+
+---
+
+#### 4. Functional requirements
+
+##### 4.1. URL discovery
+
+- seed lists;
+- links từ fetched pages;
+- sitemaps nếu website cung cấp;
+- redirects/canonical hints;
+- retry/revisit candidates;
+- removal/recrawl requests nếu nằm trong scope vận hành.
+
+##### 4.2. Crawl scheduling
+
+- priority score;
+- per-host/domain politeness;
+- DNS/connection efficiency;
+- robots policy cache;
+- next-fetch timestamp;
+- retry class theo error;
+- distributed lease/dedup để tránh nhiều crawler fetch cùng URL.
+
+##### 4.3. Fetching
+
+- HTTP/HTTPS requests;
+- redirects có giới hạn;
+- compression/content size/timeouts;
+- conditional requests như ETag/Last-Modified khi có;
+- response status/type validation;
+- raw content hoặc parsed representation retention theo policy.
+
+##### 4.4. Parsing và normalization
+
+- decode charset;
+- parse HTML trong sandbox;
+- extract text, links và metadata;
+- normalize Unicode/case/token boundaries;
+- language detection;
+- canonical URL selection;
+- duplicate/near-duplicate fingerprinting.
+
+##### 4.5. Index construction
+
+- assign stable document IDs;
+- term dictionary;
+- posting lists;
+- document statistics;
+- field-aware positions/frequencies;
+- compressed immutable segments;
+- segment merge/compaction;
+- replicated shard publication.
+
+##### 4.6. Query serving
+
+- simple keyword queries;
+- top-N results;
+- pagination/cursor;
+- spelling/query rewrite cơ bản nếu được thêm vào scope;
+- snippets/highlights;
+- safe-search/policy filters;
+- timeout và partial-result policy.
+
+##### 4.7. Ranking
+
+- lexical relevance;
+- link authority;
+- freshness/quality/spam signals;
+- deterministic/config-versioned scoring;
+- evaluation and rollback.
+
+##### 4.8. Index refresh/removal
+
+- periodic batch/nearline build;
+- publish index generation mới;
+- delete/tombstone documents;
+- rollback bad index generation;
+- verify coverage/freshness before traffic switch.
+
+##### 4.9. Analytics
+
+- query volume và latency;
+- zero-result queries;
+- clicks/position/dwell signals với privacy controls;
+- crawl coverage/failure;
+- index freshness/size;
+- ranking experiments;
+- abuse/spam analysis.
+
+Analytics không nên query trực tiếp online serving shards bằng scan nặng.
+
+---
+
+#### 5. Non-functional requirements
+
+##### 5.1. Query latency
+
+Transcript đặt mục tiêu dưới 200 ms cho top results. Cần định nghĩa measurement boundary và percentile:
+
+```text
+Client/gateway received query
+→ query parse/rewrite
+→ scatter to index shards
+→ candidate retrieval/local top-K
+→ merge/global rank
+→ snippets/policy
+→ response emitted
+```
+
+SLO nên dùng p95/p99, không chỉ average. Ví dụ:
+
+- p95 dưới 200 ms cho supported simple queries;
+- bounded timeout cho slow shards;
+- partial result chỉ khi product cho phép;
+- cache hit và miss SLO tách riêng.
+
+##### 5.2. Scalability
+
+- billions of indexed documents;
+- khoảng 50.000 queries/s theo transcript;
+- crawl/index traffic độc lập với query traffic;
+- horizontal sharding và replication;
+- scale compute, storage và network riêng;
+- chịu hot queries và skew.
+
+##### 5.3. Freshness
+
+Transcript yêu cầu index cập nhật trong vài giờ. Nhưng freshness không đồng nhất:
+
+- breaking-news/high-value pages cần nhanh hơn;
+- stable archive pages có thể recrawl chậm;
+- deletion/malware/legal removal cần propagation nhanh hơn ordinary updates;
+- index freshness cần đo từ source change/discovery tới searchable generation.
+
+##### 5.4. Fault tolerance và availability
+
+- không có single point of failure;
+- crawler retry transient fetches;
+- failed hosts không chặn global frontier;
+- index shards có replicas;
+- bad segment/build không được publish;
+- query serving degrade khi một shard/replica chậm;
+- serving tiếp tục trong lúc index build;
+- recovery từ corrupted/incorrect index generation.
+
+##### 5.5. Storage efficiency
+
+- compress raw content/index/postings;
+- deduplicate URLs và contents;
+- immutable segments + merge;
+- tier raw crawl data theo retention;
+- avoid storing unnecessary fields;
+- replication/backup overhead phải được tính;
+- không đánh đổi decompression latency quá mức.
+
+##### 5.6. Relevance và quality
+
+“Đúng kết quả” không phải Boolean đơn giản. Cần:
+
+- offline labeled relevance metrics;
+- online experiment/behavior metrics;
+- spam/safety quality;
+- diversity và source quality;
+- evaluation theo language/query class;
+- reproducible ranking configuration.
+
+##### 5.7. Responsible crawling
+
+- tôn trọng robots exclusion directives;
+- fair per-host concurrency/rate;
+- user-agent/contact information;
+- back off khi 429/5xx/latency tăng;
+- tránh crawl traps/infinite URL spaces;
+- giới hạn content size/type;
+- không biến retry thành DDoS.
+
+---
+
+#### 6. Query lifecycle
+
+```text
+1. User gửi keyword query
+2. Gateway kiểm tra rate/abuse và normalize request
+3. Query Service parse, tokenize và rewrite cơ bản
+4. Coordinator chọn index generation/shards
+5. Scatter request tới shard replicas
+6. Mỗi shard lookup postings và tạo local top-K
+7. Coordinator merge candidates
+8. Rank/re-rank và áp policy filters
+9. Fetch stored fields/snippets nếu chưa kèm candidates
+10. Trả top results + cursor
+11. Ghi query/click telemetry bất đồng bộ
+```
+
+Đường online không được phụ thuộc vào crawler hoặc batch index builder đang chạy.
+
+---
+
+#### 7. Crawl/index lifecycle
+
+```text
+URL DISCOVERED
+     ↓ dedup/canonicalization
+FRONTIER_SCHEDULED
+     ↓ host-politeness lease
+FETCHING
+     ├─ transient failure → RETRY_SCHEDULED
+     ├─ permanent/not found → TOMBSTONE_CANDIDATE
+     └─ success
+          ↓
+FETCHED
+     ↓ parse/extract/fingerprint
+PROCESSED
+     ├─ duplicate/non-indexable → SKIPPED
+     ├─ policy issue → BLOCKED
+     └─ indexable
+          ↓
+INDEX_PENDING
+     ↓ segment build/validation
+INDEXED/PUBLISHED
+     ↓ revisit scheduler
+RECRAWL_SCHEDULED
+```
+
+Document fetch state và searchable publication state là hai chuyện khác nhau. Page đã fetch nhưng chưa qua parse/policy/build chưa được coi là indexed.
+
+---
+
+#### 8. Assumptions của case study
+
+| Assumption | Hệ quả |
+|---|---|
+| Chỉ public websites | Không crawl login-protected/private content |
+| Không xử lý phức tạp JavaScript-heavy pages | Không cần large-scale browser rendering fleet trong scope cơ bản |
+| Tôn trọng `robots.txt` và politeness | Frontier phải schedule theo host/domain policy |
+| Simple keyword search | Không thiết kế full conversational/semantic answer engine |
+| Ranking cơ bản TF-IDF + PageRank | Tập trung retrieval/index/link graph trước advanced ML |
+| Query top results dưới 200 ms | Online serving cần sharding, cache, top-K merge và strict budgets |
+| Khoảng 50K QPS | Replicated distributed query serving |
+| Freshness trong vài giờ | Periodic batch/nearline indexing chấp nhận được |
+| Không personalization | Cùng query/context cơ bản trả cùng ranking |
+| Billions of pages/petabyte scale | Compressed distributed indexes và storage lifecycle |
+
+Những assumptions này dùng cho bài tập, không mô tả toàn bộ Google Search thật.
+
+---
+
+#### 9. Out of scope mặc định
+
+- authenticated/private web;
+- full browser rendering cho JavaScript-heavy applications;
+- images/video/news/maps/product vertical search;
+- ads auction;
+- personalized ranking/user profiling;
+- advanced neural/semantic retrieval;
+- conversational answers/generative search;
+- full global legal/removal workflow;
+- multilingual NLP chi tiết;
+- exact duplicate/spam algorithms;
+- real-time indexing cho mọi page;
+- exact PageRank implementation at web scale.
+
+Nếu interviewer muốn, chọn một nhánh để đào sâu; không cố thiết kế toàn bộ Google.
+
+---
+
+#### 10. Canonicalization và duplicate detection
+
+Nhiều URLs có thể biểu diễn cùng một page:
+
+```text
+http://example.com
+https://example.com/
+https://example.com/?utm_source=x
+https://www.example.com/index.html
+```
+
+URL canonicalization có thể:
+
+- normalize scheme/host/case theo rule an toàn;
+- remove default ports;
+- resolve relative URLs;
+- normalize fragments;
+- xử lý tracking parameters theo curated policy;
+- tôn trọng redirects và canonical hints;
+- tránh over-normalization làm gộp hai resources khác nhau.
+
+Các lớp dedup:
+
+| Lớp | Mục đích |
+|---|---|
+| URL seen set | Tránh enqueue chính URL đã biết quá nhiều lần |
+| Canonical URL | Gộp aliases có confidence |
+| Exact content hash | Phát hiện bytes/content giống nhau |
+| Near-duplicate fingerprint | Phát hiện templates/copied pages gần giống |
+| Cluster/representative selection | Chọn document canonical để index/rank |
+
+Dedup là optimization và quality feature; phải giữ provenance để debug hoặc đổi canonical decision.
+
+---
+
+#### 11. Crawl politeness và fairness
+
+Global frontier không chỉ là priority queue. Nó cần:
+
+```text
+global discovery/priority queues
+          ↓
+host/domain partitions
+          ↓
+robots policy + next-allowed-fetch time
+          ↓
+per-host concurrency/rate limiter
+          ↓
+fetch workers
+```
+
+Scheduler phải tránh:
+
+- nhiều workers đồng thời đánh một host nhỏ;
+- retry storm khi host lỗi;
+- crawler traps tạo infinite URLs;
+- large domains chiếm toàn bộ bandwidth;
+- DNS/connection churn;
+- stale robots policy hoặc policy bypass.
+
+Politeness có thể giảm tốc độ crawl nhưng là yêu cầu đúng đắn, không phải performance bug.
+
+---
+
+#### 12. Freshness versus cost
+
+Không recrawl mọi page cùng cadence. Priority có thể dựa trên:
+
+- lịch sử thay đổi;
+- importance/link authority;
+- query demand;
+- last modified/HTTP validators;
+- sitemap hints;
+- fetch cost/latency;
+- host budget;
+- error history;
+- freshness class.
+
+```text
+Recrawl priority ≈ expected value of fresh content
+                 × probability of change
+                 ÷ crawl cost/risk
+```
+
+Examples:
+
+- news homepage: phút;
+- active product/catalog page: giờ;
+- stable documentation: ngày/tuần;
+- dead/spam page: rất chậm hoặc ngừng.
+
+Deletion/removal là lane ưu tiên riêng; không nên chờ ordinary recrawl cadence nếu có authoritative takedown signal.
+
+---
+
+#### 13. Ranking scope và trade-offs
+
+##### TF-IDF
+
+Đo mức một term quan trọng với document dựa trên:
+
+- term frequency trong document;
+- inverse document frequency trong corpus.
+
+Hạn chế:
+
+- không hiểu sâu semantics/intent;
+- có thể bị keyword stuffing;
+- cần field/length normalization;
+- không dùng link authority.
+
+##### PageRank-style authority
+
+Xem web như directed graph và truyền authority qua links. Hữu ích cho query-independent importance nhưng:
+
+- cần large-scale graph computation;
+- bị link spam thao túng;
+- không bảo đảm page liên quan query;
+- cần refresh khi link graph đổi;
+- chỉ là một signal trong ranking.
+
+##### Kết hợp sơ bộ
+
+```text
+Final score = lexical relevance
+            + field/proximity signals
+            + link authority
+            + freshness/quality
+            − spam/safety penalties
+```
+
+Weights/version phải được quản lý, đánh giá và rollback; không hard-code vô hình trong nhiều services.
+
+---
+
+#### 14. Consistency và freshness expectations
+
+| Dữ liệu/operation | Expectation |
+|---|---|
+| Query response | Đọc một index generation nhất quán hoặc compatible shards |
+| New page discovery | Eventual, theo crawl/index freshness SLO |
+| Page update | Eventual, ưu tiên theo value/change rate |
+| Delete/takedown | Bounded, nhanh hơn ordinary refresh |
+| Ranking features | Versioned snapshot hoặc bounded staleness |
+| Query analytics | Eventual |
+| Crawl seen/frontier state | Idempotent/eventual với duplicate tolerance |
+| robots policy | Bounded cache freshness, fail-safe |
+
+Search engine chấp nhận eventual consistency cho web changes, nhưng không nên phục vụ một index generation pha trộn không tương thích giữa shards.
+
+---
+
+#### 15. Core entities ban đầu
+
+```text
+URLRecord(
+  url_id, normalized_url, host_id, canonical_url_id,
+  discovery_source, crawl_state, next_fetch_at, priority, ...
+)
+
+HostPolicy(
+  host_id, robots_version, crawl_rate, next_allowed_at,
+  error_state, dns_state, ...
+)
+
+FetchRecord(
+  fetch_id, url_id, fetched_at, status, headers,
+  content_hash, object_ref, latency, ...
+)
+
+Document(
+  document_id, canonical_url, title, language,
+  content_fingerprint, indexability, revision, ...
+)
+
+TermDictionary(term_id, normalized_term, stats, ...)
+
+Posting(
+  term_id, shard_id, document_id,
+  frequency, positions, field_flags, ...
+)
+
+LinkEdge(source_document_id, target_url/document_id, anchor_text, ...)
+
+IndexGeneration(
+  generation_id, shard_set, schema_version,
+  ranking_feature_version, state, published_at, ...
+)
+
+QueryEvent(
+  request_id, normalized_query, latency, result_count,
+  experiment_context, privacy-safe fields, ...
+)
+```
+
+Raw HTML, crawl metadata, inverted index, link graph và query logs không nhất thiết nằm trong cùng storage technology.
+
+---
+
+#### 16. Key design challenges
+
+##### 16.1. Web scale và unbounded input
+
+Không biết trước toàn bộ URLs; link graph phát triển liên tục. Crawler cần frontier, quotas và infinite-space defense.
+
+##### 16.2. Duplicate và low-quality content
+
+Nhiều URL aliases, mirrors, copied text, spam và generated pages làm lãng phí crawl/index và giảm relevance.
+
+##### 16.3. Fast retrieval trên billions of documents
+
+Inverted index phải partition, compress, cache và trả local top-K nhanh; coordinator không thể đọc mọi match.
+
+##### 16.4. Ranking quality
+
+Nhiều pages cùng match. Ranking phải kết hợp relevance, authority, freshness và safety trong strict latency budget.
+
+##### 16.5. Freshness versus cost
+
+Recrawl/reindex nhanh tiêu tốn network/compute/storage; chậm làm stale results. Scheduler phải ưu tiên theo value.
+
+##### 16.6. Hot queries và tail latency
+
+Popular queries cache tốt nhưng typo/long-tail query gây shard scatter và expensive posting intersections. Một slow shard có thể kéo p99 toàn query.
+
+##### 16.7. Index rollout
+
+Build mới có thể lỗi, thiếu documents hoặc ranking regression. Cần immutable generations, validation, canary và rollback.
+
+##### 16.8. Adversarial environment
+
+Crawler gặp malformed content, traps và malicious servers; ranking gặp SEO/link/keyword spam; query endpoint gặp bots/scraping/abuse.
+
+---
+
+#### 17. Những câu hỏi cần hỏi interviewer
+
+##### Corpus và crawling
+
+- Bao nhiêu URLs/documents active?
+- Pages trung bình/p95 bao nhiêu KB?
+- Cần giữ raw HTML không và giữ bao lâu?
+- Có render JavaScript không?
+- Recrawl freshness theo page class?
+- Sitemaps/feeds/removal APIs có trong scope?
+- Politeness per host/domain ra sao?
+
+##### Query workload
+
+- 50K QPS là average hay peak?
+- Query length/distribution?
+- Top-K bao nhiêu?
+- Có phrase, AND/OR, filters, spelling, autocomplete không?
+- p95/p99 latency target và partial-results policy?
+- Languages/regions?
+
+##### Ranking
+
+- Chỉ TF-IDF/PageRank hay learned ranking?
+- Freshness và safety có trọng số thế nào?
+- Có personalization không?
+- Evaluation metric và experiment scope?
+
+##### Indexing
+
+- Batch generation hay continuous incremental segments?
+- Freshness vài giờ đo từ lúc web đổi hay crawler phát hiện?
+- Delete/takedown SLO?
+- Full rebuild mất bao lâu?
+- Index replicas và rollout model?
+
+##### Reliability/cost
+
+- Availability target?
+- Multi-region query serving?
+- RPO/RTO cho frontier/index metadata?
+- Có thể rebuild index từ source data không?
+- Storage/compression/crawl bandwidth budget?
+
+---
+
+#### 18. SLO gợi ý
+
+Các con số chỉ để định hướng và cần xác nhận:
+
+| SLI | SLO minh họa |
+|---|---|
+| Query availability | 99,99% |
+| Query latency | p95 dưới 200 ms cho simple keyword query |
+| Query timeout/partial result | Dưới ngưỡng product quy định |
+| Fresh page searchable | p95 trong vài giờ theo priority class |
+| Urgent removal propagation | Phút hoặc nhanh hơn tùy policy |
+| Crawl politeness violation | Gần 0, có audit/alert |
+| Index-generation publish success | 100% validation gate trước rollout |
+| Zero-result/error rate | Theo query class/language |
+| Index shard availability | Đủ replicas để chịu node/AZ failure |
+
+Relevance cần quality metrics riêng; latency thấp nhưng kết quả tệ không phải search engine thành công.
+
+---
+
+#### 19. Invariants quan trọng
+
+```text
+Robots/politeness policy chưa xác minh → không crawl aggressive
+Một URL lease active              → hạn chế duplicate fetch đồng thời
+Document non-indexable/blocked    → không xuất hiện trong searchable generation
+Published index generation        → tất cả required shards/schema compatible
+Posting trỏ document              → document metadata cần tồn tại/được resolve
+Index rollout thất bại            → serving tiếp tục generation cũ
+Removal authoritative             → query path có deny/filter trước full purge nếu cần
+Analytics pipeline lỗi            → không làm query serving dừng
+```
+
+---
+
+#### 20. Lỗi scope và tư duy thường gặp
+
+1. **Bắt đầu bằng database hoặc Elasticsearch.**  
+   Trước hết phải tách crawl, process, build và serve.
+
+2. **Coi crawler là nhiều threads fetch URLs.**  
+   Frontier, robots, politeness, canonicalization, traps và retries mới là phần khó.
+
+3. **Coi raw HTML là searchable index.**  
+   Cần tokenization, inverted index, compression và ranking signals.
+
+4. **Coi PageRank là thuật toán trả kết quả.**  
+   Nó chỉ là query-independent authority signal.
+
+5. **TF-IDF đủ cho chất lượng search.**  
+   Cần field/proximity/freshness/quality/spam signals và evaluation.
+
+6. **Recrawl mọi page theo cùng lịch.**  
+   Lãng phí bandwidth và làm nội dung quan trọng không đủ fresh.
+
+7. **Batch index build làm serving dừng.**  
+   Build immutable generation bên cạnh, validate rồi atomic/canary switch.
+
+8. **Một page 404 được xóa khỏi index ngay lập tức sau một fetch.**  
+   Cần error classification, confidence/retry và tombstone policy.
+
+9. **Analytics scan trực tiếp serving shards.**  
+   Làm tăng tail latency; dùng logs/data platform riêng.
+
+10. **Chỉ tối ưu average latency.**  
+    Fan-out query bị chi phối bởi slowest shards; phải quản p95/p99 và timeout budgets.
+
+---
+
+#### 21. Ý chính cần nhớ
+
+- Search engine gồm offline/nearline ingestion và online serving planes.
+- Core lifecycle là discover → schedule → fetch → process → index → rank → serve → refresh/remove.
+- Crawler phải tôn trọng `robots.txt`, politeness và per-host budgets.
+- URL canonicalization, exact và near-duplicate detection giảm crawl/index waste.
+- Raw HTML phải được biến thành compressed inverted index để lookup nhanh.
+- Keyword retrieval tìm candidates; ranking sắp thứ tự bằng relevance, authority, freshness và quality.
+- PageRank chỉ là authority signal; TF-IDF chỉ là lexical signal.
+- Query serving target dưới 200 ms cần percentile/budget rõ, không chỉ average.
+- 50K QPS và billions of documents yêu cầu sharding, replication, caching và top-K merge.
+- Freshness nên ưu tiên theo change probability/value, không recrawl đồng đều.
+- Batch/nearline indexing cần immutable generations, validation, canary và rollback.
+- Search index và analytics là derived; source documents/crawl records cho phép rebuild.
+- Removal/takedown cần đường propagation nhanh hơn ordinary recrawl.
+- Personalization, JavaScript rendering và semantic/neural search nằm ngoài scope ban đầu.
+- Relevance, safety và storage/crawl cost đều là first-class non-functional requirements.
+- Mỗi component về sau phải giải quyết một bottleneck hoặc invariant đã xác định.
+
+#### Công thức ghi nhớ
+
+> **Search Engine = polite prioritized crawling + canonicalized/deduplicated document processing + compressed distributed inverted indexes + versioned ranking signals + low-latency top-K serving + value-aware refresh and removal.**
+
+---
+
+### Bài 109. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Mục tiêu của capacity estimation
+
+Search engine có nhiều đơn vị workload khác nhau:
+
+```text
+URLs discovered/s
+Pages fetched/s và crawl bytes/s
+Documents parsed/indexed/s
+Terms/postings generated/s
+Index bytes, segments và generations
+User queries/s
+Shard requests/s = query QPS × fan-out
+Candidates scored/s
+Query/click events/s
+Recrawl/removal backlog và freshness lag
+```
+
+Một con số như “100 triệu pages” hoặc “2.000 QPS” chưa đủ. Cần phân biệt:
+
+- initial crawl và steady-state recrawl;
+- raw HTML, processed content, forward index và inverted index;
+- logical versus physical storage;
+- user QPS versus internal shard QPS;
+- average versus peak/hot-query load;
+- index build throughput versus publish freshness;
+- normal updates versus urgent removals.
+
+---
+
+#### 2. Ba scale tiers trong transcript
+
+Transcript trộn ba mục tiêu khác nhau:
+
+| Tier | Corpus/query scale | Cách hiểu hợp lý |
+|---|---|---|
+| Internet-scale illustration | Hơn 100B pages | Minh họa eventual large corpus |
+| Bài 108 baseline | Billions of docs, khoảng 50K QPS | Target lớn của case study |
+| Bài 109 MVP | 100M pages, peak 1K–2K QPS | Target cụ thể để tính toán bước đầu |
+| Một câu trong Bài 109 | “Capacity up to 1M QPS” | Không nhất quán với MVP traffic assumptions |
+
+Ta dùng **100M pages và 1K–2K peak QPS** làm MVP sizing baseline. Kiến trúc vẫn cần horizontal scale path lên 50K QPS và xa hơn, nhưng không provision 1M QPS ngay nếu business load chỉ cần 2K.
+
+---
+
+#### 3. Internet-scale corpus illustration
+
+Giả sử:
+
+```text
+100B pages × 100 KB/page
+= 10.000.000.000.000 KB
+≈ 10 PB raw content decimal
+```
+
+Phép tính đúng.
+
+Nếu compression, boilerplate removal và dedup giảm còn 20%–30%:
+
+```text
+≈ 2–3 PB processed/retained footprint
+```
+
+Nhưng 2–3 PB chỉ là assumption. Physical system còn có:
+
+- crawl versions/raw retention;
+- forward và inverted indexes;
+- link graph;
+- metadata;
+- multiple index generations;
+- replicas;
+- build scratch space;
+- backups/DR;
+- query logs và ranking features.
+
+Do đó không nên hiểu “2–3 PB” là tổng capacity cuối cùng.
+
+---
+
+#### 4. MVP raw corpus storage
+
+```text
+100.000.000 pages × 100 KB/page
+= 10.000.000.000 KB
+≈ 10 TB raw HTML
+```
+
+Đây là logical average. Page-size distribution rất lệch:
+
+- nhiều pages nhỏ;
+- một số pages rất lớn;
+- compressed transfer size khác uncompressed content size;
+- HTML có thể tham chiếu assets nhưng case study chỉ lưu page content cần index;
+- redirects/errors/noindex/duplicates không tạo indexed document giống nhau.
+
+Crawler cần giới hạn response bytes và content types để một số page khổng lồ không chiếm hết memory/bandwidth.
+
+---
+
+#### 5. MVP storage breakdown
+
+Theo transcript:
+
+| Thành phần | Logical size ước lượng |
+|---|---:|
+| Raw HTML | Khoảng 10 TB |
+| Processed content | Khoảng 3–5 TB |
+| Inverted index | Khoảng 0,5–0,8 TB |
+| Forward index/stored fields | Khoảng 5 TB |
+| Metadata/ranking info | Khoảng 0,1–0,2 TB |
+
+Nếu cộng đơn giản:
+
+```text
+Total logical ≈ 18,6–21 TB
+```
+
+Một số dữ liệu có thể overlap: forward index có thể chính là compressed processed/stored fields, vì vậy không được cộng mù nếu data model không nói rõ.
+
+Budget 1 PB lớn hơn estimate logic hàng chục lần. Điều này có thể bao gồm headroom cho:
+
+- replicas;
+- multiple generations;
+- raw history;
+- scratch/merge;
+- link graph/features/logs;
+- backups;
+- growth.
+
+Nhưng “budget 1 PB” không có nghĩa hệ thống nên tiêu thụ 1 PB ngay.
+
+---
+
+#### 6. Physical index/storage amplification
+
+##### Index replicas và generations
+
+Giả sử inverted index 800 GB, replication factor 3 và giữ 2 generations trong rollout:
+
+```text
+800 GB × 3 × 2
+= 4,8 TB physical index bytes
+```
+
+Nếu merge/build cần scratch bằng 50% một generation:
+
+```text
+additional scratch ≈ 0,8 TB × 0,5 = 0,4 TB logical
+```
+
+##### Công thức tổng quát
+
+```text
+Physical capacity
+≈ raw/processed retention
++ index logical bytes × replicas × overlapping generations
++ merge/build scratch
++ metadata/link/features
++ backups/DR
++ safety headroom
+```
+
+Compression giảm bytes nhưng tăng CPU decompression và đôi khi làm random access khó hơn. Cần benchmark query latency, không tối ưu compression ratio cô lập.
+
+---
+
+#### 7. Query volume calculation
+
+Transcript giả định:
+
+```text
+10M active users × 5 searches/user/day
+= 50M queries/day
+```
+
+Average QPS:
+
+```text
+50.000.000 ÷ 86.400
+≈ 578,7 QPS
+```
+
+Target peak 1.000–2.000 QPS tương đương:
+
+```text
+Peak/average ≈ 1,7×–3,5×
+```
+
+Đây là target hợp lý hơn cho MVP assumptions.
+
+##### Mâu thuẫn cần ghi nhớ
+
+- 50K QPS cao hơn average MVP khoảng 86×.
+- 1M QPS cao hơn average MVP khoảng 1.728×.
+- Không thể gọi cả 2K và 1M là cùng một peak capacity mà không có scale tier/timeline riêng.
+
+Thiết kế logic có thể scale ngang, nhưng capacity provisioning, network, replicas và cost phải bám workload thực tế.
+
+---
+
+#### 8. “95% read, 5% write” cần hiểu lại
+
+User-facing API đúng là gần như read-only: search requests chiếm đa số. Nhưng crawl/index writes không nên biểu diễn bằng phần trăm của user requests vì đơn vị khác:
+
+```text
+Query plane: queries/s, shard reads/s, candidates/s
+Index plane: pages/s, terms/postings/s, segment bytes/s
+Crawl plane: URLs/s, fetches/s, network bytes/s
+```
+
+Một page fetched có thể tạo hàng nghìn terms/postings. Vì vậy “5% writes” có thể che giấu indexing workload lớn dù số user mutation requests nhỏ.
+
+Tách capacity và failure domains giữa online serving và background indexing để write/merge không phá query latency.
+
+---
+
+#### 9. Initial crawl throughput
+
+Mục tiêu crawl 100M pages trong 7 ngày:
+
+```text
+100M ÷ 7
+≈ 14,286M pages/day
+
+14,286M ÷ 24
+≈ 595.238 pages/hour
+
+595.238 ÷ 3.600
+≈ 165,3 pages/s
+```
+
+Transcript làm tròn khoảng 170 pages/s, hợp lý.
+
+Với 500 workers:
+
+```text
+165,3 ÷ 500
+≈ 0,331 page/s/worker
+≈ 1 page mỗi 3,02 giây/worker
+```
+
+Nhưng worker throughput không phải bottleneck duy nhất. Một worker có thể giữ nhiều concurrent I/O connections; per-host politeness, DNS, timeouts và response-size distribution mới quyết định concurrency thực tế.
+
+---
+
+#### 10. Crawl bandwidth
+
+Với 100 KB/page và 165,3 pages/s:
+
+```text
+165,3 × 100 KB
+≈ 16,53 MB/s
+≈ 132 Mbps average payload bandwidth
+```
+
+Nếu tính 170 pages/s:
+
+```text
+≈ 17 MB/s ≈ 136 Mbps
+```
+
+Phải cộng:
+
+- HTTP/TLS/DNS overhead;
+- retries và redirects;
+- compressed versus uncompressed sizes;
+- robots/sitemap fetches;
+- duplicate pages;
+- failed responses;
+- raw content replication/storage writes.
+
+Network tổng không quá lớn so với hệ thống Internet-scale, nhưng **bandwidth per external host** bị politeness giới hạn. 500 workers không cho phép crawl một website nhanh hơn policy.
+
+---
+
+#### 11. URL discovery amplification
+
+Nếu một fetched page chứa trung bình 50 links:
+
+```text
+100M fetched pages × 50 links/page
+= 5B discovered link occurrences
+```
+
+Tại 165 pages/s:
+
+```text
+≈ 8.265 extracted link occurrences/s
+```
+
+Phần lớn có thể là:
+
+- URLs đã thấy;
+- same-site navigation;
+- tracking/query variants;
+- duplicates;
+- non-HTTP links;
+- blocked/no-follow/out-of-scope;
+- crawl traps.
+
+Do đó URL normalization, distributed seen set, Bloom filters và authoritative URL records có thể chịu tải lớn hơn fetch rate hàng chục lần.
+
+Bloom filter giảm read/check cost nhưng có false positives; không nên là source of truth duy nhất nếu bỏ sót URL quan trọng là không chấp nhận được.
+
+---
+
+#### 12. Robots, DNS và per-host state
+
+Với hàng triệu hosts, crawler còn chịu:
+
+- DNS lookups/cache;
+- robots policy fetch/cache/expiry;
+- per-host next-allowed time;
+- concurrency/rate tokens;
+- connection pooling;
+- error/backoff state;
+- host-level circuit breaker.
+
+Domain-hash partition giúp một owner/shard quản lý host state nhất quán, nhưng tạo hot partitions với very large domains. Có thể dùng:
+
+- host authority riêng + fetch capacity pool;
+- weighted virtual shards;
+- per-host token service;
+- split large host queues nhưng giữ centralized politeness state.
+
+Không chỉ hash domain rồi giả định tải cân bằng.
+
+---
+
+#### 13. Indexing throughput
+
+Để initial index hoàn thành cùng crawl trong 7 ngày, pipeline phải duy trì ít nhất:
+
+```text
+≈ 165 documents/s average
+```
+
+Nhưng internal work amplification phụ thuộc:
+
+- tokens/document;
+- unique terms/document;
+- positions/fields;
+- outgoing links;
+- language processing;
+- duplicate detection;
+- stored fields;
+- compression và segment merge.
+
+Ví dụ giả sử 500 indexable term occurrences/page:
+
+```text
+165 pages/s × 500 terms/page
+≈ 82.500 term occurrences/s
+```
+
+Cho toàn corpus:
+
+```text
+100M × 500
+= 50B term occurrences
+```
+
+Đây chỉ là illustrative assumption. Capacity phải dựa trên measured token distribution.
+
+---
+
+#### 14. Segment build và merge amplification
+
+Index thường được build thành immutable segments nhỏ rồi merge:
+
+```text
+Parsed documents
+→ in-memory postings buffer
+→ flush small segment
+→ merge segments
+→ validate
+→ publish generation
+```
+
+Merge tạo write amplification:
+
+- postings được đọc và ghi lại nhiều lần;
+- temporary disk cần headroom;
+- background compaction cạnh tranh I/O với query serving;
+- bad merge có thể trì hoãn freshness.
+
+Nên tách build tier khỏi serving tier hoặc kiểm soát I/O mạnh. Theo dõi:
+
+- documents/s;
+- bytes indexed/s;
+- segment count/size;
+- merge backlog;
+- I/O utilization;
+- publish lag;
+- failed generation validation.
+
+---
+
+#### 15. Query fan-out amplification
+
+Nếu index được document-shard thành 64 logical shards và mỗi query fan-out tới tất cả shards:
+
+```text
+2.000 user QPS × 64 shards
+= 128.000 shard-query requests/s
+```
+
+Ở 50K QPS:
+
+```text
+50.000 × 64
+= 3,2M shard-query requests/s
+```
+
+Ở 1M QPS:
+
+```text
+1.000.000 × 64
+= 64M shard-query requests/s
+```
+
+Đây là lý do 1M QPS không phải chỉ “thêm vài replicas”. Coordinator, network, caches, shard replicas và merge compute đều tăng theo fan-out.
+
+Cách giảm:
+
+- query/result cache;
+- selective shard routing khi có partition metadata;
+- hierarchical fan-out;
+- local top-K;
+- early termination/block-max/WAND-style skipping;
+- replicated shard groups;
+- strict timeout/candidate budgets.
+
+---
+
+#### 16. Tail latency trong scatter–gather
+
+Query latency gần đúng:
+
+```text
+Total ≈ gateway/parse
+      + max(latency của các required shard responses)
+      + merge/rank/snippet
+      + network/serialization
+```
+
+Không phải average shard latency. Khi fan-out tới nhiều shards, xác suất gặp ít nhất một slow shard tăng.
+
+Mitigations:
+
+- shard replicas và latency-aware routing;
+- hedged request có budget;
+- deadline propagation;
+- bounded local top-K;
+- partial results nếu product cho phép;
+- slow-shard isolation/rebuild;
+- cache;
+- avoid synchronous remote feature fan-out.
+
+Hedging không được vô hạn vì có thể nhân tải khi hệ thống đang chậm.
+
+---
+
+#### 17. Latency budget
+
+Transcript chia:
+
+| Stage | Budget |
+|---|---:|
+| Query parse | Dưới 5 ms |
+| Index lookup | Dưới 20 ms |
+| Rank/score | Khoảng 50 ms |
+| Format response | Dưới 10 ms |
+| Tổng các mục trên | Khoảng 85 ms |
+| End-to-end target | Dưới 200 ms |
+| Còn lại | Khoảng 115 ms |
+
+115 ms còn lại dành cho:
+
+- gateway/network/TLS;
+- coordinator–shard RPC;
+- cache lookup;
+- global top-K merge;
+- stored-field/snippet fetch;
+- safety/policy filtering;
+- serialization;
+- queueing/scheduling jitter;
+- tail reserve.
+
+Cần định nghĩa p95/p99. Mỗi service phải nhận deadline còn lại, không tự timeout 200 ms rồi khiến total vượt xa 200 ms.
+
+##### Ví dụ chi tiết hơn
+
+```text
+Edge/gateway                  10 ms
+Parse/normalize/rewrite        5 ms
+Cache/routing                  5 ms
+Shard fan-out + retrieval     35 ms
+Candidate merge/rank          50 ms
+Stored fields/snippets        25 ms
+Safety/dedup/format           15 ms
+Network/tail reserve          55 ms
+Total                        200 ms
+```
+
+Đây chỉ là budget minh họa; benchmark thực tế quyết định allocation.
+
+---
+
+#### 18. Candidate-scoring amplification
+
+Giả sử mỗi shard trả local top-100 và có 64 shards:
+
+```text
+64 × 100 = 6.400 candidates/query trước global merge
+```
+
+Ở 2K QPS:
+
+```text
+≈ 12,8M candidate records/s đưa vào coordinator merge
+```
+
+Nếu expensive re-ranker chỉ chạy top-200:
+
+```text
+2.000 × 200 = 400.000 expensive scores/s
+```
+
+Candidate budget là kiến trúc parameter quan trọng. Tăng candidates có thể cải thiện recall nhưng tăng CPU/network/latency.
+
+---
+
+#### 19. Posting-list skew
+
+Term distribution theo Zipf: một số terms rất phổ biến tạo posting lists khổng lồ.
+
+Ví dụ:
+
+- rare term: vài documents;
+- common content term: hàng triệu documents;
+- stopword: phần lớn corpus.
+
+Bottlenecks:
+
+- đọc/decompress large postings;
+- intersection CPU;
+- memory/cache pressure;
+- hot term dictionary entries;
+- large candidate sets.
+
+Mitigations:
+
+- stopword/query semantics có chủ đích;
+- skip data/block metadata;
+- compressed postings;
+- field/impact ordering;
+- top-K pruning;
+- cached common-query results;
+- bounded phrase/expansion work;
+- query cost classification/rate limits.
+
+Không được xóa mọi common term tùy tiện vì phrase và language semantics có thể cần chúng.
+
+---
+
+#### 20. Query cache impact
+
+Giả sử peak 2K QPS và cache hit 30%:
+
+```text
+Index-serving QPS ≈ 2.000 × (1 − 0,30)
+= 1.400 user-query equivalents/s
+```
+
+Nhưng cache effectiveness phụ thuộc:
+
+- normalized query distribution;
+- language/region/safe-search context;
+- index generation;
+- freshness expectation;
+- result policy/takedown;
+- pagination;
+- personalization không có trong scope giúp cache dễ hơn.
+
+Cache key nên gồm index/ranking/policy version cần thiết. Khi generation đổi, versioned keys tránh trả kết quả từ corpus không tương thích.
+
+Hot-query cache giảm load mạnh; long-tail queries vẫn phải vào shards.
+
+---
+
+#### 21. Freshness workload
+
+Initial crawl target không cho biết steady-state recrawl. Ví dụ nếu 10% của 100M pages cần recrawl mỗi ngày:
+
+```text
+10M pages/day ÷ 86.400
+≈ 116 recrawls/s average
+```
+
+Nếu 1% high-value pages cần recrawl mỗi giờ:
+
+```text
+1M pages/hour
+≈ 278 recrawls/s
+```
+
+Hai policies này có thể overlap. Scheduler phải phân priority lanes và deduplicate work.
+
+Freshness latency:
+
+```text
+source changes
+→ discovery/next crawl wait
+→ fetch
+→ parse/index queue
+→ segment build
+→ generation/incremental publish
+→ query-visible
+```
+
+Chỉ tối ưu indexing time không giúp nếu recrawl wait chiếm nhiều giờ.
+
+---
+
+#### 22. Backlog và drain time
+
+Nếu crawl/index pipeline nhận 165 docs/s nhưng outage 1 giờ:
+
+```text
+Backlog = 165 × 3.600
+≈ 594.000 documents
+```
+
+Nếu recovery capacity là 250 docs/s:
+
+```text
+Spare capacity = 250 − 165 = 85 docs/s
+Drain time ≈ 594.000 ÷ 85
+≈ 6.988s
+≈ 1,94 giờ
+```
+
+Nếu capacity chỉ bằng 180 docs/s:
+
+```text
+Spare = 15 docs/s
+Drain ≈ 11 giờ
+```
+
+Capacity bằng incoming rate không thể drain backlog. Cần headroom và ưu tiên urgent/new/valuable pages.
+
+---
+
+#### 23. Replication và availability cost
+
+Replication giúp query serving khi node lỗi:
+
+- shard replica factor 2–3;
+- load balance queries giữa replicas;
+- replace/rebuild failed replica;
+- multi-zone placement;
+- version compatibility trong rollout.
+
+Nhưng replication tạo:
+
+- storage amplification;
+- rollout bandwidth;
+- rebuild traffic;
+- cache warm-up;
+- operational coordination.
+
+Replica không phải backup. Bad index generation hoặc logical deletion có thể được replicate; cần immutable prior generation/source data và rollback/rebuild.
+
+---
+
+#### 24. Index rollout capacity
+
+Blue/green generation rollout có thể tạm giữ:
+
+```text
+old serving generation
++ new validated generation
++ replicas của cả hai
++ build/merge scratch
+```
+
+Network còn phải phân phối index shards tới serving nodes và warm hot dictionaries/postings/results.
+
+Rollout bottlenecks:
+
+- insufficient disk headroom;
+- network saturation;
+- cache-cold latency spike;
+- mixed schema/ranking versions;
+- incomplete shard set;
+- rollback data đã bị xóa sớm.
+
+Capacity plan phải dành chỗ cho rollout, không chỉ steady-state generation.
+
+---
+
+#### 25. Bottleneck map
+
+| Stage | Bottleneck | Metrics |
+|---|---|---|
+| Discovery | Link explosion/crawl traps | links extracted/s, novel URL ratio |
+| Seen/canonicalization | Hot keys, false positives | dedup hit, collision/merge errors |
+| Frontier | Priority/host skew | queue age by class, hot host queues |
+| DNS/robots | External/cache latency | lookup QPS/hit/expiry/errors |
+| Fetch | Per-host limits, bandwidth, timeouts | pages/s, bytes/s, 429/5xx, latency |
+| Parse | Malformed/large HTML, CPU/memory | docs/s, parse fail, max-size rejects |
+| Dedup | Hash/fingerprint compute/state | duplicate ratio, lookup p99 |
+| Index build | RAM, disk I/O, merges | postings/s, segment/merge backlog |
+| Publication | Distribution/validation | generation age, shard readiness |
+| Query coordinator | Fan-out/network/top-K merge | shard RPC/s, candidates/s, p99 |
+| Shard serving | Hot postings/cache/I/O | term skew, cache hit, decompression CPU |
+| Ranking | Candidate/feature compute | scored docs/s, feature timeout |
+| Snippets | Stored-field fetch | p99, cache hit, bytes/query |
+| Query cache | Invalidation/key skew | hit ratio, stale/purge, hot key |
+| Analytics | Event volume/privacy | lag, drop, storage growth |
+
+---
+
+#### 26. Scale-driven design decisions
+
+##### Shard inverted index
+
+Một node không đủ capacity/reliability. Có hai broad approaches:
+
+- **Document sharding:** mỗi shard giữ subset documents và term dictionary/postings cho subset đó; query thường fan-out rộng.
+- **Term sharding:** mỗi shard giữ subset terms; multi-term query cần coordination và document score assembly phức tạp.
+
+Document sharding thường đơn giản hơn cho local scoring/top-K, nhưng fan-out là trade-off chính.
+
+##### Forward + inverted indexes
+
+- inverted index tìm candidate document IDs;
+- forward/stored-fields layer lấy title, URL, length, fields hoặc snippet inputs;
+- ranking features có thể nằm trong compact columnar/feature structures;
+- không nhất thiết “forward index” phải chứa toàn bộ processed page.
+
+##### Domain/host-aware crawling partition
+
+Hash host/domain giúp đặt politeness state cùng owner, nhưng cần virtual partitions/hot-host handling để cân bằng tải.
+
+##### Replication
+
+Replicate serving shards và critical metadata, nhưng giữ prior immutable generations/source để rollback/rebuild.
+
+##### Cache
+
+Cache popular normalized queries và hot postings/dictionaries. Cache keys phải versioned theo generation/ranking/policy context.
+
+##### Hot/cold storage
+
+- hot index/postings trên local SSD/memory/cache;
+- warm processed/stored fields trên distributed storage;
+- cold raw fetch history/archive trên object storage;
+- lifecycle theo rebuild/audit/freshness needs.
+
+---
+
+#### 27. Load tests và failure tests
+
+1. 2K peak QPS với representative query distribution.
+2. 50K QPS scale tier để xác minh horizontal path.
+3. Hot query burst và cache stampede.
+4. Rare long-tail multi-term/phrase query.
+5. Common-term huge posting lists.
+6. One slow/missing shard trong scatter–gather.
+7. Replica failure và hedged-request amplification.
+8. Index generation rollout với cold caches.
+9. Bad/incomplete index generation rollback.
+10. 500 crawler workers với host skew/politeness.
+11. Large/malformed pages và crawl traps.
+12. DNS/robots dependency outage.
+13. 429/5xx retry storm từ external hosts.
+14. Parse/index outage rồi backlog drain.
+15. Segment merge I/O saturation.
+16. Urgent removal propagation dưới cache/index lag.
+17. Analytics backlog không ảnh hưởng query serving.
+18. Storage node/AZ loss và shard rebuild.
+
+Mỗi test đo p95/p99, correctness, freshness, backlog drain và resource/cost amplification.
+
+---
+
+#### 28. Những phép tính cần chủ động trình bày trong phỏng vấn
+
+1. Corpus raw bytes:
+
+```text
+100M × 100 KB = 10 TB
+```
+
+2. Query traffic:
+
+```text
+10M × 5/day = 50M/day ≈ 579 average QPS
+Peak design = 1K–2K QPS
+```
+
+3. Crawl rate:
+
+```text
+100M / 7 days ≈ 165 pages/s
+```
+
+4. Crawler worker load:
+
+```text
+165 / 500 ≈ 0,33 page/s/worker
+```
+
+5. Crawl payload bandwidth:
+
+```text
+165 × 100 KB ≈ 16,5 MB/s ≈ 132 Mbps
+```
+
+6. Query fan-out:
+
+```text
+2K QPS × 64 shards = 128K shard requests/s
+```
+
+7. Candidate merge:
+
+```text
+64 shards × local top-100 = 6.400 candidates/query
+```
+
+Sau đó nêu assumptions còn thiếu và sensitivity thay vì giả vờ các số là chính xác.
+
+---
+
+#### 29. Các điểm cần hiệu chỉnh từ transcript
+
+##### “MVP có capacity tới 1M QPS”
+
+Không khớp với 50M queries/day và peak 1K–2K QPS. Xem 1M QPS là future/extreme tier, không phải MVP provision target.
+
+##### “95% read, 5% write”
+
+User API read-heavy là đúng, nhưng crawl/index writes dùng đơn vị pages/terms/bytes chứ không thể so trực tiếp bằng request percentage.
+
+##### “Domain hash đảm bảo cùng website vào cùng crawler”
+
+Có ích cho politeness ownership, nhưng một large domain có thể gây skew. Tách state authority khỏi flexible worker execution hoặc dùng virtual partitions.
+
+##### “Forward index map document IDs về processed content”
+
+Đây là mô tả đơn giản. Production có thể tách document metadata, stored fields, snippet source và ranking features thành nhiều compact stores.
+
+##### “Replication đảm bảo search engine available”
+
+Replication giảm node failure impact nhưng còn cần routing, quorum/read policy, failure detection, multi-zone placement, capacity headroom và compatible index generations.
+
+##### “Compression cải thiện processing efficiency”
+
+Compression giảm I/O/storage nhưng tăng CPU và random-access complexity; phải benchmark end-to-end.
+
+---
+
+#### 30. Ý chính cần nhớ
+
+- 100B pages × 100 KB ≈ 10 PB raw Internet-scale illustration.
+- MVP 100M pages × 100 KB ≈ 10 TB raw HTML.
+- Transcript ước tính total logical components khoảng 18,6–21 TB trước dedup/overlap clarification.
+- 1 PB là budget/headroom, không phải expected immediate consumption.
+- 10M users × 5 queries/day = 50M/day ≈ 579 average QPS.
+- MVP peak 1K–2K QPS hợp lý; 50K và 1M QPS là tiers khác.
+- Crawl 100M pages trong 7 ngày cần khoảng 165 pages/s.
+- 500 workers tương đương khoảng một page mỗi 3 giây/worker, nhưng politeness/host skew mới là ràng buộc chính.
+- 165 pages/s × 100 KB ≈ 16,5 MB/s hay 132 Mbps payload crawl.
+- 50 links/page có thể tạo 5B link occurrences từ 100M pages.
+- Indexing amplification đo bằng terms/postings/segments, không chỉ documents/s.
+- 64-shard fan-out tại 2K QPS tạo 128K internal shard requests/s.
+- Local top-100 từ 64 shards tạo tới 6.400 candidates/query trước merge.
+- Query tail latency bị chi phối bởi slowest required shard.
+- Common terms tạo huge posting lists; Zipf skew cần pruning, compression và cost controls.
+- Query cache giảm load nhưng phải version theo index/ranking/policy context.
+- Initial crawl khác steady-state recrawl; freshness latency gồm thời gian chờ crawl lẫn index publish.
+- Backlog drain cần capacity lớn hơn incoming rate.
+- Multiple generations, replicas và merge scratch tạo physical storage amplification.
+- Replication không thay backup/rollback/rebuild source.
+- Bottlenecks của frontier, fetch, parse, index, query, rank và analytics cần metric/giải pháp riêng.
+
+#### Công thức ghi nhớ
+
+> **Search scale = pages × raw/processed/index bytes + crawl rate × links/terms amplification + user QPS × shard fan-out × candidates + refresh backlog × drain headroom; luôn tách scale tiers, logical/physical storage và average/tail behavior.**
+
+---
+
+### Bài 110. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của high-level design
+
+Ta chia search engine thành hai plane độc lập:
+
+```text
+Crawl/index plane
+  discover → schedule → fetch → parse → dedup → build → publish
+
+Query-serving plane
+  accept query → normalize/rewrite → retrieve → rank → snippet/filter → return
+```
+
+Ranh giới này giúp:
+
+- crawl/index batch không làm tăng query p99;
+- query serving tiếp tục dùng generation cũ khi build mới lỗi;
+- scale crawler, indexer và query replicas theo signals riêng;
+- analytics/relevance experiments không scan serving shards;
+- kiểm soát freshness và rollout rõ ràng.
+
+---
+
+#### 2. Kiến trúc tổng thể
+
+```text
+                    Public Web
+                        |
+             DNS / Robots / Fetch Proxies
+                        |
+              Distributed Fetch Workers
+                        |
+                 Raw Document Store
+                        |
+             Parse / Extract / Normalize
+              /         |           \
+      New URLs      Documents      Link Edges
+          |             |              |
+   Canonicalize/     Dedup/Policy    Link Graph
+    Seen Set            |           Computation
+          |             |              |
+       URL Frontier ← Scheduler     Rank Features
+                        \              /
+                          Index Builder
+                               |
+                    Immutable Index Segments
+                               |
+                   Generation Manifest/Catalog
+                               |
+              Distribute + Validate + Canary Publish
+                               |
+                Replicated Index Serving Shards
+                               |
+ User → Edge/API → Query Coordinator → Retrieval → Rank/Snippet
+             |             |
+          Query Cache   Policy/Removal Filter
+             |
+       Query/Click Events → Analytics & Quality Platform
+```
+
+Raw document store, build storage và serving index storage có thể là các tiers khác nhau.
+
+---
+
+#### 3. Seed và URL Discovery Service
+
+Nguồn URL:
+
+- seed lists;
+- links trích xuất từ pages;
+- sitemaps;
+- redirects;
+- canonical hints;
+- operator/removal/recrawl inputs;
+- known high-value feeds nếu trong scope.
+
+Trước khi đưa vào frontier:
+
+```text
+raw href
+→ resolve relative URL
+→ validate scheme/scope
+→ normalize/canonicalize có chủ đích
+→ lookup probabilistic seen filter
+→ authoritative URL upsert/decision
+→ assign host/domain key và priority hints
+→ enqueue/schedule
+```
+
+Seen filter giảm read load nhưng authoritative URL record quyết định cuối. False positive của Bloom filter có thể làm bỏ sót URL nếu dùng một mình.
+
+---
+
+#### 4. URL Frontier
+
+URL Frontier không chỉ là FIFO queue. Mỗi item cần:
+
+```text
+url_id
+normalized_url
+host_id/domain_id
+priority_class/score
+earliest_fetch_at
+discovery/revisit reason
+attempt/error state
+lease state
+robots/policy version
+```
+
+Logical design:
+
+```text
+Global priority lanes
+  ├─ urgent removal/verification
+  ├─ new high-value URLs
+  ├─ freshness recrawls
+  ├─ normal discovery
+  └─ low-value retries/long tail
+        ↓
+Host/domain queues
+        ↓
+next-allowed-fetch scheduler
+        ↓
+worker leases
+```
+
+Frontier phải hỗ trợ:
+
+- durable enqueue/dequeue;
+- delayed delivery;
+- priority/fairness;
+- per-host ordering/budget;
+- leases và retry;
+- dedup/upsert;
+- backpressure;
+- queue age metrics;
+- recovery không mất URLs.
+
+Một SQL `url_queue` table có thể đủ cho prototype, nhưng ở scale lớn cần partitioned frontier/state store; `SELECT ... FOR UPDATE` trên một bảng trung tâm dễ thành bottleneck.
+
+---
+
+#### 5. Crawl Scheduler và Host Policy Service
+
+Scheduler quyết định **URL nào được fetch lúc nào**, dựa trên:
+
+- freshness/change probability;
+- historical crawl success;
+- link/query importance;
+- robots rules;
+- per-host concurrency và rate;
+- last fetch/ETag/Last-Modified;
+- HTTP error/backoff;
+- content/update value;
+- regional/network budget.
+
+Host Policy Service giữ:
+
+```text
+robots document/version/expiry
+user-agent rules
+next_allowed_fetch_at
+max concurrent requests
+rate tokens
+latency/error/429 state
+DNS/connection hints
+host circuit-breaker state
+```
+
+Domain hashing giúp co-locate policy state, nhưng executor workers vẫn có thể linh hoạt nếu mọi fetch phải acquire host token/lease. Large domain không nên buộc một worker duy nhất xử lý toàn bộ throughput.
+
+---
+
+#### 6. Fetch Workers
+
+Fetch worker:
+
+- nhận leased URL;
+- resolve DNS qua cache/resolver;
+- kiểm tra current robots/host token;
+- gửi conditional HTTP request khi có validators;
+- giới hạn redirects, bytes, time và content type;
+- stream response vào raw object storage;
+- ghi status, headers, checksums và timing;
+- classify success/transient/permanent failure;
+- phát `PageFetched` hoặc retry outcome;
+- release/complete lease idempotently.
+
+Security:
+
+- sandbox parsing/fetch boundaries;
+- chống SSRF tới private/internal networks;
+- block dangerous schemes/ports/IP ranges;
+- DNS rebinding defenses;
+- decompression-bomb/oversized response limit;
+- strict egress policy;
+- không execute fetched code trong scope không-JS-rendering.
+
+Retry policy:
+
+```text
+timeout/429/5xx → exponential backoff + jitter + host penalty
+404/410        → tombstone candidate/verification policy
+robots deny    → do not fetch content
+invalid URL    → terminal skip
+redirect loop  → terminal/quarantine after bounded hops
+```
+
+---
+
+#### 7. Raw Document Store
+
+Lưu immutable fetch artifacts và provenance:
+
+- compressed body/object reference;
+- URL/fetch ID;
+- HTTP status/headers;
+- fetched time;
+- checksum/content type/charset;
+- crawler version;
+- redirect chain;
+- policy/robots version;
+- retention class.
+
+Object storage phù hợp raw bodies; metadata store giữ fetch records. Raw history cho phép:
+
+- reprocess khi parser/tokenizer đổi;
+- debug ranking/indexing;
+- audit/provenance;
+- rebuild index mà không recrawl ngay.
+
+Nhưng retention tốn storage; có thể giữ latest, sampled history hoặc tier cold theo policy.
+
+---
+
+#### 8. Content Extraction & Parsing Service
+
+Pipeline:
+
+```text
+PageFetched
+  ↓
+validate/decompress/decode charset
+  ↓
+safe HTML parse
+  ↓
+extract visible text/title/headings/meta
+  ↓
+extract links/anchor text/canonical/noindex hints
+  ↓
+boilerplate/content selection
+  ↓
+language detection
+  ↓
+normalized document + fingerprints + outgoing links
+```
+
+Output cần versioned bởi parser schema/version để reprocessing reproducible.
+
+Không nên “xóa stop words và stemming” như rule cứng cho mọi language/query:
+
+- stop words có thể quan trọng trong phrase/title/name;
+- stemming có thể làm giảm precision;
+- language-specific analyzers khác nhau;
+- có thể giữ positions/raw tokens và tạo nhiều analyzed fields.
+
+Tokenizer/analyzer schema phải gắn với index generation và query analyzer tương thích.
+
+---
+
+#### 9. Canonicalization và Dedup Service
+
+Các bước khác nhau:
+
+##### Pre-fetch URL dedup
+
+- normalize URL;
+- seen set;
+- alias/redirect/canonical relationship;
+- tránh enqueue/fetch cùng URL không cần thiết.
+
+##### Post-fetch content dedup
+
+- exact content hash;
+- normalized-content hash;
+- SimHash/MinHash-style near-duplicate fingerprint;
+- cluster duplicates;
+- chọn representative/canonical document;
+- giữ provenance/aliases.
+
+**Hiệu chỉnh transcript:** SimHash cần content đã fetch/parse, nên không tự ngăn bandwidth của lần fetch đầu tiên. Nó giảm duplicate indexing/ranking và các recrawl sau khi cluster đã biết.
+
+Dedup decision có thể thay đổi; không xóa provenance quá sớm.
+
+---
+
+#### 10. Link Graph và Ranking Feature Pipeline
+
+Parser phát `LinkEdge(source_document, target_url, anchor_text)` vào durable stream/store.
+
+Link graph jobs:
+
+- resolve target URL aliases/canonical IDs;
+- filter spam/no-follow/policy edges theo scope;
+- build graph snapshots;
+- compute PageRank-style authority offline/nearline;
+- generate anchor/domain/quality features;
+- publish versioned feature snapshots.
+
+PageRank không được tính riêng lẻ trong synchronous page index request. Nó cần corpus/link graph snapshot và iterative/distributed computation.
+
+Ranking features nên có:
+
+```text
+feature_name
+document_id
+value
+feature_version
+computed_at
+source snapshot/generation
+```
+
+Query serving phải biết feature version tương thích với index/ranker.
+
+---
+
+#### 11. Document Processor và Forward/Stored-Fields Builder
+
+Tạo document representation:
+
+- stable `document_id`;
+- canonical URL;
+- title/description/language;
+- normalized/analyzed fields;
+- token counts/document length;
+- positions/field flags;
+- stored snippet text;
+- freshness/content hash;
+- indexability/policy state;
+- query-independent ranking features.
+
+“Forward index” có thể gồm nhiều structures:
+
+- document table/catalog;
+- compressed stored fields;
+- term vector per document;
+- ranking feature columns;
+- snippet source.
+
+Không nhất thiết là một relational table chứa toàn processed content.
+
+---
+
+#### 12. Inverted Index Builder
+
+Từ document terms tạo:
+
+```text
+term_id → postings[
+  document_id,
+  term_frequency,
+  positions,
+  field_flags,
+  impact/score metadata
+]
+```
+
+Build workflow:
+
+```text
+ProcessedDocument events/files
+      ↓ partition by document/shard
+in-memory term/posting buffers
+      ↓ flush
+immutable small segments
+      ↓ merge/compact
+validated shard segment set
+      ↓
+candidate index generation
+```
+
+Compression có thể dùng:
+
+- delta/gap encoding cho sorted document IDs;
+- variable-byte/bit packing/block compression;
+- dictionary compression;
+- skip/block metadata cho fast top-K.
+
+Chọn format theo storage, decode throughput và random-access/query needs.
+
+---
+
+#### 13. Index Catalog và Publication Service
+
+Index Catalog là authoritative control plane cho generations:
+
+```text
+IndexGeneration(
+  generation_id,
+  schema/analyzer version,
+  document snapshot/watermark,
+  shard manifests,
+  feature/ranker version,
+  state,
+  created_at/published_at
+)
+```
+
+Publication workflow:
+
+```text
+1. Builders upload immutable segments/manifests
+2. Validate checksums, schema, document/posting invariants
+3. Ensure all required logical shards exist và replicas can load
+4. Run offline quality/coverage tests
+5. Warm selected caches/data
+6. Canary query traffic to new generation
+7. Compare latency/error/relevance metrics
+8. Atomically update serving generation pointer/config
+9. Retain old generation for rollback
+10. GC only after safety window
+```
+
+Không để mỗi indexer mutate serving shard trực tiếp mà thiếu consistent generation semantics. Incremental updates vẫn nên tạo immutable delta segments và publish bằng manifest/versioning.
+
+---
+
+#### 14. Search API và Query Service
+
+External API minh họa:
+
+```http
+GET /v1/search?q=distributed+systems&limit=10&cursor=...
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "document_id": "doc_123",
+      "title": "...",
+      "url": "https://...",
+      "snippet": "...",
+      "display_metadata": {}
+    }
+  ],
+  "next_cursor": "opaque...",
+  "query_id": "qry_456",
+  "took_ms": 84
+}
+```
+
+Search API/Gateway xử lý:
+
+- input limits/encoding;
+- abuse/rate limit;
+- locale/safe-search context nếu có;
+- request ID/deadline;
+- cache lookup policy;
+- response/error contract.
+
+Query Service/Coordinator:
+
+- normalize/tokenize query bằng analyzer version tương thích;
+- optional spelling/rewrite/synonym expansion theo scope;
+- classify query cost;
+- chọn serving generation;
+- route/scatter tới logical shards;
+- collect local top-K;
+- merge candidates;
+- invoke rank/snippet/policy stages;
+- enforce deadline/partial-result policy;
+- produce pagination cursor.
+
+---
+
+#### 15. Query cache
+
+Cache key cần có context ảnh hưởng kết quả:
+
+```text
+normalized query
+language/region/safe-search/filter context
+page/cursor
+index generation
+ranking/config version
+policy/removal epoch
+```
+
+Không personalization giúp cache dễ hơn trong scope hiện tại.
+
+Các lớp:
+
+- edge/API response cache cho very hot public queries;
+- distributed result cache;
+- per-node postings/block cache;
+- term dictionary cache;
+- document/stored-fields cache;
+- snippet cache nếu generation-aware.
+
+Cache hit giảm latency và shard fan-out. Cache miss phải được request-coalesce để tránh stampede.
+
+Urgent removal cần deny/filter epoch hoặc invalidation lane; không chờ TTL dài của popular-query cache.
+
+---
+
+#### 16. Index Serving Shards
+
+Với document sharding:
+
+```text
+Query Coordinator
+   ├─ shard 0 replica → local top-K
+   ├─ shard 1 replica → local top-K
+   ├─ ...
+   └─ shard N replica → local top-K
+              ↓
+      global top-K merge
+```
+
+Mỗi shard server:
+
+- load immutable generation segments;
+- giữ dictionary/hot postings trong memory/cache;
+- parse shard query plan;
+- lookup/intersect postings;
+- apply filters;
+- score/prune candidates;
+- trả bounded top-K + score/features.
+
+Replica selection:
+
+- health/version compatible;
+- latency/load-aware;
+- same-region/zone topology;
+- optional hedged request có budget;
+- avoid overloaded/cold replica.
+
+Coordinator phải truyền deadline; shard không được tiếp tục expensive work sau khi request hết hạn.
+
+---
+
+#### 17. Retrieval và Ranking Engine
+
+Hai hoặc nhiều stages:
+
+##### Stage 1 — Candidate retrieval/local scoring
+
+- inverted index lexical match;
+- TF-IDF/BM25-style score;
+- field boosts/proximity;
+- block/impact pruning;
+- local top-K per shard.
+
+##### Stage 2 — Global rank/re-rank
+
+- merge shard candidates;
+- link authority/PageRank;
+- freshness;
+- document/domain quality;
+- spam/safety;
+- query intent/features cơ bản;
+- diversity/dedup.
+
+##### Stage 3 — Optional expensive reranker
+
+Chỉ chạy trên top-N nhỏ nếu latency budget cho phép. Trong scope cơ bản có thể bỏ qua neural ranker.
+
+Ranking config/model phải:
+
+- versioned;
+- reproducible;
+- canary/A-B tested;
+- rollback được;
+- tương thích feature/index versions;
+- có timeout/fallback.
+
+---
+
+#### 18. Snippet/Result Assembly Service
+
+Sau top documents:
+
+- fetch title/canonical URL/stored fields;
+- chọn đoạn chứa query terms;
+- highlight an toàn;
+- sanitize output;
+- apply final dedup/domain diversity;
+- policy/removal filter;
+- format result.
+
+Snippet fetch có thể gây random I/O và thêm fan-out. Có thể:
+
+- trả đủ stored fields cùng local candidates;
+- fetch top-N từ distributed document store;
+- cache snippet/stored fields theo generation;
+- precompute static snippets nhưng query-dependent snippets cần runtime work.
+
+Không dùng raw HTML trực tiếp ở critical path.
+
+---
+
+#### 19. Removal và Policy Service
+
+Ordinary batch freshness không đủ cho urgent removal. Cần lane riêng:
+
+```text
+Authoritative removal/blocked decision
+       ↓
+Removal registry / policy epoch
+       ├─ Query-time deny filter immediately/bounded
+       ├─ Query cache invalidate/version bump
+       ├─ Delta tombstone segment
+       ├─ Search index rebuild/merge
+       └─ Raw retention according to policy/audit
+```
+
+Search result serving phải filter blocked document IDs ngay cả khi base index generation còn chứa postings.
+
+Robots directives, `noindex`, legal removal và malware/spam block có semantics khác nhau; không gộp mọi loại thành một Boolean delete thiếu provenance.
+
+---
+
+#### 20. Analytics và Search Quality Plane
+
+Query serving phát events bất đồng bộ:
+
+```text
+QueryIssued
+ResultsReturned
+ResultClicked
+NoResult
+QueryFailed/TimedOut
+```
+
+Crawler/indexer phát:
+
+```text
+URLDiscovered
+FetchCompleted/Failed
+DocumentProcessed/Skipped
+SegmentBuilt
+GenerationPublished
+RemovalApplied
+```
+
+Events đi vào durable log/data lake/warehouse cho:
+
+- traffic/latency analysis;
+- relevance evaluation;
+- zero-result trends;
+- crawler coverage/freshness;
+- abuse/spam detection;
+- capacity/cost;
+- experiments.
+
+Privacy:
+
+- minimize query/user identifiers;
+- access control và retention;
+- sampling/aggregation khi phù hợp;
+- avoid raw sensitive query exposure trong logs/metrics;
+- separate operational telemetry from research datasets.
+
+Analytics failure không được chặn query response.
+
+---
+
+#### 21. APIs nội bộ minh họa
+
+##### Frontier
+
+```text
+UpsertDiscoveredURLs(urls[], source_document_id, discovery_context)
+LeaseFetchBatch(worker_id, host_capacity, deadline)
+CompleteFetchLease(lease_id, outcome, next_fetch_hint)
+GetHostPolicy(host_id)
+```
+
+##### Fetch/processing
+
+```text
+PageFetched(fetch_id, url_id, object_ref, headers, checksum)
+DocumentProcessed(document_id, revision, fields_ref, fingerprint)
+LinksExtracted(source_document_id, edges[]/batch_ref)
+```
+
+##### Indexing
+
+```text
+SubmitProcessedBatch(snapshot_id, shard_hint, batch_ref)
+RegisterSegment(segment_manifest, checksum, schema_version)
+ValidateGeneration(generation_id)
+PublishGeneration(generation_id, expected_current_generation)
+```
+
+##### Query serving
+
+```text
+SearchShard(generation_id, query_plan, local_k, deadline)
+FetchStoredFields(generation_id, document_ids[], fields[])
+RankCandidates(query_context, candidates[], ranker_version, deadline)
+CheckRemovalPolicy(document_ids[], policy_epoch)
+```
+
+Batch references thay vì nhét hàng nghìn URLs/postings vào một message quá lớn có thể phù hợp hơn; payload nằm trong durable object/store và event mang reference + checksum.
+
+---
+
+#### 22. Communication patterns
+
+| Interaction | Pattern | Lý do |
+|---|---|---|
+| URL discovery → frontier | Async batch/upsert | High-volume, dedup và buffering |
+| Frontier → crawler | Lease/pull queue | Backpressure, retry, worker autonomy |
+| Crawler → raw store | Streaming object write | Large bodies, durability |
+| Fetch → parser/index pipeline | Durable event/message | Decoupled stages, replay |
+| Link graph/analytics | Event/log + batch objects | High-volume fan-out |
+| Index builder → catalog | Register immutable manifests | Consistent publication |
+| Catalog → serving fleet | Versioned config/distribution | Generation coordination |
+| Client → Search API | HTTPS synchronous | User waiting |
+| Coordinator → shards | gRPC/compact RPC synchronous | Strict low latency |
+| Query events → analytics | Batched async | Không chặn response |
+| Urgent removal → serving | Push/versioned deny state | Bounded propagation |
+
+Async không tự tạo reliability. Cần durable messages, idempotent consumers, retry/DLQ, schema evolution và reconciliation.
+
+---
+
+#### 23. Conceptual data structures
+
+##### Crawl control
+
+```text
+URLRecord(
+  url_id, normalized_url, host_id, canonical_url_id,
+  state, priority, next_fetch_at, last_fetch_id,
+  attempt_count, revision, ...
+)
+
+HostPolicy(
+  host_id, robots_ref/version/expiry,
+  next_allowed_at, rate/concurrency limits,
+  error/backoff state, ...
+)
+
+FetchLease(
+  lease_id, url_id, worker_id,
+  lease_epoch, expires_at, state, ...
+)
+
+FetchRecord(
+  fetch_id, url_id, status, headers,
+  content_hash, raw_object_ref, fetched_at, ...
+)
+```
+
+##### Document/catalog
+
+```text
+Document(
+  document_id, canonical_url_id,
+  current_revision, language, indexability,
+  content_fingerprint, policy_state,
+  stored_fields_ref, ...
+)
+
+DocumentAlias(alias_url_id, document_id, reason, confidence, ...)
+DocumentTombstone(document_id, reason, effective_at, policy_revision, ...)
+```
+
+##### Index
+
+```text
+SegmentManifest(
+  segment_id, logical_shard_id,
+  document_snapshot_range,
+  schema_version, files[], checksums, stats, ...
+)
+
+IndexGeneration(
+  generation_id, shard_manifests[],
+  analyzer_version, ranker_feature_version,
+  state, published_at, ...
+)
+```
+
+##### Important correction
+
+Inverted index ở scale này không nên được hiểu đơn giản là:
+
+```sql
+InvertedIndex(term, list_of_document_ids)
+```
+
+trong một row/table. Posting list có thể cực lớn và cần segmented compressed files, blocks, skips, positions và shard-local structures.
+
+---
+
+#### 24. Consistency model
+
+| Area | Consistency |
+|---|---|
+| URL frontier | At-least-once leases; duplicate tolerance |
+| Host politeness state | Strong/bounded coordination per host |
+| Raw fetch storage | Immutable after successful write |
+| Document canonical cluster | Eventual/versioned with provenance |
+| Index segments | Immutable |
+| Published generation | Atomic/compatible manifest view |
+| Query result | One generation/context per request |
+| Search cache | Generation/policy-versioned |
+| Ranking features | Versioned snapshot/bounded staleness |
+| New/update freshness | Eventual within priority SLO |
+| Removal/takedown | Bounded via query-time deny + index tombstone |
+| Analytics | Eventual, non-blocking |
+
+Crawler duplicate fetch là chấp nhận được hơn violation politeness hoặc mất URL vĩnh viễn. Query serving ưu tiên generation consistency hơn “latest partial segment”.
+
+---
+
+#### 25. Failure handling
+
+##### Crawler chết sau khi lease URL
+
+- lease hết hạn;
+- URL được giao lại;
+- fetch completion idempotent theo fetch/lease epoch;
+- duplicate raw object có thể reconcile.
+
+##### Website chậm/429/5xx
+
+- host-level backoff;
+- giảm concurrency/token rate;
+- retry có jitter;
+- không để failed host chặn frontier partitions khác.
+
+##### Parser gặp poison document
+
+- sandbox/time/memory limits;
+- bounded retry;
+- quarantine/DLQ;
+- ghi failure state và tiếp tục pipeline.
+
+##### Indexer duplicate/out-of-order events
+
+- document revision checks;
+- immutable segment IDs;
+- stale event không overwrite newer revision;
+- rebuild/reconcile từ processed snapshot.
+
+##### Generation build thiếu shard
+
+- validation fail;
+- không publish;
+- generation cũ tiếp tục serve;
+- retry/rebuild missing shard.
+
+##### Serving shard chậm/lỗi
+
+- latency-aware replica routing;
+- hedged request có budget;
+- deadline/partial-result policy;
+- replace/rebuild replica;
+- alert theo shard/generation.
+
+##### Ranker/feature store lỗi
+
+- fallback lexical/local scores;
+- default query-independent features;
+- skip expensive reranking;
+- không làm toàn query fail nếu policy cho phép.
+
+##### Cache lỗi
+
+- request coalescing và load protection;
+- fallback index shards;
+- rate/load shed expensive queries;
+- cache không phải correctness dependency.
+
+##### Analytics lỗi
+
+- buffer/drop theo explicit policy;
+- query vẫn trả;
+- replay durable events nếu cần.
+
+---
+
+#### 26. Scaling từng component
+
+| Component | Partition/scale key | Metric |
+|---|---|---|
+| URL frontier | host/domain + priority/virtual shard | queue age, URLs/s, skew |
+| Host policy | host/domain | tokens, 429, latency |
+| Fetch workers | network/concurrency/region | pages/s, bytes/s, active fetches |
+| Parser | documents/bytes/language | docs/s, CPU, poison rate |
+| Dedup | fingerprint/URL hash | lookups/s, duplicate ratio |
+| Link graph | source/target partitions | edges/s, graph snapshot lag |
+| Index builders | logical document shard | docs/terms/bytes/s, merge lag |
+| Segment storage | generation/shard | bytes, PUT/GET, distribution lag |
+| Query coordinator | query QPS | fan-out, candidates, p99 |
+| Index serving | logical shard replicas | postings CPU/I/O/cache, p99 |
+| Ranker | candidate batches/model version | scores/s, timeout |
+| Stored fields/snippets | document shard | fetch QPS/bytes/cache |
+| Query cache | normalized query/context | hit, hot key, stale/purge |
+
+Scale theo bottleneck thật; tăng crawler workers không giúp nếu per-host budgets hoặc parser/index queue đã saturated.
+
+---
+
+#### 27. Observability
+
+##### Crawl/index SLIs
+
+- URL discovery/novel ratio;
+- frontier queue age theo priority;
+- robots policy cache/error;
+- per-host request rate và violations;
+- fetch pages/bytes/s, latency, status classes;
+- parse/dedup/indexability rates;
+- duplicate cluster rate;
+- processed docs/terms/postings/s;
+- segment/merge backlog;
+- index-generation build/publish age;
+- removal propagation;
+- stuck URL/document states.
+
+##### Query SLIs
+
+- QPS và cache hit;
+- end-to-end p50/p95/p99;
+- parse/shard/merge/rank/snippet stage latency;
+- shard fan-out và response completeness;
+- slow/missing shard rate;
+- candidates/scored docs per query;
+- zero-result/timeout/error/partial rate;
+- relevance/quality metrics;
+- generation/ranker version distribution.
+
+Trace/query IDs không nên làm metrics cardinality bùng nổ. Raw query logs cần privacy/access/retention controls.
+
+---
+
+#### 28. Các lỗi thiết kế thường gặp
+
+1. **Một central URL queue table cho production scale.**  
+   Dễ lock/hot-index bottleneck; cần partitioned frontier và per-host scheduling.
+
+2. **Dùng SimHash để tránh mọi duplicate fetch.**  
+   Nó cần content; URL canonicalization/seen state mới giảm pre-fetch duplicates.
+
+3. **Hash domain trực tiếp tới một crawler worker cố định.**  
+   Worker churn và large-domain skew; nên hash tới logical owner/partition rồi lease execution.
+
+4. **Mỗi parser tự append URLs không kiểm soát vào queue.**  
+   Cần normalize, dedup, scope/trap filter và backpressure.
+
+5. **Luôn loại stop words và stem mọi token.**  
+   Analyzer phải language/query-aware và versioned.
+
+6. **Tính PageRank ngay trong indexing request.**  
+   PageRank cần graph snapshot/distributed iterative pipeline.
+
+7. **Inverted index là một SQL row per term chứa giant list.**  
+   Cần compressed segmented shard-local structures.
+
+8. **Indexer ghi trực tiếp vào live serving index.**  
+   Có thể tạo mixed/incomplete state; dùng immutable segments và generation publication.
+
+9. **Query Service vừa coordinate vừa scan raw document store.**  
+   Retrieval dùng inverted index; stored fields chỉ fetch sau top candidates.
+
+10. **Popular query cache không gắn generation/policy version.**  
+    Dễ trả stale/blocked results.
+
+11. **Analytics/relevance jobs chạy trên serving shards.**  
+    Làm tăng p99; dùng event/data platform riêng.
+
+12. **Async queue được coi là không mất dữ liệu tự động.**  
+    Cần durability, retry, DLQ, idempotency, schema và reconciliation.
+
+---
+
+#### 29. Cách trình bày trong phỏng vấn
+
+Trình tự tốt:
+
+1. Tách crawl/index plane khỏi query-serving plane.
+2. Vẽ URL discovery → frontier → host policy → fetch workers.
+3. Vẽ raw store → parse/canonical/dedup → document/link outputs.
+4. Vẽ index builder → immutable segments → generation catalog → serving replicas.
+5. Đi query: cache → coordinator → shards → local top-K → global rank → snippet/policy.
+6. Nêu async versus sync communication.
+7. Nêu generation consistency và urgent removal lane.
+8. Chọn failure scenario: worker lease, missing shard, bad generation hoặc slow query shard.
+
+Câu hỏi cần trả lời:
+
+- Hai crawler có fetch trùng URL không và có chấp nhận không?
+- Làm sao tôn trọng per-host politeness khi workers thay đổi?
+- SimHash nằm trước hay sau fetch?
+- Analyzer/index/query versions tương thích thế nào?
+- Index generation được publish atomically ra sao?
+- Query fan-out tới bao nhiêu shards?
+- Một shard chậm thì query làm gì?
+- Cache có trả blocked result không?
+- PageRank được tính ở đâu?
+- Có thể rebuild index từ nguồn nào?
+
+---
+
+#### 30. Ý chính cần nhớ
+
+- HLD tách crawl/index plane và online query plane.
+- URL Discovery phải normalize, scope-filter và dedup trước frontier.
+- Frontier là priority + delay + per-host fairness + lease system, không chỉ FIFO queue.
+- Host Policy Service quản robots, rate, concurrency, backoff và next-fetch time.
+- Fetch workers cần SSRF/DNS-rebinding/size/timeout defenses vì Internet input không tin cậy.
+- Raw document storage tách bodies khỏi fetch metadata và hỗ trợ reprocess/rebuild.
+- Parser tạo normalized document, outgoing links, fingerprints và policy hints.
+- SimHash phát hiện near duplicates sau fetch; seen set/canonicalization giảm duplicate URL trước fetch.
+- Stopword/stemming/tokenization phải language-aware và versioned.
+- PageRank-style features được tính từ link graph snapshot ngoài online indexing request.
+- Inverted indexes là compressed immutable segments, không phải giant SQL lists.
+- Index Catalog điều phối complete compatible generations, canary, publish và rollback.
+- Incremental indexing vẫn nên dùng versioned delta segments/manifests.
+- Query Coordinator dùng cache, scatter–gather, local top-K và global ranking.
+- Ranking có lexical retrieval, authority/freshness/quality và optional reranking stages.
+- Snippets lấy từ stored fields sau candidate selection, không từ raw HTML scan.
+- Removal có query-time deny lane trước khi base index purge hội tụ.
+- Background pipeline dùng durable async events/leases; query path dùng synchronous RPC với deadlines.
+- Generation consistency quan trọng hơn phục vụ một tập newest-but-incomplete shards.
+- Analytics failure không được làm query serving dừng.
+
+#### Công thức ghi nhớ
+
+> **Search HLD = canonical URL discovery + polite leased frontier + safe immutable fetches + versioned parse/dedup/link pipelines + compressed segment generations + synchronous deadline-aware shard retrieval/ranking + bounded removal and replayable analytics.**
+
+---
+
+### Bài 111. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc lựa chọn
+
+Công nghệ phải được ánh xạ từ yêu cầu:
+
+```text
+Workload + invariant + failure model
+                 ↓
+Required capability
+                 ↓
+Technology candidates
+                 ↓
+Benchmark + operations + cost + lock-in
+                 ↓
+Decision record + scale/migration trigger
+```
+
+Một stack minh họa:
+
+| Capability | Ví dụ lựa chọn |
+|---|---|
+| URL/event stream | Kafka/Pulsar/managed Pub/Sub |
+| Fetch task dispatch | RabbitMQ/SQS/managed queue; Celery-style workers khi phù hợp |
+| Frontier/host state | Partitioned KV/SQL/durable scheduling store |
+| Raw pages/segments | S3/GCS/Azure Blob/MinIO |
+| Metadata/catalog | PostgreSQL/distributed SQL/strong KV |
+| Index engine | Lucene-based custom service, Elasticsearch/OpenSearch/Solr |
+| Query/result cache | Redis/Memcached/local caches |
+| Link graph/index jobs | Spark/Flink/Beam-style batch/stream processing |
+| Query RPC | gRPC/HTTP với deadlines |
+| Container orchestration | Kubernetes/managed containers/batch |
+| Observability | OpenTelemetry + metrics/logs/traces backend |
+
+Tên sản phẩm là candidates, không phải kiến trúc.
+
+---
+
+#### 2. Crawler runtime và ngôn ngữ
+
+Crawler chủ yếu I/O-bound:
+
+- nhiều HTTP connections chờ network;
+- DNS, TLS và redirects;
+- response streaming;
+- timeouts/retries;
+- parsing chạy CPU sau fetch.
+
+Lựa chọn runtime:
+
+- **Go/Java/.NET:** concurrency/network tooling mạnh, typed services và hiệu năng ổn định;
+- **Python + asyncio/Scrapy/Celery-style ecosystem:** phát triển nhanh, phù hợp control/worker logic, cần benchmark CPU/memory;
+- **Node.js:** async I/O tốt, nhưng parser/CPU-heavy work nên tách worker/process;
+- **Rust/C++:** hiệu năng/kiểm soát cao nhưng development complexity lớn.
+
+Không nên gắn một process với một request nối tiếp. Worker có bounded concurrency và phải tôn trọng host policy, memory, file-size và egress limits.
+
+Fetch và parse có thể tách pools vì resource profiles khác nhau:
+
+```text
+Fetch pool → network/connections
+Parse pool → CPU/memory/sandbox
+Fingerprint pool → CPU/state lookups
+```
+
+---
+
+#### 3. Kafka, Celery và task queues
+
+Transcript ghép “Kafka và Celery” cho crawl tasks, nhưng đây là các lớp khác nhau.
+
+##### Kafka/Pulsar-style log
+
+Phù hợp với:
+
+- `PageFetched`, `DocumentProcessed`, `LinkExtracted` events;
+- nhiều independent consumers;
+- retention/replay;
+- high-throughput batching;
+- rebuilding projections/indexes;
+- partition ordering theo key.
+
+Không tự cung cấp delayed per-host scheduling/visibility timeout theo kiểu task queue.
+
+##### Celery-style worker framework
+
+Celery điều phối task execution trong Python ecosystem và thường dựa trên broker/backend phù hợp. Nó cung cấp worker pools, retries, routing và task abstractions; durability/ordering/delay semantics phụ thuộc broker/configuration.
+
+##### SQS/RabbitMQ-style work queue
+
+Phù hợp cho:
+
+- một task tới một worker group;
+- ack/visibility timeout;
+- retry/DLQ;
+- delayed/requeued work;
+- scale workers theo queue age/depth.
+
+##### Kiến trúc kết hợp
+
+```text
+Durable domain/data events → Kafka/Pulsar
+Concrete fetch/parse/build tasks → task queues/leases
+Celery/custom workers → consume appropriate task broker
+Frontier store → authoritative priority/delay/host scheduling state
+```
+
+Không dùng Kafka partition ordering như cơ chế duy nhất bảo đảm crawl politeness. Host Policy/Frontier vẫn là authority.
+
+---
+
+#### 4. URL Frontier và host-state storage
+
+Frontier cần nhiều tính năng database/scheduler hơn queue đơn giản:
+
+- upsert/dedup URL;
+- delayed priority ordering;
+- per-host next-fetch timestamp;
+- leases/epochs;
+- retry/backoff;
+- large queue cardinality;
+- hot-domain handling;
+- recovery.
+
+Candidates:
+
+##### Relational/partitioned SQL
+
+Ưu:
+
+- transaction/conditional update;
+- flexible operational queries;
+- dễ bắt đầu.
+
+Trade-off:
+
+- central hot indexes/locks;
+- delayed priority scans khó scale;
+- cần partitioning và careful dequeue.
+
+##### Distributed KV/wide-column store
+
+Ưu:
+
+- horizontal scale;
+- access theo host/time buckets;
+- high write throughput.
+
+Trade-off:
+
+- query model cứng hơn;
+- global priority khó;
+- transactions/secondary indexes có giới hạn tùy hệ thống.
+
+##### Queue + state store
+
+Queue dispatches ready tasks, state store quản URL/host/lease. Đây thường là thiết kế thực dụng hơn buộc một sản phẩm xử lý mọi semantics.
+
+Partition key có thể kết hợp host hash, time bucket và priority lane. Large hosts cần virtual subpartitions nhưng vẫn dùng shared host-rate authority.
+
+---
+
+#### 5. Raw page storage
+
+S3, GCS, Azure Blob hoặc MinIO phù hợp raw fetched bodies, batch outputs và immutable segments vì:
+
+- capacity lớn;
+- durability;
+- compression/lifecycle tiers;
+- range/stream access;
+- low-cost cold storage;
+- signed/service access;
+- event integration.
+
+Object layout:
+
+```text
+raw/{crawl_date}/{host_hash}/{fetch_id}
+processed/{parser_version}/{document_shard}/{batch_id}
+segments/{generation_id}/{logical_shard}/{segment_id}/...
+manifests/{generation_id}/{logical_shard}.json
+```
+
+Keys chỉ minh họa; cần tránh hot-prefix/unsafe path và giữ checksums/manifests.
+
+Raw pages nên compressed theo splittable/block format nếu batch processing cần parallel reads. Nhiều tiny objects gây request/list overhead; có thể pack records thành larger immutable batch files với offset indexes.
+
+Managed object storage giảm repair/capacity burden. MinIO/self-hosted đòi hỏi đội ngũ tự chịu trách nhiệm erasure coding, disk failure, upgrades, replication và DR.
+
+---
+
+#### 6. Metadata và catalog database
+
+Authoritative metadata gồm:
+
+- URL/host/fetch records;
+- canonical document identity;
+- indexability/policy state;
+- segment manifests;
+- index generations/publication pointer;
+- removal registry;
+- schema/ranking versions;
+- operational leases/outbox khi phù hợp.
+
+PostgreSQL/distributed SQL/strong KV phù hợp tùy scale vì cần:
+
+- conditional writes;
+- unique identities;
+- state transitions;
+- generation publication invariant;
+- audit/provenance.
+
+Không đặt giant posting lists hoặc raw HTML vào relational rows chỉ vì metadata ở SQL.
+
+Scale path:
+
+- partition URL/fetch data theo host/hash/time;
+- archive history;
+- connection pooling;
+- indexes theo access path;
+- separate OLTP control state khỏi analytics;
+- distributed/sharded catalog khi single cluster vượt giới hạn.
+
+---
+
+#### 7. Search index không phải generic NoSQL
+
+Transcript nói search indexes phù hợp NoSQL vì flexible schema/fast lookup. Mô tả này quá rộng.
+
+Inverted index cần specialized structures:
+
+- term dictionaries;
+- compressed posting lists;
+- positions/frequencies/field flags;
+- skip/block-max data;
+- immutable segments và merges;
+- local top-K scoring;
+- stored fields/doc values;
+- shard/replica management.
+
+Một generic key-value/document NoSQL có thể giữ metadata hoặc custom postings prototype, nhưng không tự cung cấp efficient text retrieval/ranking semantics.
+
+Ba lựa chọn:
+
+##### Elasticsearch/OpenSearch
+
+Ưu:
+
+- dựa trên Lucene;
+- full-text analyzers;
+- distributed shards/replicas;
+- APIs/query DSL;
+- aggregation/operations ecosystem;
+- nhanh cho MVP/growth.
+
+Trade-off:
+
+- heap/segment/merge tuning;
+- shard-count discipline;
+- cluster/indexing pressure;
+- generic distributed search overhead;
+- customization giới hạn hơn custom engine;
+- version/upgrade/operations complexity.
+
+##### Solr/Lucene-based service
+
+Solr cung cấp distributed search trên Lucene; direct Lucene cho phép custom service sâu hơn nhưng đội ngũ phải xây distribution/catalog/routing/rollout.
+
+##### Custom index engine
+
+Phù hợp khi cần:
+
+- format/compression tối ưu riêng;
+- extreme QPS/latency;
+- custom retrieval/ranking/pruning;
+- specialized hardware/memory layout;
+- complete generation control.
+
+Đổi lại phải tự xây:
+
+- analyzer/index formats;
+- segment merge;
+- shard replication/distribution;
+- query coordinator;
+- recovery/rollout;
+- observability/tooling;
+- years of operational maturity.
+
+Chọn established engine trước thường hợp lý trừ khi requirements/scale chứng minh cần custom.
+
+---
+
+#### 8. Continuous indexing với immutable segments
+
+“Index continuously” không có nghĩa update in-place mọi posting list trên serving nodes.
+
+Một design:
+
+```text
+Processed document batches
+→ build small immutable delta segments
+→ upload object storage
+→ register/validate manifest
+→ publish delta generation/version
+→ periodically merge compact segments
+→ publish consolidated generation
+```
+
+Lợi ích:
+
+- freshness trong vài giờ/phút tùy batch;
+- rollback;
+- checksum/validation;
+- serving readers không thấy partial writes;
+- rebuild/canary.
+
+Trade-off:
+
+- nhiều small segments làm query fan-out/merge cost tăng;
+- background merge tạo I/O amplification;
+- cần policy giữ generations/deltas;
+- deletion/tombstone overlays.
+
+Balance freshness bằng micro-batch size/interval, không nhất thiết full rebuild hoặc per-document realtime mutation.
+
+---
+
+#### 9. Link graph và PageRank compute
+
+PageRank-style authority cần large graph processing. Candidates:
+
+- Spark/MapReduce-style batch jobs;
+- Flink/Beam-style data pipelines;
+- custom distributed graph processing;
+- object/data-lake snapshots + partitioned adjacency lists.
+
+Pipeline:
+
+```text
+LinkEdge events
+→ canonical ID resolution
+→ graph snapshot
+→ iterative authority computation
+→ normalized/versioned feature files/store
+→ index/ranker rollout
+```
+
+Không đưa graph compute vào query request. Query serving chỉ lookup precomputed authority feature.
+
+Need controls:
+
+- spam/link filtering;
+- dangling nodes;
+- convergence/iteration budget;
+- snapshot/version alignment;
+- incremental versus full recompute;
+- rollback.
+
+---
+
+#### 10. Ranking technology
+
+Baseline:
+
+```text
+Lexical match → TF-IDF/BM25-style scoring
+Authority     → PageRank-style feature
+Freshness     → time/change/query-class-aware feature
+Quality       → domain/content/spam/safety features
+```
+
+Implementation options:
+
+- built-in search engine scoring/scripts;
+- custom ranking service;
+- compact feature store/doc values;
+- optional learned-to-rank plugin/model serving later.
+
+Requirements:
+
+- ranker version/config;
+- feature version compatibility;
+- bounded candidate set;
+- deadline/timeout;
+- fallback lexical scoring;
+- offline relevance evaluation;
+- canary/A-B experiment;
+- rollback;
+- explain/debug tooling.
+
+Freshness không phải luôn boost new pages. Query như “current exchange rate” khác “history of Rome”; ranking cần query/document context.
+
+---
+
+#### 11. Query API runtime và RPC
+
+Search API/Coordinator cần:
+
+- stateless horizontal replicas;
+- low allocation/serialization overhead;
+- deadline propagation;
+- scatter–gather concurrency;
+- result cache;
+- local top-K merge;
+- load shedding;
+- policy/removal filtering;
+- observability.
+
+Go, Java, C++, Rust hoặc .NET đều có thể phù hợp; chọn theo benchmark/team/tooling. Python/Node cũng có thể dùng ở gateway/light orchestration nhưng hot retrieval/merge path cần benchmark nghiêm túc.
+
+Internal RPC:
+
+- gRPC/compact binary protocol;
+- connection pooling;
+- per-stage deadline;
+- bounded retries;
+- optional hedging;
+- compression chỉ khi CPU/network trade-off hợp lý;
+- versioned schema.
+
+HTTP/JSON có thể đủ cho MVP external API; internal shard calls ở 128K+/s hưởng lợi từ compact RPC.
+
+---
+
+#### 12. Load balancers và global routing
+
+Layers:
+
+```text
+Anycast/global DNS/traffic manager
+→ regional L4/L7 load balancer
+→ API Gateway/Search API replicas
+→ query coordinator shard routing
+→ index shard replicas
+```
+
+Load balancer giải quyết:
+
+- distribute incoming requests;
+- health/zone routing;
+- TLS/WAF/rate limit ở edge;
+- regional failover;
+- canary versions.
+
+Nó không tự giải quyết:
+
+- index-shard fan-out;
+- generation compatibility;
+- hot queries;
+- slow shards;
+- ranker deadlines;
+- search relevance.
+
+Query coordinators cần shard topology/catalog riêng và latency/load-aware replica selection.
+
+---
+
+#### 13. Redis hoặc Memcached cache
+
+Cache targets:
+
+- normalized hot query results;
+- query rewrites/suggestions nếu có;
+- term dictionary/hot posting blocks ở local memory;
+- stored fields/snippets;
+- policy/removal state với correctness controls;
+- routing/catalog config local cache.
+
+Redis:
+
+- richer data structures;
+- replication/cluster;
+- TTL/counters/pub-sub features;
+- operational complexity/memory cost.
+
+Memcached:
+
+- simple disposable key-value cache;
+- dễ scale cho basic response caching;
+- ít capabilities hơn.
+
+Search result cache key:
+
+```text
+normalized_query
++ language/region/safe-search/filter/page
++ index_generation
++ ranker/config_version
++ policy_epoch
+```
+
+Requirements:
+
+- request coalescing;
+- TTL/versioning;
+- hot-key distribution;
+- negative/zero-result cache ngắn;
+- removal invalidation/version bump;
+- fallback khi cache mất;
+- cache warming cho generation mới.
+
+Cache không phải source of truth và không được làm urgent removal chậm ngoài SLO.
+
+---
+
+#### 14. Containers và Kubernetes
+
+Kubernetes/managed containers có thể chạy:
+
+- stateless Search API/Coordinator;
+- fetch/parse/fingerprint workers;
+- index build jobs;
+- ranker/snippet services;
+- event consumers;
+- reconciliation jobs.
+
+Config cần:
+
+```text
+requests/limits
+readiness/liveness/startup probes
+PodDisruptionBudget
+topology spread/anti-affinity
+HPA/KEDA/custom metrics
+priority classes
+NetworkPolicy
+workload identity
+rolling/canary deployments
+```
+
+Index serving có local SSD/memory-heavy state. Có thể dùng:
+
+- StatefulSets với careful lifecycle;
+- dedicated VMs/bare metal;
+- managed Elasticsearch/OpenSearch;
+- custom immutable shard-serving fleet.
+
+Không ép mọi stateful workload vào Kubernetes nếu deployment/data-locality/rebuild model không phù hợp.
+
+---
+
+#### 15. Autoscaling signals
+
+| Component | Signal tốt |
+|---|---|
+| Fetch workers | ready leases, active fetches, bytes/s, host availability |
+| Parsers | queued document bytes, oldest document age, CPU/memory |
+| Dedup | fingerprint backlog/lookups/s |
+| Index builders | queued docs/terms/bytes, merge backlog |
+| Segment distributors | pending GB/shards, rollout age |
+| Search API | QPS, concurrency, p95/p99, CPU |
+| Query coordinators | shard RPC/s, candidates/s, queue time |
+| Rankers | candidate batches/s, p99, timeout rate |
+| Cache | hit ratio, memory/evictions/hot key—not replica count alone |
+
+Crawler workers không nên autoscale chỉ theo queue depth vì per-host politeness có thể làm nhiều URLs chưa fetchable. Dùng ready-to-fetch backlog và available host capacity.
+
+Index serving shards scale theo corpus/shard size/query load và replica needs; không thể tạo replica instant nếu phải tải/warm hàng chục GB.
+
+---
+
+#### 16. Cloud infrastructure và regional design
+
+Cloud giúp:
+
+- elastic workers;
+- managed object storage;
+- managed queues/logs/databases;
+- multi-zone deployments;
+- load balancers;
+- autoscaling;
+- observability integrations.
+
+Nhưng crawler có yêu cầu đặc biệt:
+
+- stable/traceable outbound IPs;
+- reverse DNS/contact/user-agent;
+- egress controls và cost;
+- distributed origins tránh traffic concentration nhưng không né website policy;
+- abuse complaints handling;
+- DNS resolver capacity.
+
+Query serving regional topology:
+
+```text
+Global router
+  ├─ Region A: full/appropriate index replicas + API/cache
+  ├─ Region B: full/appropriate index replicas + API/cache
+  └─ Region C: ...
+```
+
+Replicating full index mọi region tăng storage/distribution cost. Có thể chọn regional coverage, active-passive hoặc tiered serving theo SLO.
+
+---
+
+#### 17. Horizontal scaling và failover
+
+##### Crawl/index plane
+
+- partition frontier/host state;
+- add fetch/parse workers;
+- shard document batches/index builders;
+- queues absorb bursts;
+- replay raw/events;
+- failed task leases expire/retry.
+
+##### Query plane
+
+- stateless API/coordinator replicas;
+- index document shards;
+- 2–3 replicas/shard across zones;
+- load-aware replica routing;
+- generation-aware health checks;
+- cached query results;
+- old generation rollback.
+
+Automatic failover cần fencing/version checks. Replica “healthy” nhưng load sai generation không được nhận query.
+
+Capacity phải chịu replica/node/AZ loss; nếu bình thường chạy 95% saturation, failover không còn headroom.
+
+---
+
+#### 18. Security
+
+##### Crawler
+
+- SSRF/private IP/metadata endpoint blocks;
+- DNS rebinding defense;
+- strict egress allow/deny policy;
+- sandbox parse/decompression;
+- response size/time/type limits;
+- patched libraries;
+- no broad cloud credentials;
+- audit user-agent/host rates.
+
+##### Query API
+
+- DDoS/WAF/bot/rate limits;
+- query length/operator/expansion limits;
+- abuse/scraping controls;
+- safe output/highlight escaping;
+- TLS;
+- internal workload identity/mTLS as needed.
+
+##### Data
+
+- encryption at rest/in transit;
+- KMS/secrets manager;
+- least privilege;
+- query-log privacy/access/retention;
+- signed/checksummed index manifests;
+- supply-chain/image scanning;
+- immutable audit for removals/publication.
+
+---
+
+#### 19. Observability tooling
+
+Một stack có thể dùng OpenTelemetry, Prometheus-compatible metrics, Grafana, centralized logs và distributed traces.
+
+Crawler/index dimensions:
+
+```text
+host/domain class, region, worker/parser version,
+priority lane, content type/language,
+index generation, shard, schema version
+```
+
+Query dimensions:
+
+```text
+region, cache hit/miss, query cost class,
+generation/ranker version, shard, partial/timeout,
+language/safe-search context
+```
+
+Không dùng raw URL/query/document IDs làm metric labels không giới hạn. High-cardinality details đi vào sampled/traced logs có access control.
+
+Alert theo SLO:
+
+- query p95/p99/error/partial;
+- slow/missing shard;
+- frontier freshness/queue age;
+- politeness violations;
+- parse/index/merge backlog;
+- generation rollout failure;
+- urgent removal lag;
+- storage/cost anomaly.
+
+---
+
+#### 20. Backup, rebuild và disaster recovery
+
+Search index là derived và có thể rebuild, nhưng rebuild 100M/billions documents mất thời gian. Cần:
+
+- durable raw/processed snapshots;
+- document/URL/catalog backups;
+- immutable index generations;
+- cross-zone/region copies theo RPO/RTO;
+- generation manifests/checksums;
+- restore/rebuild drills;
+- frontier checkpoint;
+- removal/policy registry backup;
+- ranking/analyzer/config version archive.
+
+Ưu tiên DR:
+
+```text
+Query serving generation + policy state
+→ document/catalog/stored fields
+→ frontier/host state
+→ raw/processed corpus
+→ analytics (theo business criticality)
+```
+
+Replication không thay backup. Bad generation, logical corruption hoặc policy error có thể replicate.
+
+---
+
+#### 21. Cost model
+
+```text
+Total cost ≈ crawl egress/DNS/compute
+           + raw/processed object storage
+           + index build/merge CPU + disk I/O
+           + index replicas × generations × regions
+           + query CPU/memory/local SSD/network
+           + cache memory
+           + analytics/link graph compute
+           + logs/monitoring
+           + backup/DR
+```
+
+Unit economics:
+
+- cost per million pages fetched;
+- cost per million documents indexed;
+- cost per indexed document-month;
+- cost per million queries;
+- cost per index generation rollout;
+- cost per freshness class;
+- cache savings versus memory cost.
+
+Tối ưu:
+
+- conditional fetch;
+- prioritized recrawl;
+- dedup;
+- raw retention tiers;
+- compact index formats;
+- query/result/posting caches;
+- local SSD/memory placement;
+- segment merge scheduling;
+- autoscale workers;
+- avoid over-replicating cold/unused generations;
+- sample analytics có chủ đích.
+
+Không giảm politeness, removal correctness hoặc rollback safety chỉ để giảm cost.
+
+---
+
+#### 22. Managed engine hay custom engine?
+
+| Tiêu chí | Elasticsearch/OpenSearch/Solr | Custom Lucene/engine |
+|---|---|---|
+| Time-to-market | Nhanh hơn | Chậm hơn |
+| Built-in distribution | Có | Phải xây |
+| Custom index format | Hạn chế | Toàn quyền |
+| Extreme optimization | Có giới hạn | Cao nếu có đội chuyên sâu |
+| Operations | Vẫn đáng kể/managed option | Rất cao |
+| Query DSL/features | Có sẵn | Phải xây |
+| Generation rollout semantics | Cần thiết kế trên engine | Có thể tối ưu riêng nhưng phải xây |
+| Talent requirement | Search ops/Lucene | Deep IR/storage/distributed systems |
+
+Chọn custom khi measured bottleneck/capability gap đủ lớn. Không dùng “Google tự xây” làm lý do; quy mô và đội ngũ của bài toán mới quyết định.
+
+---
+
+#### 23. Architecture Decision Record examples
+
+##### Event log và task queue
+
+```text
+Decision: Kafka giữ PageFetched/DocumentProcessed events;
+          task queue dispatch parse/fetch jobs.
+Why: replay/multi-consumer khác ack/lease task semantics.
+Trade-off: vận hành hai lớp messaging.
+Revisit: khi managed platform hợp nhất semantics với cost/SLI phù hợp.
+```
+
+##### Established search engine
+
+```text
+Decision: dùng OpenSearch/Elasticsearch cho MVP 100M docs.
+Why: full-text, shards, replicas và operations ecosystem có sẵn.
+Trade-off: shard/merge/heap tuning và limited custom retrieval.
+Revisit: khi p99/cost/custom ranking requirements không đạt sau benchmark.
+```
+
+##### Object storage raw corpus
+
+```text
+Decision: compressed immutable raw batches trên object storage.
+Why: low-cost durable retention và reprocess/rebuild.
+Trade-off: random single-document access cần offset/catalog index.
+Revisit: nếu access pattern chuyển sang frequent low-latency document fetch.
+```
+
+---
+
+#### 24. Các lỗi lựa chọn công nghệ thường gặp
+
+1. **Kafka + Celery được coi là một queue product pair bắt buộc.**  
+   Phân biệt event log, broker, worker framework và frontier authority.
+
+2. **Kafka topic thay URL Frontier hoàn toàn.**  
+   Kafka không tự quản priority, delayed recrawl và per-host politeness semantics.
+
+3. **NoSQL vì inverted index có schema linh hoạt.**  
+   Text retrieval cần specialized posting/segment/scoring engine.
+
+4. **Elasticsearch nghĩa là không cần thiết kế index.**  
+   Vẫn cần analyzers, shards, mappings, refresh/merge, rollout, policy và capacity.
+
+5. **Custom engine để có “full control” ngay từ MVP.**  
+   Control đi kèm nhiều năm engineering/operations burden.
+
+6. **Continuous indexing là update live index row-by-row.**  
+   Immutable delta segments và versioned publication an toàn hơn.
+
+7. **PageRank tính trong online ranking request.**  
+   Authority được precompute từ graph snapshot.
+
+8. **Redis giữ authoritative removal state duy nhất.**  
+   Cache loss/eviction không được làm blocked docs xuất hiện.
+
+9. **Kubernetes tự giải quyết stateful index locality.**  
+   Cần shard distribution, local data loading, warming và generation health.
+
+10. **Cloud autoscaling crawler theo queue depth.**  
+    URLs có thể chưa fetchable do politeness; scale theo ready work và host capacity.
+
+11. **Replication là backup.**
+
+12. **Load balancer tự xử lý shard routing.**  
+    Query coordinator cần topology/generation/load-aware routing.
+
+---
+
+#### 25. Stack tham khảo
+
+```text
+Crawler runtime       Go/Java/Python async/custom workers
+Task dispatch         SQS/RabbitMQ/managed work queue
+Event stream          Kafka/Pulsar/managed Pub/Sub
+Frontier state        Partitioned SQL/KV + delayed priority scheduler
+Host policy           Strong/bounded per-host KV/service
+Raw/processed corpus  S3/GCS/Azure Blob/MinIO, compressed batches
+Metadata/catalog      PostgreSQL/distributed SQL/strong KV
+Index engine          Elasticsearch/OpenSearch/Solr/Lucene/custom
+Graph/index jobs      Spark/Flink/Beam/managed data processing
+Query API/RPC         Stateless services + gRPC/HTTP deadlines
+Cache                 Redis/Memcached/local memory
+Orchestration         Kubernetes/managed containers/batch
+Observability         OpenTelemetry + metrics/logs/traces
+Security              WAF/KMS/secrets/workload identity/sandbox
+```
+
+Mỗi lựa chọn phải có owner, SLO, scaling metric, failure/recovery plan, cost và migration trigger.
+
+---
+
+#### 26. Ý chính cần nhớ
+
+- Chọn technology theo semantics và workload, không theo popularity.
+- Crawler runtime cần async network concurrency; parser/fingerprint có CPU profile riêng.
+- Kafka/Pulsar là replayable event log; SQS/RabbitMQ là work queues; Celery là worker/task framework.
+- URL Frontier vẫn cần authoritative priority, delay, lease và host-policy state.
+- Object storage phù hợp raw bodies, processed batches và immutable index segments.
+- Nhiều tiny objects tăng request/list cost; packed immutable batches có thể hiệu quả hơn.
+- Authoritative URL/document/catalog state cần conditional writes và provenance.
+- Inverted index là specialized search structure, không phải generic NoSQL use case.
+- Elasticsearch/OpenSearch/Solr tăng tốc MVP nhưng vẫn cần shard/merge/rollout design.
+- Custom engine chỉ hợp lý khi requirements/benchmarks biện minh operational cost.
+- Continuous freshness có thể dùng immutable delta segments và versioned publication.
+- PageRank-style authority được compute offline/nearline trên link graph snapshot.
+- Ranking config/features phải versioned, evaluated và rollback được.
+- Query coordinators cần deadline-aware gRPC, shard topology và candidate budgets.
+- Load balancer không thay query shard routing.
+- Redis/Memcached cache cần generation/ranker/policy-aware keys.
+- Kubernetes hữu ích cho elastic workers/services nhưng không tự giải quyết index locality.
+- Autoscale crawler theo ready-to-fetch work; indexer theo docs/terms/bytes/merge backlog.
+- Multi-zone replicas cần generation compatibility và failure headroom.
+- Security phải coi crawler/parser là Internet-facing untrusted-input execution plane.
+- Backup raw/catalog/config và immutable generations để rebuild/rollback.
+- Cost phải đo theo pages, documents, indexed bytes và queries—not chỉ instance count.
+
+#### Công thức ghi nhớ
+
+> **Strategic search stack = authoritative polite frontier + replayable events and leased work queues + durable object corpus + transactional generation catalog + specialized compressed search engine + generation-aware caches/RPC + observable secure horizontal recovery.**
+
+---
+
+### Bài 112. The Final Design — Search Engine
+
+#### 1. Hai workflow lớn
+
+Final architecture gồm:
+
+```text
+Crawl/index workflow
+  liên tục khám phá, tải, xử lý, xây và publish searchable corpus
+
+Query workflow
+  nhận user query, retrieve/rank top results trong strict latency budget
+```
+
+Chúng dùng chung document/index generations nhưng phải tách failure và resource domains:
+
+- crawler/indexer chậm không làm query hiện tại dừng;
+- query spike không làm crawler vi phạm website rate limits;
+- generation build lỗi không làm mất generation đang serve;
+- analytics lỗi không chặn response;
+- urgent removal có đường nhanh hơn normal batch refresh.
+
+---
+
+#### 2. Sơ đồ kiến trúc cuối
+
+```text
+                                Public Web
+                                    |
+                        DNS / Robots / Host Policies
+                                    |
+                         URL Frontier + Scheduler
+                                    |
+                        Leased Distributed Crawlers
+                                    |
+                           Raw Document Storage
+                                    |
+                      Parser / Extractor / Normalizer
+                         /          |           \
+                  New URLs      Documents      Link Edges
+                      |             |              |
+               URL Seen/       Canonical/      Link Graph /
+               Trap Filter      Dedup/Policy    Rank Features
+                      |             |              |
+                      +------ Index Build Pipeline-+
+                                    |
+                         Immutable Index Segments
+                                    |
+                     Index Catalog + Generation Gate
+                                    |
+                   Distribution / Validation / Canary
+                                    |
+                      Replicated Index Serving Shards
+                                    |
+ User → Global Edge → Search API → Query Coordinator
+                |          |         /       |       \
+             Rate/WAF   Query Cache Shards  Ranker  Stored Fields
+                                      \       |       /
+                                       Result Assembly
+                                              |
+                                  Removal/Policy Final Filter
+                                              |
+                                          Top Results
+
+ Query/Click/Crawl Events → Durable Log → Analytics / Quality / Capacity
+```
+
+---
+
+#### 3. Crawl lifecycle end-to-end
+
+##### 3.1. Discover và normalize
+
+```text
+1. Seed/sitemap/parser phát hiện raw URLs
+2. Resolve relative URL và validate HTTP/HTTPS scope
+3. Normalize/canonicalize thận trọng
+4. Check probabilistic seen filter
+5. Upsert authoritative URL record
+6. Filter traps/out-of-scope/blocked candidates
+7. Gán host, priority và revisit hints
+8. Đưa URL vào frontier
+```
+
+Một URL có thể được phát hiện nhiều lần; enqueue/upsert phải idempotent.
+
+##### 3.2. Schedule politely
+
+```text
+9. Scheduler lấy ready URLs theo priority
+10. Host Policy kiểm tra robots.txt, next-allowed time và rate budget
+11. Frontier cấp fetch lease/epoch cho worker
+12. Large host queues vẫn chia execution nhưng dùng chung host authority
+```
+
+`robots.txt` là đúng tên; transcript nhiều lần viết `robot.txt`.
+
+##### 3.3. Fetch
+
+```text
+13. Worker resolve DNS và kiểm tra destination an toàn
+14. Gửi conditional GET khi có ETag/Last-Modified
+15. Enforce redirect/body/time/content-type limits
+16. Stream body vào immutable raw object storage
+17. Ghi FetchRecord với status, headers, hash và provenance
+18. Complete lease và phát PageFetched event
+```
+
+Transient failures retry với host-level backoff; 404/410 trở thành tombstone candidates theo policy, không nhất thiết xóa ngay sau một lần fetch.
+
+##### 3.4. Parse và discover tiếp
+
+```text
+19. Parser decode/decompress/safely parse HTML
+20. Extract visible text, title, fields, links và index directives
+21. Detect language và apply compatible analyzers
+22. Sinh exact/near-duplicate fingerprints
+23. Phát outgoing links trở lại discovery pipeline
+24. Lưu processed document representation
+```
+
+SimHash/MinHash nằm sau fetch/parse; pre-fetch duplicate URL được xử lý bằng canonicalization/seen set.
+
+---
+
+#### 4. Document và link processing
+
+```text
+Processed page
+   ├─ canonical cluster/representative selection
+   ├─ exact/near-duplicate decision
+   ├─ indexability + policy state
+   ├─ stored fields/snippet source
+   ├─ analyzed term vectors
+   └─ outgoing link edges
+```
+
+Link edges đi vào graph snapshot để compute PageRank-style authority offline/nearline. PageRank không chạy trên online query path và không phải toàn bộ ranking.
+
+Document revision cần gắn:
+
+- parser/analyzer version;
+- content hash;
+- canonical decision/provenance;
+- fetch time/freshness;
+- feature snapshot/version;
+- indexability/removal policy revision.
+
+---
+
+#### 5. Index build workflow
+
+```text
+1. Processed documents được partition theo logical document shard
+2. Builder tạo term dictionary và posting buffers
+3. Flush compressed immutable small segments
+4. Build forward/stored-field structures
+5. Merge/compact theo policy
+6. Gắn ranking feature snapshot
+7. Upload segment files + manifest + checksums
+8. Register candidate generation trong Index Catalog
+```
+
+Inverted index ánh xạ term tới compressed postings, không phải một SQL table row chứa giant document list.
+
+Mỗi posting có thể chứa:
+
+```text
+document_id gaps
+term frequency
+positions
+field flags
+impact/block metadata
+```
+
+Index builder không mutate live serving generation tùy ý. Dùng immutable full/delta segments và manifests.
+
+---
+
+#### 6. Index publication workflow
+
+```text
+Candidate generation
+      ↓
+checksums/schema/analyzer compatibility
+      ↓
+all required shard manifests present
+      ↓
+document/posting/removal invariants
+      ↓
+offline coverage/relevance tests
+      ↓
+distribute segments tới serving replicas
+      ↓
+replicas load + warm + report generation-aware health
+      ↓
+canary query traffic
+      ↓
+compare latency/error/relevance
+      ↓
+atomic serving-generation switch
+      ↓
+retain old generation for rollback
+```
+
+Nếu một shard thiếu hoặc ranker/analyzer không tương thích, không publish. Generation cũ tiếp tục phục vụ.
+
+Multiple generations tạo storage/headroom cost nhưng là nền tảng của safe rollout.
+
+---
+
+#### 7. Query flow end-to-end
+
+##### 7.1. Entry và cache
+
+```text
+1. User gửi keyword query tới global edge/Search API
+2. WAF/rate/abuse/input limits được áp dụng
+3. Request có query_id, context và deadline
+4. Query được normalize bằng analyzer version tương thích
+5. Kiểm tra generation/ranker/policy-aware result cache
+6. Cache hit hợp lệ → final policy filter → trả nhanh
+```
+
+Transcript bị thiếu một từ trong câu “served directly from the ...”; thành phần được nói tới là **cache**.
+
+##### 7.2. Retrieval
+
+```text
+7. Cache miss → Query Coordinator chọn serving generation
+8. Parse/rewrite/classify query cost
+9. Scatter compact RPC tới logical index shards
+10. Mỗi shard lookup/intersect posting lists
+11. Apply local filters và lexical scoring/pruning
+12. Mỗi shard trả bounded local top-K
+```
+
+Query không scan raw pages hay toàn forward store.
+
+##### 7.3. Global ranking
+
+```text
+13. Coordinator merge local candidates
+14. Ranking Engine kết hợp:
+      lexical relevance
+      PageRank/link authority
+      freshness
+      quality/spam/safety
+      field/proximity signals
+15. Optional expensive reranker chỉ chạy trên small top-N
+16. Dedup/diversity/policy filters
+```
+
+##### 7.4. Result assembly
+
+```text
+17. Fetch title, canonical URL và stored snippet fields cho top docs
+18. Generate/highlight query-dependent snippets
+19. Apply final removal/policy registry check
+20. Format top results + opaque cursor
+21. Cache result với generation/ranker/policy context
+22. Return trong p95/p99 budget
+23. Emit privacy-controlled Query/Result events async
+```
+
+---
+
+#### 8. Ranking pipeline
+
+Một công thức conceptual:
+
+```text
+score(q, d) = lexical(q, d)
+            + field/proximity(q, d)
+            + authority(d)
+            + freshness(q, d)
+            + quality(d)
+            − spam/safety penalties(d, q)
+```
+
+Các signals:
+
+| Signal | Tính chất |
+|---|---|
+| TF-IDF/BM25-style lexical | Query-dependent |
+| Field/proximity/anchor match | Query-dependent |
+| PageRank/link authority | Chủ yếu query-independent, precomputed |
+| Freshness | Query/document/time-dependent |
+| Domain/document quality | Query-independent hoặc contextual |
+| Spam/malware/policy | Filtering/penalty, correctness-sensitive |
+
+Ranker version, feature snapshot và index generation phải tương thích. Nếu expensive ranker lỗi, fallback lexical + stable features thay vì làm toàn query fail.
+
+---
+
+#### 9. Search cache architecture
+
+```text
+L1 process cache
+    ↓ miss
+L2 distributed query/result cache
+    ↓ miss
+Index serving shards/posting caches
+```
+
+Cache key:
+
+```text
+normalized query
++ language/region/filter/safe-search/page
++ index generation
++ ranker/config version
++ removal/policy epoch
+```
+
+Yêu cầu:
+
+- request coalescing chống stampede;
+- TTL và versioned invalidation;
+- hot-key replication;
+- cache warming cho new generation;
+- negative/zero-result TTL ngắn;
+- fallback khi cache mất;
+- urgent removal deny dù entry chưa hết TTL.
+
+Không cache raw personalized result vì personalization ngoài scope; nếu thêm personalization sau này, cache cardinality/hit ratio thay đổi đáng kể.
+
+---
+
+#### 10. Urgent removal và deletion flow
+
+```text
+Removal/blocked signal
+      ↓
+Authoritative Removal Registry + policy epoch
+      ├─ query-time deny filter
+      ├─ result-cache version bump/invalidation
+      ├─ delta tombstone segment
+      ├─ search-index merge/rebuild
+      └─ raw retention/delete theo legal/audit policy
+```
+
+Cần phân biệt:
+
+- page 404/410;
+- `noindex`;
+- robots crawl restriction;
+- canonical consolidation;
+- spam/malware block;
+- legal/policy removal;
+- temporary fetch failure.
+
+`robots.txt` kiểm soát crawling theo protocol, không phải authorization hoặc đảm bảo de-index toàn bộ content đã biết. Semantics removal phải được xác định riêng.
+
+---
+
+#### 11. Storage tiers
+
+| Dữ liệu | Store/tier | Vai trò |
+|---|---|---|
+| Raw fetch bodies | Compressed object storage hot→cold | Reprocess/audit/rebuild |
+| Fetch/URL/host metadata | Partitioned SQL/KV | Crawl control/source state |
+| Processed document batches | Object/distributed storage | Index build input |
+| Link graph | Partitioned object/data platform | Offline authority features |
+| Immutable segments | Object storage + local SSD/memory | Build distribution/serving |
+| Index Catalog | Transactional metadata store | Generation control |
+| Forward/stored fields | Sharded compressed store | Result assembly |
+| Removal registry | Strong/bounded policy store + cache | Immediate deny path |
+| Query result cache | Redis/Memcached/local cache | Hot-query latency/load |
+| Query/click logs | Durable event log + lake/warehouse | Analytics/quality |
+
+Derived index có thể rebuild nhưng thời gian lớn; giữ immutable generations và sufficient source snapshots theo RPO/RTO.
+
+---
+
+#### 12. Communication architecture
+
+##### Asynchronous crawl/index path
+
+```text
+URL events/upserts
+→ frontier/leases
+→ fetch events
+→ parse/dedup/link events
+→ processed batch refs
+→ segment build/registration
+→ generation publication
+```
+
+Dùng durable logs/queues, object references, idempotent revisions, retries, DLQ và reconciliation.
+
+##### Synchronous query path
+
+```text
+Search API → Coordinator → Shard RPCs → Ranker/Stored Fields/Policy
+```
+
+Dùng compact RPC, connection pools, deadlines, bounded retry/hedging và circuit/load controls.
+
+##### Analytics path
+
+Events được batch asynchronous; ingestion failure không chặn query.
+
+---
+
+#### 13. Consistency model
+
+| Boundary | Model |
+|---|---|
+| URL task execution | At-least-once lease + idempotency |
+| Host politeness | Coordinated per-host authority |
+| Raw fetch/content | Immutable versioned artifacts |
+| Canonical/duplicate cluster | Eventual/versioned with provenance |
+| Index segment | Immutable |
+| Published index | Atomic complete generation manifest |
+| Query | Một generation/ranker/policy context nhất quán |
+| Query cache | Versioned by generation/config/policy |
+| New/update page visibility | Eventual within freshness class |
+| Urgent removal | Bounded via deny registry + tombstone/index propagation |
+| Analytics | Eventual/non-blocking |
+
+Serving newest partial segments không quan trọng bằng serving compatible complete generation.
+
+---
+
+#### 14. Scaling và workload isolation
+
+| Spike/failure | Primary impact | Isolation/scaling |
+|---|---|---|
+| URL discovery burst | Seen/frontier | Batch/upsert, trap filters, backpressure |
+| Large domain | Host partition/rate state | Shared host authority + virtual execution shards |
+| Parser poison pages | Parse workers | Sandbox, limits, DLQ/quarantine |
+| Index backlog | Builders/merge storage | Autoscale by docs/terms/bytes/age |
+| Generation rollout | Network/disk/cache | Throttled distribution, overlap headroom, warming |
+| Hot query | Cache/coordinator/shards | Multi-level cache, request collapse |
+| Common term | Posting decode/CPU | Compression, skips, WAND/pruning, cost limits |
+| Slow shard | Query tail | Replica routing, deadlines, bounded hedging |
+| Ranker outage | Ranking | Stable fallback scoring |
+| Analytics outage | Event backlog | Buffer/replay; query unaffected |
+
+Crawler, builder và serving fleets có independent autoscaling. Không chạy heavy merge/analytics trên serving nodes nếu có thể tránh.
+
+---
+
+#### 15. Fault tolerance
+
+##### Crawler worker failure
+
+- lease expires;
+- URL reassigns;
+- stale worker fenced bằng lease epoch;
+- duplicate fetch tolerated/reconciled.
+
+##### Frontier partition failure
+
+- replicated durable state;
+- leader/failover fencing;
+- no host-policy bypass;
+- recovered leases become eligible safely.
+
+##### Raw storage write failure
+
+- không phát successful `PageFetched` trước durable object/checksum;
+- retry object write;
+- incomplete object cleanup.
+
+##### Parser/indexer failure
+
+- durable input/event replay;
+- idempotent document revision;
+- bounded retries/DLQ;
+- backlog metrics và drain capacity.
+
+##### Bad index generation
+
+- validation/canary fails;
+- generation pointer không switch hoặc rollback;
+- old generation retained;
+- diagnose by manifest/schema/quality versions.
+
+##### Index serving node failure
+
+- route tới compatible replica;
+- rebuild/load shard từ immutable segments;
+- maintain zone/headroom;
+- warm before marking healthy.
+
+##### One slow shard
+
+- deadline-aware RPC;
+- optional bounded hedge;
+- partial result only under explicit product policy;
+- isolate/rebuild slow replica;
+- do not retry unlimited across all shards.
+
+##### Region failure
+
+- global router directs compatible region;
+- region holds required generation/policy state;
+- accept documented RPO/RTO/freshness;
+- failover/failback drills.
+
+---
+
+#### 16. Security và responsible operation
+
+```text
+Crawler:
+  robots/politeness + stable user-agent/contact
+  SSRF/private network/DNS rebinding defenses
+  response/time/redirect/decompression limits
+  sandboxed parsers + restricted credentials/egress
+
+Query edge:
+  DDoS/WAF/rate/query-cost controls
+  safe query/operator limits
+  response/snippet escaping
+
+Data:
+  encryption + KMS + workload identity
+  signed/checksummed generation manifests
+  least privilege + immutable audit
+
+Privacy:
+  minimize, protect and retain query/click logs deliberately
+
+Policy:
+  authoritative removal registry and bounded propagation
+```
+
+Crawler retry hoặc distributed IPs không được dùng để lách website rate limits.
+
+---
+
+#### 17. Graceful degradation priorities
+
+```text
+Tier 0: removal/policy correctness + generation integrity
+Tier 1: cached/direct core keyword search
+Tier 2: full shard retrieval + baseline ranking
+Tier 3: fresh snippets, advanced rewrites, expensive reranking
+Tier 4: analytics, experiments, deep graph updates
+Tier 5: low-priority crawl/recrawl
+```
+
+Khi quá tải:
+
+- serve valid cache entries;
+- giảm expensive expansions/reranking;
+- use lexical fallback;
+- enforce candidate/query cost budgets;
+- defer low-value crawling/merges;
+- protect shard serving and removal checks;
+- không mix incompatible generations hoặc ignore policy.
+
+---
+
+#### 18. Observability end-to-end
+
+Lineage:
+
+```text
+raw_url → url_id → fetch_id/raw object
+        → document_id/revision/canonical cluster
+        → segment_id/logical shard
+        → generation_id/ranker version
+        → query_id/local candidates/top result
+```
+
+Crawler/index dashboards:
+
+- novel URLs and frontier age by priority;
+- host politeness/429/5xx violations;
+- fetch pages/bytes/latency/status;
+- parse/indexability/duplicate ratios;
+- docs/terms/postings throughput;
+- segment count/merge backlog;
+- build-to-publish freshness;
+- generation rollout/warming;
+- removal propagation.
+
+Query dashboards:
+
+- QPS/cache hit;
+- p50/p95/p99 end-to-end và stage latency;
+- shard RPC fan-out, slow/missing responses;
+- candidates/query và scoring work;
+- timeout/partial/zero-result/error rates;
+- ranking/quality metrics;
+- generation/config distribution;
+- cost per million queries.
+
+---
+
+#### 19. Requirements-to-components traceability
+
+| Requirement | Component/decision |
+|---|---|
+| Crawl billions of pages | Distributed frontier, host scheduler, fetch workers |
+| Responsible crawling | Robots cache, per-host rate/concurrency/backoff |
+| Avoid duplicate work | URL seen/canonicalization + content fingerprints |
+| Fast keyword lookup | Compressed sharded inverted index |
+| Relevant ordering | Multi-stage ranker + lexical/authority/freshness/quality |
+| Under-200 ms query | Cache, in-memory/SSD shards, local top-K, deadlines |
+| Fresh within hours | Priority recrawl + delta segments + micro-batch publication |
+| High availability | Shard replicas, multi-zone, old generation rollback |
+| Efficient storage | Compression, dedup, immutable segments, hot/cold tiers |
+| Safe index changes | Catalog, validation, canary, atomic generation switch |
+| Fast removals | Removal registry, policy epoch, tombstone overlay |
+| Analytics without p99 impact | Durable logs + separate data platform |
+
+Mỗi component phải giải quyết requirement, bottleneck hoặc failure mode cụ thể.
+
+---
+
+#### 20. Các điểm cần hiệu chỉnh từ transcript
+
+##### “Crawler workers lấy URL từ frontier rồi tự đưa mọi link trở lại”
+
+Link phải qua resolve, normalize, scope/trap filter, seen state và authoritative upsert trước frontier; nếu không queue sẽ bùng nổ.
+
+##### “Fingerprint như SimHash tránh crawl nội dung trùng”
+
+SimHash phát hiện near duplicate sau khi content đã được fetch. Nó giảm duplicate indexing và future work; không ngăn bandwidth lần đầu.
+
+##### “Indexer liên tục update inverted index store”
+
+Production design nên dùng immutable segments/delta generations với validation/publication; direct in-place updates có thể để serving thấy partial state.
+
+##### “Forward/inverted indexes là các database tables”
+
+Đây chỉ là conceptual schema. Inverted index thực là specialized compressed shard-local files/structures.
+
+##### “Query Service search inverted index rồi đưa toàn candidates cho Ranking Engine”
+
+Ở scale lớn, mỗi shard thực hiện local retrieval/scoring/pruning, trả bounded top-K; coordinator mới merge/rerank. Không truyền toàn bộ matching documents.
+
+##### “Cache popular search là đủ”
+
+Cache key phải gắn generation/ranker/policy context; urgent removal cần deny path độc lập với TTL.
+
+##### “Replication cung cấp fault tolerance”
+
+Chỉ đúng khi replicas ở failure domains khác, load compatible generation, có routing/health/headroom và source để rebuild/rollback.
+
+---
+
+#### 21. Cách trình bày final design trong phỏng vấn
+
+1. Tách crawl/index và query-serving planes.
+2. Vẽ discovery → frontier/host policy → leased crawlers.
+3. Vẽ raw store → parse → canonical/dedup → document/link outputs.
+4. Vẽ index builder → immutable segments → generation catalog/publication.
+5. Đi query: cache → coordinator → shard local top-K → global rank → snippets/filter.
+6. Nêu PageRank offline và TF-IDF/BM25 online lexical retrieval.
+7. Nêu removal registry/policy epoch.
+8. Nêu one bad generation và one slow shard failure paths.
+9. Kết thúc bằng freshness/cost/latency trade-offs.
+
+Cần trả lời được:
+
+- Frontier giữ per-host politeness ra sao?
+- Duplicate URL và duplicate content khác nhau thế nào?
+- Indexer làm sao publish consistent generation?
+- Query fan-out và candidate budget bao nhiêu?
+- Slow shard có kéo toàn query quá deadline không?
+- Cache có trả stale blocked result không?
+- Khi batch index lỗi, user search gì?
+- Index có thể rebuild từ raw/processed data nào?
+- Analytics outage có ảnh hưởng query không?
+
+---
+
+#### 22. Ý chính cần nhớ
+
+- Final search engine có crawl/index workflow và real-time query workflow độc lập.
+- Discovery URLs phải normalize/dedup/filter trước frontier.
+- Frontier phối hợp priority, delay, host politeness, leases và retries.
+- Crawlers stream immutable raw pages vào object storage và phát durable events sau commit.
+- Parser/extractor tạo analyzed documents, links, fingerprints và policy hints.
+- URL dedup xảy ra trước fetch; content near-dedup xảy ra sau fetch.
+- PageRank được precompute từ link graph snapshot.
+- Index builder tạo compressed immutable segments và manifests.
+- Index Catalog validate complete compatible generation trước canary/publish.
+- Old generation tiếp tục serve và hỗ trợ rollback khi build mới lỗi.
+- Query cache phải generation/ranker/policy-aware.
+- Query Coordinator scatter tới shards; mỗi shard trả bounded local top-K.
+- Ranking chỉ xử lý candidate budget, không mọi matching document.
+- Result assembly lấy stored fields/snippets sau ranking.
+- Query-time Removal Registry chặn document trước khi base index purge hội tụ.
+- Async pipeline dùng durable log/queues; online query dùng deadline-aware compact RPC.
+- Shard replicas phải đúng generation và warm trước khi healthy.
+- Search/analytics/indexing có metrics và autoscaling signals riêng.
+- Graceful degradation bảo vệ policy, generation integrity và core keyword search.
+- Search engine thành công nhờ phối hợp specialized components—not một database hay thuật toán đơn lẻ.
+
+#### Công thức ghi nhớ
+
+> **Final Search Engine = policy-aware leased web discovery + immutable crawl provenance + versioned parse/dedup/link processing + validated compressed index generations + cached deadline-aware scatter/top-K ranking + immediate removal overlay + replayable quality analytics.**
+
+---
+
+## Phần 22 — Design an E-commerce Platform (Amazon)
+
+### Bài 113. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần giải quyết
+
+Thiết kế một multi-vendor marketplace, nơi:
+
+- nhiều sellers đăng và quản lý hàng hóa;
+- buyers browse/search/compare sản phẩm;
+- buyers thêm offer vào cart và checkout;
+- platform giữ tồn kho, tạo order và tích hợp payment gateway;
+- buyers theo dõi order;
+- sellers theo dõi sales, orders và payouts;
+- administrators kiểm duyệt, giám sát và xử lý disputes.
+
+Core buyer journey:
+
+```text
+Discover product
+      ↓
+Select seller offer / variant
+      ↓
+Add to cart
+      ↓
+Checkout quote
+      ↓
+Reserve inventory
+      ↓
+Authorize/capture payment
+      ↓
+Confirm order
+      ↓
+Seller fulfillment/shipping
+      ↓
+Delivery/status tracking
+```
+
+Không nên nhìn hệ thống chỉ như “catalog + payment”. Phần khó nằm ở việc phối hợp nhiều authority có failure semantics khác nhau: giá, tồn kho, order, payment và fulfillment.
+
+---
+
+#### 2. Product, variant, seller offer và SKU
+
+Trong multi-vendor marketplace, cần tách rõ:
+
+```text
+Product
+  Mô tả mặt hàng chung: tên, brand, attributes, category, media
+
+Variant
+  Một biến thể: màu, size, model, capacity...
+
+Seller Offer
+  Seller nào bán variant đó, giá bao nhiêu, condition, policy, fulfillment method
+
+Inventory SKU
+  Đơn vị tồn kho cụ thể của seller/location/offer
+```
+
+Ví dụ:
+
+```text
+Product:      iPhone 15
+Variant:      128 GB, Black
+Offer A:      Seller X, 19 triệu, new
+Offer B:      Seller Y, 18,8 triệu, refurbished
+Inventory:    offer/location-specific available/reserved units
+```
+
+Nếu gộp tất cả vào một `Product` row:
+
+- seller updates dễ ghi đè nhau;
+- giá/tồn kho không có authority rõ;
+- search/product page khó hiển thị nhiều offers;
+- checkout có thể mua nhầm seller/variant;
+- fulfillment/payout không truy vết được.
+
+---
+
+#### 3. Actors chính
+
+| Actor | Trách nhiệm/mục tiêu |
+|---|---|
+| **Buyer** | Browse, search, cart, checkout, pay và track orders |
+| **Seller** | Quản catalog contribution, offers, price, stock và fulfillment |
+| **Marketplace platform** | Identity, discovery, checkout orchestration, order/payment records, policy và audit |
+| **Payment gateway/processor** | Xử lý authorization/capture/refund và phát webhook events |
+| **Fraud/Risk system** | Đánh giá buyer, seller, payment và transaction risk |
+| **Administrator/Moderator** | Catalog moderation, account actions, disputes và operational controls |
+| **Carrier/Shipping provider** | Ngoài fulfillment ownership của MVP nhưng có thể cung cấp tracking events |
+| **Seller operations staff** | Pick/pack/ship và xử lý seller-side orders |
+| **Customer support** | Điều tra order/payment/refund/dispute với audit trail |
+
+Một account có thể có nhiều roles, nhưng authorization phải tách buyer, seller staff và admin privileges.
+
+---
+
+#### 4. Functional requirements
+
+##### 4.1. Registration và authentication
+
+- buyer/seller sign-up/sign-in;
+- account/profile/address management;
+- seller onboarding và verification cơ bản;
+- role-based access;
+- password/session recovery;
+- MFA hoặc step-up authentication cho sensitive actions nếu cần;
+- admin access với audit chặt.
+
+##### 4.2. Catalog management
+
+Sellers có thể:
+
+- tạo product proposal hoặc gắn offer vào product hiện có;
+- cập nhật product attributes/media theo permissions;
+- tạo variants;
+- tạo/disable offers;
+- cập nhật giá/condition/policies;
+- xem moderation/publication status.
+
+Platform phải:
+
+- validate category/schema;
+- deduplicate/merge catalog items;
+- moderate prohibited/misleading content;
+- version/audit changes;
+- publish derived search documents.
+
+##### 4.3. Browse và product detail
+
+- browse category;
+- product detail page;
+- available variants;
+- seller offers;
+- price/availability estimate;
+- media;
+- seller information/rating nếu trong scope;
+- pagination/filter/sort.
+
+Catalog detail có thể cache; giá/tồn kho hiển thị có thể hơi trễ, nhưng checkout phải xác minh lại authoritative state.
+
+##### 4.4. Search
+
+- keyword search;
+- category/attribute filters;
+- price range;
+- sort theo relevance/price/popularity cơ bản;
+- autocomplete/spelling nếu MVP cho phép;
+- pagination;
+- chỉ trả products/offers được publish và eligible.
+
+Search index là derived view, có eventual freshness. Không dùng search document làm authority cuối cho price, stock hoặc seller eligibility.
+
+##### 4.5. Shopping cart
+
+- add/remove item;
+- update quantity;
+- persist cart across sessions/devices nếu user đăng nhập;
+- anonymous cart merge khi login nếu trong scope;
+- hiển thị estimated price/availability;
+- cart expiration/lifecycle;
+- validate items at checkout.
+
+**Cart không giữ inventory.** Nếu giữ hàng chỉ vì user để trong cart, abandoned carts sẽ khóa stock vô thời hạn.
+
+##### 4.6. Checkout
+
+- lấy addresses và shipping choices;
+- revalidate offer, price, stock và seller status;
+- tính subtotal/discount/tax/shipping theo scope;
+- tạo immutable/versioned checkout quote;
+- reserve inventory với TTL;
+- tạo payment attempt;
+- xác nhận order idempotently;
+- trả trạng thái rõ khi kết quả chưa biết.
+
+##### 4.7. Inventory
+
+- seller/location stock updates;
+- `available`, `reserved`, `sold` accounting;
+- atomic reservation/release/commit;
+- reservation expiry;
+- idempotency;
+- prevent overselling theo SKU authority;
+- reconcile với seller/warehouse reports;
+- low-stock/out-of-stock events.
+
+##### 4.8. Order management
+
+- create order từ successful checkout;
+- order lines giữ price/product/offer snapshot;
+- trạng thái: pending/confirmed/paid/processing/shipped/delivered/cancelled/refunded;
+- split order theo seller nếu cần;
+- buyer/seller order views;
+- status history/audit;
+- cancellation/refund rules cơ bản;
+- webhook/event integration với payment/shipping.
+
+##### 4.9. Payment
+
+- tạo payment intent/attempt;
+- external gateway integration;
+- idempotency key;
+- authorization/capture/refund;
+- webhook signature verification;
+- unknown/timeout reconciliation;
+- no raw card storage trong platform khi có thể tránh;
+- ledger/payment audit records;
+- double-charge prevention.
+
+##### 4.10. Fraud detection
+
+MVP rule-based:
+
+- transaction velocity;
+- unusually high amount/quantity;
+- account/device/IP anomalies;
+- repeated payment failure;
+- risky seller/item/category;
+- shipping/billing mismatch signals;
+- manual-review queue/alerts.
+
+Risk engine phải có outcome rõ: allow, deny, challenge hoặc review. Không nên silently hold order vô thời hạn.
+
+##### 4.11. Seller dashboard
+
+- manage listings/offers;
+- update stock/price;
+- view seller orders;
+- mark fulfillment status;
+- sales summaries;
+- payout status/ledger view;
+- alerts/disputes;
+- audit staff actions.
+
+##### 4.12. Administration
+
+- catalog/content moderation;
+- seller/buyer account action;
+- fraud/risk review;
+- disputes/refunds support;
+- operational health dashboards;
+- configuration/feature controls;
+- immutable audit trail.
+
+---
+
+#### 5. Checkout không phải một database transaction đơn giản
+
+Checkout phối hợp nhiều systems:
+
+```text
+Offer/Pricing authority
+Inventory authority
+Order authority
+External Payment Gateway
+Fraud/Risk
+Notification/Fulfillment projections
+```
+
+Không thể dựa vào một distributed ACID transaction xuyên external payment provider. Thay vào đó cần:
+
+- idempotency;
+- explicit state machines;
+- inventory reservation;
+- saga/orchestration;
+- durable events/outbox;
+- webhook processing;
+- timeout/unknown-state reconciliation;
+- compensating actions như release reservation/refund/cancel.
+
+---
+
+#### 6. Inventory model và invariant
+
+Một model đơn giản:
+
+```text
+on_hand = available + reserved + allocated/sold adjustments
+```
+
+Reservation operation:
+
+```text
+reserve(sku_id, quantity, reservation_id, expires_at)
+
+Precondition:
+  available >= quantity
+
+Atomic transition:
+  available -= quantity
+  reserved  += quantity
+```
+
+Commit:
+
+```text
+reserved -= quantity
+allocated/sold += quantity
+```
+
+Expire/cancel:
+
+```text
+reserved  -= quantity
+available += quantity
+```
+
+Invariant:
+
+```text
+available >= 0
+same reservation command retry → không reserve lần hai
+expired reservation → không được commit nếu chưa renew/revalidate
+stock update/reconciliation → có audit/version
+```
+
+Strong consistency cần trong phạm vi một SKU/inventory authority, không nhất thiết khóa toàn catalog.
+
+---
+
+#### 7. Checkout và order state machines
+
+##### Checkout state
+
+```text
+CREATED
+  ↓ quote accepted
+VALIDATING
+  ↓
+INVENTORY_RESERVED
+  ↓ risk/payment
+PAYMENT_PENDING
+  ├─ success → CONFIRMING_ORDER
+  ├─ failure → FAILED + release stock
+  └─ timeout → PAYMENT_UNKNOWN → reconcile
+                       ↓
+COMPLETED / FAILED / EXPIRED
+```
+
+##### Order state
+
+```text
+PENDING_CONFIRMATION
+  ↓
+CONFIRMED / PAID
+  ↓
+PROCESSING
+  ↓
+SHIPPED
+  ↓
+DELIVERED
+
+Branches:
+CANCELLED
+REFUND_PENDING → REFUNDED / REFUND_FAILED
+DISPUTED
+```
+
+Payment state và order state không nên dùng một field duy nhất; chúng có lifecycle khác nhau.
+
+---
+
+#### 8. Price và order snapshot
+
+Giá trên product page/cart chỉ là estimate. Checkout cần authoritative quote:
+
+```text
+CheckoutQuote(
+  quote_id,
+  buyer_id,
+  offer revisions,
+  line unit prices,
+  discounts,
+  tax,
+  shipping,
+  currency,
+  total,
+  expires_at,
+  pricing_rules_version
+)
+```
+
+OrderLine phải snapshot:
+
+- product/variant/offer IDs;
+- seller ID;
+- title/description tối thiểu cần audit/display;
+- unit price/currency;
+- tax/discount/shipping allocations;
+- quantity;
+- fulfillment policy;
+- quote revision.
+
+Nếu chỉ tham chiếu live Product/Offer, seller đổi title/price sau checkout sẽ làm lịch sử order sai.
+
+---
+
+#### 9. Payment semantics
+
+External payment call có thể gặp:
+
+```text
+Request timeout nhưng provider đã charge
+Webhook đến trước API response
+Webhook gửi trùng/out-of-order
+User retry checkout
+Provider retry callback
+Capture/refund thất bại tạm thời
+```
+
+Do đó cần:
+
+- stable `payment_attempt_id`;
+- gateway idempotency key;
+- provider transaction mapping;
+- signed webhook verification;
+- monotonic/valid state transitions;
+- unique constraints/dedup events;
+- periodic reconciliation/polling;
+- immutable payment ledger/audit;
+- không coi timeout là failure chắc chắn.
+
+Payment success không nên mất nếu notification hoặc seller dashboard tạm lỗi.
+
+---
+
+#### 10. Non-functional requirements
+
+##### 10.1. Performance
+
+Transcript đặt dưới 300 ms cho common browse/search queries. Cần dùng percentile và tách đường đi:
+
+- catalog/search p95 dưới 300 ms;
+- cart reads/writes có latency target riêng;
+- checkout/payment phụ thuộc external gateway nên có stage budgets và async/pending outcome;
+- seller bulk update không được kéo buyer browse p99;
+- flash-sale behavior phải load test riêng.
+
+##### 10.2. Scalability
+
+Baseline:
+
+- khoảng 10.000 concurrent users;
+- catalog khoảng 500.000 products;
+- growth không cần major redesign;
+- elastic scale cho browse/search/cart;
+- serialized/partitioned inventory authority cho hot SKUs;
+- asynchronous background processing.
+
+Concurrent users không đủ capacity planning; Bài 114 cần DAU, requests/user, orders/day, peak factor, catalog update và SKU distribution.
+
+##### 10.3. Availability
+
+Target 99,9% tương đương xấp xỉ:
+
+```text
+43,8 phút downtime / 30-day month
+8,76 giờ / year
+```
+
+Không phải mọi capability có cùng criticality:
+
+- browse/search có thể đọc cache/index khi một backend suy giảm;
+- cart có thể tạm unavailable nhưng không được mất dữ liệu đã ack;
+- checkout cần correctness hơn fail-open;
+- payment unknown phải reconcile;
+- seller analytics có thể degrade mà buyer checkout vẫn chạy.
+
+##### 10.4. Consistency
+
+| Capability | Consistency kỳ vọng |
+|---|---|
+| Catalog description/search | Eventual thường chấp nhận được |
+| Product page price/stock display | Có thể bounded-stale/ước lượng |
+| Checkout quote | Versioned/immutable trong TTL |
+| Inventory reservation | Strong per SKU authority |
+| Order creation/state | Durable/idempotent |
+| Payment attempt/ledger | Durable/idempotent/reconciled |
+| Public sales/search popularity | Eventual |
+| Seller dashboard aggregates | Eventual |
+
+##### 10.5. Security và compliance
+
+- secure authentication/session;
+- authorization theo buyer/seller/admin/resource;
+- TLS và encryption at rest;
+- external payment tokenization/hosted payment fields khi phù hợp;
+- secrets/KMS;
+- least privilege;
+- webhook signature/replay protection;
+- audit logs;
+- privacy/data retention;
+- fraud/abuse/rate controls;
+- regulatory/security requirements không được bỏ qua vì MVP.
+
+Không lưu raw card data nếu không thật sự cần; giảm payment-data scope bằng gateway-hosted/tokenized flows.
+
+##### 10.6. Maintainability và operability
+
+- clear business boundaries;
+- versioned APIs/events;
+- idempotent workflows;
+- observability/correlation;
+- feature flags;
+- schema migrations;
+- runbooks;
+- managed services phù hợp đội nhỏ;
+- modular deployment thay premature microservice explosion.
+
+---
+
+#### 11. Key challenges
+
+##### 11.1. Overselling dưới concurrency
+
+Flash sale tạo nhiều requests cùng mua một hot SKU. Cache/search stock không đủ làm authority. Cần atomic reservation/conditional decrement hoặc serialized inventory command handling.
+
+##### 11.2. Price consistency
+
+Seller hoặc promotion có thể đổi giá giữa add-to-cart và checkout. Cần reprice và quote/version; không silently charge giá khác.
+
+##### 11.3. Payment unknown outcomes
+
+Network timeout không cho biết provider có charge hay chưa. Retry thiếu idempotency gây double charge; mark failed ngay có thể tạo paid-but-cancelled inconsistency.
+
+##### 11.4. Multi-seller order decomposition
+
+Một cart có offers của nhiều sellers. Platform có thể cần:
+
+- parent marketplace order;
+- child seller orders;
+- per-seller fulfillment/cancellation;
+- payment/tax/shipping allocation;
+- payout ledger;
+- partial refund.
+
+MVP cần xác nhận có hỗ trợ multi-seller checkout trong một transaction hay không.
+
+##### 11.5. Search freshness versus transactional truth
+
+Search phải nhanh và có thể hơi stale; checkout phải revalidate offer/stock. Search index không được quyết định cuối cùng rằng item vẫn bán được.
+
+##### 11.6. Flash-sale hotspots
+
+Một SKU nhận phần lớn traffic:
+
+- cache stampede;
+- inventory row/partition contention;
+- retry amplification;
+- queue growth;
+- bot traffic;
+- database connection exhaustion.
+
+##### 11.7. Seller isolation và abuse
+
+- seller chỉ sửa resource của mình;
+- bulk imports không làm buyer API nghẽn;
+- fake listings/counterfeit/prohibited products;
+- price manipulation;
+- inventory spam;
+- compromised seller accounts.
+
+##### 11.8. Order/payment auditability
+
+Customer support và finance cần trả lời:
+
+- buyer đã thấy quote nào;
+- stock được reserve lúc nào;
+- gateway nhận request nào;
+- webhook nào thay state;
+- order bị cancel/refund vì sao;
+- seller được trả bao nhiêu.
+
+---
+
+#### 12. Assumptions của transcript
+
+| Assumption | Hệ quả |
+|---|---|
+| Stable Internet | Không thiết kế offline cart/order sync |
+| External payment gateway | Tích hợp/token hóa/webhook thay vì xây card processing |
+| Sellers tự warehouse và ship | Không thiết kế fulfillment network nội bộ |
+| Catalog khoảng 500K products | Managed search/database có thể đủ cho MVP |
+| 10K concurrent users | Cần horizontal stateless read tiers nhưng chưa hyperscale |
+| Rule-based fraud | Rules/alerts/manual review, chưa cần ML platform phức tạp |
+| Keyword search | Không personalized recommendations trong MVP |
+| MVP 3–4 tháng | Ưu tiên core workflows và managed services |
+| Minimal DevOps/SRE | Operational simplicity là first-class constraint |
+| Managed cloud preference | Giảm self-hosted databases/brokers/search nếu phù hợp |
+
+---
+
+#### 13. Scope cần làm rõ thêm
+
+- Một checkout có nhiều sellers không?
+- Guest checkout hay bắt buộc login?
+- Product/variant/offer data model?
+- Một offer có nhiều warehouses/locations không?
+- Inventory do platform hay seller system làm authority?
+- Có coupons/promotions/tax/shipping calculation không?
+- Payment authorize rồi capture khi nào?
+- Có partial cancellation/refund không?
+- Seller payouts có trong MVP hay chỉ hiển thị trạng thái?
+- Có returns/refunds/disputes sâu tới đâu?
+- Shipping tracking tích hợp carrier không?
+- Currency/country/region scope?
+- Search filters/sorting/autocomplete?
+- Reviews/ratings/recommendations có trong scope không?
+- Flash-sale peak và oversell tolerance?
+- Reservation TTL?
+- Order/payment retention/compliance?
+
+---
+
+#### 14. Out of scope mặc định
+
+- platform-owned warehouse/fulfillment network;
+- route optimization/last-mile logistics;
+- recommendation/ads engine;
+- advanced ML fraud detection;
+- auctions;
+- subscription commerce;
+- cross-border tax/customs engine;
+- full returns/RMA automation;
+- loyalty/rewards;
+- real-time seller ERP integration chi tiết;
+- multi-currency settlement/FX;
+- advanced dynamic pricing;
+- live shopping/social commerce.
+
+Nếu interviewer thêm, cần mở rộng requirements và state machines thay vì lén đưa vào thiết kế.
+
+---
+
+#### 15. MVP boundary và modularity
+
+Với 3–4 tháng, 500K products, 10K concurrent users và minimal SRE:
+
+- không nhất thiết tách mọi capability thành microservice;
+- có thể dùng modular monolith cho catalog/order/control logic;
+- giữ logical boundaries và tables/modules rõ;
+- tách external-risk/high-scale components sớm khi cần: search index, payment adapter, cache, background workers;
+- dùng managed database/search/queue/object storage;
+- dùng outbox để nối transactions với events;
+- chuẩn bị extraction seams cho inventory/order/payment nếu growth xảy ra.
+
+Microservices quá sớm có thể làm chậm MVP bằng network failures, deployments, tracing và distributed consistency. Maintainability đến từ boundaries/invariants trước deployment count.
+
+---
+
+#### 16. Core entities
+
+```text
+User(user_id, roles, state, ...)
+BuyerProfile(user_id, addresses, ...)
+Seller(seller_id, owner_id, verification_state, ...)
+SellerStaff(seller_id, user_id, role, ...)
+
+Product(product_id, category_id, brand, attributes, state, ...)
+Variant(variant_id, product_id, variant_attributes, ...)
+Offer(offer_id, seller_id, variant_id, price, currency, state, revision, ...)
+InventorySKU(sku_id, offer_id, location_id, available, reserved, version, ...)
+
+Cart(cart_id, buyer_or_session_id, revision, expires_at, ...)
+CartLine(cart_id, offer_id, quantity, observed_price, ...)
+
+CheckoutQuote(quote_id, buyer_id, lines_snapshot, totals, expires_at, ...)
+InventoryReservation(reservation_id, sku_id, quantity, state, expires_at, ...)
+CheckoutSession(checkout_id, quote_id, state, idempotency_key, ...)
+
+Order(order_id, buyer_id, state, totals, created_at, ...)
+SellerOrder(seller_order_id, order_id, seller_id, fulfillment_state, ...)
+OrderLine(order_line_id, seller_order_id, offer/product_snapshot, quantity, amounts, ...)
+
+PaymentAttempt(payment_attempt_id, order/checkout_id, gateway_ref, state, amount, ...)
+PaymentEvent(event_id, provider_event_id, payment_attempt_id, state, ...)
+Refund(refund_id, payment_attempt_id, amount, state, ...)
+
+FraudDecision(decision_id, subject/order/payment_id, outcome, rules_version, ...)
+AuditEvent(event_id, actor, action, resource, correlation_id, ...)
+```
+
+Search documents, carts, inventory, orders, payments và analytics có thể dùng stores khác nhau về sau.
+
+---
+
+#### 17. SLO gợi ý
+
+Các con số là minh họa, cần xác nhận:
+
+| SLI | SLO minh họa |
+|---|---|
+| Browse/search latency | p95 dưới 300 ms cho common queries |
+| Catalog read availability | 99,9% hoặc cao hơn theo business |
+| Checkout success excluding user/provider decline | Product-defined |
+| Inventory oversell | Gần 0 theo SKU authority invariant |
+| Cart acknowledged-write durability | Không mất trong retention/session policy |
+| Order duplicate rate | 0 logical duplicates cho cùng idempotent checkout |
+| Payment double-charge | 0 do platform retry semantics |
+| Payment unknown reconciliation | Bounded minutes/time target |
+| Search/catalog freshness | Seconds/minutes theo update class |
+| Seller update propagation | Bounded, không ảnh hưởng checkout truth |
+| Fraud rule latency | Nằm trong checkout stage budget hoặc async-review policy |
+
+“99,9% toàn platform” nên được tách thành SLO theo user journey; checkout correctness không thể đổi lấy availability bằng fail-open.
+
+---
+
+#### 18. Consistency boundaries
+
+```text
+Catalog product content → eventual/versioned
+Seller offer price      → authoritative revision; cached/indexed projections
+Search results          → eventual
+Cart                    → session/user durable, optimistic concurrency
+Checkout quote          → immutable within TTL
+Inventory               → strong per SKU/reservation authority
+Order                   → durable state machine
+Payment                 → provider + local idempotent/reconciled state
+Seller dashboard totals → eventual projection
+Admin/audit             → durable append-only trail
+```
+
+Không cần strong consistency toàn platform. Chỉ áp nơi business invariant đòi hỏi.
+
+---
+
+#### 19. Những lỗi scope thường gặp
+
+1. **Gộp Product và Seller Listing/Offer.**  
+   Không mô hình hóa được multi-vendor price, stock và ownership.
+
+2. **Cart giữ inventory.**  
+   Abandoned cart khóa stock; reservation chỉ tại checkout với TTL.
+
+3. **Search index là nguồn giá/tồn kho cuối cùng.**  
+   Index có thể stale; checkout phải revalidate.
+
+4. **Payment timeout được coi là failed.**  
+   Có thể đã charge; cần UNKNOWN + reconciliation.
+
+5. **Retry checkout tạo order/payment mới.**  
+   Thiếu idempotency sẽ duplicate order/double charge.
+
+6. **Một transaction DB bao trùm inventory và external gateway.**  
+   Không khả thi; dùng reservation/saga/compensation.
+
+7. **Order chỉ lưu product ID và đọc live price.**  
+   Lịch sử tài chính sai khi seller cập nhật.
+
+8. **99,9% nghĩa là mọi feature fail-open.**  
+   Checkout/inventory/payment phải fail safely.
+
+9. **MVP buộc microservices toàn bộ.**  
+   Với minimal SRE, modular boundaries và managed services có thể tốt hơn.
+
+10. **External payment gateway nghĩa là platform không cần security/audit.**  
+    Vẫn phải bảo vệ tokens, webhooks, access và transaction state.
+
+---
+
+#### 20. Câu hỏi cần hỏi interviewer
+
+##### Product/business
+
+- Buyers, sellers, admins có workflows nào bắt buộc?
+- Multi-seller cart/checkout?
+- Guest checkout?
+- Returns/refunds/cancellations?
+- Seller payout?
+- Shipping/tax/promotion scope?
+
+##### Scale
+
+- DAU/MAU, peak concurrent users?
+- Browse/search/product-detail QPS?
+- Orders/day và peak checkout TPS?
+- Catalog products, variants, offers, SKUs?
+- Seller updates/day?
+- Flash-sale hot-SKU traffic?
+
+##### Correctness
+
+- Oversell tolerance?
+- Reservation TTL?
+- Price-change behavior?
+- Payment authorization/capture semantics?
+- Partial order/refund?
+- Inventory source of truth?
+
+##### SLO/security
+
+- Browse/checkout/payment SLOs?
+- Regions/currencies?
+- Data residency/compliance?
+- Fraud latency/manual review?
+- RPO/RTO?
+
+##### Constraints
+
+- Team size/skills?
+- Managed cloud restrictions?
+- Existing payment/search/account systems?
+- MVP deadline và migration expectations?
+
+---
+
+#### 21. Ý chính cần nhớ
+
+- Multi-vendor marketplace phục vụ buyer, seller, admin và external payment systems.
+- Tách Product, Variant, Seller Offer và Inventory SKU.
+- Buyer journey là discover → offer → cart → quote → reserve → pay → confirm → fulfill.
+- Cart là intent, không phải inventory reservation.
+- Checkout revalidates price, stock, seller và policy.
+- Quote và OrderLine giữ immutable pricing/product snapshots.
+- Inventory dùng atomic reserve/commit/release với TTL và idempotency.
+- Strong consistency cần per SKU authority, không phải toàn catalog.
+- Payment timeout có thể là unknown, không phải chắc chắn failed.
+- External gateway calls/webhooks cần idempotency, signatures và reconciliation.
+- Order, payment và fulfillment là các state machines riêng.
+- Search/catalog projections có thể eventual; checkout authority không dựa vào chúng.
+- Flash-sale hot SKU cần xử lý contention, bots, retries và cache stampede.
+- Seller bulk operations phải cô lập khỏi buyer critical paths.
+- Security, fraud, audit và compliance là core requirements.
+- Với 500K products, 10K concurrent users, 3–4 tháng và minimal SRE, managed services/modular monolith có thể hợp lý.
+- 99,9% tương đương khoảng 43,8 phút downtime/tháng; cần SLO theo journey.
+- Architecture phải xuất phát từ business invariants và team constraints.
+
+#### Công thức ghi nhớ
+
+> **E-commerce Marketplace = searchable shared catalog + seller-owned versioned offers + authoritative SKU reservations + immutable checkout quotes/order snapshots + idempotent reconciled payments + auditable multi-party fulfillment workflows.**
+
+---
+
+### Bài 114. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Assumptions từ transcript
+
+| Thông số | Giá trị | Ý nghĩa/cần làm rõ |
+|---|---:|---|
+| Registered users | 1 triệu | Accounts, không phải active traffic |
+| Daily active users | 10.000 | 1% registered users |
+| Peak request rate | 100 RPS | Chưa có endpoint mix/peak duration |
+| Catalog | 500.000 products | Chưa rõ products hay seller offers/SKUs |
+| Orders/day | 1.000 | Critical writes nhưng throughput trung bình thấp |
+| Active sellers | 5.000 | Chưa rõ daily active hay onboarded sellers |
+| Availability target | 99,9% | Từ Bài 113 |
+| Browse/search target | Dưới 300 ms | Cần percentile và query class |
+
+Mục tiêu là scale vừa đủ cho MVP và có đường tăng trưởng, không provision Internet scale ngay ngày đầu.
+
+---
+
+#### 2. Mâu thuẫn DAU và concurrent users
+
+Bài 113 nói “khoảng 10.000 concurrent users”, trong khi Bài 114 nói “10.000 daily active users”. Hai con số khác nhau lớn:
+
+- **10.000 DAU:** tổng user duy nhất hoạt động trong ngày.
+- **10.000 concurrent users:** 10.000 users đang active cùng thời điểm.
+
+Nếu session active trung bình 10 phút và 10K DAU phân bố đều:
+
+```text
+Average concurrent users
+≈ 10.000 × 10 phút ÷ 1.440 phút/ngày
+≈ 69 users
+```
+
+Peak concurrency có thể cao hơn nhiều do time-zone/campaign, nhưng khó đạt 10.000 nếu chỉ có 10.000 DAU trừ khi gần như toàn bộ DAU online cùng lúc.
+
+Baseline bài này:
+
+```text
+Current MVP: 10K DAU + 100 peak RPS
+Growth/load-test tier: lên tới 10K concurrent users nếu business yêu cầu
+```
+
+---
+
+#### 3. Traffic từ 100 peak RPS
+
+100 RPS chưa cho biết daily requests. Cần peak/average ratio và peak duration.
+
+Ví dụ giả định peak bằng 5× average:
+
+```text
+Average RPS ≈ 100 ÷ 5 = 20 RPS
+Daily requests ≈ 20 × 86.400 = 1,728M requests/day
+```
+
+Với 10K DAU:
+
+```text
+≈ 173 requests/DAU/day
+```
+
+Điều này có thể hợp lý nếu tính page/API fan-out, nhưng phải đo thực tế.
+
+Nếu 100 RPS được duy trì cả ngày:
+
+```text
+100 × 86.400 = 8,64M requests/day
+≈ 864 requests/DAU/day
+```
+
+Không annualize peak nếu chưa biết duty cycle.
+
+---
+
+#### 4. Endpoint mix minh họa
+
+Giả sử tại 100 peak RPS:
+
+| Nhóm request | Tỷ lệ minh họa | Peak RPS |
+|---|---:|---:|
+| Browse/search/category | 45% | 45 |
+| Product detail/offers | 30% | 30 |
+| Cart | 10% | 10 |
+| Account/order tracking | 8% | 8 |
+| Seller/admin updates | 5% | 5 |
+| Checkout/payment initiation | 2% | 2 |
+
+Đây không phải transcript fact. Mục đích là thấy rằng:
+
+- read traffic chiếm đa số;
+- checkout TPS nhỏ nhưng business critical;
+- search/product detail cache tốt;
+- seller writes và inventory updates cần isolation;
+- một UI action có thể tạo nhiều backend requests.
+
+Thực tế cần logs/analytics hoặc product assumptions để xác nhận mix.
+
+---
+
+#### 5. Order throughput
+
+```text
+1.000 orders/day ÷ 86.400
+≈ 0,0116 orders/s average
+≈ 1 order mỗi 86,4 giây
+```
+
+Nếu peak order rate là 10× average:
+
+```text
+≈ 0,116 orders/s
+≈ 7 orders/phút
+```
+
+Nếu flash sale tạo 100× average:
+
+```text
+≈ 1,16 orders/s
+```
+
+Order throughput thấp không làm checkout đơn giản. Mỗi order có:
+
+- quote revalidation;
+- multiple inventory reservations;
+- risk decision;
+- payment attempts/webhooks;
+- order lines/seller splits;
+- outbox events;
+- notifications;
+- fulfillment/payout projections;
+- retry/reconciliation.
+
+Correctness và external failure semantics quan trọng hơn raw TPS.
+
+---
+
+#### 6. Conversion và business sanity check
+
+Nếu có 10K DAU và 1.000 orders/day:
+
+```text
+Orders per DAU = 1.000 ÷ 10.000 = 10%
+```
+
+Đây không hẳn là conversion rate vì:
+
+- một user có thể tạo nhiều orders;
+- DAU bao gồm sellers/admins;
+- guest checkout có thể tồn tại;
+- order có thể cancelled/failed;
+- sessions/visits khác unique users.
+
+Cần đo funnel:
+
+```text
+impression → product view → add-to-cart → checkout start
+→ inventory reserved → payment attempted → order confirmed
+```
+
+Mỗi bước có count, unique users và drop-off riêng.
+
+---
+
+#### 7. Checkout concurrency
+
+Little's Law:
+
+```text
+Concurrent checkout sessions
+≈ checkout starts/s × average checkout duration
+```
+
+Nếu peak 2 checkout starts/s và mỗi checkout kéo dài 60 giây:
+
+```text
+≈ 120 concurrent checkout sessions
+```
+
+Không phải tất cả giữ inventory suốt 60 giây. Reservation chỉ bắt đầu khi quote/stock được revalidate và có TTL có chủ đích.
+
+Nếu reservation TTL 10 phút và peak reservation creation 1/s:
+
+```text
+Up to ≈ 600 active reservations
+```
+
+trước khi tính completed/released sớm. TTL dài làm stock bị giữ nhiều; TTL ngắn làm genuine buyers hết hạn giữa payment. Đây là product/architecture trade-off.
+
+---
+
+#### 8. Catalog cardinality amplification
+
+500K products không bằng 500K searchable/sellable units.
+
+```text
+Products
+× variants per product
+× offers per variant
+× inventory locations per offer
+= SKUs/inventory authorities
+```
+
+Ví dụ minh họa:
+
+```text
+500K products
+× 3 variants/product
+× 2 seller offers/variant
+= 3M offers
+```
+
+Nếu mỗi offer có 2 locations:
+
+```text
+≈ 6M inventory SKU-location records
+```
+
+Không được capacity-plan từ `products` nếu data model thực có variants/offers/locations.
+
+##### Seller sanity check
+
+Nếu 500K chỉ là offers và 5K sellers phân bố đều:
+
+```text
+≈ 100 offers/seller average
+```
+
+Thực tế phân bố lệch: một vài large sellers có hàng chục nghìn offers và bulk update traffic lớn.
+
+---
+
+#### 9. Catalog/search storage sơ bộ
+
+Giả sử core product metadata trung bình 4 KB:
+
+```text
+500K × 4 KB ≈ 2 GB raw product metadata
+```
+
+Nếu search document trung bình 8 KB:
+
+```text
+500K × 8 KB ≈ 4 GB logical search documents
+```
+
+Nhưng physical footprint tăng bởi:
+
+- variants/offers;
+- analyzers/inverted indexes/doc values;
+- replicas/shards;
+- multiple index generations;
+- media references;
+- audit/history;
+- translations/attributes;
+- seller policies;
+- backups.
+
+Product images thường lớn hơn metadata rất nhiều và nên ở object storage/CDN. Transcript chưa cung cấp images/product, average size hoặc update volume nên chưa thể tính media bytes.
+
+Với 500K products, managed search service có thể đủ; bottleneck thường là query/index model và freshness, không phải raw bytes.
+
+---
+
+#### 10. Orders và transactional storage growth
+
+```text
+1.000 orders/day × 365
+= 365.000 orders/year
+```
+
+Nếu average 3 order lines:
+
+```text
+≈ 1,095M order lines/year
+```
+
+Nếu một logical order tạo 20 durable workflow/audit events:
+
+```text
+≈ 7,3M order/payment/inventory events/year
+```
+
+Chưa gồm:
+
+- cart mutations;
+- payment webhooks/retries;
+- inventory adjustments;
+- fulfillment status;
+- notifications;
+- seller payout ledger;
+- support/audit;
+- replicas/backups.
+
+Dung lượng không lớn với MVP, nhưng retention, indexes và audit correctness quan trọng.
+
+---
+
+#### 11. Seller update throughput
+
+5K sellers có thể tạo:
+
+- interactive edits;
+- bulk catalog imports;
+- price feeds;
+- inventory synchronization;
+- order fulfillment updates.
+
+Ví dụ nếu mỗi seller cập nhật trung bình 100 offers/ngày:
+
+```text
+5.000 × 100 = 500K updates/day
+≈ 5,8 updates/s average
+```
+
+Một bulk feed có thể gửi hàng chục nghìn updates trong vài phút, tạo burst lớn hơn average. Pipeline cần:
+
+- batch upload;
+- validation;
+- idempotency/versioning;
+- per-seller quota;
+- async processing;
+- search/cache projection;
+- dead-letter/error report;
+- isolation để seller bulk job không làm buyer browse chậm.
+
+---
+
+#### 12. Search/browse bottleneck
+
+Challenges:
+
+- keyword/filter/sort trên products/variants/offers;
+- high read ratio;
+- search index refresh từ seller updates;
+- hot categories/queries;
+- facets/aggregations;
+- price/availability projections stale;
+- images/CDN;
+- cache invalidation;
+- under-300 ms p95.
+
+Search path nên:
+
+- dùng specialized search index;
+- cache hot queries/category pages;
+- CDN product media;
+- paginate;
+- denormalize display fields có kiểm soát;
+- filter unpublished/suspended offers;
+- revalidate price/stock khi detail/checkout cần;
+- isolate indexing from query serving.
+
+Nếu search index hỏng, có thể degrade sang cached categories/popular products; không nên làm checkout của known offer dừng nếu transactional stores còn khỏe.
+
+---
+
+#### 13. Inventory consistency bottleneck
+
+Toàn platform có thể chỉ 1 order mỗi 86 giây average, nhưng một hot SKU có thể nhận hàng nghìn reservation attempts cùng lúc.
+
+Average system TPS không phản ánh per-key contention.
+
+##### Atomic conditional update
+
+```sql
+UPDATE inventory
+SET available = available - :qty,
+    reserved  = reserved + :qty,
+    version   = version + 1
+WHERE sku_id = :sku
+  AND available >= :qty;
+```
+
+Nếu affected rows = 0, reservation fail/out-of-stock hoặc retry theo policy.
+
+##### Alternatives
+
+- pessimistic row lock cho low/moderate contention;
+- optimistic compare-and-swap/version;
+- serialized command queue/actor per hot SKU;
+- preallocated stock buckets/tokens cho extreme flash sale;
+- database stored transaction;
+- reservation ledger với materialized balance.
+
+Trade-off:
+
+- strong per-SKU correctness;
+- latency;
+- contention/retry;
+- ordering/fairness;
+- operational complexity;
+- recovery/audit.
+
+Không dùng Redis cache decrement làm authority duy nhất nếu cache loss/failover có thể oversell mà không reconciliation/invariant design.
+
+---
+
+#### 14. Flash-sale amplification
+
+Ví dụ 100 units và 10.000 buyers cùng click trong 5 giây:
+
+```text
+Reservation attempts = 2.000/s
+Success = 100
+Failure/out-of-stock ≈ 9.900
+```
+
+Mặc dù chỉ 100 orders có thể thành công, hệ thống vẫn chịu:
+
+- 10K authentication/API requests;
+- pricing/offer reads;
+- inventory attempts;
+- bot/rate checks;
+- retries từ clients;
+- out-of-stock responses;
+- metrics/logs;
+- potential payment attempts nếu reserve boundary sai.
+
+Mitigations:
+
+- virtual waiting room/admission control;
+- per-user/SKU rate limit;
+- bot defense;
+- idempotent reservation key;
+- serialized/bounded inventory authority;
+- early sold-out signal/cache;
+- retry-after/backoff;
+- no automatic aggressive retries;
+- load shedding before payment.
+
+Sold-out cache có thể giảm load nhưng authority vẫn phải là inventory service.
+
+---
+
+#### 15. Database hotspots
+
+Hot records/partitions:
+
+- popular product detail;
+- hot SKU inventory;
+- promotion/coupon counters;
+- seller with huge catalog;
+- flash-sale cart/checkout keys;
+- global order sequence nếu dùng;
+- aggregate sales/view counters.
+
+Read hotspot solutions:
+
+- cache/CDN/read replicas;
+- request coalescing;
+- denormalized projections;
+- hot-key replication;
+- immutable product revisions.
+
+Write hotspot solutions:
+
+- shard by authority key;
+- serialized commands;
+- time/bucket-sharded counters;
+- append events then aggregate;
+- partition large seller feeds;
+- avoid global locks/sequences;
+- admission control.
+
+Không thể giải quyết write contention chỉ bằng thêm read replicas.
+
+---
+
+#### 16. Checkout critical path và latency budget
+
+Illustrative synchronous stages:
+
+```text
+Authenticate/validate request       20 ms
+Load cart/quote inputs              40 ms
+Reprice/tax/shipping                80 ms
+Reserve inventory                  80 ms
+Fraud decision                     80 ms
+Payment gateway               500–3000+ ms
+Persist order/state                 50 ms
+```
+
+Checkout không thể có cùng 300 ms SLO như search vì external payment dominates. Cần:
+
+- overall user-experience target;
+- per-stage timeouts;
+- pending state khi gateway chậm;
+- no unbounded synchronous fan-out;
+- background notification/analytics;
+- clear progress/result UI;
+- reservation TTL lớn hơn expected payment duration nhưng không quá dài.
+
+Nếu cart có nhiều sellers/SKUs, inventory reservations có thể fan-out. Cần deterministic ordering/parallelism/compensation và tránh deadlocks.
+
+---
+
+#### 17. Payment amplification và reliability
+
+Một checkout có thể tạo:
+
+```text
+payment intent create
+authorization/capture API call
+API retry
+one or more webhooks
+status reconciliation poll
+refund/cancel later
+ledger/audit events
+```
+
+1.000 orders/day không có nghĩa chỉ 1.000 provider interactions/day.
+
+Metrics:
+
+- attempts/order;
+- gateway latency/p95/p99;
+- decline versus technical failure;
+- timeout/unknown rate;
+- duplicate webhook rate;
+- reconciliation backlog/age;
+- double-charge/duplicate-order invariant;
+- capture/refund failure;
+- provider availability.
+
+Retry phải giữ cùng business idempotency key khi đại diện cùng payment attempt.
+
+---
+
+#### 18. Fraud bottleneck
+
+Rule engine nằm trong checkout path có thể tăng latency và false positives.
+
+Workload:
+
+- synchronous lightweight rules;
+- external/device signals;
+- velocity counters;
+- blacklist/allowlist;
+- seller/buyer history;
+- async deeper review;
+- manual queue.
+
+Design:
+
+```text
+Fast deterministic rules → allow / deny / challenge / review
+Async event pipeline      → aggregate velocity/risk features
+Manual review             → bounded SLA và explicit order state
+```
+
+Fraud system unavailable:
+
+- không mặc định allow mọi risky transaction;
+- có fallback rules/risk thresholds;
+- step-up/challenge/review;
+- fail policy theo amount/category/risk class;
+- audit quyết định/version.
+
+---
+
+#### 19. Cart scale
+
+Cart traffic thường lớn hơn confirmed orders nhiều lần.
+
+Nếu 10K DAU, average 5 cart mutations/DAU/day:
+
+```text
+50K cart writes/day
+≈ 0,58 writes/s average
+```
+
+Peak có thể 10–50× average trong campaign. Cart requirements:
+
+- partition theo cart/user/session;
+- optimistic revision;
+- idempotent add/update semantics;
+- TTL/abandoned cleanup;
+- anonymous/login merge policy;
+- acknowledged durability;
+- price/availability revalidation;
+- no inventory lock.
+
+Cart có thể dùng managed KV/document/SQL; chọn theo access pattern và durability, không vì “cart phải Redis”. Redis-only cart cần xem xét persistence/failover/data loss semantics.
+
+---
+
+#### 20. Cache và freshness amplification
+
+Cache candidates:
+
+- product metadata;
+- category pages;
+- search results;
+- seller summaries;
+- price/stock display projection;
+- session/cart reads tùy source-of-truth design;
+- sold-out hint.
+
+Risks:
+
+- stale price;
+- stale stock;
+- suspended offer vẫn hiển thị;
+- cache stampede cho popular product;
+- hot keys;
+- invalidation event lag;
+- negative cache giữ out-of-stock quá lâu sau restock.
+
+Policy:
+
+- immutable/versioned product keys;
+- short TTL cho price/stock hints;
+- event-driven invalidation/update;
+- request coalescing;
+- checkout revalidation;
+- never fail-open seller/product authorization.
+
+---
+
+#### 21. Queue/event bottlenecks
+
+Một order/offer update fan-out:
+
+```text
+OrderConfirmed
+  ├─ seller order projection
+  ├─ inventory commit
+  ├─ notification
+  ├─ analytics
+  ├─ fraud feedback
+  ├─ payout/ledger
+  └─ fulfillment workflow
+
+OfferUpdated
+  ├─ search index
+  ├─ product page cache
+  ├─ price projection
+  ├─ moderation/audit
+  └─ seller analytics
+```
+
+Theo dõi:
+
+- event rate;
+- duplicate/out-of-order rate;
+- consumer lag;
+- oldest message age;
+- DLQ;
+- schema version;
+- projection freshness;
+- backlog drain.
+
+User-facing transaction commit cần outbox để event không mất giữa database và broker.
+
+---
+
+#### 22. Growth tiers
+
+| Tier | Example | Architecture implication |
+|---|---|---|
+| MVP | 100 peak RPS, 500K products, 1K orders/day | Managed DB/search/cache/queue, modular services |
+| Growth | 1K peak RPS, millions offers, 10K orders/day | Read replicas, partitions, independent inventory/order workers |
+| Large | 10K+ RPS, flash-sale bursts, multi-region | Sharded authorities, regional reads, hot-SKU admission, mature event platform |
+
+Growth path không có nghĩa deploy mọi large-tier component ngày đầu. Cần:
+
+- stable IDs;
+- clear authority boundaries;
+- versioned APIs/events;
+- outbox/idempotency;
+- partition-friendly keys;
+- observability;
+- migration/backfill capability.
+
+---
+
+#### 23. Bottleneck map
+
+| Component/path | Bottleneck | Metrics |
+|---|---|---|
+| Search | Query/index p99, facets | QPS, cache hit, index freshness |
+| Product detail | Hot key/fan-out | RPS/product, dependency calls |
+| Seller feed | Burst/validation | updates/s, batch age/error |
+| Cache | Stampede/stale/hot key | hit, eviction, stale serve |
+| Cart | write burst/revision conflict | mutations/s, conflicts, latency |
+| Inventory | hot SKU contention | attempts/s/SKU, reserve conflict, oversell |
+| Checkout | synchronous fan-out | starts/s, stage p99, abandonment |
+| Payment | external latency/unknown | attempt p99, timeout, unknown age |
+| Fraud | latency/false positive | decision p99/outcomes/review age |
+| Order DB | duplicate/state contention | confirms/s, transition failures |
+| Broker | downstream lag | oldest age, retries, DLQ |
+| Seller dashboard | projection freshness | lag, query p99 |
+
+---
+
+#### 24. Backlog drain
+
+Nếu seller bulk pipeline nhận 5,8 updates/s average và outage 1 giờ:
+
+```text
+Backlog ≈ 5,8 × 3.600 ≈ 20.880 updates
+```
+
+Nếu phục hồi xử lý 20 updates/s:
+
+```text
+Spare capacity = 20 − 5,8 = 14,2/s
+Drain ≈ 20.880 ÷ 14,2 ≈ 1.470s ≈ 24,5 phút
+```
+
+Nếu search indexer capacity chỉ bằng incoming update rate, freshness không bao giờ bắt kịp sau outage.
+
+Checkout/payment reconciliation backlog cần priority cao hơn seller analytics/search popularity projections.
+
+---
+
+#### 25. Availability và degradation
+
+Criticality tiers:
+
+```text
+Tier 0: inventory/order/payment correctness + auth
+Tier 1: checkout and cart acknowledged durability
+Tier 2: product detail/catalog authority
+Tier 3: search/category discovery
+Tier 4: seller dashboards/notifications/analytics
+```
+
+Khi dependency lỗi:
+
+- search index lỗi → cached/popular/category fallback;
+- recommendations không có trong MVP;
+- payment gateway chậm → PENDING/UNKNOWN, không retry blind;
+- fraud advanced signals lỗi → fallback risk policy;
+- notification lỗi → order vẫn confirm, event retry;
+- seller dashboard lag → transactional order truth không đổi;
+- inventory authority lỗi → checkout fail safely, không oversell;
+- cache lỗi → load protection/fallback source, không bypass AuthZ.
+
+---
+
+#### 26. Load tests và failure tests
+
+1. 100 RPS baseline peak với realistic endpoint mix.
+2. 10× traffic growth tier.
+3. 500K catalog full reindex và incremental seller updates.
+4. Popular query/product cache stampede.
+5. 10K buyers tranh 100 units trong 5 giây.
+6. Duplicate/retried reservation requests.
+7. Reservation expiry race với payment success.
+8. Multi-SKU checkout với một reservation fail.
+9. Payment timeout nhưng webhook báo success sau đó.
+10. Duplicate/out-of-order webhooks.
+11. User retry checkout/request timeout.
+12. Fraud service timeout/challenge/manual review.
+13. Seller bulk feed malformed/huge burst.
+14. Search index lag hoặc complete outage.
+15. Broker outage sau order commit.
+16. Notification/analytics consumer lag.
+17. Database failover giữa checkout transitions.
+18. Cache loss/hot-key overload.
+19. Region/AZ dependency failure theo RPO/RTO.
+20. Refund/cancel race với fulfillment.
+
+Kiểm tra invariant, p95/p99, backlog drain và user-visible outcome—not chỉ max throughput.
+
+---
+
+#### 27. Những assumptions còn thiếu
+
+- 100 RPS là average hay peak, kéo dài bao lâu?
+- Endpoint mix?
+- 10K là DAU hay concurrent?
+- Average session/request count?
+- Products versus variants/offers/SKUs cardinality?
+- Product media size/count?
+- Seller update/bulk feed rate?
+- Orders peak factor và lines/order?
+- Multi-seller order ratio?
+- Cart mutations/checkouts/day?
+- Reservation TTL?
+- Hot-SKU flash-sale intensity?
+- Payment latency/failure/unknown rates?
+- Search query/filter distribution?
+- Regions/currency/tax/shipping?
+- Retention/RPO/RTO?
+
+Nêu assumption rõ và chạy sensitivity thay vì đưa ra con số giả chính xác.
+
+---
+
+#### 28. Cách trình bày trong phỏng vấn
+
+1. Tóm tắt baseline: 1M registered, 10K DAU, 100 peak RPS, 500K products, 1K orders/day, 5K sellers.
+2. Chỉ ra DAU versus concurrent mismatch.
+3. Tính average orders/s và nhấn mạnh correctness hơn throughput.
+4. Mở rộng products → variants → offers → inventory records.
+5. Tách endpoint mix và critical paths.
+6. Mô hình hot SKU/flash sale, không chỉ average traffic.
+7. Tính checkout/reservation concurrency theo Little's Law.
+8. Nêu payment/webhook/retry amplification.
+9. Vẽ bottleneck map và degradation tiers.
+10. Đề xuất growth tiers thay over-engineer MVP.
+
+Một câu trả lời mạnh:
+
+> “Average order rate chỉ khoảng 0,012/s, nhưng capacity/correctness của inventory phải thiết kế theo hot-key burst. Ví dụ 10.000 buyers tranh 100 units trong 5 giây tạo 2.000 reservation attempts/s dù chỉ 100 orders thành công.”
+
+---
+
+#### 29. Ý chính cần nhớ
+
+- Baseline là 1M registered users, 10K DAU, 100 peak RPS, 500K products, 1K orders/day và 5K sellers.
+- 10K DAU khác hoàn toàn 10K concurrent users; cần xác nhận assumption.
+- Không được suy số request/ngày trực tiếp từ peak RPS khi chưa biết thời lượng hoặc tỷ lệ peak/average.
+- Với giả định peak = 5× average, 100 peak RPS tương ứng khoảng 1,728M requests/day.
+- 1K orders/day chỉ khoảng 0,0116 orders/s average.
+- 1K orders trên 10K DAU tương ứng 10% orders/DAU, không nhất thiết là conversion rate.
+- Checkout concurrency bằng start rate × duration; active reservations phụ thuộc rate × TTL.
+- 500K products có thể khuếch đại thành hàng triệu variants/offers/SKU-location records.
+- Catalog metadata nhỏ; product media, index replicas và offer cardinality mới tăng footprint.
+- 1K orders/day tạo 365K orders/year; 3 lines/order tạo khoảng 1,095M lines/year.
+- Seller bulk updates tạo burst lớn hơn average interactive writes.
+- Search/browse là read-heavy và cacheable; checkout revalidates authority.
+- Inventory bottleneck là contention theo hot SKU, không phải global average TPS.
+- Flash sale 10K attempts/5s tạo 2K reservation attempts/s dù chỉ 100 units.
+- Cart không reserve stock và phải chịu optimistic concurrent updates.
+- Payment call amplification gồm retries, webhooks, reconciliation và refunds.
+- Checkout latency khác search latency vì external payment dominates.
+- Cache stock/price chỉ là hint; authoritative check ở checkout.
+- Event fan-out và consumer lag ảnh hưởng search/dashboard/notifications sau commit.
+- Scale theo growth tiers và giữ clear boundaries/idempotency/partition keys từ MVP.
+- Availability phải degrade theo business criticality; inventory/payment không fail-open.
+
+#### Công thức ghi nhớ
+
+> **E-commerce scale = users × request mix + catalog × variants × offers × locations + carts/checkouts × duration/TTL + orders × lines/events + hot-SKU contention + payment retry/webhook amplification; design peaks per authority key, not global averages.**
+
+---
+
+### Bài 115. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của bước thiết kế cấp cao
+
+Sau khi xác định yêu cầu và quy mô, ta chia marketplace thành các **business capabilities** có trách nhiệm rõ ràng. Mục tiêu không phải tạo thật nhiều microservices, mà là:
+
+- Làm rõ thành phần nào sở hữu dữ liệu và business invariant nào.
+- Cô lập workload có đặc điểm khác nhau: search, inventory, order, payment và notification.
+- Cho phép các thành phần quan trọng mở rộng, triển khai và phục hồi độc lập khi cần.
+- Xác định giao tiếp nào phải đồng bộ, việc nào có thể đưa ra khỏi request path.
+
+Ở quy mô hiện tại khoảng 100 peak RPS, các ranh giới dưới đây cũng có thể được triển khai trước dưới dạng **module trong modular monolith**. Chỉ tách thành dịch vụ độc lập khi có lý do rõ ràng về tải, ownership, bảo mật hoặc nhịp triển khai.
+
+---
+
+#### 2. Các dịch vụ cốt lõi
+
+| Dịch vụ | Trách nhiệm chính | Dữ liệu sở hữu | Đặc điểm tải/invariant |
+|---|---|---|---|
+| **User/Identity Service** | Đăng ký, đăng nhập, hồ sơ buyer/seller, danh tính | User, credential reference, profile, role | Identity phải nhất quán; mật khẩu phải được hash an toàn |
+| **Catalog Service** | Product, category, listing và seller offer | Product metadata, category, offer | Read-heavy; product không đồng nghĩa seller offer |
+| **Search Service** | Full-text search, filter, sort, facets | Search index dạng projection | Độ trễ thấp; chấp nhận eventual consistency |
+| **Inventory Service** | Available, reserved, sold stock; reservation | Inventory theo SKU-location, reservation | Nguồn authoritative; không oversell |
+| **Cart Service** | Giỏ hàng và cart items | Cart, item, optimistic version | Cart là ý định mua, không phải cam kết giữ hàng |
+| **Order Service** | Checkout orchestration và order lifecycle | Order, order line, price snapshot, state history | Order transition hợp lệ và không tạo trùng |
+| **Payment Service** | Payment intent, provider integration, refund, reconciliation | Payment attempt, provider reference, payment state | Không double-charge; webhook có chữ ký và idempotency |
+| **Notification Service** | Email, SMS, push về order/payment/shipping | Template, delivery attempt, preference | Bất đồng bộ; lỗi notification không làm checkout thất bại |
+| **Admin Service** | Moderation seller/product, dispute, audit, vận hành | Admin action/audit reference | RBAC chặt, mọi thao tác nhạy cảm cần audit |
+
+Trong marketplace nhiều seller, thường còn cần các capability như **Seller Service**, pricing/promotion, fulfillment/shipping, review và fraud/risk. Có thể bổ sung khi scope yêu cầu; không nên nhồi tất cả vào Order Service.
+
+---
+
+#### 3. Ranh giới Catalog, Offer, Inventory và Search
+
+Bốn khái niệm này dễ bị gộp nhầm:
+
+- **Product:** mô tả mặt hàng dùng chung, ví dụ một mẫu điện thoại.
+- **Offer/Listing:** một seller bán product đó với giá và điều kiện cụ thể.
+- **Inventory:** số lượng của SKU/offer tại từng location.
+- **Search document:** bản projection tối ưu cho tìm kiếm, ghép dữ liệu cần hiển thị.
+
+Luồng cập nhật điển hình:
+
+```text
+Seller -> Catalog/Offer DB -> Outbox/Event -> Search Indexer -> Search Index
+                                  |
+                                  +----------> Cache invalidation
+```
+
+Postgres có thể là source of truth cho product và offer; Elasticsearch chỉ là read model. Nếu indexing chậm hoặc lỗi, dữ liệu tìm kiếm có thể cũ nhưng source of truth không mất. Giá và tồn kho từ search chỉ nên là **hint**; checkout phải đọc lại authority.
+
+---
+
+#### 4. API bên ngoài tiêu biểu
+
+Các endpoint minh họa, không phải danh sách bắt buộc:
+
+```http
+POST   /v1/users
+POST   /v1/auth/login
+GET    /v1/users/{userId}
+
+GET    /v1/products?query=&category=&cursor=
+GET    /v1/products/{productId}
+POST   /v1/sellers/{sellerId}/offers
+PATCH  /v1/offers/{offerId}
+
+GET    /v1/inventory/{skuId}?locationId=...
+POST   /v1/inventory/reservations
+DELETE /v1/inventory/reservations/{reservationId}
+
+POST   /v1/carts/{cartId}/items
+PATCH  /v1/carts/{cartId}/items/{itemId}
+POST   /v1/checkouts
+GET    /v1/orders/{orderId}
+
+POST   /v1/payments/intents
+GET    /v1/payments/{paymentId}
+POST   /v1/payments/provider-webhooks
+```
+
+Nguyên tắc API:
+
+- **Stateless:** instance không giữ session cục bộ cần thiết cho request tiếp theo.
+- **Versioned:** `/v1` giúp tiến hóa contract, nhưng không thay thế backward compatibility.
+- **Authenticated và authorized:** kiểm tra cả danh tính lẫn quyền trên resource.
+- **Idempotent:** các lệnh dễ retry như checkout, reserve và payment nhận `Idempotency-Key`.
+- **Pagination:** search, order history và seller listings dùng cursor thay vì trả toàn bộ.
+- **Explicit state:** trả trạng thái `PENDING`, `RESERVED`, `PAID`, `FAILED`, không dùng thông báo mơ hồ.
+- **Stable contract:** client không phụ thuộc chi tiết triển khai nội bộ của service.
+
+Ví dụ tạo checkout:
+
+```http
+POST /v1/checkouts
+Idempotency-Key: 6fd7...
+
+{
+  "cartId": "cart_123",
+  "shippingAddressId": "addr_7",
+  "paymentMethodToken": "pm_tok_abc"
+}
+```
+
+Response có thể là `201 Created` nếu hoàn tất nhanh hoặc `202 Accepted` với `checkoutId` và trạng thái `PROCESSING` nếu workflow còn chờ payment.
+
+---
+
+#### 5. Giao tiếp đồng bộ và bất đồng bộ
+
+| Kiểu | Dùng khi | Ví dụ | Rủi ro cần xử lý |
+|---|---|---|---|
+| **Synchronous HTTP/gRPC** | Bước tiếp theo cần kết quả ngay | Reprice cart, reserve stock, tạo payment intent | Timeout, retry storm, cascading failure |
+| **Asynchronous event/queue** | Công việc có thể hoàn thành sau response | Search indexing, email, analytics, fulfillment trigger | Duplicate, out-of-order, consumer lag, poison message |
+
+Quy tắc “user đang chờ thì synchronous” chỉ là điểm khởi đầu. Cần hỏi thêm:
+
+- Kết quả có quyết định correctness của transaction hiện tại không?
+- Caller có thể nhận `PENDING` rồi poll/subscribe trạng thái không?
+- Deadline của dependency là bao nhiêu?
+- Nếu dependency hỏng, hệ thống fail closed, degrade hay tiếp tục sau?
+
+Không nên tạo chuỗi synchronous quá dài qua nhiều service vì tổng latency và xác suất lỗi tăng theo mỗi hop.
+
+---
+
+#### 6. Luồng browse và search
+
+```text
+Client
+  -> API Gateway
+  -> Search Service
+  -> Query/result cache
+  -> Elasticsearch
+  -> product/offer summaries
+```
+
+- Cache phục vụ query hoặc product phổ biến.
+- Search index hỗ trợ full-text, filter, facets và sort.
+- Product detail có thể hydrate thêm dữ liệu từ Catalog Service.
+- Availability và price hiển thị có thể là snapshot ngắn hạn.
+- Khi checkout, Order/Checkout Service phải reprice và xác nhận inventory authoritative.
+
+Search nên chịu được degradation: nếu ranking/facets gặp lỗi, có thể trả kết quả đơn giản hơn. Không được dùng search index để quyết định việc trừ tồn kho.
+
+---
+
+#### 7. Luồng checkout đúng đắn
+
+Một luồng điển hình:
+
+```text
+Client -> Gateway -> Checkout/Order Service
+                     1. Đọc cart và xác thực buyer
+                     2. Reprice từ Catalog/Pricing authority
+                     3. Reserve inventory có TTL
+                     4. Tạo order PENDING_PAYMENT
+                     5. Tạo/confirm payment intent
+                     6. Chuyển order sang PAID hoặc chờ webhook
+                     7. Commit reservation thành SOLD
+                     8. Ghi outbox và publish OrderPaid
+                                           |
+                                           +-> Notification
+                                           +-> Fulfillment
+                                           +-> Analytics
+```
+
+Điểm quan trọng: **reserve inventory phải là thao tác authoritative trong critical path**, không chỉ là event xử lý sau khi order đã đặt. Nếu chỉ gửi event cập nhật tồn kho sau đó, nhiều checkout có thể cùng được chấp nhận và gây overselling.
+
+Một reservation thường chứa:
+
+- `reservationId`, `checkoutId`, `skuId`, `locationId`.
+- Quantity và trạng thái.
+- `expiresAt` để tự nhả hàng khi user bỏ checkout.
+- Idempotency key hoặc unique constraint để retry không giữ hàng hai lần.
+
+---
+
+#### 8. State machine cho Order và Payment
+
+Order và payment là hai state machine liên quan nhưng không nên gộp thành một trạng thái:
+
+```text
+Order:   CREATED -> INVENTORY_RESERVED -> PENDING_PAYMENT -> PAID
+                                      \-> CANCELLED
+                                      \-> PAYMENT_FAILED
+
+Payment: NOT_STARTED -> PENDING -> AUTHORIZED -> CAPTURED
+                            \-> FAILED
+                            \-> UNKNOWN -> RECONCILED
+```
+
+Không được suy luận `payment failed` chỉ vì request tới provider timeout. Provider có thể đã charge nhưng response bị mất. Payment Service phải:
+
+- Dùng idempotency key khi gọi provider.
+- Lưu provider payment reference.
+- Xác minh webhook signature.
+- Dedupe webhook và cho phép event đến lặp/out-of-order.
+- Reconcile các giao dịch ở trạng thái `UNKNOWN/PENDING`.
+- Không lưu raw card data nếu có thể dùng hosted fields/tokenization.
+
+---
+
+#### 9. Transaction phân tán và Saga
+
+Không thể mở một ACID transaction duy nhất xuyên Inventory DB, Order DB và payment provider. Checkout cần một workflow kiểu Saga:
+
+| Bước | Hành động | Compensation khi thất bại |
+|---|---|---|
+| 1 | Reserve stock | Release reservation |
+| 2 | Tạo pending order | Cancel order |
+| 3 | Authorize/capture payment | Void authorization hoặc refund |
+| 4 | Confirm stock/order | Manual reconciliation nếu trạng thái mơ hồ |
+
+Hai phong cách:
+
+- **Orchestration:** Order/Checkout Service điều phối các bước; dễ theo dõi workflow checkout.
+- **Choreography:** service phản ứng với event; ít coupling trực tiếp nhưng flow khó nhìn và debug hơn.
+
+Với critical checkout, orchestration thường dễ kiểm soát hơn; event vẫn được dùng để phát tán kết quả sau commit.
+
+---
+
+#### 10. Event và Outbox
+
+Các event hữu ích:
+
+```text
+ProductChanged
+OfferChanged
+InventoryReserved
+InventoryReservationExpired
+OrderCreated
+PaymentAuthorized
+PaymentFailed
+OrderPaid
+OrderCancelled
+OrderReadyForFulfillment
+```
+
+Nếu service commit DB rồi publish message riêng biệt, có thể xảy ra hai lỗi:
+
+1. DB commit thành công nhưng publish thất bại.
+2. Publish thành công nhưng DB rollback.
+
+**Transactional Outbox** giải quyết bằng cách ghi business change và outbox record trong cùng local transaction. Relay sau đó publish event; consumer vẫn phải idempotent vì delivery thường là at-least-once.
+
+Event nên có `eventId`, `eventType`, `aggregateId`, `aggregateVersion`, `occurredAt`, `correlationId` và schema version.
+
+---
+
+#### 11. Lựa chọn storage theo workload
+
+| Workload | Storage phù hợp | Lý do |
+|---|---|---|
+| User/profile | Relational DB | Constraint và transaction rõ ràng |
+| Product/offer source of truth | Relational DB ở scale hiện tại | Quan hệ, ownership và audit |
+| Product discovery | Elasticsearch/OpenSearch | Full-text, filters, facets |
+| Inventory | Relational/transactional KV | Atomic conditional update và consistency |
+| Cart | Redis hoặc DB tùy durability | Truy cập nhanh, TTL; cần chiến lược mất cache |
+| Order | Relational DB | Transaction, state transition, audit |
+| Payment records | Relational DB + encryption | Correctness, uniqueness, reconciliation |
+| Media | Object storage + CDN | File lớn, durable và rẻ |
+| Logs/audit archive | Object storage/search backend | Append-heavy, retention dài |
+
+Transcript nói “event records” cần transaction và mã hóa; theo ngữ cảnh đây nhiều khả năng là **payment records**. Event/audit vẫn cần độ bền và quyền truy cập phù hợp, nhưng không phải mọi event đều chứa financial fields.
+
+Mỗi service sở hữu schema của mình; service khác truy cập qua API/event, không join trực tiếp vào database nội bộ. Tuy vậy, ở modular monolith ban đầu có thể dùng chung một Postgres cluster nhưng tách schema và ownership logic.
+
+---
+
+#### 12. Cache strategy
+
+Ứng viên cache:
+
+- Product detail và category phổ biến.
+- Search result cho query nóng.
+- User session hoặc token metadata ngắn hạn.
+- Stock/price snapshot chỉ để hiển thị.
+
+Không nên xem Redis là source of truth cho inventory chỉ vì đọc nhanh. Mẫu phổ biến:
+
+```text
+Read:  cache -> miss -> authority DB -> populate cache
+Write: authority DB commit -> event/invalidation -> cache refresh/remove
+```
+
+Cần xác định TTL, invalidation, cache stampede protection, hot-key handling và hành vi khi Redis hỏng. Với giá/tồn kho, cache có thể cũ; checkout luôn revalidate.
+
+---
+
+#### 13. Queue strategy
+
+Queue dùng cho:
+
+- Gửi email/SMS/push.
+- Đồng bộ catalog sang search index.
+- Analytics và audit pipeline.
+- Fulfillment/shipping initiation sau khi order đã paid.
+- Seller bulk imports.
+- Retry các integration tạm thời lỗi.
+
+Mỗi consumer cần:
+
+- Idempotent handler.
+- Retry có exponential backoff và jitter.
+- Dead-letter queue cho poison messages.
+- Giới hạn số lần retry.
+- Theo dõi queue depth, oldest-message age và processing error rate.
+- Partition/order key phù hợp, chẳng hạn `orderId` hoặc `skuId` khi thứ tự quan trọng.
+
+**Cache tối ưu read path; queue tối ưu workflow và temporal decoupling.** Queue không tự động bảo đảm exactly-once business effect.
+
+---
+
+#### 14. API Gateway và security boundary
+
+API Gateway có thể xử lý:
+
+- TLS termination, authentication và route.
+- Rate limiting theo user, seller, IP và endpoint.
+- Request size/schema validation ở mức cơ bản.
+- Correlation/request ID.
+- API version routing và observability.
+
+Gateway không thay thế authorization trong domain service. Ví dụ Catalog Service vẫn phải kiểm tra seller có sở hữu offer đang sửa hay không; Admin Service cần RBAC và audit riêng.
+
+Endpoint payment webhook cần xác minh signature từ provider, chống replay và không áp dụng authentication kiểu end-user thông thường.
+
+---
+
+#### 15. Reliability và failure handling
+
+| Tình huống | Hành vi mong muốn |
+|---|---|
+| Search index lỗi | Degrade search hoặc dùng cache; checkout authority vẫn hoạt động |
+| Redis lỗi | Fallback DB có rate limit; tránh cache stampede |
+| Inventory timeout | Không đoán còn hàng; checkout giữ trạng thái retryable hoặc fail closed |
+| Payment timeout | Đánh dấu `UNKNOWN/PENDING`, reconcile; không retry charge mù quáng |
+| Notification lỗi | Order vẫn thành công; retry qua queue/DLQ |
+| Event broker chậm | Outbox giữ event; monitor lag và backlog |
+| Seller bulk feed tăng đột biến | Queue, quota và cô lập khỏi buyer critical path |
+
+Các synchronous dependency cần deadline, bounded retry và circuit breaker. Retry chỉ an toàn khi operation có idempotency.
+
+---
+
+#### 16. Observability xuyên luồng
+
+Một checkout đi qua nhiều service nên cần `correlationId/traceId` xuyên suốt:
+
+```text
+client request
+ -> checkoutId
+ -> reservationId
+ -> orderId
+ -> paymentId/providerReference
+ -> eventId
+```
+
+Các chỉ số quan trọng:
+
+- Search p50/p95/p99 latency và zero-result rate.
+- Cache hit rate, hot-key rate và DB fallback traffic.
+- Inventory reservation success/conflict/expiry rate.
+- Checkout success rate theo từng stage.
+- Payment pending/unknown/failure và webhook lag.
+- Queue depth, oldest-message age, retry và DLQ count.
+- Order state stuck duration.
+
+Business metrics và technical metrics phải nối được với nhau; ví dụ payment latency tăng có làm conversion giảm hay không.
+
+---
+
+#### 17. Sơ đồ kiến trúc tổng quát
+
+```text
+Web/Mobile/Seller Portal
+          |
+     API Gateway
+          |
+  +-------+---------+----------+-----------+
+  |                 |          |           |
+User/Auth       Catalog      Cart       Admin
+                    |          |
+              Search Index     +------> Checkout/Order Orchestrator
+                    ^                         |
+                    |                    Inventory Authority
+              Index Consumer                  |
+                    ^                     Payment Service ----> Provider
+                    |                         |
+                Event Bus <------------------+
+                 |      |          |
+          Notification  Fulfillment  Analytics/Audit
+
+Cross-cutting: Redis cache, relational stores, object storage,
+               tracing/metrics/logs, secrets and IAM
+```
+
+---
+
+#### 18. Những điều cần sửa hoặc làm rõ so với transcript
+
+1. **Inventory không nên chỉ cập nhật async sau `OrderPlaced`.** Phải reserve/conditional decrement authoritative trước khi cam kết order.
+2. **Payment success không nên chỉ dựa vào response đồng bộ.** Cần webhook và reconciliation cho trạng thái mơ hồ.
+3. **Catalog search nên tách source of truth và search projection.** Elasticsearch không phải authority của price/inventory.
+4. **Order Service không nên ôm mọi thứ.** Cart, fulfillment, promotion hoặc seller capability có thể là module/service riêng theo scale.
+5. **REST stateless không có nghĩa toàn hệ thống không có state.** State nằm trong durable stores hoặc shared session/token infrastructure, không nằm độc quyền trong một app instance.
+6. **API versioning không tự giải quyết compatibility.** Schema/event evolution và deprecation vẫn phải được quản lý.
+
+---
+
+#### 19. Cách trình bày trong phỏng vấn
+
+Một trình tự rõ ràng:
+
+1. Vẽ client, gateway và read path search/browse.
+2. Tách Product, Offer, Inventory và Search Projection.
+3. Vẽ checkout critical path: reprice → reserve → pending order → payment.
+4. Nêu inventory invariant và idempotency.
+5. Tách payment state khỏi order state; giải thích timeout/webhook/reconciliation.
+6. Đưa notification, indexing và analytics ra event bus.
+7. Nêu Outbox, idempotent consumer và DLQ.
+8. Chỉ ra cache là acceleration layer, không phải correctness authority.
+9. Kết thúc bằng bottleneck, failure mode và scale-out path.
+
+Một câu tóm tắt mạnh:
+
+> “Browse path ưu tiên latency và chấp nhận dữ liệu projection hơi cũ; checkout path ưu tiên correctness, reprice và reserve inventory authoritative trước khi xử lý payment. Sau commit, outbox phát event cho search, notification và fulfillment.”
+
+---
+
+#### 20. Ý chính cần nhớ
+
+- Chia hệ thống theo business capability và data ownership, không theo tên công nghệ.
+- Ở 100 peak RPS, modular monolith vẫn có thể là lựa chọn tốt nếu giữ ranh giới sạch.
+- Search/catalog là read-heavy; inventory/order/payment là correctness-heavy.
+- Product, seller offer, SKU-location inventory và search document là các thực thể khác nhau.
+- REST API cần stateless, versioned, authorized, paginated và idempotent khi retry.
+- Đồng bộ dùng cho quyết định critical; bất đồng bộ dùng cho công việc hậu kỳ và fan-out.
+- Reserve tồn kho phải nằm trong checkout critical path để tránh overselling.
+- Cart không giữ hàng; price và stock hiển thị chỉ là hint cho đến khi checkout revalidate.
+- Order và Payment là hai state machine; timeout payment tạo trạng thái chưa biết, không đồng nghĩa thất bại.
+- Saga và compensation thay thế distributed ACID transaction.
+- Transactional Outbox tránh mất event giữa DB commit và publish.
+- Consumer phải idempotent vì broker thường cung cấp at-least-once delivery.
+- Postgres giữ business authority; Elasticsearch là search projection; Redis là acceleration layer.
+- Queue cần retry có giới hạn, backoff, DLQ và đo consumer lag.
+- Gateway xử lý cross-cutting concerns nhưng domain service vẫn chịu trách nhiệm authorization.
+- Thiết kế failure behavior cho search, cache, inventory, payment và queue ngay từ đầu.
+
+#### Công thức ghi nhớ
+
+> **Marketplace HLD = capability boundaries + authoritative transactional core + read-optimized projections/cache + synchronous correctness path + asynchronous side effects + idempotent Saga/Outbox + observable failure handling.**
+
+---
+
+### Bài 116. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc lựa chọn
+
+Công nghệ được chọn **sau khi** đã xác định yêu cầu, quy mô, bottleneck và ranh giới kiến trúc. Không có một technology stack duy nhất đúng cho mọi marketplace.
+
+Với mỗi lựa chọn, cần trả lời được:
+
+1. Nó giải quyết requirement hoặc bottleneck nào?
+2. Source of truth nằm ở đâu?
+3. Failure mode và phương án phục hồi là gì?
+4. Đội ngũ có đủ khả năng vận hành hay nên dùng managed service?
+5. Khi quy mô tăng, giới hạn đầu tiên sẽ xuất hiện ở đâu?
+
+Baseline của case study hiện tại chỉ khoảng **100 peak RPS, 500K products và 1K orders/day**. Vì vậy, tính đơn giản và khả năng vận hành thường quan trọng hơn việc triển khai một stack phân tán quá phức tạp ngay từ đầu.
+
+---
+
+#### 2. Bản đồ yêu cầu → công nghệ
+
+| Nhu cầu | Lựa chọn minh họa | Lý do | Đánh đổi/rủi ro |
+|---|---|---|---|
+| Transactional business data | PostgreSQL | ACID, constraint, index, transaction | Write scaling và hot-row contention cần xử lý |
+| Product search/filter | Elasticsearch/OpenSearch | Inverted index, full-text, facets | Eventual consistency, vận hành cluster, reindex |
+| Cache/hot data | Redis | In-memory, TTL, atomic primitives | Mất cache, stale data, hot key, stampede |
+| Event streaming | Kafka | Throughput cao, retention, replay, partition ordering | Vận hành và consumer semantics phức tạp |
+| Managed async queue | AWS SQS hoặc tương đương | Ít vận hành, autoscaling, DLQ | Ít kiểm soát log/replay/ordering hơn Kafka tùy mode |
+| Media và archive | Object storage | Durable, rẻ, scale lớn | Không phù hợp transaction/query quan hệ |
+| Identity federation | OAuth 2.0 + OpenID Connect | Chuẩn hóa authorization và authentication | Token lifecycle, key rotation, revocation |
+| Payment | Stripe/Razorpay hoặc provider tương đương | Compliance và payment rails có sẵn | External dependency, fee, timeout, webhook |
+| Synchronous communication | REST/HTTP | Phổ biến, đơn giản, dễ tích hợp | Coupling theo thời gian và cascading failure |
+| Cloud infrastructure | AWS/Azure/GCP managed services | Giảm operational burden | Vendor dependence, cost governance, quotas |
+
+Tên sản phẩm chỉ là ví dụ. Trong phỏng vấn, phần quan trọng nhất là ánh xạ đúng **workload và invariant** sang đặc tính công nghệ.
+
+---
+
+#### 3. PostgreSQL cho transactional core
+
+PostgreSQL phù hợp với:
+
+- User/profile và seller ownership.
+- Product/offer source of truth ở quy mô hiện tại.
+- Inventory và reservation.
+- Order, order lines và state transitions.
+- Payment attempt, provider reference và reconciliation records.
+
+Các khả năng hữu ích:
+
+- ACID transaction và foreign key/unique/check constraints.
+- Atomic conditional update để chống overselling.
+- Row-level locking hoặc optimistic concurrency.
+- Index, read replica và point-in-time recovery.
+- JSONB cho một phần metadata linh hoạt mà chưa cần NoSQL riêng.
+
+Ví dụ trừ tồn kho có điều kiện:
+
+```sql
+UPDATE inventory
+SET available = available - :qty,
+    reserved  = reserved + :qty,
+    version   = version + 1
+WHERE sku_id = :sku_id
+  AND location_id = :location_id
+  AND available >= :qty;
+```
+
+Nếu số hàng bị cập nhật là `0`, reservation thất bại. Thao tác này phải nằm trong local transaction cùng việc tạo reservation/idempotency record phù hợp.
+
+Không nhất thiết dùng **một database instance duy nhất** cho mọi domain. Có thể bắt đầu với một managed PostgreSQL cluster và schema ownership rõ ràng, sau đó tách workload khi có bằng chứng về scale, isolation hoặc team autonomy.
+
+---
+
+#### 4. Elasticsearch là projection, không phải authority
+
+Elasticsearch/OpenSearch phục vụ:
+
+- Keyword và full-text search.
+- Filter theo category, brand, price range.
+- Facets, sorting và autocomplete.
+- Denormalized search documents để đọc nhanh.
+
+Luồng dữ liệu:
+
+```text
+Postgres commit product/offer
+        -> Transactional Outbox
+        -> Kafka/SQS
+        -> Search Indexer
+        -> Elasticsearch index/alias
+```
+
+Hệ quả:
+
+- Index có thể trễ vài giây hoặc phút so với source of truth.
+- Search result có thể hiển thị giá hoặc stock cũ.
+- Checkout phải reprice và revalidate inventory từ authority.
+- Cần quy trình backfill/reindex, index version và alias switch.
+- Khi search cluster lỗi, có thể degrade sang category browsing/cache nhưng không làm hỏng order data.
+
+Với 500K products, một managed search service thường đủ. Không nên xây custom search engine nếu yêu cầu chưa thực sự đặc biệt.
+
+---
+
+#### 5. Redis là acceleration layer
+
+Redis có thể cache:
+
+- Product detail và category nóng.
+- Search results phổ biến.
+- Session/token metadata nếu chọn server-side state.
+- Rate-limit counters.
+- Price/stock snapshot cho browse path.
+
+Cache pattern điển hình:
+
+```text
+Read:  Redis -> miss -> Postgres/Search -> populate cache
+Write: Postgres commit -> event/invalidate -> cache refresh/remove
+```
+
+Các quyết định phải nêu rõ:
+
+- TTL theo độ nhạy freshness của từng dữ liệu.
+- Cache key, size limit và eviction policy.
+- Request coalescing/lock để tránh cache stampede.
+- Jitter cho TTL để nhiều key không hết hạn cùng lúc.
+- Hành vi khi Redis unavailable.
+
+Không nên dựa vào cached stock để quyết định bán hàng. Redis có thể cung cấp hint hoặc admission control, còn Inventory Service/transactional store vẫn là correctness authority.
+
+---
+
+#### 6. Kafka hay managed queue?
+
+Không phải hệ thống nào có async workflow cũng cần Kafka.
+
+| Tiêu chí | Kafka | SQS/managed queue |
+|---|---|---|
+| Mô hình | Durable event log | Managed work queue |
+| Replay | Tự nhiên theo offset/retention | Tùy dịch vụ, thường hạn chế hơn |
+| Nhiều consumer độc lập | Rất phù hợp | Có thể cần nhiều queue/subscription |
+| Ordering | Theo partition key | Tùy standard/FIFO mode |
+| Throughput | Rất cao | Cao và tự mở rộng theo service |
+| Vận hành | Phức tạp hơn | Ít overhead hơn |
+| Phù hợp | Event backbone, CDC, analytics, nhiều consumers | Notification jobs, background tasks, MVP nhỏ |
+
+Ở baseline 100 peak RPS, **managed queue thường là lựa chọn đơn giản hơn** nếu không cần retention/replay dài hoặc nhiều consumer groups. Kafka hợp lý khi event stream thực sự là nền tảng chung cho indexing, analytics, fulfillment và nhiều downstream consumers.
+
+Dù chọn công nghệ nào:
+
+- Delivery thường là at-least-once; consumer phải idempotent.
+- Retry phải có giới hạn, backoff và DLQ.
+- Dùng partition/order key khi thứ tự theo `orderId` hoặc `skuId` quan trọng.
+- Theo dõi consumer lag hoặc oldest-message age.
+- Dùng Outbox để nối DB transaction với việc publish.
+
+---
+
+#### 7. Sửa một điểm quan trọng về inventory event
+
+Transcript nói event-driven approach giúp “inventory update” không làm chậm user request. Điều này chỉ đúng với **các cập nhật phụ**, chẳng hạn:
+
+- Đồng bộ inventory projection sang search/cache.
+- Cập nhật dashboard hoặc analytics.
+- Phát `InventoryChanged` cho downstream consumers.
+- Replenishment workflow không nằm trong checkout hiện tại.
+
+Việc **reserve/decrement inventory để quyết định checkout có được chấp nhận hay không** không thể bị đẩy hoàn toàn ra background queue. Nó cần thao tác authoritative và trả kết quả rõ ràng trước khi order được cam kết, nếu không hệ thống có nguy cơ overselling.
+
+---
+
+#### 8. Managed cloud services
+
+Có thể dùng AWS, Azure hoặc GCP với các capability tương đương:
+
+- Managed PostgreSQL với Multi-AZ, backup và point-in-time recovery.
+- Managed Redis có replication/failover.
+- Managed search cluster.
+- Managed queue/stream.
+- Object storage cho ảnh sản phẩm, invoice archive và logs.
+- CDN cho media.
+- Secret manager/KMS cho credential và encryption keys.
+- Managed monitoring, logging và tracing.
+
+Managed service giảm toil nhưng không loại bỏ trách nhiệm kiến trúc. Vẫn phải thiết kế:
+
+- Backup restore test, RPO/RTO và failover procedure.
+- Capacity, quotas, connection limits và autoscaling bounds.
+- Network isolation, IAM và key rotation.
+- Cost budget, lifecycle policy và data retention.
+- Exit/migration plan cho thành phần có vendor lock-in cao.
+
+Với workload nhỏ, triển khai app trên container service/PaaS hoặc một Kubernetes cluster dùng chung đều có thể được. Kubernetes không bắt buộc; chỉ chọn khi lợi ích orchestration vượt chi phí vận hành.
+
+---
+
+#### 9. OAuth 2.0, OpenID Connect và JWT
+
+Ba khái niệm không đồng nghĩa:
+
+- **OAuth 2.0:** framework ủy quyền truy cập.
+- **OpenID Connect:** lớp identity/authentication trên OAuth 2.0.
+- **JWT:** một định dạng token, không phải giao thức đăng nhập.
+
+Luồng khái quát:
+
+```text
+User -> Identity Provider -> ID token / access token
+Client -> API Gateway -> validate issuer, audience, signature, expiry
+Gateway/Service -> domain authorization (buyer, seller, admin, ownership)
+```
+
+JWT giúp service xác minh access token mà không gọi session store ở mọi request, nhưng không hoàn toàn “miễn state”:
+
+- Identity provider vẫn quản lý user, consent, key và refresh token lifecycle.
+- Revocation/logout tức thời khó với access token sống lâu.
+- Cần token expiry ngắn, key rotation và refresh-token protection.
+- Không đặt dữ liệu nhạy cảm trong payload chỉ vì token được ký; JWT thường không được mã hóa.
+- Authorization theo ownership vẫn phải kiểm tra trong domain service.
+
+Nếu yêu cầu revoke mạnh hoặc session đơn giản, opaque token/server-side session cũng là lựa chọn hợp lệ.
+
+---
+
+#### 10. External payment gateway
+
+Dùng Stripe, Razorpay hoặc provider tương đương giúp tận dụng:
+
+- Tokenization/hosted fields để giảm phạm vi dữ liệu thẻ.
+- Payment methods và compliance infrastructure.
+- Webhook, refund, dispute và reconciliation API.
+
+Nhưng provider trở thành external dependency. Payment Service cần:
+
+- Idempotency key khi tạo/confirm payment.
+- Unique constraint trên logical payment và provider reference.
+- Timeout có deadline; không retry charge vô hạn.
+- Webhook signature verification, replay protection và deduplication.
+- Trạng thái `PENDING/UNKNOWN` khi không chắc kết quả.
+- Scheduled reconciliation với provider.
+- Refund/void là compensation khi bước sau thất bại.
+
+Không để client tự tuyên bố thanh toán thành công; backend phải xác minh với provider hoặc webhook đáng tin cậy.
+
+---
+
+#### 11. REST và event-driven messaging
+
+Kiến trúc kết hợp:
+
+```text
+Synchronous critical path:
+Client -> Gateway -> Checkout -> Inventory -> Payment
+
+Asynchronous side effects:
+Order DB commit -> Outbox -> Broker
+                         +-> Notification
+                         +-> Fulfillment
+                         +-> Search/cache projection
+                         +-> Analytics/audit
+```
+
+REST phù hợp khi caller cần kết quả trước khi đi tiếp. Event phù hợp để decouple công việc hậu kỳ hoặc fan-out. Không nên biến mọi giao tiếp thành event nếu workflow cần phản hồi ngay, và cũng không nên kéo notification/analytics vào synchronous chain.
+
+Trong nội bộ có thể dùng REST hoặc gRPC; lựa chọn dựa trên latency, schema/tooling và năng lực đội ngũ, không ảnh hưởng nguyên tắc ranh giới service.
+
+---
+
+#### 12. Triển khai theo quy mô thực tế
+
+Một phương án hợp lý cho giai đoạn đầu:
+
+```text
+CDN/WAF
+   -> Load Balancer/API Gateway
+   -> 2+ stateless app instances hoặc modular services
+   -> Managed PostgreSQL Multi-AZ
+   -> Managed Redis
+   -> Managed Search
+   -> Managed Queue
+   -> Object Storage
+```
+
+Các bước mở rộng dựa trên số liệu:
+
+1. Thêm application instances và connection pooling.
+2. Tách Search/Indexer và seller bulk ingestion khỏi buyer path.
+3. Thêm read replicas cho read workload phù hợp.
+4. Partition inventory theo SKU/location khi contention/data volume đòi hỏi.
+5. Tách Order và Payment để tăng isolation/security.
+6. Dùng Kafka/event backbone khi số consumer và replay requirements tăng.
+7. Chỉ cân nhắc multi-region active-active khi business SLO và consistency trade-off biện minh được.
+
+---
+
+#### 13. High availability và disaster recovery
+
+Technology choice phải gắn với topology và recovery:
+
+- App instances chạy ít nhất ở hai failure domains/AZ.
+- Load balancer health check và loại instance lỗi.
+- PostgreSQL synchronous standby hoặc managed Multi-AZ cho HA.
+- Read replica không mặc nhiên là failover-ready authority.
+- Backup riêng biệt, mã hóa và kiểm thử restore định kỳ.
+- Redis/cache mất hoàn toàn không được làm mất business data.
+- Broker giữ message đủ lâu để downstream phục hồi.
+- Search index có thể rebuild từ source/outbox/archive.
+
+Nên xác định RTO/RPO theo capability. Order/payment có yêu cầu nghiêm hơn search index vì index có thể dựng lại.
+
+---
+
+#### 14. Security và compliance
+
+- TLS cho mọi traffic bên ngoài và service-to-service khi phù hợp.
+- KMS/secret manager; không đặt secret trong source code hoặc image.
+- Least-privilege IAM cho từng workload.
+- Network segmentation giữa public edge, application và data layer.
+- Mã hóa data at rest, đặc biệt PII/payment metadata.
+- WAF, rate limiting và bot mitigation cho login, checkout, flash sale.
+- Audit admin action và seller-sensitive changes.
+- Không log access token, raw credential hoặc payment secrets.
+- Data retention/deletion policy theo yêu cầu pháp lý và business.
+
+OAuth/OIDC không tự bảo vệ toàn hệ thống; đây chỉ là một phần của defense-in-depth.
+
+---
+
+#### 15. Observability và vận hành
+
+Các chỉ số cần theo dõi theo technology layer:
+
+| Thành phần | Chỉ số chính |
+|---|---|
+| PostgreSQL | Query p95/p99, locks, deadlocks, connections, replica lag |
+| Elasticsearch | Query latency, indexing lag, rejected requests, shard health |
+| Redis | Hit ratio, latency, evictions, memory, hot keys |
+| Kafka/SQS | Consumer lag/oldest message, queue depth, retry, DLQ |
+| Payment | Provider latency, pending/unknown, webhook lag, duplicate prevented |
+| Application | RPS, error rate, saturation, checkout stage latency |
+
+Trace cần nối `requestId → checkoutId → reservationId → orderId → paymentId → eventId`. Alert dựa trên SLO/business impact tốt hơn chỉ alert CPU.
+
+---
+
+#### 16. Cost và operational complexity
+
+Managed service thường tiết kiệm nhân lực nhưng không nhất thiết rẻ nhất theo hóa đơn. Cần tính:
+
+- Database/search provisioned capacity và storage replicas.
+- Kafka broker/retention hoặc queue request cost.
+- Redis memory và replica.
+- Object storage request, lifecycle và egress/CDN.
+- Cross-AZ/cross-region data transfer.
+- Observability retention và high-cardinality metrics/logs.
+
+Ở quy mô bài toán, một stack ít thành phần nhưng được vận hành tốt có giá trị hơn một kiến trúc microservices/Kafka/Kubernetes đầy đủ nhưng đội ngũ không kiểm soát được.
+
+---
+
+#### 17. Cách giải thích trong phỏng vấn
+
+Không nên liệt kê công nghệ đơn thuần. Có thể trình bày:
+
+1. “Postgres giữ transactional authority vì inventory, order và payment cần constraint/ACID.”
+2. “Elasticsearch là projection cho search; checkout không tin price/stock trong index.”
+3. “Redis giảm read latency nhưng phải chịu được cache miss hoặc cache outage.”
+4. “Ở baseline hiện tại tôi ưu tiên managed queue; chuyển sang Kafka nếu cần replay và nhiều consumer groups.”
+5. “Inventory reservation vẫn synchronous/authoritative; chỉ projection và side effects đi qua event.”
+6. “OIDC xác thực identity, OAuth 2.0 cấp quyền truy cập, JWT chỉ là token format.”
+7. “Payment provider được cô lập sau Payment Service với idempotency, webhook và reconciliation.”
+8. “Managed cloud giảm toil, nhưng vẫn cần HA, restore test, IAM, monitoring và cost control.”
+
+---
+
+#### 18. Ý chính cần nhớ
+
+- Technology follows architecture; chọn theo requirement, invariant và team capability.
+- PostgreSQL phù hợp làm transactional core ở quy mô hiện tại.
+- Elasticsearch tối ưu search nhưng chỉ là eventually consistent projection.
+- Redis tăng tốc, không phải nguồn chân lý của price, stock hoặc order.
+- Kafka phù hợp event log/replay/many consumers; managed queue thường đơn giản hơn cho MVP.
+- Inventory reservation authoritative không được đẩy hoàn toàn sang background event.
+- Managed cloud giảm operational overhead nhưng vẫn cần capacity, DR, IAM và cost governance.
+- OAuth 2.0, OIDC và JWT giải quyết các vấn đề khác nhau.
+- External payment gateway giảm PCI scope nhưng đưa vào timeout, webhook và reconciliation complexity.
+- REST phục vụ immediate decisions; messaging xử lý side effects và fan-out.
+- Bắt đầu với topology vừa đủ, đo tải rồi tách/scale thành phần có bottleneck thật.
+- Mỗi công nghệ phải có failure behavior và recovery path rõ ràng.
+
+#### Công thức ghi nhớ
+
+> **Strategic technology choice = workload fit + correctness needs + failure/recovery model + operational capability + cost + evolutionary path; product names are implementation examples, not the architecture itself.**
+
+---
+
+### Bài 117. The Final Design: E-Commerce Platform
+
+#### 1. Bức tranh tổng thể
+
+Kiến trúc cuối cùng kết hợp các quyết định từ Bài 113–116 để giải quyết hai nhóm workload rất khác nhau:
+
+- **Discovery path:** search, browse và product detail; ưu tiên latency, throughput và khả năng degrade.
+- **Transaction path:** cart, inventory, order và payment; ưu tiên correctness, idempotency và auditability.
+
+Sơ đồ khái quát:
+
+```text
+ Buyers / Sellers / Admins
+          |
+      CDN + WAF
+          |
+   API Gateway / Load Balancer
+          |
+  +-------+---------+----------+-----------+----------+
+  |                 |          |           |          |
+Identity         Catalog     Search      Cart       Admin
+                    |          |           |
+                    |     Search Index     +----> Checkout/Order
+                    |          ^                       |
+                    |          |                 Inventory Authority
+                    |     Index Consumer                |
+                    |          ^                  Payment Service
+                    |          |                       |
+                    +------> Event Bus <---------------+----> Payment Provider
+                                |
+                     +----------+-----------+-----------+
+                     |                      |           |
+                Notification          Fulfillment  Analytics/Audit
+
+Data/infra: PostgreSQL, Redis, object storage, message broker,
+            tracing/metrics/logging, secret manager/KMS
+```
+
+API Gateway là entry point chung cho routing, authentication, rate limiting và request correlation. Tuy nhiên, từng domain service vẫn phải tự kiểm tra authorization và business invariant của mình.
+
+---
+
+#### 2. Trách nhiệm và data ownership
+
+| Thành phần | Trách nhiệm | Source of truth/read model |
+|---|---|---|
+| **Identity Service** | User, login, buyer/seller/admin identity | Relational identity store hoặc managed IdP |
+| **Catalog Service** | Product, category, seller offer | PostgreSQL authority |
+| **Search Service** | Query, filtering, facets, sorting | Elasticsearch/OpenSearch projection |
+| **Cart Service** | Cart và cart-item intentions | Redis/relational store tùy durability |
+| **Inventory Service** | Available/reserved/sold theo SKU-location | Transactional inventory store |
+| **Checkout/Order Service** | Reprice, orchestrate checkout, order lifecycle | PostgreSQL order store |
+| **Payment Service** | Provider interaction, payment state, refund, reconcile | PostgreSQL payment ledger/reference |
+| **Notification Service** | Email/SMS/push | Delivery records + external providers |
+| **Admin Service** | Moderation, dispute, fraud investigation | Domain APIs + immutable audit trail |
+| **Fulfillment capability** | Pick, pack, ship, seller handoff | Fulfillment/shipping records |
+
+Mỗi service sở hữu dữ liệu của mình về mặt logic. Ở quy mô hiện tại, nhiều module có thể dùng chung một managed PostgreSQL cluster nhưng nên tách schema, migration và quyền truy cập để giữ ownership rõ ràng.
+
+---
+
+#### 3. Luồng đăng nhập và xác thực
+
+```text
+Client -> Identity Provider/Auth Service
+       <- ID token/access token
+
+Client -> API Gateway -- access token --> Backend Service
+                            |
+                     verify signature,
+                     issuer, audience,
+                     expiry and scopes
+```
+
+- OpenID Connect xử lý identity/authentication.
+- OAuth 2.0 xử lý delegated authorization.
+- JWT có thể là access-token format, không phải toàn bộ cơ chế đăng nhập.
+- Gateway xác minh token cơ bản; service kiểm tra role, ownership và resource-level permission.
+- Seller/admin endpoints cần rate limit và audit nghiêm ngặt hơn buyer read APIs.
+
+---
+
+#### 4. Luồng seller tạo hoặc cập nhật sản phẩm
+
+```text
+Seller Portal
+  -> Gateway
+  -> Catalog Service
+  -> validate ownership/schema
+  -> PostgreSQL transaction:
+       update product/offer + write outbox
+  -> Outbox Relay -> Event Broker -> Search Indexer
+                                  -> Cache invalidator
+                                  -> Audit/Analytics
+```
+
+Catalog database là authority; search index và Redis chỉ là projection/cache. Vì cập nhật bất đồng bộ, seller có thể nhận trạng thái `PUBLISHED` ở source nhưng search cần vài giây để phản ánh. Giao diện quản trị nên hiển thị indexing status nếu freshness là quan trọng.
+
+Seller bulk import phải đi qua queue, quota và validation pipeline riêng để không cạnh tranh tài nguyên với buyer checkout.
+
+---
+
+#### 5. Luồng browse và search
+
+```text
+Client -> CDN/Gateway -> Search Service
+                          |
+                       Redis cache
+                          |
+                     Search Index
+                          |
+                 product/offer summaries
+```
+
+Luồng này được tối ưu cho latency:
+
+- CDN phục vụ ảnh và static assets.
+- Redis giữ product/query nóng.
+- Elasticsearch hỗ trợ full-text, filters và facets.
+- Cursor pagination tránh offset sâu tốn kém.
+- Search document có thể denormalize product, seller offer, rating và price range.
+
+Giá và tồn kho hiển thị ở đây có thể cũ. Khi người dùng checkout, hệ thống luôn lấy lại giá và stock từ authority. Nếu search gặp lỗi, hệ thống có thể degrade sang category/popular-products cache; không cần làm transaction core ngừng hoạt động.
+
+---
+
+#### 6. Luồng thêm vào giỏ hàng
+
+```text
+Client -> Cart Service
+       -> validate product/offer exists
+       -> write cart item + optimistic version
+       <- updated cart and warnings
+```
+
+Giỏ hàng thể hiện **ý định mua**, không giữ inventory. Vì vậy:
+
+- Cart có thể chứa item sau đó hết hàng hoặc đổi giá.
+- Nhiều thiết bị sửa cùng cart cần optimistic concurrency/version.
+- Cart có TTL hoặc archival policy.
+- Khi đọc cart có thể hiển thị price/stock hint, nhưng checkout phải revalidate.
+
+Không nên reserve stock ngay lúc add-to-cart vì người dùng có thể bỏ giỏ, khiến inventory bị khóa vô ích.
+
+---
+
+#### 7. Checkout critical path
+
+Luồng an toàn hơn so với cách mô tả đơn giản “payment thành công rồi mới tạo order”:
+
+```text
+Client
+  -> Checkout/Order Service  [Idempotency-Key]
+       1. Validate user/cart/address
+       2. Reprice từ Catalog/Pricing authority
+       3. Reserve inventory atomically với TTL
+       4. Tạo Order = PENDING_PAYMENT và price snapshot
+       5. Yêu cầu Payment Service tạo/confirm payment
+       6a. Success  -> Order = PAID; commit reservation = SOLD
+       6b. Failure  -> Order = PAYMENT_FAILED; release reservation
+       6c. Timeout  -> Order/Payment = PENDING hoặc UNKNOWN; reconcile
+       7. Commit state + outbox event
+  <- success, failure hoặc processing status
+```
+
+Lý do tạo pending order trước payment:
+
+- Có một business identifier để gắn payment attempt và idempotency.
+- Không mất dấu giao dịch nếu provider charge thành công nhưng response bị mất.
+- Có thể resume, reconcile và audit workflow.
+- Tránh tình trạng “đã thanh toán nhưng chưa có order record”.
+
+Việc reserve stock phải authoritative trước khi cam kết bán. Queue có thể đồng bộ cache/search sau đó, nhưng không thay thế bước reserve/conditional update.
+
+---
+
+#### 8. Đơn hàng nhiều seller
+
+Trong marketplace, một cart có thể chứa offer của nhiều seller. Một thiết kế thực tế thường tạo:
+
+```text
+Checkout
+  -> Parent Order
+       -> Seller Order A -> fulfillment/payment allocation A
+       -> Seller Order B -> fulfillment/payment allocation B
+       -> Seller Order C -> fulfillment/payment allocation C
+```
+
+Điều này giúp:
+
+- Mỗi seller xác nhận và fulfill phần của mình.
+- Tách phí vận chuyển, thuế, commission và payout.
+- Hủy/refund từng phần thay vì toàn bộ checkout.
+- Theo dõi shipment riêng.
+
+Đây là lý do “Order Service tạo một order” chỉ là mô hình khởi đầu; marketplace production cần parent/child order hoặc fulfillment groups.
+
+---
+
+#### 9. Payment flow và trạng thái mơ hồ
+
+```text
+Order Service -> Payment Service -> External Provider
+                                      |
+Payment Service <- signed webhook ----+
+       |
+       +-> verify signature + dedupe
+       +-> update payment state
+       +-> outbox PaymentCaptured/Failed
+```
+
+Payment Service phải bảo vệ các invariant:
+
+- Một logical payment không bị charge hai lần dù client retry.
+- Không coi timeout là thất bại chắc chắn.
+- Webhook lặp hoặc đến sai thứ tự không làm state regression.
+- Refund/void cũng idempotent.
+- Reconciliation job xử lý transaction ở `PENDING/UNKNOWN` quá lâu.
+
+Client không phải nguồn xác nhận payment. Chỉ backend/provider response đáng tin hoặc webhook đã xác minh mới được chuyển state.
+
+---
+
+#### 10. Xử lý bất đồng bộ sau commit
+
+Sau khi local transaction tạo trạng thái an toàn, Outbox phát event:
+
+```text
+OrderPaid
+  +-> Notification: gửi xác nhận buyer/seller
+  +-> Fulfillment: tạo pick-pack-ship workflow
+  +-> Inventory projection: cập nhật search/cache
+  +-> Analytics: conversion/revenue metrics
+  +-> Fraud/Risk: post-transaction analysis
+```
+
+Các tác vụ này không nên kéo dài request checkout. Tuy nhiên “async” không có nghĩa là tùy ý mất dữ liệu:
+
+- Broker/message phải lưu bền.
+- Consumer idempotent.
+- Retry có backoff và giới hạn.
+- Poison message đi DLQ.
+- Theo dõi oldest-message age và business backlog.
+- Có replay/re-drive procedure.
+
+Notification thất bại không làm order thất bại. Fulfillment event bị trễ không làm mất order; hệ thống phải phát hiện và xử lý order bị kẹt.
+
+---
+
+#### 11. Inventory consistency và flash sale
+
+Inventory Service là authority cho invariant:
+
+```text
+available >= 0
+available + reserved + sold = tracked stock
+```
+
+Có thể dùng atomic conditional update, row lock hoặc optimistic compare-and-set. Với hot SKU:
+
+- Rate limit/admission control trước inventory authority.
+- Queue hoặc serialize theo SKU nếu contention cực lớn.
+- Idempotency theo checkout/reservation.
+- Reservation TTL và expiry worker.
+- Anti-bot, waiting room và per-user purchase limit.
+- Cache `sold-out` hint để chặn tải hiển nhiên, nhưng authority vẫn quyết định cuối.
+
+Global average order rate rất thấp không phản ánh burst trên một SKU. Capacity phải kiểm tra theo **per-authority-key peak**.
+
+---
+
+#### 12. Caching trong kiến trúc cuối
+
+| Dữ liệu | Có thể cache? | Authority/revalidation |
+|---|---|---|
+| Product detail/category | Có, TTL tương đối dài | Catalog DB |
+| Search result | Có, TTL ngắn và query-aware | Search index |
+| Price hiển thị | Có, TTL ngắn | Pricing/Catalog khi checkout |
+| Stock hiển thị | Có như hint | Inventory khi reserve |
+| User session/token metadata | Có tùy auth model | Identity system |
+| Order state | Có rất ngắn nếu cần | Order DB |
+| Payment state | Không dựa vào cache để quyết định | Payment DB/provider reconcile |
+
+Cache outage phải làm hệ thống chậm hơn chứ không mất business data. Cần rate-limit fallback để tránh mọi cache miss đồng thời đánh sập database.
+
+---
+
+#### 13. Availability và graceful degradation
+
+| Thành phần lỗi/quá tải | Hành vi mong muốn |
+|---|---|
+| CDN/media | Placeholder hoặc origin fallback có giới hạn |
+| Search | Cache/category fallback; degraded filters/ranking |
+| Redis | Fallback DB/search có rate limit và request coalescing |
+| Inventory | Checkout fail closed hoặc trả retryable; không đoán stock |
+| Payment provider | Giữ `PENDING`, thử provider khác nếu business flow hỗ trợ; reconcile |
+| Message broker | Outbox tích backlog; core transaction vẫn có record |
+| Notification | Retry/DLQ; không rollback order |
+| Analytics | Chấp nhận delay; không ảnh hưởng buyer path |
+
+Thứ tự ưu tiên bảo vệ:
+
+1. Không double-charge, không oversell, không mất order.
+2. Checkout/cart durability.
+3. Product detail authority.
+4. Search richness và recommendation.
+5. Notification, analytics và dashboard freshness.
+
+---
+
+#### 14. Scalability của từng thành phần
+
+- Stateless API/services scale ngang sau load balancer.
+- Search scale theo shard/replica nhưng cần tránh oversharding.
+- Redis scale bằng replication/cluster khi dataset hoặc throughput cần.
+- Inventory partition theo SKU/location; hot key cần xử lý riêng.
+- Order partition theo order/customer/region khi volume lớn.
+- Kafka partition theo aggregate key; SQS tăng consumers theo queue depth.
+- Seller imports và indexing workers autoscale độc lập.
+- Media nằm ở object storage và CDN, không đi xuyên application server.
+
+Không cần scale mọi service cùng nhau. Viral product chủ yếu tác động search/cache/inventory; seller bulk feed tác động catalog/indexer; payment incident tác động checkout/payment/reconciliation.
+
+---
+
+#### 15. Security trong kiến trúc cuối
+
+- CDN/WAF chống bot và traffic độc hại ở edge.
+- TLS cho client và service communication cần thiết.
+- OIDC/OAuth 2.0 cho identity/access; domain RBAC/ownership trong service.
+- Rate limit riêng login, seller writes, checkout và payment webhook.
+- Tokenization/hosted fields giảm payment-data scope.
+- Secret manager/KMS cho credentials và encryption keys.
+- Least-privilege IAM và network segmentation.
+- Webhook signature/replay protection.
+- Immutable audit cho admin, seller catalog và order/payment transitions.
+- Không log credential, access token hoặc raw payment data.
+
+External payment gateway giảm gánh nặng compliance nhưng không chuyển hết trách nhiệm bảo mật cho provider.
+
+---
+
+#### 16. Observability end-to-end
+
+Mọi request và event nên liên kết qua các định danh:
+
+```text
+traceId / correlationId
+ -> cartId
+ -> checkoutId
+ -> reservationId
+ -> parentOrderId / sellerOrderId
+ -> paymentId / providerReference
+ -> eventId
+```
+
+Dashboard cần thể hiện cả technical lẫn business health:
+
+- Browse/search p95/p99, zero-result rate, cache hit ratio.
+- Reservation conflict, expiry và hot-SKU rejection.
+- Checkout funnel và latency theo stage.
+- Payment success, pending/unknown, webhook/reconciliation lag.
+- Order stuck-state count và age.
+- Broker lag, retry và DLQ.
+- Seller indexing freshness.
+- Oversell và duplicate-charge invariant violations phải gần bằng 0.
+
+Distributed tracing giúp thấy dependency nào làm checkout chậm; audit trail giúp giải thích một order cụ thể đã chuyển trạng thái ra sao.
+
+---
+
+#### 17. Hạ tầng triển khai gợi ý
+
+Ở quy mô hiện tại:
+
+```text
+Region
+  +-- AZ-A: application instances/workers
+  +-- AZ-B: application instances/workers
+  +-- Managed load balancer/API gateway
+  +-- Managed PostgreSQL Multi-AZ + backups/PITR
+  +-- Managed Redis with replica/failover
+  +-- Managed Search
+  +-- Managed Queue hoặc Kafka khi có nhu cầu rõ
+  +-- Object Storage + CDN
+  +-- Metrics, logs, traces, secrets/KMS
+```
+
+Đây có thể là modular monolith cùng vài worker thay vì hàng chục microservices vật lý. Logical boundaries trong sơ đồ vẫn hữu ích và tạo đường tách sau này.
+
+Kubernetes là lựa chọn, không phải yêu cầu. Managed container platform/PaaS có thể giảm chi phí vận hành cho đội nhỏ.
+
+---
+
+#### 18. Các điểm cần điều chỉnh so với transcript
+
+1. **Không nên xử lý payment trước rồi mới tạo dấu vết order.** Tạo pending order/payment intent trước giúp idempotency và recovery.
+2. **Inventory update không hoàn toàn là background task.** Reserve/commit là critical correctness path; chỉ projection/cache update được async.
+3. **“Checking inventory” từ Redis không đủ để bán hàng.** Redis chỉ tăng tốc hiển thị; authority xác nhận khi reserve.
+4. **Mỗi service sở hữu dữ liệu không đồng nghĩa mỗi service bắt buộc có một database server riêng từ ngày đầu.** Logical ownership quan trọng hơn physical sprawl.
+5. **Synchronous checkout không nhất thiết luôn trả success/failure cuối cùng.** Payment timeout hợp lệ có thể trả `PROCESSING/PENDING` rồi hoàn tất qua webhook.
+6. **Notification và fulfillment được kích hoạt sau durable commit/outbox**, không publish message kiểu best effort.
+
+---
+
+#### 19. Đối chiếu với bottleneck ban đầu
+
+| Bottleneck Bài 114 | Quyết định xử lý |
+|---|---|
+| Search/browse latency | Search index, Redis, CDN, denormalized projection |
+| Inventory consistency | Transactional authority, atomic reservation, TTL, idempotency |
+| Checkout/payment | Orchestrated state machine, pending order, provider isolation, reconcile |
+| Database hotspot | Cache read, partition theo authority key, hot-SKU admission control |
+| Fraud/payment error | Risk checks, signed webhook, audit, reconciliation, manual review |
+| Seller bulk updates | Async ingestion, quota, queue và workload isolation |
+| Traffic spike | Horizontal scaling, load balancing, queue buffering, graceful degradation |
+
+Mỗi component phải truy ngược được về một requirement hoặc failure mode; nếu không giải thích được lý do tồn tại, có thể kiến trúc đang quá phức tạp.
+
+---
+
+#### 20. Cách trình bày final design trong phỏng vấn
+
+1. Bắt đầu từ hai path: read-heavy discovery và correctness-heavy checkout.
+2. Giới thiệu domain boundaries cùng data ownership.
+3. Đi qua search/browse flow và giải thích eventual consistency.
+4. Đi qua checkout theo thứ tự reprice → reserve → pending order → payment → confirm.
+5. Nêu idempotency, timeout và payment reconciliation.
+6. Giải thích Outbox cùng async consumers.
+7. Nêu hot-SKU/flash-sale strategy.
+8. Trình bày failure/degradation behavior.
+9. Kết thúc bằng scale path và trade-off theo quy mô hiện tại.
+
+Một câu trả lời mạnh:
+
+> “Tôi tách read path khỏi transaction path. Search và cache ưu tiên latency, chấp nhận projection hơi cũ; checkout reprice và reserve inventory tại authority, tạo pending order trước khi gọi payment, rồi dùng Outbox phát các side effect như notification, fulfillment và search update.”
+
+---
+
+#### 21. Ý chính cần nhớ
+
+- Final design phải nối requirement, bottleneck, component và failure handling thành một hệ thống thống nhất.
+- Gateway là entry point, không phải nơi duy nhất thực thi domain authorization.
+- Catalog DB là authority; search index và Redis là derived acceleration layers.
+- Cart không giữ hàng; checkout reprice và revalidate.
+- Inventory reservation authoritative ngăn overselling.
+- Pending order trước payment giúp audit, idempotency và recovery.
+- Payment timeout tạo trạng thái `UNKNOWN/PENDING`, cần webhook và reconciliation.
+- Marketplace nhiều seller thường cần parent order và seller sub-orders.
+- Outbox nối durable transaction với event publishing.
+- Notification, indexing, analytics và fulfillment fan-out chạy async sau commit.
+- Queue consumer phải idempotent và có retry, DLQ, lag monitoring.
+- Cache outage làm chậm hệ thống nhưng không được làm mất business data.
+- Scale service theo workload riêng, không scale toàn bộ platform đồng đều.
+- Graceful degradation ưu tiên inventory/order/payment correctness trước search richness.
+- Managed infrastructure giảm toil, nhưng vẫn cần HA, backups, restore tests và observability.
+- Logical service boundaries có thể bắt đầu trong modular monolith ở quy mô hiện tại.
+
+#### Công thức ghi nhớ
+
+> **E-commerce final design = low-latency discovery projections + authoritative inventory reservations + idempotent order/payment state machines + durable Outbox events + independently scalable side effects + security, observability and graceful degradation end to end.**
+
+---
+
+## Phần 23. Design a Taxi Hailing App (aka Uber)
+
+### Bài 118. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần xây dựng
+
+Thiết kế một nền tảng gọi xe theo thời gian thực tương tự Uber, kết nối:
+
+- **Rider:** yêu cầu và theo dõi chuyến xe.
+- **Driver:** công bố trạng thái sẵn sàng, nhận chuyến và vận chuyển rider.
+- **Backend platform:** tìm tài xế, điều phối trạng thái chuyến, xử lý vị trí và thanh toán.
+- **External providers:** bản đồ/định tuyến, payment, push notification.
+
+Đây không chỉ là ứng dụng đặt xe. Nó là một distributed system có:
+
+- Rất nhiều location updates liên tục.
+- Kết nối real-time sống lâu.
+- Quyết định matching phải hoàn tất trong vài giây.
+- Tranh chấp đồng thời trên tài nguyên khan hiếm là tài xế.
+- Mobile network không ổn định và GPS có sai số.
+- Business workflow kéo dài từ vài phút đến hàng giờ.
+
+Bốn capability cốt lõi của MVP:
+
+1. Ghép rider với driver gần và phù hợp.
+2. Theo dõi vị trí và chuyến đi gần thời gian thực.
+3. Quản lý ride lifecycle nhất quán.
+4. Tính cước và thanh toán an toàn sau chuyến đi.
+
+---
+
+#### 2. Actors và mục tiêu
+
+| Actor | Mục tiêu | Điều quan trọng nhất |
+|---|---|---|
+| **Rider** | Tìm xe, biết ETA, theo dõi và thanh toán | Match nhanh, thông tin rõ, an toàn |
+| **Driver** | Nhận chuyến phù hợp và kiếm thu nhập | Request kịp thời, không gán trùng, navigation ổn định |
+| **Platform** | Điều phối marketplace hai phía | Correctness, utilization, availability, fraud control |
+| **Operations/Admin** | Hỗ trợ, giải quyết tranh chấp, giám sát | Audit trail và công cụ can thiệp |
+| **Map provider** | Geocoding, route, ETA/distance | Latency, quota, accuracy và cost |
+| **Payment provider** | Thu tiền và hỗ trợ refund | Idempotency, webhook, reconciliation |
+
+Rider và driver là hai phía của một marketplace. Thiếu driver làm ETA tăng; thiếu rider làm driver idle. Matching không chỉ là bài toán kỹ thuật mà còn phải cân bằng supply–demand.
+
+---
+
+#### 3. Functional requirements phía rider
+
+Rider có thể:
+
+- Đăng ký, đăng nhập và quản lý hồ sơ/phương thức thanh toán.
+- Nhập hoặc chọn điểm đón và điểm đến.
+- Xem ước tính giá/ETA trước khi yêu cầu chuyến.
+- Gửi yêu cầu ride.
+- Nhận thông tin driver/vehicle được gán.
+- Theo dõi driver đến điểm đón và theo dõi chuyến đi gần thời gian thực.
+- Xem trạng thái: đang tìm xe, đã gán, driver đang đến, đang di chuyển, hoàn thành/hủy.
+- Thanh toán điện tử trong ứng dụng.
+- Nhận receipt/trip history.
+
+Transcript tập trung vào booking → tracking → payment. Các tính năng như scheduled rides, multi-stop, shared rides, tipping, promotions và cash payment có thể để ngoài MVP.
+
+---
+
+#### 4. Functional requirements phía driver
+
+Driver có thể:
+
+- Đăng ký/đăng nhập; quy trình xác minh driver/vehicle có thể là back-office flow.
+- Chuyển `ONLINE/OFFLINE`.
+- Gửi location updates khi online hoặc đang có chuyến.
+- Nhận ride offer kèm pickup/ETA cơ bản.
+- Chấp nhận hoặc từ chối trong thời hạn nhất định.
+- Điều hướng đến điểm đón và điểm đến.
+- Cập nhật ride state: arrived, picked up, started, completed/cancelled.
+- Xem fare/earnings cơ bản.
+
+Mobile client cần xử lý reconnect, gửi lại có thứ tự tương đối và loại location update quá cũ. Không nên giả định kết nối luôn ổn định.
+
+---
+
+#### 5. Trách nhiệm của backend
+
+Backend phải:
+
+- Quản lý identity và quyền của rider/driver.
+- Tiếp nhận, xác thực và index vị trí driver.
+- Tìm nearby available drivers.
+- Chọn và gửi ride offer tới candidate drivers.
+- Bảo đảm một driver không được gán đồng thời cho hai ride.
+- Đồng bộ ride state cho rider, driver và operations.
+- Tính ETA/distance/fare với map provider và pricing rules.
+- Xử lý payment, webhook, refund và reconciliation.
+- Gửi push notification khi client không có real-time connection.
+- Ghi audit/event history để hỗ trợ dispute và điều tra.
+
+---
+
+#### 6. Happy path end-to-end
+
+```text
+Rider đặt pickup + destination
+  -> Platform ước tính giá và ETA
+  -> Rider gửi RideRequest
+  -> Matching tìm candidate drivers gần đó
+  -> Ride offer được gửi tới driver
+  -> Một driver accept thành công
+  -> Rider nhận assignment và theo dõi driver
+  -> Driver ARRIVED -> rider PICKED_UP -> trip IN_PROGRESS
+  -> Driver COMPLETED
+  -> Fare được chốt
+  -> Payment được xử lý/reconcile
+  -> Rider/driver nhận receipt và earnings update
+```
+
+Mỗi mũi tên có thể thất bại, timeout hoặc lặp. Thiết kế production phải định nghĩa hành vi cho các đường đi không hoàn hảo, không chỉ happy path.
+
+---
+
+#### 7. Ride state machine
+
+Một mô hình trạng thái khởi đầu:
+
+```text
+REQUESTED
+   -> SEARCHING
+       -> DRIVER_ASSIGNED
+           -> DRIVER_EN_ROUTE
+               -> DRIVER_ARRIVED
+                   -> IN_PROGRESS
+                       -> COMPLETED
+
+REQUESTED/SEARCHING/ASSIGNED/EN_ROUTE/ARRIVED
+   -> CANCELLED_BY_RIDER | CANCELLED_BY_DRIVER | EXPIRED | NO_DRIVER_FOUND
+```
+
+Các chuyển đổi cần guard:
+
+- Chỉ driver được gán mới có thể báo `ARRIVED/IN_PROGRESS/COMPLETED`.
+- Không thể `COMPLETED` trước `IN_PROGRESS`.
+- Ride đã terminal không quay lại active state.
+- Mỗi command/event có `rideId`, sequence/version và idempotency key.
+- Late/duplicate messages không được làm state regression.
+
+Payment có state machine riêng và không nên gộp vào ride state. Một ride có thể `COMPLETED` nhưng payment vẫn `PENDING/FAILED/UNKNOWN`.
+
+---
+
+#### 8. Business invariants quan trọng
+
+1. Một rider chỉ có tối đa một active ride trong phạm vi MVP.
+2. Một driver chỉ được assigned cho tối đa một active ride.
+3. Chỉ driver `ONLINE + AVAILABLE + fresh location` mới là candidate.
+4. Chỉ một driver thắng quá trình accept cho một ride.
+5. Ride state chỉ chuyển theo state machine hợp lệ.
+6. Fare cuối cùng được tính từ một pricing/versioned trip record có thể audit.
+7. Một logical payment không bị charge hai lần dù retry.
+8. Location update cũ không ghi đè vị trí mới hơn.
+
+Các invariant về assignment, ride state và payment cần strong/transactional consistency. Vị trí hiển thị có thể eventual.
+
+---
+
+#### 9. Matching là allocation, không chỉ nearest-neighbor search
+
+Tìm driver gần nhất chỉ tạo **candidate set**. Matching còn phải xem:
+
+- Driver có `AVAILABLE` và location đủ mới không?
+- Vehicle type có phù hợp yêu cầu không?
+- ETA theo đường đi thực tế thay vì khoảng cách đường thẳng.
+- Driver đã nhận offer/ride khác chưa?
+- Acceptance probability và time-to-pickup.
+- Policies về khu vực, safety và fairness.
+
+Hai rider có thể cùng thấy một driver là gần nhất. Do đó cần hai bước:
+
+```text
+Candidate discovery (nhanh, eventual)
+        -> Assignment claim/commit (atomic, authoritative)
+```
+
+Nearby index có thể hơi cũ, nhưng assignment authority phải ngăn double-booking bằng conditional update, lease hoặc transaction/version check.
+
+---
+
+#### 10. Location data model
+
+Một location update tối thiểu:
+
+```json
+{
+  "driverId": "drv_123",
+  "latitude": 10.776,
+  "longitude": 106.700,
+  "accuracyMeters": 12,
+  "heading": 85,
+  "speedMps": 8.4,
+  "deviceTimestamp": "...",
+  "sequence": 1842
+}
+```
+
+Phân biệt:
+
+- **Latest location:** phục vụ matching/live tracking, giá trị ngắn hạn, cập nhật nhiều.
+- **Trip location history:** mẫu vị trí cần lưu để route/audit/safety; có retention riêng.
+- **Raw telemetry:** có thể rất lớn, không nhất thiết giữ mãi hoặc giữ toàn bộ độ phân giải.
+
+Cần kiểm tra accuracy, timestamp/sequence, tốc độ bất thường và quyền gửi update. Device timestamp không hoàn toàn đáng tin; server nhận dữ liệu phải ghi thêm ingest time.
+
+---
+
+#### 11. Geospatial search
+
+Query cơ bản: tìm các driver `AVAILABLE` trong vùng quanh pickup.
+
+Có thể chia không gian thành cell bằng geohash, H3 hoặc S2:
+
+```text
+pickup -> cell C
+       -> query drivers trong C và các neighboring cells
+       -> filter stale/unavailable
+       -> rank theo ETA/distance
+```
+
+Nếu chưa đủ candidate, mở rộng vòng cell. Cách này tránh quét toàn bộ driver.
+
+Các vấn đề:
+
+- Cell quá lớn: nhiều candidate không liên quan.
+- Cell quá nhỏ: phải fan-out sang nhiều neighbor và driver di chuyển cell liên tục.
+- Ranh giới cell: driver rất gần có thể nằm ở cell kế bên.
+- Khoảng cách thẳng chỉ là bước lọc; ETA đường phố cần routing provider hoặc mô hình nội bộ.
+
+---
+
+#### 12. Non-functional requirements
+
+| Thuộc tính | Ý nghĩa đối với hệ thống |
+|---|---|
+| **Scalability** | Scale location ingestion, matching và connections độc lập |
+| **High availability** | Request/matching/active-trip functions hoạt động trong peak hoặc failure |
+| **Low latency** | Match và event delivery cảm giác gần tức thời |
+| **Consistency** | Assignment/payment mạnh; location/presence có thể eventual |
+| **Reliability** | Không mất ride state, phục hồi reconnect và xử lý duplicate |
+| **Security/privacy** | Bảo vệ PII, payment và dữ liệu vị trí nhạy cảm |
+| **Observability** | Theo dõi match funnel, stale location, stuck ride và provider health |
+
+Transcript chưa đưa SLO số cụ thể. Trong phỏng vấn cần hỏi, ví dụ:
+
+- Match p95/p99 phải dưới bao nhiêu giây?
+- Location update end-to-end delay chấp nhận bao nhiêu?
+- Availability mục tiêu của ride-request và active-trip path?
+- Bao lâu không có location thì driver bị xem là stale/offline?
+
+Không nên tự coi “real-time” là 0 ms; phải biến nó thành latency/freshness budget đo được.
+
+---
+
+#### 13. Consistency theo loại dữ liệu
+
+| Dữ liệu/quyết định | Mức consistency | Lý do |
+|---|---|---|
+| Driver latest location | Eventual/last-write-by-sequence | Cập nhật liên tục, stale ngắn có thể chấp nhận |
+| Driver online presence | Eventual với heartbeat/lease | Mất mạng cần hết hạn tự động |
+| Nearby candidate list | Eventual | Chỉ là danh sách ứng viên |
+| Driver assignment | Strong/atomic | Không double-book driver |
+| Ride state transition | Strong/versioned | Tránh state mâu thuẫn |
+| Fare estimate | Approximate/versioned quote | Traffic/route có thể thay đổi |
+| Final fare | Durable/auditable | Liên quan tiền và dispute |
+| Payment | Idempotent + reconciled | Không double-charge/mất giao dịch |
+
+Đây là ví dụ điển hình của việc một hệ thống không chọn “strong hoặc eventual” cho mọi thứ; consistency được chọn theo invariant.
+
+---
+
+#### 14. Security và privacy
+
+Dữ liệu vị trí tiết lộ hành vi nhạy cảm, nên cần:
+
+- TLS in transit và encryption at rest.
+- Least-privilege access; service nào không cần thì không đọc precise location.
+- Chỉ chia sẻ vị trí cần thiết giữa rider/driver trong thời gian ride phù hợp.
+- Retention và deletion policy cho trip/location history.
+- Không ghi precise coordinates tùy tiện vào application logs.
+- Authentication cho cả user lẫn device/session.
+- Chống fake GPS, account takeover và automated abuse ở mức phù hợp.
+- Tokenization/hosted payment UI để giảm payment-data scope.
+- Audit quyền truy cập dữ liệu nhạy cảm của support/admin.
+
+Safety features như masked phone number, emergency/SOS và trip sharing có thể chưa nằm trong MVP nhưng cần được hỏi vì có ảnh hưởng kiến trúc.
+
+---
+
+#### 15. Assumptions của MVP
+
+Transcript đưa ra:
+
+- Rider và driver dùng smartphone có GPS.
+- Ra mắt trong một thành phố/khu vực.
+- Dùng map/routing và payment provider bên ngoài.
+- Chỉ thanh toán kỹ thuật số, chưa xử lý tiền mặt.
+- WebSocket hoặc MQTT hỗ trợ cập nhật real-time.
+
+Cần điều chỉnh cách hiểu “external provider available and reliable”: đó chỉ là dependency kỳ vọng, không phải bảo đảm. Ngay trong transcript cũng thừa nhận provider có latency, rate limit và outage. Kiến trúc phải có timeout, circuit breaker, cache/fallback và reconciliation.
+
+Single-city MVP đơn giản hóa:
+
+- Time zone, currency và regulations.
+- Region partitioning và cross-region ride ownership.
+- Driver licensing và pricing policies.
+- Map/provider routing scope.
+
+Nhưng vẫn nên mang `cityId/regionId` vào partition key và policy model để có đường mở rộng.
+
+---
+
+#### 16. Constraints thực tế
+
+- Mobile connectivity chập chờn, disconnect/reconnect thường xuyên.
+- GPS noisy, delayed, out-of-order hoặc bị spoof.
+- Device bị giới hạn pin, CPU, data và background execution.
+- Driver có thể đột ngột offline sau khi nhận offer hoặc được assigned.
+- Map/payment provider có quota, latency và failure.
+- Peak demand không đồng đều theo thời gian/địa điểm.
+- Một điểm nóng như sân bay/sự kiện có thể tạo geospatial hot partition.
+- Người dùng mong đợi phản hồi nhanh kể cả khi backend đang xử lý trạng thái bất đồng bộ.
+
+Location frequency phải adaptive: đang offline/idle gửi thưa hơn; đang đến pickup hoặc in-trip gửi dày hơn, cân bằng freshness với pin và bandwidth.
+
+---
+
+#### 17. Các thách thức kỹ thuật chính
+
+##### 17.1 Location ingestion volume
+
+Mỗi driver gửi update vài giây một lần; tổng write rate có thể lớn hơn ride-request rate nhiều bậc. Pipeline phải hỗ trợ high-write throughput, loại update cũ và không ép mọi điểm vào transactional database chính.
+
+##### 17.2 Concurrent real-time connections
+
+Rider và driver cần nhận offer/state/location. Connection layer phải quản lý reconnect, heartbeat, backpressure và mapping `user/device -> connection/server`.
+
+##### 17.3 Low-latency geospatial discovery
+
+Không thể query toàn bộ driver. Cần spatial partition/index và candidate expansion.
+
+##### 17.4 Atomic assignment
+
+Candidate list có thể stale; commit assignment phải atomic để một driver không thắng hai ride.
+
+##### 17.5 Stale/missing location
+
+Driver có location cũ không nên tiếp tục được match. Dùng heartbeat/lease và freshness threshold thay vì giữ `ONLINE` vô hạn.
+
+##### 17.6 External dependency failure
+
+Map failure có thể làm ETA kém chính xác; payment timeout tạo trạng thái không chắc chắn. Cần degrade/retry phù hợp thay vì cascade toàn hệ thống.
+
+##### 17.7 Ride recovery
+
+App crash hoặc reconnect không được mất ride state. Client đọc lại snapshot authoritative rồi tiếp tục nhận events từ version/sequence phù hợp.
+
+---
+
+#### 18. Failure scenarios cần định nghĩa sớm
+
+| Scenario | Câu hỏi thiết kế |
+|---|---|
+| Driver accept nhưng ACK bị mất | Retry có tạo assignment thứ hai không? Driver lấy current assignment thế nào? |
+| Hai drivers cùng accept | Ai thắng và loser nhận phản hồi gì? |
+| Driver mất mạng sau assignment | Chờ bao lâu, rematch hay cho rider hủy? |
+| Rider mất mạng | Ride tiếp tục; client đồng bộ state ra sao khi reconnect? |
+| Location đến sai thứ tự | Dùng sequence/timestamp nào để từ chối stale write? |
+| Map provider timeout | Dùng cached route/rough distance hay trả retryable? |
+| Payment timeout sau trip | Ride vẫn completed; payment chuyển pending/unknown và reconcile |
+| WebSocket server hỏng | Client reconnect qua load balancer và lấy lại snapshot/subscription |
+| Matching backlog tăng | Admission control, timeout request và mở rộng candidate/worker thế nào? |
+
+---
+
+#### 19. Ngoài phạm vi MVP cần xác nhận
+
+- Scheduled rides và reservations trước giờ.
+- Carpool/shared rides, multi-stop và vehicle classes phức tạp.
+- Dynamic/surge pricing chi tiết.
+- Cash payment, wallet và driver payout/settlement.
+- Promotions, loyalty và subscription.
+- Driver onboarding/background check đầy đủ.
+- Ratings, fraud detection nâng cao và customer support tooling.
+- Safety/SOS, masked calling và trip sharing.
+- Multi-city/multi-country, multi-currency và regulatory compliance.
+- Route optimization tự xây thay vì dùng map provider.
+
+Ngoài phạm vi không có nghĩa là không quan trọng; nó giúp giữ case study tập trung và tránh thiết kế sai độ phức tạp.
+
+---
+
+#### 20. Câu hỏi cần làm rõ trong phỏng vấn
+
+1. Bao nhiêu registered/active riders và drivers?
+2. Peak ride requests/s và peak location updates/s?
+3. Driver gửi location mỗi bao lâu theo từng trạng thái?
+4. Bao nhiêu concurrent connections và active trips?
+5. Match latency SLO và location freshness SLO?
+6. Candidate radius, vehicle type và matching policy?
+7. Driver accept model: offer tuần tự, broadcast theo batch hay marketplace bid?
+8. Một rider/driver có được có nhiều active rides không?
+9. Cancellation/reassignment rules và fees?
+10. Fare estimate/final fare được tính theo distance, time, toll và surge thế nào?
+11. Payment timing: pre-authorize hay charge sau trip?
+12. Retention của precise location/trip history?
+13. Availability, RTO/RPO và single-city failure-domain assumptions?
+14. Có cần safety, masked communication hoặc regulatory audit trong MVP không?
+
+---
+
+#### 21. Cách trình bày bước 1
+
+Một trình tự tốt:
+
+1. Nêu actors và happy path rider–driver.
+2. Chốt functional requirements MVP.
+3. Vẽ ride state machine.
+4. Nêu invariants: unique driver assignment, valid transitions, idempotent payment.
+5. Chia dữ liệu thành location eventual và assignment/payment strong.
+6. Nêu SLO cần hỏi cho matching, tracking và availability.
+7. Liệt kê assumptions, constraints và out-of-scope.
+8. Chốt ba bottleneck sẽ định lượng ở bước sau: location writes, connections và matching hot spots.
+
+Một câu tóm tắt mạnh:
+
+> “Nearby-driver lookup có thể dựa trên location index eventually consistent, nhưng assignment phải được commit atomically tại authority để một driver không nhận hai ride. Ride state và payment cần version/idempotency; telemetry vị trí được tối ưu riêng cho high-write và freshness.”
+
+---
+
+#### 22. Ý chính cần nhớ
+
+- Taxi hailing là real-time, geospatial, two-sided marketplace và long-running workflow.
+- MVP gồm identity, ride request, matching, live tracking, ride lifecycle, fare và digital payment.
+- Candidate discovery và assignment commit là hai bước khác nhau.
+- Nearby location có thể eventual; driver assignment phải atomic.
+- Một driver chỉ có tối đa một active assignment.
+- Ride và payment là hai state machine riêng.
+- Location update cần timestamp/sequence, accuracy và ingest time.
+- Spatial cells giúp tìm nearby drivers mà không quét toàn bộ tập dữ liệu.
+- Heartbeat/lease giúp phát hiện driver stale/offline.
+- WebSocket/MQTT là cơ chế truyền, không tự giải quyết reconnect, ordering hay durability.
+- Mobile network, GPS và third-party provider đều không đáng tin tuyệt đối.
+- Single-city và digital-only payment giúp giới hạn MVP.
+- Location privacy, retention và least privilege là yêu cầu cốt lõi.
+- “Real-time” phải được chuyển thành latency/freshness SLO cụ thể.
+- Thiết kế phải xử lý duplicate, out-of-order, timeout và reconnect ngay từ đầu.
+
+#### Công thức ghi nhớ
+
+> **Taxi-hailing scope = high-rate location telemetry + geospatial candidate discovery + atomic driver assignment + versioned ride state + real-time delivery/reconnect + auditable fare/payment + mobile/provider failure handling.**
+
+---
+
+### Bài 119. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Baseline từ transcript
+
+| Thông số | Giá trị | Nhận xét |
+|---|---:|---|
+| Registered users | 10 triệu | Tổng accounts trong một metro city |
+| Daily active users | 1 triệu | 10% registered users |
+| Active drivers/day | 200.000 | Chưa rõ có nằm trong 1M DAU hay tính riêng |
+| Peak concurrent connections | 150.000 | Tổng rider + driver đang kết nối |
+| Ride requests/day | 500.000 | Request tìm chuyến, chưa chắc là completed rides |
+| Map tile views/hour | 1 triệu | Khoảng 278 views/s trung bình |
+| Payments/day | 100.000 | Khoảng 1,16 transactions/s trung bình |
+| Location updates/s theo transcript | 18 | Không nhất quán với 150K connections và update mỗi vài giây |
+
+Các số này là baseline để suy luận, không phải capacity plan hoàn chỉnh. Cần có peak factor, request mix, session/trip duration, update interval và retention mới ước lượng được hạ tầng.
+
+---
+
+#### 2. Registered, active và concurrent khác nhau
+
+- **10M registered users:** ảnh hưởng account/profile storage nhưng không trực tiếp quyết định traffic.
+- **1M DAU:** tổng user duy nhất hoạt động trong ngày.
+- **200K active drivers/day:** nguồn cung hoạt động trong ngày.
+- **150K peak concurrent connections:** quyết định socket capacity và real-time gateway scale.
+
+Tỷ lệ cơ bản:
+
+```text
+DAU / registered = 1M / 10M = 10%
+Active drivers / DAU = 200K / 1M = 20%  (nếu cùng mẫu số)
+Peak concurrent / DAU = 150K / 1M = 15%
+```
+
+Nếu 1M DAU chỉ nói về riders và 200K drivers là tập riêng, tổng daily active actors là 1,2M. Đây là assumption cần xác nhận trước khi tính location và connection traffic.
+
+---
+
+#### 3. Ride-request throughput
+
+```text
+500.000 ride requests/day
+÷ 86.400 seconds/day
+≈ 5,79 requests/s trung bình
+```
+
+Con số trung bình khoảng 6 RPS là đúng, nhưng không dùng nó để provision matching. Nhu cầu gọi xe tập trung vào rush hour, thời tiết xấu, sân bay và sự kiện.
+
+Ví dụ:
+
+| Peak factor | Peak ride requests/s |
+|---:|---:|
+| 5× average | ~29 RPS |
+| 10× average | ~58 RPS |
+| 20× average | ~116 RPS |
+
+Peak toàn thành phố vẫn có thể che giấu local burst. Một sân bay có thể nhận phần lớn request trong vài phút và gây hot cell dù global RPS còn thấp.
+
+---
+
+#### 4. Matching amplification
+
+Một ride request không tương đương một operation. Nó có thể gây:
+
+1. Query nhiều geospatial cells.
+2. Lọc driver stale/unavailable.
+3. Tính/rank ETA cho nhiều candidates.
+4. Gửi offer theo batch hoặc tuần tự.
+5. Nhận accept/reject/timeout.
+6. Thử vòng candidates tiếp theo nếu chưa match.
+7. Commit assignment và push kết quả.
+
+Nếu mỗi request gửi offer trung bình tới 10 drivers:
+
+```text
+Average: 5,79 × 10 ≈ 58 ride offers/s
+10× peak: 58 × 10 ≈ 580 ride offers/s
+```
+
+Nếu acceptance rate thấp hoặc fan-out là 20, traffic tăng tương ứng. Capacity phải tính theo **match attempts và offers**, không chỉ ride requests.
+
+Một số đo quan trọng:
+
+```text
+match amplification = candidate queries + ETA calls + offers + retries
+                      trên mỗi ride request
+```
+
+---
+
+#### 5. Bất nhất nghiêm trọng trong location-update estimate
+
+Transcript lấy location traffic bằng 3× ride-request rate:
+
+```text
+6 ride requests/s × 3 ≈ 18 location updates/s
+```
+
+Phép tính này không phù hợp với mô tả “riders và drivers gửi vị trí mỗi vài giây”. Location rate phải suy từ **số thiết bị đang phát vị trí và update interval**:
+
+```text
+location updates/s = concurrent location producers / update interval (seconds)
+```
+
+Nếu toàn bộ 150K connections phát vị trí:
+
+| Update interval | Location updates/s |
+|---:|---:|
+| 2 giây | 75.000 |
+| 5 giây | 30.000 |
+| 10 giây | 15.000 |
+| 30 giây | 5.000 |
+
+Ngay cả nếu chỉ 50K concurrent drivers gửi mỗi 5 giây:
+
+```text
+50.000 / 5 = 10.000 updates/s
+```
+
+Do đó, **18/s thấp hơn thực tế hàng trăm đến hàng nghìn lần**. Đây là điểm quan trọng nhất của Bài 119.
+
+---
+
+#### 6. Location frequency nên phụ thuộc trạng thái
+
+Không phải mọi thiết bị gửi cùng tần suất:
+
+| Trạng thái | Interval minh họa | Mục tiêu |
+|---|---:|---|
+| Driver offline | Không gửi | Tiết kiệm pin/data |
+| Driver online nhưng idle | 10–30 giây | Đủ freshness cho nearby discovery |
+| Driver đang đến pickup | 2–5 giây | ETA/live tracking tốt |
+| Trip đang diễn ra | 2–5 giây | Tracking, route, fare/safety |
+| Rider đang chờ | 5–10 giây hoặc theo event | Pickup coordination |
+
+Adaptive frequency giúp giảm bandwidth, pin và storage nhưng làm capacity estimation cần tách theo từng state cohort:
+
+```text
+total updates/s = Σ(concurrent devices in state i / interval i)
+```
+
+---
+
+#### 7. Location bandwidth
+
+Giả sử mỗi update sau protocol overhead chiếm khoảng 300 bytes:
+
+```text
+30.000 updates/s × 300 B
+= 9 MB/s ingress
+≈ 778 GB/day nếu duy trì cả ngày
+```
+
+Với payload/overhead 500 bytes:
+
+```text
+30.000 × 500 B = 15 MB/s
+≈ 1,296 TB/day
+```
+
+Đây chỉ là ingress. Nếu mỗi update được đẩy tới counterpart, ghi stream, history và analytics, tổng internal/network amplification còn cao hơn.
+
+Không nên lưu mọi raw update vĩnh viễn trong primary relational DB. Cần tách latest-location store, stream processing và lịch sử đã sampling/compress theo retention policy.
+
+---
+
+#### 8. Location storage theo chuyến
+
+Giả sử 100K completed rides/day, chuyến trung bình 20 phút và lưu một điểm mỗi 5 giây:
+
+```text
+20 phút × 60 / 5 = 240 points/ride
+100.000 rides × 240 = 24 triệu points/day
+```
+
+Nếu một record lưu trữ hiệu dụng 100–200 bytes:
+
+```text
+~2,4–4,8 GB/day raw logical data
+~0,88–1,75 TB/year trước replication/index/metadata
+```
+
+Nếu 500K ride requests thực ra đều là completed rides, số điểm và storage tăng 5 lần. Vì vậy phải phân biệt request, accepted, started và completed ride counts.
+
+Retention tier có thể là:
+
+- Latest position: vài phút/giờ.
+- High-resolution active-trip buffer: đến khi chuyến hoàn tất và pipeline bền hóa.
+- Sampled trip history: theo safety/dispute retention.
+- Aggregated analytics: giữ lâu hơn nhưng không cần precise coordinates.
+
+---
+
+#### 9. Concurrent connections
+
+150K concurrent connections là workload riêng, dù message rate thấp. Connection layer phải quản lý:
+
+- File descriptors/socket memory.
+- TLS và authentication.
+- Heartbeat/ping-pong.
+- Connection routing và presence mapping.
+- Reconnect storm.
+- Backpressure cho slow clients.
+- Rolling deployment mà không ngắt hàng loạt clients.
+
+Nên capacity test với headroom:
+
+```text
+2× headroom = 300K concurrent connections
+3× headroom = 450K concurrent connections
+```
+
+Không nên chia 150K cho số server theo giới hạn socket lý thuyết. Phải benchmark memory/CPU/bandwidth/message rate và giữ đủ capacity sau khi mất một AZ hoặc một nhóm gateway.
+
+---
+
+#### 10. Reconnect storm
+
+Nếu một real-time gateway/AZ gặp lỗi, hàng chục nghìn client có thể reconnect đồng thời. Ví dụ 50K clients reconnect trong 10 giây:
+
+```text
+50.000 / 10 = 5.000 connection attempts/s
+```
+
+Reconnect còn kéo theo token validation, subscription restore, ride snapshot fetch và presence update. Client cần exponential backoff + jitter; server cần admission control và fast snapshot recovery.
+
+Peak connection-establishment rate có thể nguy hiểm hơn steady-state connection count.
+
+---
+
+#### 11. Real-time fan-out
+
+Không phải mọi location update được broadcast cho toàn bộ users:
+
+- Trước match: rider chỉ cần nearby-driver representation đã aggregate/throttle.
+- Sau assignment: driver location chủ yếu gửi cho assigned rider và operations cần thiết.
+- Rider location gửi cho assigned driver khi cần pickup.
+- Ride-state event gửi cho rider, driver và một số downstream services.
+
+Nếu 30K location updates/s đều có một counterpart subscriber, đã có xấp xỉ 30K outbound updates/s, chưa kể protocol overhead. Nếu UI nearby map theo dõi nhiều drivers và push từng điểm thô, fan-out sẽ bùng nổ. Nên aggregate, sample hoặc chỉ gửi thay đổi có ý nghĩa.
+
+```text
+outbound events/s = inbound updates/s × average subscriber fan-out
+```
+
+---
+
+#### 12. Map traffic
+
+```text
+1.000.000 map tile views/hour
+÷ 3.600
+≈ 277,8 views/s trung bình
+
+24 giờ -> 24 triệu tile views/day
+```
+
+Cần làm rõ “tile view” là tile object request, map viewport load hay session-level event. Một viewport thường tải nhiều tiles, nên định nghĩa metric ảnh hưởng cost rất lớn.
+
+Map tiles thường đi trực tiếp từ map provider/CDN tới client, không nhất thiết đi qua backend. Backend vẫn gọi provider cho:
+
+- Geocoding/reverse geocoding.
+- Route/distance matrix.
+- ETA.
+- Map matching hoặc toll information.
+
+Các lời gọi backend này mới ảnh hưởng critical path, quota và cost. Không nên đánh đồng tile delivery với routing API calls.
+
+---
+
+#### 13. Map-provider call amplification
+
+Nếu mỗi ride request tính ETA cho 20 candidates bằng 20 API calls riêng:
+
+```text
+5,79 ride requests/s × 20
+≈ 116 ETA calls/s average
+```
+
+Ở peak 10× sẽ thành khoảng 1.160 calls/s, dễ chạm quota và chi phí cao. Các cách giảm:
+
+- Spatial filter bằng approximate distance trước.
+- Batch distance-matrix requests.
+- Cache route/ETA theo short-lived origin/destination cells.
+- Chỉ gọi precise ETA cho top K candidates.
+- Dùng internal approximation khi provider degraded.
+- Budget provider calls trên mỗi match.
+
+Map provider có thể là bottleneck tài chính trước khi là bottleneck kỹ thuật.
+
+---
+
+#### 14. Payment throughput và bất nhất funnel
+
+```text
+100.000 payments/day
+÷ 86.400
+≈ 1,16 payments/s trung bình
+```
+
+So với 500K ride requests/day:
+
+```text
+100K / 500K = 20%
+```
+
+Nếu MVP chỉ thanh toán số và mỗi completed ride tạo một payment, số liệu ngụ ý chỉ 20% requests tạo payment. Có thể do no-driver, cancellation hoặc request count/transaction count được định nghĩa khác. Cần xác nhận funnel:
+
+```text
+ride requested
+ -> matched
+ -> driver accepted
+ -> rider picked up
+ -> completed
+ -> payment attempted
+ -> payment settled
+```
+
+Payment average TPS thấp nhưng correctness quan trọng hơn throughput. Một logical payment có thể tạo nhiều interactions do retry, 3DS/redirect, webhook và reconciliation.
+
+---
+
+#### 15. Concurrent active rides
+
+Nếu 100K rides hoàn tất/ngày và duration trung bình 20 phút, phân bố đều:
+
+```text
+100.000 × 20 / 1.440
+≈ 1.389 active rides trung bình
+```
+
+Nếu 500K rides/day đều hoàn tất:
+
+```text
+500.000 × 20 / 1.440
+≈ 6.944 active rides trung bình
+```
+
+Peak active rides có thể nhiều lần average. Con số này quyết định:
+
+- Số location streams cần relay.
+- Active ride state working set.
+- Số subscriber pairs.
+- Fare/trip monitoring workload.
+
+Transcript chưa cho duration và completion rate nên chưa thể kết luận chính xác.
+
+---
+
+#### 16. Notification workload
+
+Một ride có thể tạo nhiều notification/event:
+
+- Ride offer tới nhiều candidate drivers.
+- Driver assigned.
+- Driver arriving/arrived.
+- Cancellation hoặc reassignment.
+- Trip completed và receipt.
+- Payment status.
+
+Push notification chỉ là fallback khi app không có active connection hoặc OS yêu cầu; không nên gửi push cho mọi location point. Notification capacity phải tính theo event amplification và peak ride funnel, không chỉ rides/day.
+
+---
+
+#### 17. Geospatial hot spots
+
+Driver và rider không phân bố đều. Sân bay, ga tàu, khu trung tâm và concert có thể tạo:
+
+- Một cell chứa rất nhiều driver updates.
+- Nhiều rider cùng query neighboring cells.
+- Assignment contention trên ít available drivers.
+- Map/ETA calls tăng mạnh.
+- Surge hoặc waiting-area business rules.
+
+Partition chỉ theo city chưa đủ. Cell key cần có khả năng split/subdivide, load-aware routing hoặc time bucketing. Một hot cell có thể cần dedicated capacity/admission control.
+
+---
+
+#### 18. Các bottleneck chính
+
+| Bottleneck | Vì sao xảy ra | Hậu quả | Hướng xử lý |
+|---|---|---|---|
+| Location ingestion | Hàng chục nghìn updates/s | Stale vị trí, lag matching | Partitioned stream, latest store, sequence dedupe |
+| Nearby search | Candidate pool và hot cells | Match latency tăng | H3/S2/geohash index, progressive radius |
+| Assignment race | Nhiều rides tranh một driver | Double-booking | Atomic claim/lease/versioned authority |
+| Real-time connections | 150K sockets + reconnect | Mất live update | Sharded gateways, backoff, snapshot recovery |
+| Fan-out | Một update có nhiều consumers | Bandwidth/CPU tăng | Targeted subscription, sampling, aggregation |
+| Map provider | Rate limit, latency, cost | Match/ETA chậm | Batch/cache/top-K/fallback/circuit breaker |
+| Payment provider | Timeout và webhook delay | Trạng thái mơ hồ | Idempotency, pending state, reconciliation |
+| Notification burst | Offers/status fan-out | Queue backlog | Priority queues, rate limit, provider failover |
+| Cross-service state | Event delay/out-of-order | UI không coherent | Versioned events, authoritative snapshot |
+| Cost | Map, egress, telemetry retention | Unit economics xấu | Per-ride cost budgets, sampling, lifecycle policies |
+
+---
+
+#### 19. Cross-service synchronization
+
+Không cần mọi service cập nhật cùng lúc. Cần phân loại:
+
+- **Assignment/Ride state:** authoritative, versioned và durable.
+- **Location/presence:** eventual, freshness-bound.
+- **ETA/nearby map:** derived, cacheable và degrade được.
+- **Notifications/analytics:** async và retryable.
+- **Payment:** state machine riêng, idempotent/reconciled.
+
+Client nên nhận event có `rideVersion`, nhưng khi phát hiện gap hoặc reconnect thì gọi API lấy ride snapshot authoritative. Không cố biến WebSocket stream thành database duy nhất.
+
+---
+
+#### 20. Cost model cần theo dõi
+
+Chi phí đơn vị có thể biểu diễn:
+
+```text
+cost per completed ride =
+  map/geocoding/ETA calls
+  + location ingest/stream/storage
+  + real-time egress
+  + compute/database/cache
+  + push/SMS
+  + payment fee
+  + observability retention
+```
+
+Metrics nên gồm:
+
+- Provider calls và cost per ride request/completed ride.
+- Bytes ingested/egressed per active trip.
+- Location points retained per trip.
+- Offers sent per successful match.
+- Compute seconds per match.
+- Payment interactions per settled payment.
+
+Scale hiệu quả nghĩa là chi phí trên mỗi completed ride không tăng mất kiểm soát khi traffic tăng.
+
+---
+
+#### 21. Headroom và failure capacity
+
+Capacity không chỉ đáp ứng peak bình thường. Nếu triển khai qua ba failure domains và phải chịu mất một domain, hai domain còn lại phải gánh peak.
+
+Ví dụ 150K peak connections:
+
+```text
+Normal across 3 zones: ~50K/zone
+Lose 1 zone: remaining zones must handle ~75K/zone
+```
+
+Cộng thêm reconnect surge và growth headroom. Tương tự, location stream và matching workers phải có spare capacity để drain backlog sau sự cố, không chỉ giữ kịp steady state.
+
+```text
+backlog drain time = backlog / (recovery throughput - new arrival rate)
+```
+
+Nếu recovery throughput không lớn hơn arrival rate, backlog không bao giờ hết.
+
+---
+
+#### 22. Load test cần thực hiện
+
+- 150K–450K concurrent sockets, heartbeat và targeted push.
+- Reconnect storm sau khi mất gateway/AZ.
+- 15K–75K location updates/s tùy update interval.
+- Out-of-order, duplicate và delayed GPS points.
+- Hot-cell burst tại sân bay/sự kiện.
+- Hai rides tranh cùng driver và nhiều drivers accept một ride.
+- Low acceptance khiến matching mở rộng nhiều vòng.
+- Map latency, rate-limit và full outage.
+- Payment timeout/webhook duplicate/out-of-order.
+- Queue lag và consumer recovery.
+- Slow client/backpressure.
+- Database/cache failover trong active trip.
+
+Test phải đo p50/p95/p99, error rate, freshness, match success, invariant violations và unit cost—not chỉ CPU.
+
+---
+
+#### 23. Những assumption còn thiếu
+
+1. 1M DAU có bao gồm 200K active drivers không?
+2. Tỷ lệ concurrent rider/driver trong 150K là bao nhiêu?
+3. Update interval theo từng ride/driver state?
+4. Average và p95 trip duration?
+5. 500K là request, accepted, started hay completed rides?
+6. Vì sao chỉ có 100K payments nếu mọi payment đều digital?
+7. Peak-to-average factor và peak window?
+8. Candidate batch size, acceptance rate và retry rounds?
+9. Bao nhiêu map/ETA calls cho một match?
+10. Location payload size, history sampling và retention?
+11. SLO cho matching, location freshness và connection delivery?
+12. Growth target trong 1–3 năm và failure headroom?
+
+---
+
+#### 24. Cách trình bày trong phỏng vấn
+
+Một trình tự tốt:
+
+1. Ghi nguyên baseline từ đề.
+2. Chuyển rides/day và payments/day thành average RPS.
+3. Áp peak factor thay vì provision theo average.
+4. Tính matching amplification theo candidates/offers/retries.
+5. Tính location rate từ concurrent producers ÷ interval.
+6. Tính connection capacity và reconnect storm.
+7. Ước lượng location bandwidth/storage theo retention.
+8. Tách map tiles khỏi backend routing/ETA API calls.
+9. Kiểm tra funnel inconsistency 500K requests và 100K payments.
+10. Xác định hot-cell, assignment race và third-party bottlenecks.
+11. Nêu cost per completed ride và failure headroom.
+
+Một câu trả lời mạnh:
+
+> “Ride requests trung bình chỉ khoảng 5,8/s, nhưng đó không phải workload chi phối. Với 150.000 thiết bị cùng gửi vị trí mỗi 5 giây, location ingress có thể đạt 30.000 updates/s; matching còn khuếch đại mỗi request thành nhiều candidate queries, ETA calls và ride offers. Tôi sẽ capacity-plan theo peak cục bộ ở hot cell, không theo average toàn thành phố.”
+
+---
+
+#### 25. Ý chính cần nhớ
+
+- 10M registered, 1M DAU, 200K active drivers và 150K peak connections là baseline.
+- 500K ride requests/day tương ứng khoảng 5,79/s average, không phải peak capacity.
+- 10× peak giả định tạo khoảng 58 ride requests/s.
+- Matching khuếch đại một request thành nhiều queries, ETA calls, offers và retries.
+- Location rate phải tính bằng concurrent producers ÷ update interval.
+- 150K devices gửi mỗi 5 giây tạo 30K updates/s, không phải 18/s.
+- 30K updates/s ở 300 bytes tạo khoảng 9 MB/s hay 778 GB/day ingress nếu duy trì.
+- Adaptive update frequency cân bằng freshness, pin, bandwidth và cost.
+- 150K sockets cần headroom, failure capacity và reconnect-storm testing.
+- Map tiles và backend route/ETA calls là các workload khác nhau.
+- 1M tile views/hour tương ứng khoảng 278/s average và 24M/day.
+- 100K payments/day tương ứng 1,16/s và chỉ 20% của 500K requests; cần làm rõ funnel.
+- Geospatial hot cell quan trọng hơn global average load.
+- Assignment bottleneck là contention/correctness, không chỉ compute throughput.
+- Targeted fan-out và sampling tránh broadcast từng raw location update.
+- Cost phải đo trên mỗi completed ride.
+- Capacity cần chịu mất failure domain và có throughput dư để drain backlog.
+
+#### Công thức ghi nhớ
+
+> **Taxi-hailing scale = ride-request peaks × matching amplification + concurrent producers ÷ location interval + concurrent sockets/reconnects + targeted fan-out + map/payment interactions + geospatial skew; design for hot cells and failure headroom, not citywide averages.**
+
+---
+
+### Bài 120. High-Level Design: Services, APIs & Communication
+
+#### 1. Mục tiêu của thiết kế cấp cao
+
+Chia hệ thống theo capability và đặc điểm workload:
+
+- Location ingestion có write rate cực lớn.
+- Matching cần geospatial lookup và quyết định trong vài giây.
+- Assignment/ride state cần consistency mạnh.
+- Realtime delivery cần duy trì hàng trăm nghìn connections.
+- Payment cần idempotency, audit và reconciliation.
+
+Các ranh giới này có thể là logical modules trước khi trở thành microservices vật lý. Tuy nhiên, Location và Realtime Gateway là những ứng viên tách sớm vì workload khác biệt rõ rệt so với transactional APIs.
+
+---
+
+#### 2. Các thành phần cốt lõi
+
+| Thành phần | Trách nhiệm | Dữ liệu/authority |
+|---|---|---|
+| **Identity/User Service** | Rider account, authentication, profile | User/profile authority |
+| **Driver Service** | Driver onboarding, vehicle, eligibility | Driver/vehicle authority |
+| **Availability/Presence Service** | Online/offline, heartbeat, availability lease | Driver presence/availability |
+| **Location Service** | Ingest, validate và giữ latest locations | Latest-location working set |
+| **Geospatial Index** | Driver IDs theo spatial cell | Derived, freshness-bound index |
+| **Matching Service** | Candidate discovery, ranking và offer strategy | Matching attempt state |
+| **Assignment Authority** | Atomic claim driver ↔ ride | Unique active assignment |
+| **Trip/Ride Service** | Ride aggregate, state machine, lifecycle | Authoritative ride state/history |
+| **Realtime Gateway** | WebSocket/MQTT connections, targeted push | Ephemeral connection registry |
+| **Pricing/Fare Service** | Estimate và final fare theo versioned rules | Pricing rules/quotes |
+| **Payment Service** | Payment intent, provider, refund, reconcile | Payment state/reference |
+| **Notification Service** | Push/SMS/email fallback | Delivery attempts/preferences |
+| **Map Adapter** | Geocoding, route, distance, ETA | Provider abstraction/cache |
+| **Event Broker** | Event distribution và workload decoupling | Durable event stream/queue |
+
+Transcript gộp online/offline vào Driver Service. Về logic vẫn đúng, nhưng ở quy mô 150K concurrent connections và heartbeat liên tục, **driver profile** và **driver presence** nên được xem là hai workload khác nhau.
+
+---
+
+#### 3. Logical architecture
+
+```text
+Rider App             Driver App
+    |                      |
+    +------ API Gateway ---+
+    |                      |
+    +--- Realtime Gateway -+
+              |
+      Connection Registry
+
+API Gateway
+  +-> Identity/User
+  +-> Driver
+  +-> Trip/Ride Authority <------> Assignment Authority
+  +-> Matching ------------------> Location/Geo Index
+  +-> Pricing/Fare --------------> Map Adapter -> Map Provider
+  +-> Payment -------------------------------> Payment Provider
+
+Driver location stream
+  -> Location Ingestion
+  -> Partitioned Event Stream
+       +-> Latest-location store / Geo Index
+       +-> Active-trip relay -> Realtime Gateway -> assigned rider
+       +-> Sampled trip history
+       +-> Analytics/safety pipeline
+
+Trip/Payment commits
+  -> Transactional Outbox -> Event Broker
+       +-> Realtime delivery
+       +-> Push Notification fallback
+       +-> Analytics/Audit
+       +-> Driver earnings/receipt
+```
+
+REST/gRPC, event messaging và persistent realtime connections cùng tồn tại vì giải quyết các yêu cầu khác nhau.
+
+---
+
+#### 4. Data ownership và consistency
+
+| Data | Owner | Consistency |
+|---|---|---|
+| Rider/driver profile | Identity/Driver Service | Strong cho account changes |
+| Driver online presence | Presence Service | Lease-based/eventual |
+| Latest GPS location | Location Service | Last accepted by sequence/freshness |
+| Spatial cell membership | Geo Index | Eventual và rebuildable |
+| Match attempt/offers | Matching Service | Versioned/TTL |
+| Driver assignment | Assignment/Trip authority | Atomic/strong |
+| Ride lifecycle | Trip Service | Strong, versioned state machine |
+| Fare quote/rule version | Pricing Service | Durable/versioned |
+| Payment | Payment Service | Idempotent/reconciled |
+| Client connection | Realtime Gateway | Ephemeral; rebuild on reconnect |
+
+Không cho service khác cập nhật trực tiếp database nội bộ. Dữ liệu derived như geo index và analytics nhận event; dữ liệu quyết định correctness như assignment và ride transition đi qua authority.
+
+---
+
+#### 5. External API tiêu biểu
+
+```http
+POST /v1/auth/login
+GET  /v1/users/me
+
+POST /v1/drivers/me/availability
+POST /v1/drivers/me/locations
+
+POST /v1/fare-estimates
+POST /v1/rides
+GET  /v1/rides/{rideId}
+POST /v1/rides/{rideId}/cancel
+
+POST /v1/ride-offers/{offerId}/accept
+POST /v1/ride-offers/{offerId}/reject
+
+POST /v1/rides/{rideId}/arrive
+POST /v1/rides/{rideId}/start
+POST /v1/rides/{rideId}/complete
+
+GET  /v1/payments/{paymentId}
+POST /v1/payments/provider-webhooks
+```
+
+Các command quan trọng nhận `Idempotency-Key`. API trả ride/payment state rõ ràng và current `version` để client xử lý retry/reconnect.
+
+Location throughput cao có thể dùng persistent/binary stream thay vì một HTTP request đầy đủ cho từng điểm. Tuy nhiên protocol choice không thay đổi validation, sequencing và authentication requirements.
+
+---
+
+#### 6. Tạo ride request
+
+```text
+Rider -> API Gateway -> Trip Service
+  1. Authenticate rider
+  2. Validate pickup/destination và active-ride invariant
+  3. Lấy fare estimate/quote version nếu cần
+  4. Tạo Ride = SEARCHING + request idempotency record
+  5. Commit ride + outbox MatchRequested
+  6. Trả rideId/state cho rider
+```
+
+Không cần giữ HTTP request mở cho đến khi có driver. Có thể trả `202 Accepted` với `rideId`, rồi cập nhật matching qua WebSocket/push/poll. Điều này tránh long synchronous request và cho phép workflow chịu retry tốt hơn.
+
+---
+
+#### 7. Candidate discovery
+
+Matching Service nhận `MatchRequested` và:
+
+1. Chuyển pickup thành H3/S2/geohash cell.
+2. Query cell hiện tại và neighboring cells.
+3. Lọc driver `ONLINE + AVAILABLE` có location đủ mới.
+4. Lọc vehicle type, policy, exclusion và eligibility.
+5. Rank sơ bộ bằng khoảng cách.
+6. Chỉ gọi precise ETA cho top K candidates.
+7. Tạo offer batch/round có TTL.
+
+```text
+pickup cell
+ -> candidate IDs from geo index
+ -> join presence/freshness
+ -> approximate ranking
+ -> top K route ETA
+ -> offer round
+```
+
+Candidate set là dữ liệu eventual. Driver có thể rời cell hoặc nhận ride ngay sau query; vì vậy discovery không được coi là assignment commit.
+
+---
+
+#### 8. Ride-offer strategy
+
+Hai lựa chọn phổ biến:
+
+| Strategy | Ưu điểm | Nhược điểm |
+|---|---|---|
+| **Sequential offer** | Ít spam driver, kiểm soát tốt | Match chậm khi driver từ chối/timeout |
+| **Small-batch offer** | Giảm time-to-match | Nhiều driver accept cùng lúc; cần chọn một winner |
+| **Large broadcast** | Nhanh ở supply thấp | Notification storm, trải nghiệm/fairness kém |
+
+MVP có thể dùng small-batch với offer TTL ngắn. Matching attempt cần:
+
+- `matchId`, `rideId`, round number.
+- Candidate list/rank.
+- Offer expiry.
+- Acceptance records.
+- Max rounds/radius và overall match deadline.
+
+Nếu không ai accept, mở rộng radius hoặc tạo round tiếp theo. Hết deadline thì ride chuyển `NO_DRIVER_FOUND` hoặc đề nghị rider tiếp tục chờ.
+
+---
+
+#### 9. Atomic assignment
+
+Khi driver accept:
+
+```text
+Driver -> Realtime/API -> Matching/Trip Authority
+  -> validate offer not expired
+  -> atomic claim:
+       driver.status == AVAILABLE
+       ride.status == SEARCHING
+  -> set driver ASSIGNED and ride DRIVER_ASSIGNED
+  -> commit assignment + outbox
+```
+
+Có thể triển khai bằng transaction/conditional write:
+
+```sql
+UPDATE driver_assignment
+SET active_ride_id = :ride_id,
+    version = version + 1
+WHERE driver_id = :driver_id
+  AND active_ride_id IS NULL
+  AND availability_lease_expires_at > NOW();
+```
+
+Sau đó commit ride state trong cùng authority/transaction nếu cùng store, hoặc dùng orchestrated workflow với reservation/compensation nếu tách store. Loser accept nhận `409 Offer no longer available`, không được tạo assignment khác.
+
+**Exactly one winner** là business effect cần đạt bằng constraint/idempotency; không nên dựa vào “message broker exactly once”.
+
+---
+
+#### 10. Trip Service là workflow authority
+
+Transcript nói không service nào sở hữu toàn bộ workflow. Về collaboration thì đúng, nhưng phải có một authority chịu trách nhiệm cho ride aggregate:
+
+- Current ride state và allowed transitions.
+- Assigned rider/driver.
+- Pickup/destination snapshot.
+- State version và timestamps.
+- Cancellation actor/reason.
+- Fare quote/pricing version reference.
+- Links tới payment và trip-location history.
+
+Trip Service không làm mọi công việc, nhưng nó quyết định transition nào hợp lệ. Nếu không có owner rõ ràng, rider và driver có thể thấy các trạng thái mâu thuẫn.
+
+---
+
+#### 11. Ride state commands và events
+
+Command có chủ đích và có thể bị từ chối:
+
+```text
+AcceptRideOffer
+MarkDriverArrived
+StartRide
+CompleteRide
+CancelRide
+```
+
+Event là sự kiện đã xảy ra sau durable commit:
+
+```text
+DriverAssigned
+DriverArrived
+RideStarted
+RideCompleted
+RideCancelled
+```
+
+Không dùng event như một command mơ hồ. Ví dụ mobile app gửi `StartRide` tới Trip Service; service kiểm tra assigned driver/current version rồi commit và mới phát `RideStarted`.
+
+Event nên có `eventId`, `rideId`, `rideVersion`, `occurredAt`, `actorId`, schema version và correlation ID.
+
+---
+
+#### 12. Location ingestion pipeline
+
+Thiết kế cho kịch bản thực tế 15K–75K updates/s, không phải 18/s:
+
+```text
+Driver Device
+  -> Location Gateway/Ingestion
+       authenticate device/driver
+       validate coordinates/accuracy
+       reject stale sequence
+       attach server ingest time
+  -> Partitioned Stream (key = driverId)
+       +-> Latest Location Consumer
+       |     -> Geo Index + latest store
+       +-> Active Trip Relay
+       |     -> Realtime Gateway -> rider
+       +-> History Sampler
+       |     -> durable trip history/object/time-series store
+       +-> Analytics/Safety
+```
+
+Partition theo `driverId` giúp giữ thứ tự tương đối cho từng driver. Không cần global ordering giữa mọi driver.
+
+Ingestion path cần backpressure và overload behavior: ưu tiên điểm mới, coalesce/drop intermediate points nếu consumer chậm, nhưng không làm mất authoritative ride-state events.
+
+---
+
+#### 13. Latest location và geo index
+
+Latest-location record có thể gồm:
+
+```text
+driverId -> lat/lon, cellId, sequence, deviceTime,
+            ingestTime, accuracy, heading, speed, TTL
+```
+
+Khi driver di chuyển cell:
+
+```text
+remove driverId from old cell
+add driverId to new cell
+update latest record
+```
+
+Thao tác có thể eventual; matching luôn kiểm tra freshness và availability trước khi offer. Geo index hỏng/mất có thể rebuild từ latest-location stream/store.
+
+Presence lease hết hạn khi không có heartbeat/location trong thời gian quy định; driver không còn là candidate dù profile vẫn tồn tại.
+
+---
+
+#### 14. Realtime delivery layer
+
+Realtime Gateway quản lý WebSocket hoặc MQTT connections:
+
+```text
+userId/deviceId
+ -> gateway shard/connectionId
+ -> subscribed rideId/topics
+ -> last acknowledged sequence/version
+```
+
+Delivery flow:
+
+```text
+Domain event/location relay
+ -> Pub/Sub routing
+ -> correct gateway shard
+ -> client connection
+```
+
+Quan trọng:
+
+- Broker nội bộ không đồng nghĩa client đã nhận event.
+- Socket write thành công cũng không chắc UI đã xử lý.
+- Critical state cần durable snapshot/API; realtime event chỉ giúp giảm latency.
+- Client gửi ACK hoặc version, phát hiện gap thì refetch snapshot.
+- Slow clients cần bounded buffer và coalescing/drop location frames cũ.
+- Ride state events quan trọng hơn transient intermediate location points.
+
+---
+
+#### 15. WebSocket hay MQTT?
+
+| Tiêu chí | WebSocket | MQTT |
+|---|---|---|
+| Mô hình | Bidirectional socket | Publish/subscribe protocol |
+| Browser support | Native | Thường qua WebSocket/library |
+| Mobile/IoT efficiency | Tốt | Rất tốt, header nhỏ và QoS options |
+| Server ecosystem | Phổ biến | Cần MQTT broker/topic design |
+| Phù hợp | App realtime tổng quát | Telemetry/presence với pub-sub semantics |
+
+Có thể dùng WebSocket cho rider/driver UI và một binary/WebSocket/MQTT channel cho location telemetry. Không nhất thiết chọn một protocol cho mọi luồng.
+
+MQTT QoS không thay thế business idempotency; WebSocket cũng không cung cấp durable replay mặc định.
+
+---
+
+#### 16. Polling fallback và reconnect
+
+Khi persistent connection mất:
+
+1. Client chuyển UI sang trạng thái reconnecting.
+2. Retry bằng exponential backoff + jitter.
+3. Push notification có thể báo event quan trọng khi app background/offline.
+4. Sau reconnect, client gọi `GET /rides/{rideId}` lấy snapshot/version.
+5. Tiếp tục subscribe từ trạng thái mới.
+
+Polling fallback cần interval và backoff hợp lý. Nếu 150K clients cùng poll mỗi giây khi WebSocket layer lỗi, backend bị thundering herd. Polling nên là degraded mode có rate limit và ưu tiên active trips.
+
+---
+
+#### 17. Notification Service so với Realtime Gateway
+
+Không nên đưa mọi live update qua Notification Service:
+
+- **Realtime Gateway:** ride offer khi app active, live location, ride-state event.
+- **Notification Service:** mobile push khi app background/offline, SMS/email/receipt, retry provider delivery.
+
+Ride offer có TTL rất ngắn. Khi push notification đến trễ, driver app phải kiểm tra offer còn hợp lệ trước khi cho accept. Notification không tạo authority.
+
+---
+
+#### 18. Fare và map integration
+
+Pricing/Fare Service dùng:
+
+- Route distance và duration.
+- Base fare, time/distance rates.
+- Surge/demand multiplier nếu nằm trong scope.
+- Toll, fee, tax và cancellation rule.
+- Versioned pricing policy.
+
+Map Adapter cô lập provider:
+
+```text
+Pricing/Matching -> Map Adapter -> primary provider
+                                 -> cache/batch
+                                 -> fallback/approximation
+```
+
+Matching chỉ gọi precise ETA cho top K candidates để giảm provider amplification. Fare estimate là quote có version/expiry; final fare dựa trên trip facts và versioned rules, có audit trail.
+
+Map timeout không nên làm mất ride state. Có thể dùng straight-line/last-known/cached route để degrade một số UI, nhưng safety/correctness policy phải rõ.
+
+---
+
+#### 19. Payment flow
+
+Khi `RideCompleted` được commit:
+
+```text
+Trip Service -> outbox RideCompleted
+ -> Fare Service chốt final fare
+ -> Payment Service tạo/confirm payment [idempotency]
+ -> External Provider
+ <- synchronous result hoặc signed webhook
+ -> Payment state update + reconciliation
+ -> receipt/driver earnings events
+```
+
+Ride completion không nên rollback chỉ vì provider timeout. Payment chuyển `PENDING/UNKNOWN`, user nhận trạng thái phù hợp và reconciliation tiếp tục. Không retry charge mù quáng.
+
+Nếu business yêu cầu giảm rủi ro, có thể pre-authorize trước chuyến và capture sau khi hoàn thành; đây là requirement cần xác nhận.
+
+---
+
+#### 20. Synchronous và asynchronous communication
+
+| Interaction | Pattern đề xuất | Lý do |
+|---|---|---|
+| Client command/query | REST/GraphQL qua gateway | Contract đơn giản cho mobile |
+| Internal immediate query | gRPC/HTTP với deadline | Cần kết quả trước bước tiếp theo |
+| Ride/location events | Broker/pub-sub | Decouple, buffer và fan-out |
+| Live client updates | WebSocket/MQTT | Low-latency server push |
+| Offline alerts | Push notification | Client không có active socket |
+| Recovery | REST snapshot + version | Durable truth sau reconnect/gap |
+
+Không nên tạo chuỗi gRPC synchronous dài Matching → Location → Driver → Map → Notification. Mỗi hop tăng latency và failure coupling. Dùng local/derived views cho hot path, đặt deadline và đưa side effects ra event.
+
+---
+
+#### 21. Transactional Outbox và idempotency
+
+Trip Service phải commit ride state và outbox event trong cùng local transaction:
+
+```text
+BEGIN
+  validate expected ride version
+  update ride state/version
+  insert outbox event
+COMMIT
+```
+
+Outbox relay publish event ít nhất một lần. Consumer dùng `eventId` hoặc `(rideId, rideVersion, consumer)` để dedupe.
+
+Các thao tác cần idempotency:
+
+- `POST /rides` để client retry không tạo nhiều rides.
+- Accept offer để duplicate packet không gây state khác.
+- Start/complete/cancel commands.
+- Fare finalization.
+- Payment create/capture/refund.
+- Notification delivery nếu provider callback/retry lặp.
+
+---
+
+#### 22. API Gateway responsibilities và giới hạn
+
+Gateway xử lý:
+
+- TLS, authentication, route/version.
+- Rate limit/quota theo user, driver, device và endpoint.
+- Request validation cơ bản.
+- Correlation ID, metrics và protection.
+- Response aggregation cho read-only composite views nếu hợp lý.
+
+Gateway không nên:
+
+- Chứa matching algorithm hay ride state machine.
+- Là source of truth cho presence/assignment.
+- Aggregate nhiều service đồng bộ trên critical path không giới hạn.
+- Thay domain authorization; Trip Service vẫn xác nhận assigned driver/rider.
+
+GraphQL hữu ích cho composite read UI nhưng mutation critical vẫn cần idempotency và domain command semantics rõ ràng.
+
+---
+
+#### 23. Failure handling
+
+| Failure | Hành vi |
+|---|---|
+| Location point trễ/out-of-order | Bỏ qua theo sequence/freshness |
+| Geo index stale | Recheck presence/availability trước offer/claim |
+| Driver accept ACK mất | Retry cùng idempotency key; đọc current assignment |
+| Hai drivers accept | Atomic assignment chọn một winner |
+| Driver disconnect sau assigned | Lease/grace period, alert rider, cancel/rematch policy |
+| Realtime gateway chết | Reconnect + ride snapshot recovery |
+| Map provider timeout | Cache/batch/fallback approximation; circuit breaker |
+| Broker lag | Authority vẫn giữ state; monitor và drain backlog |
+| Push provider lỗi | Retry/fallback; không thay đổi ride authority |
+| Payment timeout | `PENDING/UNKNOWN`; webhook/reconcile |
+
+Mỗi operation cần deadline và retry budget. Retry chỉ an toàn khi command idempotent.
+
+---
+
+#### 24. Scaling boundaries
+
+- **Location ingestion:** scale theo updates/s; partition theo driverId/city/cell strategy.
+- **Geo index:** scale theo cell và handle hot-cell subdivision.
+- **Matching workers:** scale theo ride requests, candidate rounds và ETA budgets.
+- **Realtime gateways:** scale theo concurrent sockets, message rate và reconnect rate.
+- **Trip Service:** scale theo commands/events nhưng giữ atomic authority.
+- **Notification workers:** scale theo queue depth/provider quota.
+- **Payment workers:** scale theo transactions và reconciliation backlog.
+
+Không scale mọi service đồng đều. 30K location updates/s có thể cần hàng chục workers trong khi payment chỉ khoảng 1,16/s average.
+
+---
+
+#### 25. Observability
+
+Trace/correlation chain:
+
+```text
+rideRequestId -> matchId -> offerId -> assignmentId
+              -> rideId/version -> fareId -> paymentId -> eventId
+```
+
+Metrics quan trọng:
+
+- Location ingest rate, drop/reorder rate và freshness p95/p99.
+- Geo-index update lag và hot-cell size.
+- Candidate count, offer rounds, acceptance và time-to-match.
+- Assignment conflict/double-book prevention.
+- Concurrent sockets, reconnect attempts, slow-client drops.
+- Realtime delivery latency và snapshot refetch rate.
+- Ride state transition errors và stuck rides.
+- Map calls/cost/latency per match.
+- Payment pending/unknown và reconciliation age.
+- Queue lag/DLQ và notification provider errors.
+
+SLO nên đo theo user journey: request-to-assignment, driver-location-to-rider-screen và complete-to-receipt—not chỉ latency từng service.
+
+---
+
+#### 26. Những điều cần sửa/làm rõ so với transcript
+
+1. **Không mặc định mọi boundary phải là microservice deployment.** Logical separation có thể đi trước physical split.
+2. **Driver profile và online presence có workload khác nhau.** Presence cần heartbeat/lease và scale cao.
+3. **Matching không được chỉ đọc location rồi “assign”.** Candidate discovery eventual; assignment commit atomic.
+4. **Notification Service không nên vận chuyển mọi live update.** Realtime Gateway lo active connections; notification là offline/fallback channel.
+5. **Trip Service vẫn phải sở hữu ride workflow.** Nhiều service cộng tác nhưng cần một state authority.
+6. **Pub/Sub không tự giữ client đồng bộ hoàn hảo.** Client cần version, ACK/gap detection và snapshot recovery.
+7. **Polling fallback có thể gây thundering herd.** Phải backoff, rate limit và ưu tiên active rides.
+8. **Payment sau ride có thể bất đồng bộ.** Provider timeout không đồng nghĩa payment failure.
+9. **Thiết kế Location Service theo hàng chục nghìn updates/s**, không dùng estimate 18/s của transcript.
+
+---
+
+#### 27. Cách trình bày trong phỏng vấn
+
+1. Vẽ rider/driver, API Gateway và Realtime Gateway riêng.
+2. Tách Driver Profile, Presence, Location và Geo Index.
+3. Đi qua request → candidate discovery → offer rounds → atomic assignment.
+4. Nêu Trip Service là versioned ride authority.
+5. Vẽ location stream tới latest store, rider relay và sampled history.
+6. Giải thích REST/gRPC, broker và WebSocket/MQTT giải quyết ba lớp khác nhau.
+7. Nêu reconnect snapshot, idempotency và Outbox.
+8. Đi qua complete ride → fare → payment pending/webhook/reconcile.
+9. Kết thúc bằng scaling boundary, hot cell và failure behavior.
+
+Một câu trả lời mạnh:
+
+> “Tôi tách data plane vị trí khỏi control plane chuyến xe: location stream và geo index tối ưu throughput/freshness, còn Trip/Assignment authority dùng versioned atomic transitions. Realtime socket chỉ vận chuyển event; sau reconnect, client luôn phục hồi từ ride snapshot bền vững.”
+
+---
+
+#### 28. Ý chính cần nhớ
+
+- Tách services theo capability và workload, không phải để có càng nhiều microservices càng tốt.
+- Driver profile, presence, location và assignment là bốn trách nhiệm khác nhau.
+- Location pipeline phải chịu 15K–75K updates/s theo assumptions thực tế.
+- Spatial index là projection có thể stale/rebuild; matching phải recheck freshness.
+- Candidate discovery không phải assignment commit.
+- Offer strategy đánh đổi time-to-match với notification/accept contention.
+- Assignment authority bảo đảm đúng một winner bằng atomic claim.
+- Trip Service sở hữu ride aggregate và state machine.
+- Commands được kiểm tra; events chỉ phát sau durable commit.
+- Realtime Gateway và Notification Service phục vụ các kênh khác nhau.
+- WebSocket/MQTT không thay thế durable snapshot và idempotency.
+- Client reconnect bằng backoff, sau đó lấy ride snapshot/version.
+- Location events có thể coalesce/drop điểm trung gian; ride-state event quan trọng hơn.
+- Map Adapter giảm coupling với provider và kiểm soát call budget.
+- Ride hoàn tất không rollback khi payment timeout; Payment Service reconcile riêng.
+- Outbox tránh mất event sau state commit; consumer phải idempotent.
+- Scale location, matching, sockets và payment độc lập theo workload.
+- SLO phải theo hành trình user end-to-end.
+
+#### Công thức ghi nhớ
+
+> **Taxi-hailing HLD = high-throughput location data plane + freshness-bound geo index + iterative matching/offers + atomic assignment control plane + authoritative ride state + realtime delivery with snapshot recovery + idempotent fare/payment workflows.**
+
+---
+
+### Bài 121. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc ra quyết định
+
+Không chọn công nghệ vì phổ biến. Với mỗi thành phần cần hỏi:
+
+1. Workload là read-heavy, write-heavy, streaming hay transactional?
+2. Invariant nào bắt buộc phải giữ?
+3. Latency, throughput và freshness SLO là gì?
+4. Dữ liệu truy cập theo key, time range hay geospatial query?
+5. Failure domain và recovery model là gì?
+6. Đội ngũ có đủ khả năng vận hành hay nên dùng managed service?
+7. Chi phí trên mỗi completed ride có chấp nhận được không?
+
+Với case study này, công nghệ phải chịu được khoảng 150K concurrent connections và kịch bản 15K–75K location updates/s, đồng thời bảo vệ assignment, ride state và payment correctness.
+
+---
+
+#### 2. Ma trận workload → công nghệ
+
+| Workload | Lựa chọn minh họa | Lý do | Rủi ro/đánh đổi |
+|---|---|---|---|
+| External command/query APIs | REST/HTTP | Đơn giản, phổ biến, mobile-friendly | Payload lớn hơn binary RPC |
+| Internal low-latency RPC | gRPC | Protobuf, streaming, typed contract | Coupling theo thời gian, tooling/debug |
+| Live client delivery | WebSocket | Hỗ trợ web/mobile rộng, hai chiều | Tự quản reconnect, sequence và backpressure |
+| Telemetry/pub-sub mobile | MQTT | Nhẹ, phù hợp mạng không ổn định | Topic/QoS/broker operations phức tạp hơn |
+| Transactional authority | PostgreSQL/MySQL | ACID, constraints, locking/versioning | Hot-row/write scale và regional ownership |
+| Latest location/cache/presence | Redis-compatible store | Latency thấp, TTL, geo primitives | Memory cost, hot key, không nên là durable ride authority |
+| High-volume keyed location/history | Cassandra/ScyllaDB | Write throughput, partition/time-range access | Data modeling theo query, eventual semantics |
+| Flexible ride log/document | MongoDB | Document model và flexible schema | Sharding/index/transaction trade-offs |
+| Event backbone | Kafka/Pulsar hoặc managed stream | Partitioned ordering, retention, replay | Operational complexity, lag và key skew |
+| Background work | SQS/Pub/Sub/Service Bus | Managed queue, retry, DLQ | Ordering/replay semantics tùy service |
+| Spatial partition | H3/S2/geohash | Nearby-cell query và sharding | Boundary/hot-cell/precision trade-offs |
+| Trip media/archive/history | Object storage | Durable, rẻ, lifecycle/analytics | Không phục vụ low-latency mutable query |
+
+Tên sản phẩm không định nghĩa kiến trúc; requirement và access pattern mới định nghĩa vai trò.
+
+---
+
+#### 3. WebSocket hay MQTT?
+
+##### WebSocket
+
+Phù hợp khi:
+
+- Rider/driver app cần bidirectional realtime channel.
+- Browser support là ưu tiên.
+- Đội ngũ muốn application protocol tự kiểm soát.
+- Ride state/location updates được định tuyến qua connection gateway.
+
+Cần tự thiết kế heartbeat, reconnect, authentication refresh, message version/ACK, backpressure và recovery snapshot.
+
+##### MQTT
+
+Phù hợp khi:
+
+- Payload nhỏ và bandwidth/battery nhạy cảm.
+- Connectivity chập chờn.
+- Topic-based pub/sub và broker-managed sessions/QoS hữu ích.
+- Mobile telemetry là workload chính.
+
+MQTT QoS:
+
+- QoS 0: at-most-once, hợp với intermediate location point có thể mất.
+- QoS 1: at-least-once, có thể dùng cho event cần retry nhưng consumer phải dedupe.
+- QoS 2: overhead cao; vẫn không tự tạo exactly-once business transition end-to-end.
+
+Có thể dùng WebSocket cho UI/control và MQTT/binary stream cho telemetry. Không cần ép một protocol phục vụ mọi traffic.
+
+---
+
+#### 4. Realtime Gateway infrastructure
+
+Gateway cần:
+
+- Load balancing hỗ trợ long-lived connections.
+- Connection draining khi deploy.
+- Registry ánh xạ user/device tới gateway shard.
+- Sticky routing chỉ khi thật sự cần; tốt hơn là routing qua shared pub/sub.
+- Heartbeat và lease expiration.
+- Per-connection outbound buffer có giới hạn.
+- Coalesce/drop location frames cũ cho slow client.
+- Ưu tiên ride-state event hơn telemetry.
+- Reconnect backoff/jitter và snapshot recovery.
+
+Capacity plan theo cả:
+
+```text
+concurrent sockets
+messages/s
+bytes/s
+new connections/s
+reconnect burst
+```
+
+Chỉ benchmark số socket tối đa là chưa đủ.
+
+---
+
+#### 5. gRPC cho internal communication
+
+Ưu điểm:
+
+- Protobuf nhỏ và nhanh.
+- Typed contract/code generation.
+- Unary và streaming RPC.
+- HTTP/2 multiplexing.
+
+Nhưng gRPC không tự giải quyết distributed-system failure. Mỗi call vẫn cần:
+
+- Deadline propagated xuyên call chain.
+- Bounded retry chỉ với idempotent operation.
+- Circuit breaker/load shedding.
+- Compatibility rules cho protobuf fields.
+- Observability và correlation ID.
+
+Không tạo synchronous chain dài như:
+
+```text
+Matching -> Location -> Presence -> Driver -> Map -> Notification
+```
+
+Hot path nên đọc derived/local views; side effects dùng event. gRPC phù hợp cho immediate query, không phải lý do để mọi service gọi nhau trực tiếp.
+
+---
+
+#### 6. REST cho external APIs
+
+REST phù hợp với ride commands và recovery queries:
+
+```text
+POST /v1/rides                  [Idempotency-Key]
+GET  /v1/rides/{rideId}
+POST /v1/ride-offers/{id}/accept
+POST /v1/rides/{id}/complete
+```
+
+Cần:
+
+- OAuth/OIDC access token validation.
+- Domain authorization.
+- API versioning và backward compatibility cho mobile app cũ.
+- Idempotency cho retry trên mạng di động.
+- Cursor pagination cho history.
+- `202/PENDING` cho workflow chưa hoàn tất.
+- Request/version fields để chống state regression.
+
+GraphQL có thể hữu ích cho composite read UI, nhưng không thay business command semantics và idempotency.
+
+---
+
+#### 7. PostgreSQL/MySQL cho transactional authority
+
+Phù hợp với:
+
+- User/driver/vehicle structured records.
+- Unique active assignment.
+- Ride aggregate và versioned transitions.
+- Fare quote/final fare references.
+- Payment state/provider references.
+
+Constraints có thể bảo vệ invariant:
+
+```text
+unique active ride per driver
+unique active ride per rider
+expected ride version on update
+unique idempotency key per command scope
+unique provider payment reference
+```
+
+Một mẫu optimistic transition:
+
+```sql
+UPDATE rides
+SET status = :next_status,
+    version = version + 1,
+    updated_at = NOW()
+WHERE ride_id = :ride_id
+  AND status = :expected_status
+  AND version = :expected_version;
+```
+
+Số hàng cập nhật bằng 0 nghĩa là command stale hoặc transition không còn hợp lệ.
+
+Không đưa từng GPS point vào cùng transactional database với ride commands. Location write rate và durability/access pattern hoàn toàn khác.
+
+---
+
+#### 8. MongoDB hay Cassandra cho RideLog/location history?
+
+Transcript gom MongoDB và Cassandra thành “NoSQL cho high-volume/flexible data”, nhưng hai hệ khác nhau:
+
+##### MongoDB
+
+Phù hợp khi:
+
+- Ride log được đọc như document/aggregate.
+- Schema thay đổi và cần secondary indexes linh hoạt.
+- Query patterns đa dạng vừa phải.
+- Scale chưa đòi write distribution cực lớn.
+
+##### Cassandra/ScyllaDB
+
+Phù hợp khi:
+
+- Write throughput rất cao.
+- Query chủ yếu theo known partition key và time range.
+- Dữ liệu append-heavy như sampled GPS points.
+- Cần scale ngang nhiều node và chấp nhận mô hình consistency phù hợp.
+
+Ví dụ key cho trip history:
+
+```text
+partition key: (cityId, rideId, timeBucket)
+clustering key: eventTimestamp, sequence
+```
+
+Không chọn NoSQL chỉ vì “dữ liệu lớn”. Phải thiết kế từ query và partition size. Ride state authoritative vẫn nên ở transactional store; RideLog/history là append/read model riêng.
+
+---
+
+#### 9. Redis: cache, presence và latest location
+
+Redis có thể dùng cho:
+
+- Driver presence/availability lease với TTL.
+- Latest location working set.
+- Spatial-cell membership hoặc short-lived candidate set.
+- Connection routing registry.
+- Rate-limit counters và short-lived cache.
+
+Ưu điểm là latency thấp và TTL tự nhiên. Rủi ro:
+
+- Memory cost lớn với hàng trăm nghìn drivers/indices.
+- Hot cell/hot key.
+- Eviction hoặc failover gây mất ephemeral state.
+- Redis Geo dùng geohash-based indexing nhưng có giới hạn query/model cần benchmark.
+
+Nguyên tắc:
+
+- Redis có thể là authority tạm thời cho **ephemeral presence lease** nếu loss/rebuild behavior được chấp nhận.
+- Redis không nên là durable authority duy nhất cho ride assignment/payment.
+- Geo index phải rebuild được từ stream/latest state.
+- Cache failure không được làm mất ride history.
+
+---
+
+#### 10. Kafka cho location và domain events
+
+Kafka phù hợp khi cần:
+
+- Ingest hàng chục nghìn location events/s.
+- Partition ordering theo `driverId` hoặc `rideId`.
+- Nhiều consumers: latest store, live relay, history, analytics, safety.
+- Retention/replay để rebuild projection.
+
+Topic/partition key minh họa:
+
+| Topic | Key | Consumers |
+|---|---|---|
+| `driver-location` | `driverId` | Latest-location, relay, history sampler |
+| `ride-events` | `rideId` | Realtime, notification, analytics, payment/fare |
+| `payment-events` | `paymentId` | Receipt, earnings, reconciliation analytics |
+| `notification-jobs` | `userId` hoặc provider key | Push/SMS workers |
+
+Partition key cần cân bằng ordering và skew. Key theo `cellId` tiện spatial processing nhưng sân bay có thể tạo hot partition; key theo `driverId` phân phối đều hơn nhưng query cell cần derived index.
+
+Kafka không tự bảo đảm exactly-once business result. Producer/outbox và idempotent consumer vẫn cần thiết.
+
+---
+
+#### 11. Managed queue thay cho Kafka khi phù hợp
+
+Nếu đội nhỏ hoặc workload đơn giản:
+
+- SQS/Pub/Sub/Service Bus cho notification jobs và background work.
+- Managed stream/Kafka cho location fan-out nếu cần replay/many consumers.
+
+Không nhất thiết một broker cho mọi use case. Queue tối ưu work distribution; event log tối ưu retention/replay/multiple consumer groups.
+
+Ở scale location 15K–75K/s, cần kiểm tra quota, batching, partition count và cost của managed service thay vì chỉ tin nhãn “auto scale”.
+
+---
+
+#### 12. Geohash, H3 và S2
+
+##### Geohash
+
+- Chuỗi phân cấp, prefix giúp gom vùng.
+- Dễ hiểu và hỗ trợ phổ biến.
+- Cell hình chữ nhật; distortion và boundary cases cần xử lý neighbor.
+
+##### H3
+
+- Lưới lục giác phân cấp.
+- Neighbor/ring operations thuận tiện.
+- Diện tích/hình dạng tương đối đồng đều cho nhiều bài toán city mobility.
+
+##### S2
+
+- Chia mặt cầu thành hierarchy of cells.
+- Mạnh cho spherical geometry và covering phức tạp.
+
+Không có lựa chọn luôn tốt nhất. Cần benchmark:
+
+- Driver density theo cell/resolution.
+- Số neighboring cells cho query radius.
+- Frequency driver đổi cell.
+- Hot spot distribution.
+- False candidates trước precise ETA.
+- Library/tooling của đội ngũ.
+
+H3 có thể phù hợp taxi-hailing, nhưng “chính xác hơn” không phải kết luận tuyệt đối; accuracy phụ thuộc resolution, geometry và query design.
+
+---
+
+#### 13. Spatial resolution và hot-cell strategy
+
+Resolution quá thô:
+
+- Candidate set lớn.
+- Nhiều filtering và provider ETA calls.
+
+Resolution quá mịn:
+
+- Query nhiều neighbor cells.
+- Driver đổi cell thường xuyên.
+- Index update/churn tăng.
+
+Có thể dùng adaptive/multi-resolution:
+
+- Khu thưa: cell lớn hơn.
+- Khu đông/sân bay: cell nhỏ hơn hoặc subdivision.
+- Matching mở rộng ring theo từng vòng.
+- Dedicated policy/capacity cho airport queue.
+
+Spatial key là data-model decision, không chỉ tiện ích thư viện.
+
+---
+
+#### 14. Object storage và retention
+
+Object storage phù hợp với:
+
+- Raw/sampled telemetry archive.
+- Trip event archive.
+- Audit exports.
+- Analytics lake và model-training datasets.
+
+Lifecycle policy:
+
+```text
+hot searchable history -> warm compressed objects -> cold/archive -> delete
+```
+
+Precise location cần retention tối thiểu theo legal/safety/business policy, encryption và access audit. Không giữ dữ liệu vô thời hạn chỉ vì object storage rẻ.
+
+---
+
+#### 15. Container và orchestration
+
+Kubernetes hỗ trợ:
+
+- Deployment, service discovery và rolling update.
+- Horizontal Pod Autoscaling.
+- Resource requests/limits.
+- Pod disruption budgets.
+- Multi-AZ scheduling.
+
+Nhưng Kubernetes thêm:
+
+- Control-plane/cluster/network complexity.
+- Upgrade, security, observability và capacity-management burden.
+- Chi phí base capacity.
+- Rủi ro autoscaling sai metric.
+
+Managed container service/PaaS cũng có thể phù hợp. Ở scale này, realtime gateways và location consumers cần kiểm soát tốt, nhưng không có nghĩa mọi service bắt buộc chạy Kubernetes.
+
+---
+
+#### 16. Autoscaling theo đúng signal
+
+| Component | Scaling signal |
+|---|---|
+| REST/gRPC API | RPS, p95 latency, CPU, inflight requests |
+| Realtime Gateway | Active connections, messages/s, bytes/s, event-loop lag |
+| Location ingestion | Updates/s, partition lag, CPU/network |
+| Stream consumers | Consumer lag, oldest event age |
+| Matching workers | Pending match count, time-to-match, rounds/s |
+| Notification workers | Queue depth, provider rate limit |
+| Payment/reconcile workers | Pending/unknown age, queue backlog |
+
+CPU-only autoscaling không đủ. Ví dụ WebSocket gateway có thể cạn connection/memory trước CPU; Kafka consumer cần scale theo lag nhưng không vượt số partitions hữu ích.
+
+Autoscaling cũng phải có warm-up, min/max bounds và scale-down stabilization để tránh thrashing.
+
+---
+
+#### 17. Load balancing
+
+- API load balancer cho short-lived REST/gRPC requests.
+- Realtime load balancer phải hỗ trợ WebSocket/MQTT và long idle timeout phù hợp.
+- Connection draining khi deploy/failover.
+- Health check tách liveness, readiness và dependency health.
+- Multi-AZ routing và capacity đủ chịu mất một zone.
+- Global traffic management nếu triển khai nhiều region.
+
+Không dùng sticky session để che giấu state cục bộ không thể phục hồi. Connection tự nhiên gắn với một gateway trong vòng đời socket, nhưng mapping/subscription cần rebuild hoặc shared routing khi reconnect.
+
+---
+
+#### 18. Single-city region strategy
+
+Với MVP một thành phố:
+
+- Chọn cloud region gần thành phố để giảm latency.
+- Triển khai multi-AZ trong một region.
+- Database authority có HA/failover trong region.
+- Backup/PITR sang failure boundary phù hợp.
+- Object/archive có replication policy.
+
+Đây thường hợp lý hơn active-active multi-region từ ngày đầu. Active-active cho ride assignment khó vì cross-region coordination có thể tăng latency và split-brain risk.
+
+---
+
+#### 19. Multi-region khi mở rộng
+
+Multi-region không chỉ là “replicate dữ liệu”. Cần định nghĩa ownership:
+
+```text
+cityId/regionId -> home region
+rideId          -> immutable home-region ownership
+driver          -> active in one region/city at a time
+```
+
+Mô hình phổ biến:
+
+- Mỗi city/metro có một home region xử lý matching/assignment/trip writes.
+- Profile/config có thể replicate toàn cầu.
+- Location stream và geo index ở local region.
+- Analytics/archive replicate async.
+- Cross-region DR dùng warm standby/failover procedure.
+
+Nếu active-active cùng sửa một ride/driver assignment, cần global consensus hoặc conflict model rất phức tạp. Thường không đáng cho MVP và có thể làm match latency xấu hơn.
+
+---
+
+#### 20. Consistency và replication
+
+| Dữ liệu | Replication/consistency gợi ý |
+|---|---|
+| Latest location | Async/local, freshness-bound |
+| Geo index | Async projection, rebuildable |
+| Presence lease | Local low-latency, expiry-based |
+| Ride assignment/state | Strong trong home region |
+| Payment state | Strong local record + provider reconciliation |
+| Profile/config | Async cross-region replication có thể phù hợp |
+| Analytics/history | Async/batch replication |
+
+Strong consistency không có nghĩa phải dùng global synchronous replication cho mọi request. Giữ authority gần workload và partition ownership giúp vừa đúng vừa nhanh.
+
+---
+
+#### 21. Resilience patterns
+
+- Multi-AZ stateless instances và managed database failover.
+- Kafka replication hoặc managed broker durability.
+- Transactional Outbox cho ride/payment events.
+- Idempotency/deduplication trên commands và consumers.
+- Deadline, retry budget, jitter và circuit breaker cho map/payment.
+- Load shedding và admission control khi matching/location overloaded.
+- Snapshot recovery khi realtime event bị mất.
+- DLQ và re-drive cho background jobs.
+- Backup/PITR và restore test.
+- Graceful degradation: approximate ETA, delayed analytics, pending payment.
+
+Failure hierarchy:
+
+1. Giữ assignment/ride/payment correctness.
+2. Giữ active-trip visibility và recovery.
+3. Giảm location frequency/precision nếu quá tải.
+4. Degrade ETA/map richness.
+5. Trì hoãn analytics/notification không khẩn cấp.
+
+---
+
+#### 22. Map và payment provider strategy
+
+Map Adapter:
+
+- Batch top-K ETA requests.
+- Cache theo origin/destination cell trong TTL ngắn.
+- Quota/rate-limit budget.
+- Circuit breaker và fallback approximation/provider.
+- Theo dõi latency/cost per match.
+
+Payment Adapter/Service:
+
+- Provider tokenization/hosted UI.
+- Idempotency key và provider reference.
+- Signed webhook, replay protection và dedupe.
+- `PENDING/UNKNOWN` state khi timeout.
+- Scheduled reconciliation.
+- Refund/void idempotent.
+
+External service giảm build effort nhưng tạo latency, quota, cost và failure modes mới.
+
+---
+
+#### 23. Security và privacy infrastructure
+
+- OIDC/OAuth 2.0 cho rider/driver identity và access.
+- Device/session binding phù hợp cho location channel.
+- TLS mọi external connection; mTLS/service identity nội bộ nếu cần.
+- IAM least privilege và network segmentation.
+- Secret manager/KMS, key rotation.
+- Encryption at rest cho PII/location/payment metadata.
+- Không log precise GPS/token/raw payment data.
+- Location retention và access audit.
+- WAF/rate limiting cho login/ride/payment.
+- GPS spoof/anomaly detection pipeline.
+- Admin/support access qua audited privileged workflow.
+
+JWT chỉ là token format; cần issuer/audience/expiry/key rotation và chiến lược revoke/refresh.
+
+---
+
+#### 24. Observability stack
+
+Có thể dùng OpenTelemetry cùng Prometheus/Grafana và centralized logs/traces hoặc managed equivalents.
+
+Telemetry quan trọng:
+
+- Realtime: connections, reconnect rate, delivery latency, slow-client drops.
+- Location: updates/s, bytes/s, invalid/stale/out-of-order, consumer lag.
+- Matching: candidates, rounds, acceptance, assignment conflicts, p95/p99 time-to-match.
+- Geo index: freshness, cell cardinality, hot partitions.
+- Database: transaction conflicts, locks, query latency, replica lag.
+- Kafka/queue: partition skew, lag, oldest message, DLQ.
+- Map/payment: latency, quota, cost, timeout và error rate.
+- Journey: request-to-assigned, assigned-to-pickup, complete-to-payment.
+
+High-cardinality labels như `rideId` không nên đưa trực tiếp vào metrics; chúng phù hợp với trace/log có sampling và retention kiểm soát.
+
+---
+
+#### 25. Chi phí và operational complexity
+
+Chi phí lớn có thể đến từ:
+
+- Map route/ETA calls.
+- Realtime egress và connection infrastructure.
+- Kafka/stream retention.
+- In-memory Redis footprint.
+- Location history storage và analytics.
+- Cross-AZ/cross-region traffic.
+- Observability volume.
+- Kubernetes base capacity và nhân lực vận hành.
+
+Nên theo dõi `cost per ride request`, `cost per match` và `cost per completed ride`. Managed services giảm toil nhưng cần kiểm tra quota, unit pricing và lock-in.
+
+---
+
+#### 26. Một stack triển khai minh họa
+
+```text
+Mobile Apps
+  -> CDN/WAF + API Load Balancer
+  -> REST API services
+  -> WebSocket/MQTT Gateway fleet
+
+Transactional:
+  -> Managed PostgreSQL Multi-AZ
+
+Ephemeral/realtime:
+  -> Managed Redis-compatible cache/presence
+  -> H3 spatial cell index
+
+Streaming:
+  -> Managed Kafka/Pulsar/event stream
+  -> Location, relay, history, analytics consumers
+
+History/archive:
+  -> Cassandra/ScyllaDB or fit-for-query store
+  -> Object storage lifecycle archive
+
+External:
+  -> Map Adapter -> map provider
+  -> Payment Service -> payment provider
+
+Operations:
+  -> OpenTelemetry + metrics/logs/traces
+  -> IAM, secrets/KMS, backups/PITR
+```
+
+Đây chỉ là một phương án. Một managed queue thay Kafka, managed container service thay Kubernetes hoặc PostgreSQL partitioning thay Cassandra đều có thể đúng nếu workload/team constraints khác.
+
+---
+
+#### 27. Những điều cần chỉnh so với transcript
+
+1. **Không phải lúc nào một database duy nhất cũng sai.** Polyglot storage chỉ đáng khi workload/access pattern biện minh được; mỗi database mới tăng vận hành.
+2. **MongoDB và Cassandra không hoán đổi tùy ý.** Mongo thiên về flexible document/query; Cassandra thiên về partitioned high-write/time-range access.
+3. **Redis cache khác Redis làm ephemeral presence/latest-location store.** Phải định nghĩa durability/rebuild semantics.
+4. **Kafka là event log/stream, không chỉ “message queue”.** Background task đơn giản có thể dùng managed queue.
+5. **H3 không mặc nhiên chính xác hơn geohash trong mọi trường hợp.** Resolution và query pattern quyết định.
+6. **Kubernetes không tự tạo scalability.** App stateless/partitioning, đúng metrics và capacity mới quyết định khả năng scale.
+7. **Multi-region replication không tự tạo availability.** Assignment cần single-writer/home-region ownership hoặc coordination rõ ràng.
+8. **Eventual consistency chỉ phù hợp location/projection.** Assignment, ride transition và payment cần authority/version/idempotency.
+9. **Technology choices phải dùng location estimate đã sửa**, tức hàng chục nghìn updates/s thay vì 18/s.
+
+---
+
+#### 28. Cách trình bày trong phỏng vấn
+
+1. Nêu workload trước: 150K sockets và 15K–75K location updates/s.
+2. Chọn WebSocket/MQTT theo client/network semantics.
+3. Chọn REST ngoài, gRPC nội bộ có deadline, Kafka/event cho async fan-out.
+4. Dùng PostgreSQL bảo vệ assignment/ride/payment invariants.
+5. Dùng Redis/H3 cho ephemeral latest-location/geo index, giải thích rebuild.
+6. Chọn Cassandra chỉ nếu location-history access pattern và scale cần nó.
+7. Nêu Kafka partition keys và hot-cell trade-off.
+8. Giải thích autoscaling signal riêng từng workload.
+9. Chọn single-region Multi-AZ cho MVP; home-region partitioning khi multi-city.
+10. Kết thúc bằng resilience, privacy, observability và cost per ride.
+
+Một câu trả lời mạnh:
+
+> “Tôi dùng PostgreSQL cho assignment và ride-state authority, Redis/H3 cho presence và nearby projection, Kafka cho location fan-out/replay, rồi lưu history theo access pattern. Single-city MVP chạy Multi-AZ; khi multi-region, mỗi ride có home region để tránh global coordination trên critical path.”
+
+---
+
+#### 29. Ý chính cần nhớ
+
+- Chọn technology theo workload, invariant, failure model, team và cost.
+- WebSocket phổ biến cho UI realtime; MQTT hữu ích cho telemetry/network yếu.
+- MQTT QoS không thay business idempotency.
+- gRPC cần deadline, retry budget và compatibility; không nên tạo call chain dài.
+- REST external API cần idempotency và mobile backward compatibility.
+- PostgreSQL/MySQL bảo vệ assignment, ride state và payment transactions.
+- MongoDB và Cassandra phục vụ access pattern khác nhau.
+- Redis phù hợp ephemeral presence/latest-location/cache nhưng không phải durable ride authority.
+- Kafka phù hợp location stream, replay và nhiều consumers; queue managed hợp background jobs đơn giản.
+- Partition theo driverId giữ per-driver ordering; partition theo cell có nguy cơ hot spot.
+- H3/geohash/S2 cần chọn bằng benchmark resolution và density.
+- Kubernetes là lựa chọn vận hành, không phải điều kiện của horizontal scaling.
+- Autoscaling signal phải phù hợp: sockets, lag, pending matches, không chỉ CPU.
+- MVP single-city nên ưu tiên single-region Multi-AZ.
+- Multi-region cần home-region/single-writer ownership cho ride và driver.
+- Eventual consistency phù hợp location/geo projection; strong consistency dành cho business invariant.
+- Precise location cần encryption, retention và access audit.
+- Đánh giá chi phí theo mỗi match/completed ride.
+
+#### Công thức ghi nhớ
+
+> **Taxi-hailing technology strategy = protocol by interaction + storage by authority/access pattern + spatial index by density/query + stream partitions by ordering/skew + autoscaling by workload signal + regional ownership by consistency boundary.**
+
+---
+
+### Bài 122. The Final Design — Taxi Hailing Application
+
+#### 1. Kiến trúc hoàn chỉnh
+
+Final design kết hợp bốn lớp có đặc tính khác nhau:
+
+1. **Edge/client communication:** API Gateway và Realtime Gateway.
+2. **Location data plane:** ingest GPS, stream, latest store và spatial index.
+3. **Ride control plane:** matching, atomic assignment và authoritative trip state.
+4. **Financial/supporting workflows:** fare, payment, notification, analytics và audit.
+
+```text
+                 Rider App                         Driver App
+                    |                                  |
+             +------+----------+              +--------+------+
+             |                 |              |               |
+         REST/HTTP       WebSocket/MQTT    REST/HTTP     Location Stream
+             |                 |              |               |
+             +---------- API / Realtime Edge -----------------+
+                               |
+         +---------------------+-----------------------+
+         |                     |                       |
+    Identity/User         Realtime Gateway        Driver/Profile
+                               |                       |
+                       Connection Registry       Presence/Lease
+                               |                       |
+                               |                  Location Ingestion
+                               |                       |
+                               |               Partitioned Event Stream
+                               |                 /         |          \
+                               |        Latest/Geo     Trip Relay    History
+                               |              |             |          |
+                               +<-------------+-------------+          |
+                                              |                        |
+Ride request -> Trip Authority -> Matching -> Geo/Presence -> Map Adapter
+                    |              |
+                    |         Offer/Assignment Authority
+                    |              |
+                    +<-------------+
+                    |
+             Ride state + Outbox
+                    |
+               Event Broker
+          +---------+----------+-----------+
+          |                    |           |
+    Notification          Fare/Payment  Analytics/Audit
+                              |              |
+                       Payment Provider  Object Storage
+```
+
+Realtime channel giúp truyền nhanh nhưng không phải nguồn chân lý. Trip/Assignment authority cùng transactional storage giữ business state bền vững.
+
+---
+
+#### 2. Component map
+
+| Thành phần | Trách nhiệm chính | Scale theo |
+|---|---|---|
+| **API Gateway** | Auth, routing, rate limit, request ID | RPS/inflight requests |
+| **Realtime Gateway** | WebSocket/MQTT, targeted push, reconnect | Sockets, messages/s, bytes/s |
+| **User Service** | Rider identity/profile | Account/read/write traffic |
+| **Driver Service** | Driver/vehicle/eligibility | Onboarding/profile traffic |
+| **Presence Service** | Online/offline/available lease | Heartbeats và active drivers |
+| **Location Service** | GPS validation/stream ingestion | Location updates/s |
+| **Geo Index** | Nearby-driver projection | Drivers/cell, cell query rate |
+| **Matching Service** | Candidate/ranking/offer rounds | Ride requests, candidates, rounds |
+| **Assignment Authority** | Chọn đúng một driver cho ride | Accept contention |
+| **Trip Service** | Ride aggregate/state machine | Ride commands/events |
+| **Map Adapter** | Geocode/route/ETA provider abstraction | Provider calls và quota |
+| **Fare Service** | Estimate/final fare, versioned rules | Quotes/completions |
+| **Payment Service** | Charge/refund/webhook/reconcile | Payment interactions |
+| **Notification Service** | Push/SMS/email fallback | Queue backlog/provider quota |
+
+Logical ownership không bắt buộc mỗi dòng là một deployment/database vật lý từ ngày đầu. Tách vật lý theo scale, failure isolation, security hoặc team ownership.
+
+---
+
+#### 3. Storage map
+
+| Dữ liệu | Store gợi ý | Vai trò |
+|---|---|---|
+| User, driver, vehicle | PostgreSQL/MySQL | Transactional authority |
+| Ride, assignment, payment refs | PostgreSQL/MySQL | Strong consistency và audit |
+| Presence/availability lease | Redis-compatible store | Ephemeral TTL state |
+| Latest driver location | Redis/high-throughput KV | Low-latency working set |
+| Spatial-cell membership | H3/S2/geohash-backed index | Derived nearby projection |
+| Location/event stream | Kafka/Pulsar/managed stream | Buffer, ordering theo key, replay |
+| Sampled trip history | Cassandra/Scylla/time-series store | Append và time-range query |
+| Archive/analytics | Object storage | Retention dài, batch analytics |
+| Cache | Redis | Acceleration, không phải ride authority |
+
+Service khác truy cập authority qua API/event thay vì đọc database nội bộ trực tiếp.
+
+---
+
+#### 4. Luồng rider tạo yêu cầu
+
+```text
+Rider App
+ -> API Gateway
+ -> Trip Service
+      validate rider/pickup/destination
+      enforce one-active-ride invariant
+      attach fare-quote/pricing version
+      create Ride(SEARCHING)
+      write Outbox(MatchRequested)
+ <- 202 Accepted {rideId, status: SEARCHING, version}
+```
+
+Ride phải được tạo ngay khi request được chấp nhận, không đợi driver accept mới “tạo trip”. Điều này cung cấp:
+
+- `rideId` ổn định cho retry, tracking và cancellation.
+- Audit trail của trường hợp không tìm được driver.
+- State để client phục hồi sau disconnect.
+- Idempotency khi mobile gửi lặp request.
+
+Client nhận matching updates qua realtime channel; nếu mất kết nối, dùng snapshot API.
+
+---
+
+#### 5. Luồng location ingestion
+
+```text
+Driver App
+ -> Location Ingestion
+      authenticate driver/device
+      validate coordinate/accuracy/speed
+      reject duplicate/out-of-order sequence
+      attach server ingest timestamp
+ -> Event Stream, partition key = driverId
+      +-> update latest-location + geo cell
+      +-> relay newest point to assigned rider
+      +-> sample/compress trip history
+      +-> safety/analytics consumers
+```
+
+Thiết kế theo 15K–75K updates/s. Khi overload:
+
+- Coalesce intermediate points và giữ điểm mới nhất.
+- Ưu tiên active-trip data hơn idle driver telemetry.
+- Không drop ride-state transitions cùng cách với location points.
+- Dùng backpressure/load shedding có kiểm soát.
+
+Location history không ghi thẳng từng điểm vào ride transactional DB.
+
+---
+
+#### 6. Luồng matching
+
+```text
+MatchRequested
+ -> Matching Service
+      pickup -> spatial cell
+      query cell + neighbor rings
+      filter ONLINE/AVAILABLE/fresh/eligible
+      approximate rank
+      precise ETA only for top K
+      send small-batch offers with TTL
+```
+
+Nếu không ai accept:
+
+- Mở rộng radius/ring.
+- Tạo offer round mới.
+- Dừng khi vượt overall deadline/max radius.
+- Chuyển ride sang `NO_DRIVER_FOUND` hoặc đề nghị rider tiếp tục chờ.
+
+Matching Service không được tin tuyệt đối vào geo index vì đó là projection eventual. Availability và assignment phải được xác nhận tại authority.
+
+---
+
+#### 7. Ride offer delivery
+
+```text
+Matching -> OfferCreated event
+  -> Realtime Gateway -> active Driver App
+  -> Push Notification -> driver offline/background fallback
+```
+
+Offer chứa `offerId`, `rideId`, pickup summary, ETA/distance, fare/earnings hint và `expiresAt`.
+
+Push notification đến trễ không làm offer sống lại. Driver app phải gọi accept endpoint; authority kiểm tra TTL và current state.
+
+Không broadcast toàn thành phố. Small-batch offer giảm notification storm và accept contention.
+
+---
+
+#### 8. Atomic driver assignment
+
+```text
+Driver App -> AcceptOffer(offerId, idempotencyKey)
+ -> Assignment/Trip Authority
+      offer valid and not expired?
+      ride still SEARCHING?
+      driver still AVAILABLE with live lease?
+      atomic claim driver + transition ride
+      commit + outbox DriverAssigned
+ <- winner: success / loser: 409 no longer available
+```
+
+Invariant:
+
+```text
+at most one active ride per driver
+at most one assigned driver per ride
+```
+
+Hai driver có thể accept cùng lúc, nhưng constraint/conditional transaction chỉ cho một winner. Broker delivery semantics không thay thế atomic business constraint.
+
+---
+
+#### 9. Sau khi assignment thành công
+
+`DriverAssigned` được phát sau commit:
+
+- Realtime Gateway cập nhật rider và winning driver.
+- Các offer còn lại được đánh dấu/hiển thị hết hiệu lực.
+- Presence/Geo projection chuyển driver khỏi available pool.
+- ETA/navigation được cập nhật.
+- Notification fallback dùng khi client không active.
+- Analytics ghi match outcome.
+
+Nếu event lag, assignment authority vẫn đúng. Geo index có thể tạm thời còn driver nhưng atomic claim tiếp theo sẽ từ chối.
+
+---
+
+#### 10. Ride lifecycle
+
+```text
+SEARCHING
+ -> DRIVER_ASSIGNED
+ -> DRIVER_EN_ROUTE
+ -> DRIVER_ARRIVED
+ -> IN_PROGRESS
+ -> COMPLETED
+```
+
+Trip Service xác thực commands:
+
+- Chỉ assigned driver được `ARRIVE/START/COMPLETE`.
+- Rider/driver cancellation theo policy và current state.
+- Mỗi transition dùng expected version/idempotency key.
+- Terminal state không quay lại active.
+- Duplicate/out-of-order command không làm state regression.
+
+Mỗi commit ghi state, timestamp, actor/reason và Outbox trong cùng transaction.
+
+---
+
+#### 11. Live trip tracking
+
+Trong active ride:
+
+```text
+Driver location event
+ -> Active-trip Relay
+ -> routing key: rideId/riderId
+ -> Realtime Gateway
+ -> Rider App
+```
+
+Client hiển thị smooth movement bằng interpolation/map matching thay vì cần mọi GPS point. Các nguyên tắc:
+
+- Chỉ gửi vị trí đúng participant và thời gian được phép.
+- Coalesce frame cũ khi client chậm.
+- Gắn sequence/ingest time để client loại update trễ.
+- Nếu phát hiện event gap, client lấy ride snapshot/latest location.
+- Rider location chỉ chia sẻ cho assigned driver khi pickup flow cần.
+
+“Cả rider và driver thấy live movement” không đồng nghĩa mọi precise location được broadcast hai chiều vô hạn; privacy boundary phải rõ.
+
+---
+
+#### 12. Reconnect và offline behavior
+
+```text
+Connection lost
+ -> exponential backoff + jitter
+ -> reconnect to any healthy gateway
+ -> authenticate again/refresh token
+ -> GET /rides/{rideId} authoritative snapshot
+ -> subscribe from current rideVersion
+```
+
+Push notification báo các event quan trọng khi app background. Polling chỉ là degraded fallback có rate limit; nếu 150K clients poll cùng lúc sẽ tạo thundering herd.
+
+Ride tiếp tục tồn tại khi mobile app hoặc socket chết. Connection state là ephemeral; ride state là durable.
+
+---
+
+#### 13. Driver mất kết nối
+
+Các trạng thái cần policy khác nhau:
+
+- **AVAILABLE:** lease hết hạn → loại khỏi matching.
+- **OFFERED:** offer hết TTL → chuyển candidate khác.
+- **ASSIGNED/EN_ROUTE:** giữ grace period, thông báo rider, sau đó cancel/rematch theo policy.
+- **IN_PROGRESS:** không tự hủy ngay; giữ ride state, phục hồi khi reconnect, dùng last known location và support/safety flow.
+
+Một timeout duy nhất cho mọi trạng thái sẽ tạo hành vi nguy hiểm. Active ride cần độ bền và recovery cao hơn idle presence.
+
+---
+
+#### 14. Fare calculation
+
+Fare Service, không phải Payment Service, nên sở hữu pricing logic:
+
+```text
+Fare = base fare
+     + distance component
+     + time component
+     + toll/tax/fees
+     × surge/policy adjustments
+```
+
+Fare estimate trước ride gắn `pricingRuleVersion` và expiry. Final fare dùng:
+
+- Actual trip duration/distance hoặc trusted route facts.
+- Versioned pricing rules.
+- Cancellation/waiting/toll policies.
+- Audit inputs để giải quyết dispute.
+
+Payment Service nhận final monetary amount đã được xác định và xử lý giao dịch tài chính.
+
+---
+
+#### 15. Hoàn tất chuyến và payment
+
+```text
+Driver -> CompleteRide
+ -> Trip Service validates/versioned transition
+ -> commit Ride(COMPLETED) + Outbox(RideCompleted)
+ -> Fare Service finalizes fare
+ -> Payment Service creates/captures payment idempotently
+ -> Provider response or signed webhook
+ -> payment CAPTURED / FAILED / PENDING / UNKNOWN
+ -> receipt and driver-earnings events
+```
+
+Ride completion và payment state là hai việc khác nhau. Nếu provider timeout:
+
+- Không rollback chuyến đã hoàn tất.
+- Không retry charge mù quáng.
+- Lưu `PENDING/UNKNOWN`.
+- Chờ signed webhook hoặc query/reconciliation.
+- Hiển thị trạng thái phù hợp cho rider/operations.
+
+Có thể pre-authorize trước ride và capture sau complete nếu business/payment method yêu cầu.
+
+---
+
+#### 16. Async event flows
+
+| Event | Consumers tiêu biểu |
+|---|---|
+| `MatchRequested` | Matching |
+| `OfferCreated` | Realtime/notification |
+| `DriverAssigned` | Realtime, geo/presence projection, analytics |
+| `RideStarted` | Realtime, safety, trip-history pipeline |
+| `RideCompleted` | Fare, payment, analytics |
+| `PaymentCaptured` | Receipt, earnings, analytics |
+| `RideCancelled` | Realtime, release driver, fare/cancellation policy |
+
+Transactional Outbox tránh khoảng trống giữa DB commit và publish. Broker thường at-least-once nên mọi consumer phải idempotent; poison events đi DLQ và có re-drive procedure.
+
+---
+
+#### 17. Cache trong final design
+
+Cache phù hợp với:
+
+- Driver/profile summary.
+- Pricing configuration/version.
+- Short-lived map/ETA results.
+- Latest location/presence working set.
+- Read-only ride summary ngắn hạn nếu snapshot authority vẫn ở DB.
+
+Không cache để bỏ qua:
+
+- Atomic assignment claim.
+- Ride state expected-version check.
+- Final payment state/reconciliation.
+
+Cache outage nên làm hệ thống chậm/degrade, không làm mất ride/payment data.
+
+---
+
+#### 18. Map provider integration
+
+Map Adapter thực hiện:
+
+- Geocoding/reverse geocoding.
+- Route/distance/ETA.
+- Batch top-K candidate ETA.
+- Cache theo cell và TTL ngắn.
+- Quota, deadline và circuit breaker.
+- Approximate/fallback behavior.
+- Cost/latency tracking trên mỗi match.
+
+Map tile delivery từ CDN/provider tới client khác với backend ETA/routing calls. Đừng đưa mọi tile qua application backend.
+
+---
+
+#### 19. Scaling và partitioning
+
+| Thành phần | Cách scale/partition |
+|---|---|
+| API services | Stateless horizontal instances |
+| Realtime Gateway | Shard connection fleet; route qua connection registry |
+| Location stream | Partition theo driverId, đủ partitions cho consumers |
+| Latest/geo index | Partition theo city/cell; split hot cells |
+| Matching | Worker pool theo city/region và pending matches |
+| Trip authority | Home region/city ownership; shard theo rideId khi cần |
+| History | `(cityId, rideId, timeBucket)` hoặc query-driven key |
+| Notification | Queue workers theo provider quota |
+| Payment | Worker/reconcile scale theo backlog và provider limits |
+
+Autoscaling signal riêng:
+
+- Realtime: sockets/messages/bytes/event-loop lag.
+- Location: updates/s và consumer lag.
+- Matching: pending matches và time-to-match.
+- Payment: pending age/reconciliation backlog.
+
+CPU-only autoscaling không đủ.
+
+---
+
+#### 20. Single-city deployment
+
+MVP hợp lý:
+
+```text
+Cloud region gần metro city
+  -> Multi-AZ API/realtime/location/matching fleets
+  -> Managed PostgreSQL Multi-AZ + PITR
+  -> Managed Redis/stream/broker
+  -> Object storage + backups
+  -> Map/payment providers qua adapters
+  -> Metrics/logs/traces/secrets/KMS
+```
+
+Phải đủ capacity khi mất một AZ và chịu reconnect storm. Kubernetes có thể dùng, nhưng managed container/PaaS cũng hợp lệ nếu giảm operational burden.
+
+---
+
+#### 21. Multi-region evolution
+
+Khi mở nhiều thành phố:
+
+```text
+cityId -> home region
+rideId -> immutable owning region
+driver -> một active operating region tại một thời điểm
+```
+
+- Location, matching và ride writes ở region gần thành phố.
+- Profile/config có thể replicate async.
+- Analytics/archive replicate/batch toàn cầu.
+- DR dùng standby/failover procedure rõ ràng.
+- Không active-active cùng sửa assignment nếu không có global coordination model.
+
+Multi-region không tự động tốt hơn; global consensus trên matching critical path có thể làm tăng latency và giảm availability khi network partition.
+
+---
+
+#### 22. Graceful degradation
+
+| Failure/overload | Hành vi |
+|---|---|
+| Map ETA chậm | Approximate distance/cached ETA; giảm top-K calls |
+| Location lag | Giảm update frequency, coalesce, hiển thị stale indicator |
+| Geo index stale | Recheck authority; rebuild projection |
+| Realtime gateway lỗi | Reconnect, snapshot, push fallback |
+| Notification provider lỗi | Retry/DLQ; ride state không rollback |
+| Payment timeout | Pending/unknown + reconciliation |
+| Analytics lag | Trì hoãn; không ảnh hưởng ride path |
+| One AZ failure | Load chuyển sang zones còn lại trong capacity budget |
+
+Thứ tự ưu tiên:
+
+1. Không double-assign driver và không làm hỏng ride/payment state.
+2. Duy trì active-trip recovery/safety.
+3. Duy trì matching với latency chấp nhận được.
+4. Giảm location/map richness khi quá tải.
+5. Trì hoãn notification không khẩn cấp và analytics.
+
+---
+
+#### 23. Security và location privacy
+
+- TLS và authenticated device/session cho location channel.
+- OIDC/OAuth 2.0; domain authorization trong Trip/Driver services.
+- Chỉ rider/driver được gán mới xem dữ liệu cần thiết của nhau.
+- Precise coordinates không ghi vào log/metrics labels.
+- Encryption at rest, least-privilege IAM, network segmentation.
+- Retention/deletion policy cho location history.
+- Admin/support access có audit và approval phù hợp.
+- GPS spoof/anomaly detection.
+- Payment tokenization/hosted UI, signed webhook và replay protection.
+- Rate limiting/bot protection cho login, ride request và driver accept.
+
+Location là dữ liệu nhạy cảm ngay cả khi không chứa tên; chuỗi vị trí có thể nhận diện hành vi và nơi ở/làm việc.
+
+---
+
+#### 24. Observability end-to-end
+
+Correlation chain:
+
+```text
+requestId -> rideId -> matchId -> offerId
+          -> assignmentId -> rideVersion
+          -> fareId -> paymentId -> eventId
+```
+
+SLO/metrics:
+
+- Request-to-match p50/p95/p99 và match success rate.
+- Location device-to-rider freshness/delivery latency.
+- Invalid/stale/out-of-order location rate.
+- Offer rounds và accepts per match.
+- Assignment conflicts; double-assignment violation phải bằng 0.
+- Concurrent sockets, reconnect rate và slow-client drops.
+- Ride stuck state count/age.
+- Map calls/cost per successful match.
+- Payment pending/unknown/reconciliation age.
+- Consumer lag, oldest event và DLQ.
+- Cost per completed ride.
+
+Dashboard cần phản ánh user journey, không chỉ CPU/memory từng service.
+
+---
+
+#### 25. Đối chiếu bottleneck với giải pháp
+
+| Bottleneck Bài 119 | Thành phần/giải pháp |
+|---|---|
+| 15K–75K location updates/s | Partitioned stream, latest store, coalescing, sampling |
+| Nearby search | H3/S2/geohash geo index, progressive rings, top-K ETA |
+| Double assignment | Atomic Assignment Authority, unique constraint/version |
+| 150K connections | Realtime Gateway fleet, registry, backpressure |
+| Reconnect storm | Backoff/jitter, capacity headroom, snapshot recovery |
+| Fan-out | Targeted trip subscriptions; không broadcast raw telemetry |
+| Map quota/cost | Adapter, batching, cache, call budget và fallback |
+| Payment uncertainty | Idempotency, webhook, pending state, reconciliation |
+| Cross-service lag | Versioned authority + Outbox + idempotent consumers |
+| Hot spatial cell | Multi-resolution/split cell và dedicated capacity |
+
+---
+
+#### 26. Điểm cần sửa hoặc làm rõ so với transcript
+
+1. **Ride/trip không chỉ được tạo sau driver accept.** Tạo ride ở `SEARCHING` ngay khi nhận request để có state/idempotency/audit.
+2. **Fare calculation nên thuộc Pricing/Fare capability.** Payment Service chịu trách nhiệm giao dịch tiền.
+3. **Notification Service không vận chuyển mọi live update.** Realtime Gateway lo active socket; push/SMS là fallback.
+4. **“Mỗi service có data store riêng” là logical ownership.** Không bắt buộc database server riêng cho từng service ở MVP.
+5. **WebSocket chỉ là transport.** Durable snapshot/version và reconnect logic mới giúp client đồng bộ.
+6. **Cache location không quyết định assignment.** Atomic authority xác nhận driver vẫn available.
+7. **Async inventory update** là câu từ sót từ case e-commerce nếu xuất hiện; taxi cần async projection/update nhưng assignment/ride transition là synchronous/authoritative.
+8. **“Hybrid services” trong transcript nhiều khả năng là “dedicated services”.** Giá trị nằm ở ranh giới trách nhiệm, không phải số lượng services.
+
+---
+
+#### 27. Cách trình bày final design trong phỏng vấn
+
+1. Vẽ hai clients, API Gateway và Realtime Gateway.
+2. Tách location data plane và ride control plane.
+3. Đi qua `CreateRide → MatchRequested → candidates → offers → atomic assignment`.
+4. Nêu ride state machine và versioned commands.
+5. Vẽ location stream tới latest geo index, rider relay và history.
+6. Giải thích reconnect bằng snapshot/version.
+7. Đi qua `RideCompleted → FareFinalized → Payment pending/webhook/reconcile`.
+8. Nêu partition keys, hot-cell và autoscaling signals.
+9. Trình bày graceful degradation, privacy và observability.
+10. Kết thúc bằng single-city Multi-AZ và home-region evolution.
+
+Một câu trả lời mạnh:
+
+> “Tôi dùng pipeline vị trí eventually consistent để tìm candidates nhanh, nhưng assignment và ride state nằm trong một transactional authority có version/idempotency. WebSocket chỉ đẩy cập nhật; reconnect luôn phục hồi từ snapshot. Sau RideCompleted, Fare Service chốt giá và Payment Service xử lý giao dịch bất đồng bộ, kể cả trạng thái chưa xác định.”
+
+---
+
+#### 28. Ý chính cần nhớ
+
+- Final architecture tách edge, location data plane, ride control plane và financial workflows.
+- API Gateway xử lý requests; Realtime Gateway xử lý persistent connections.
+- Ride được tạo ở `SEARCHING` trước matching.
+- Location stream tối ưu high write, per-driver ordering và targeted relay.
+- Geo index là projection; atomic assignment mới bảo đảm correctness.
+- Matching dùng progressive cells, top-K ETA và small-batch offers.
+- Một driver/ride chỉ có một assignment winner.
+- Trip Service sở hữu versioned ride state machine.
+- Realtime event không thay durable ride snapshot.
+- Driver disconnect policy phụ thuộc ride state.
+- Fare Service tính giá; Payment Service xử lý tiền và reconciliation.
+- Ride completion không rollback khi payment provider timeout.
+- Outbox và idempotent consumers bảo đảm post-commit event flow.
+- Logical data ownership không bắt buộc physical database per service.
+- Scale location, sockets, matching, trip và payment theo signal riêng.
+- Single-city MVP nên Multi-AZ; multi-city dùng home-region ownership.
+- Graceful degradation bảo vệ assignment/ride/payment trước map richness và analytics.
+- Privacy precise location là yêu cầu kiến trúc cốt lõi.
+- Observability phải đo time-to-match, freshness, stuck rides và cost per ride.
+
+#### Công thức ghi nhớ
+
+> **Taxi-hailing final design = durable Ride(SEARCHING) + streaming location plane + derived spatial candidates + atomic assignment winner + versioned trip authority + realtime push with snapshot recovery + auditable fare and reconciled payment.**
+
+---
+
+## Phần 24. Design a Collaborative Document Editor (aka Google Docs)
+
+### Bài 123. Understanding the Problem & Defining the Scope
+
+#### 1. Bài toán cần xây dựng
+
+Thiết kế trình soạn thảo tài liệu trên web tương tự Google Docs, cho phép nhiều người cùng sửa một tài liệu gần thời gian thực.
+
+Năm capability cốt lõi:
+
+1. **Simultaneous editing:** nhiều user thao tác mà không phải khóa toàn tài liệu hoặc chờ nhau.
+2. **Realtime synchronization:** edit nhanh chóng xuất hiện ở các clients khác.
+3. **Convergence/conflict handling:** mọi replica hợp lệ cuối cùng đạt cùng document state.
+4. **Version history:** theo dõi, xem và khôi phục trạng thái cũ.
+5. **Access control/sharing:** viewer, editor, owner và chia sẻ bằng invite/link.
+
+Điểm khó không nằm ở CRUD document, mà ở việc kết hợp:
+
+- Phản hồi gõ phím tức thời.
+- Edit đồng thời và có thể chồng lấn.
+- Message trễ, lặp, sai thứ tự hoặc mất kết nối.
+- Lưu bền để không mất công sức người dùng.
+- Quyền truy cập có thể đổi ngay khi session đang mở.
+
+---
+
+#### 2. Actors và mục tiêu
+
+| Actor | Mục tiêu | Yêu cầu nổi bật |
+|---|---|---|
+| **Owner** | Tạo, chia sẻ, đổi quyền, xóa/khôi phục | Kiểm soát ownership và audit |
+| **Editor** | Sửa nội dung đồng thời | Local responsiveness, convergence, autosave |
+| **Viewer** | Đọc nội dung mới | Không được gửi content mutation |
+| **Commenter** | Có thể thêm comment nhưng không sửa body | Nếu role này nằm trong scope mở rộng |
+| **Admin/Operations** | Hỗ trợ, abuse response, recovery | Privileged access có audit |
+| **System** | Đồng bộ, lưu bền, phân quyền, versioning | Correctness và availability |
+
+MVP transcript nêu viewer/editor; owner là vai trò cần thiết để quản lý ACL. Commenter có thể để ngoài scope nhưng nên giữ đường mở rộng.
+
+---
+
+#### 3. Functional requirements của MVP
+
+##### 3.1 Document lifecycle
+
+- Tạo document.
+- Đọc/mở document.
+- Sửa text và basic formatting.
+- Xóa document; nên làm rõ soft delete hay hard delete.
+- Autosave các thay đổi.
+
+##### 3.2 Collaboration
+
+- 2–50 users cùng mở/chỉnh một document.
+- Mỗi client áp dụng local edit ngay để không tạo cảm giác lag.
+- Edit được đồng bộ tới collaborators gần thời gian thực.
+- Hiển thị ai đang online, cursor/selection nếu nằm trong MVP.
+- Client reconnect và nhận các update bị lỡ.
+
+##### 3.3 Version history
+
+- Xem các phiên bản/checkpoint trước.
+- Biết ai thay đổi và khi nào ở mức phù hợp.
+- Khôi phục một phiên bản cũ bằng một thao tác mới có audit, không xóa lịch sử đã có.
+
+##### 3.4 Sharing và permissions
+
+- Invite bằng email/user identity.
+- Shareable link.
+- Vai trò tối thiểu: owner, editor, viewer.
+- Thu hồi quyền hoặc link.
+- Chặn edit từ viewer và user đã bị revoke.
+
+---
+
+#### 4. Ngoài phạm vi MVP
+
+- Rich media phức tạp: video, diagram, spreadsheet, arbitrary embeds.
+- Full office-format compatibility.
+- Comments/suggestions/track changes nâng cao.
+- Offline-first nhiều ngày với merge phức tạp.
+- Hàng nghìn người cùng sửa một document.
+- Fine-grained permission theo đoạn/section.
+- Plugins/macros và arbitrary code execution.
+- Printing/pagination hoàn hảo.
+- End-to-end encryption nếu server vẫn cần transform/search nội dung.
+- Semantic merge cho table/layout phức tạp.
+
+Giới hạn text-heavy và basic formatting giúp tập trung vào collaboration core.
+
+---
+
+#### 5. Document model cần làm rõ
+
+“Text document” vẫn có nhiều cách biểu diễn:
+
+- Chuỗi text phẳng.
+- Danh sách blocks/paragraphs.
+- Tree gồm paragraphs, spans và formatting attributes.
+
+Một operation không nên chỉ là “gửi toàn bộ document mới”. Ví dụ:
+
+```json
+{
+  "opId": "clientA:1842",
+  "documentId": "doc_123",
+  "clientId": "clientA",
+  "baseVersion": 519,
+  "type": "insert",
+  "position": 87,
+  "text": "hello",
+  "attributes": {"bold": true}
+}
+```
+
+Với CRDT, operation có thể tham chiếu stable element IDs thay vì numeric position. Representation quyết định conflict semantics, storage và thuật toán đồng bộ.
+
+---
+
+#### 6. Collaboration state có nhiều lớp
+
+| State | Ví dụ | Durability/consistency |
+|---|---|---|
+| **Document content** | Text, formatting, structure | Durable; phải converge |
+| **Operation log** | Insert/delete/format operations | Durable trong retention/checkpoint model |
+| **Document snapshot** | Materialized state tại version N | Durable, dùng load/recovery |
+| **Version history metadata** | Actor, timestamp, checkpoint label | Durable/auditable |
+| **ACL/ownership** | Owner/editor/viewer, share links | Strong và security-critical |
+| **Presence** | Ai đang online | Ephemeral/eventual |
+| **Cursor/selection** | Vị trí con trỏ/selection | Ephemeral, có thể mất/coalesce |
+| **Connection/session** | Socket, clientId, last ACK | Ephemeral/rebuildable |
+
+Không lưu cursor/presence với cùng durability như content operations. Mất một cursor update là chấp nhận được; mất một acknowledged content edit thì không.
+
+---
+
+#### 7. Core correctness properties
+
+Một collaborative editor nên xác định ít nhất:
+
+##### 7.1 Convergence
+
+Nếu các clients nhận cùng tập operations hợp lệ, chúng cuối cùng tạo cùng document state.
+
+##### 7.2 Causality preservation
+
+Nếu operation B được tạo sau khi user đã thấy A, hệ thống không nên áp dụng B như thể A chưa tồn tại.
+
+##### 7.3 Intention preservation
+
+Sau transform/merge, thao tác vẫn phản ánh ý định hợp lý của user trong bối cảnh edit đồng thời.
+
+##### 7.4 No acknowledged-edit loss
+
+Khi server xác nhận edit đã durable theo contract, crash/reconnect không làm edit biến mất.
+
+##### 7.5 Idempotent operation application
+
+Cùng `opId` được retry nhiều lần chỉ tạo một logical effect.
+
+##### 7.6 Authorization at apply time
+
+Server kiểm tra quyền khi chấp nhận operation; client UI ẩn nút edit không phải security control.
+
+---
+
+#### 8. Ví dụ conflict đơn giản
+
+Document ban đầu:
+
+```text
+cat
+```
+
+Hai user đồng thời:
+
+- A chèn `s` ở đầu → dự định `scat`.
+- B chèn `!` ở cuối → dự định `cat!`.
+
+Nếu cả hai chỉ gửi numeric positions dựa trên version cũ và server áp dụng ngây thơ, position có thể lệch. OT hoặc CRDT định nghĩa cách transform/merge để mọi client hội tụ, ví dụ:
+
+```text
+scat!
+```
+
+Trường hợp khó hơn:
+
+- Một user xóa đoạn mà user khác đang chèn vào.
+- Hai user format cùng range bằng attributes khác nhau.
+- Undo một edit sau nhiều concurrent operations.
+
+Conflict resolution không chỉ là last-write-wins cho toàn document; cách đó sẽ làm mất edit hợp lệ.
+
+---
+
+#### 9. OT và CRDT ở mức phạm vi
+
+Chưa cần chốt thuật toán ở bước 1, nhưng cần nhận diện hai họ giải pháp:
+
+##### Operational Transformation (OT)
+
+- Transform operation dựa trên concurrent operations/version.
+- Thường có server ordering/coordination rõ.
+- Có lịch sử triển khai lâu trong collaborative text editing.
+- Correct transformation rules phức tạp, nhất là rich structure/undo.
+
+##### Conflict-free Replicated Data Type (CRDT)
+
+- Dùng cấu trúc/IDs và merge rules bảo đảm hội tụ.
+- Hỗ trợ offline/decentralized merge tự nhiên hơn trong nhiều mô hình.
+- Có metadata/tombstone, memory và implementation complexity.
+
+Không có đáp án “luôn dùng CRDT” hoặc “OT luôn tốt hơn”. Quyết định phụ thuộc document model, offline scope, server authority, scale per document và độ phức tạp đội ngũ có thể kiểm chứng.
+
+---
+
+#### 10. Local-first interaction và acknowledgement
+
+Để editor phản hồi tức thời:
+
+```text
+Keystroke
+ -> apply optimistically to local replica
+ -> enqueue operation in local pending buffer
+ -> send to collaboration server
+ -> server authorize/order/transform/merge/persist
+ -> ACK with canonical version/op metadata
+ -> broadcast to other collaborators
+```
+
+Client cần phân biệt:
+
+- Local pending operations chưa được server ACK.
+- Acknowledged operations đã durable theo contract.
+- Remote operations cần integrate với local pending state.
+
+Nếu server reject do mất quyền hoặc invalid operation, client phải rollback/rebase hoặc reload authoritative state với UX rõ ràng.
+
+---
+
+#### 11. Realtime latency SLO
+
+Transcript đặt mục tiêu đồng bộ edit dưới 100 ms. Cần tách:
+
+- **Local echo latency:** từ keystroke đến màn hình local, nên gần như tức thời, thường dưới một frame/ít chục ms.
+- **Server ACK latency:** local operation được server chấp nhận/lưu bền.
+- **Remote propagation latency:** operation xuất hiện ở collaborator khác.
+- **Convergence/recovery latency:** thời gian replica bắt kịp sau lag/reconnect.
+
+Khoảng cách địa lý đặt giới hạn vật lý. Một SLO hợp lý có thể là:
+
+- Local echo < 16–50 ms.
+- Remote update p95 < 100–200 ms trong cùng khu vực tốt.
+- Cross-region có budget cao hơn theo RTT.
+
+Con số cuối phải được xác nhận; không nên tuyên bố <100 ms toàn cầu cho mọi percentile/network.
+
+---
+
+#### 12. Scalability dimensions
+
+“Millions of documents” chưa đủ. Cần tách:
+
+- Tổng documents và total storage.
+- DAU/MAU.
+- Concurrent connected users.
+- Active documents cùng lúc.
+- Collaborators trên một document: giả định 2–50.
+- Operations/s trên mỗi document và toàn hệ thống.
+- Average/maximum document size.
+- Snapshot/version history growth.
+- Share/invite traffic.
+- Reconnect rate và catch-up operations.
+
+Thông thường partition tốt nhất xoay quanh `documentId`, vì edits của cùng document cần phối hợp/order/merge với nhau.
+
+---
+
+#### 13. Hot document problem
+
+Dù average 2–50 collaborators, một document nổi tiếng có thể có rất nhiều viewers/editors. Một document là một natural coordination key nên không scale ngang vô hạn dễ dàng.
+
+Các hướng:
+
+- Giới hạn editors, cho phần còn lại read-only.
+- Một active collaboration leader/session per document.
+- Batch/coalesce operations.
+- Tách presence/cursor fan-out khỏi durable content path.
+- Hierarchical fan-out/read replicas cho viewers.
+- Partition document theo blocks chỉ khi model/semantics cho phép.
+- Admission control và degrade presence/cursors trước content edits.
+
+Global throughput cao không có nghĩa hot-document contention tự biến mất.
+
+---
+
+#### 14. Version history semantics
+
+Không nhất thiết lưu full copy sau mỗi keystroke. Có thể kết hợp:
+
+```text
+Operation log + periodic snapshots/checkpoints
+```
+
+Load version hiện tại:
+
+```text
+latest snapshot at version N
+ + replay operations N+1 ... current
+```
+
+Version history cho user có thể nhóm edits theo thời gian/author thay vì hiển thị từng keystroke.
+
+Restore không nên xóa lịch sử:
+
+```text
+Restore version 120
+ -> create new operation/checkpoint at current version
+ -> current content becomes equivalent to version 120
+ -> previous timeline remains auditable
+```
+
+Compaction phải giữ khả năng reconstruct theo retention contract.
+
+---
+
+#### 15. Sharing và ACL
+
+Mô hình quyền cơ bản:
+
+```text
+Owner:  read + edit + share + revoke + delete/restore
+Editor: read + edit
+Viewer: read only
+```
+
+Shareable link cần:
+
+- Random unguessable token.
+- Permission scope.
+- Optional expiry/password/domain restriction.
+- Revocation/rotation.
+- Audit creation/access/change.
+
+Quyền được kiểm tra:
+
+- Khi mở document.
+- Khi thiết lập/recover collaboration session.
+- Khi server áp dụng từng content mutation quan trọng.
+- Khi export/share/delete/restore.
+
+Nếu editor bị revoke trong khi socket còn mở, server phải chặn operation mới và thông báo client; không chờ socket tự hết hạn.
+
+---
+
+#### 16. Security requirements
+
+- TLS cho API và WebSocket.
+- Authentication/token validation và secure session refresh.
+- Document-level authorization.
+- Encryption at rest và key management.
+- Rate limiting/abuse protection cho operations, share links và invites.
+- Input/schema/size validation để chống malformed operation và resource exhaustion.
+- Audit permission/version restore/delete.
+- Không log document content/token mặc định.
+- Malware scan nếu sau này hỗ trợ file upload.
+- Data retention, deletion và tenant isolation.
+
+Share link là bearer capability; ai có link có thể có quyền theo scope. Vì vậy entropy, leakage và revocation rất quan trọng.
+
+---
+
+#### 17. Availability và offline/reconnect
+
+Transcript giả định internet tương đối ổn định nhưng vẫn yêu cầu reconnect không mất dữ liệu. Cần xác định mức offline support:
+
+##### Short disconnect MVP
+
+- Client giữ pending operations trong memory/local durable queue.
+- Reconnect bằng `documentId`, client/session ID và last acknowledged version/vector.
+- Server gửi missing operations hoặc snapshot mới.
+- Client rebase/merge local pending edits.
+
+##### Full offline-first
+
+- Edit nhiều giờ/ngày và nhiều thiết bị offline.
+- Durable client storage, garbage collection và complex merge.
+- Authentication/permission revocation semantics khó hơn.
+
+MVP có thể chỉ cam kết short disconnect; không nên vô tình hứa offline-first hoàn chỉnh.
+
+---
+
+#### 18. Presence và cursor
+
+Presence/cursor làm collaboration dễ hiểu nhưng không ảnh hưởng document correctness:
+
+- Heartbeat/TTL xác định ai còn online.
+- Cursor update có thể throttle/coalesce.
+- Mất một cursor frame không cần retry vô hạn.
+- Cursor position phải transform/map khi document thay đổi.
+- Presence fan-out nên tách khỏi durable operation log.
+- Khi quá tải, degrade cursor frequency trước content synchronization.
+
+Nếu transcript không coi cursor là MVP, có thể để optional; nhưng realtime “ai đang sửa đâu” thường là phần quan trọng của trải nghiệm.
+
+---
+
+#### 19. Failure scenarios cần xử lý
+
+| Tình huống | Hành vi cần có |
+|---|---|
+| Client gửi cùng op nhiều lần | Dedupe bằng `opId` |
+| Operations đến sai thứ tự | Causal/version handling hoặc buffer/resync |
+| ACK mất | Client retry; server trả kết quả cũ, không apply lại |
+| Server crash sau persist trước broadcast | Recover từ log/outbox và rebroadcast/catch-up |
+| Client disconnect | Local queue + reconnect/catch-up/snapshot |
+| ACL bị revoke giữa session | Reject edit mới; update session permissions |
+| Operation log quá dài | Snapshot/compaction có kiểm chứng |
+| Client quá chậm | Backpressure; snapshot resync thay vì buffer vô hạn |
+| Hot document | Admission/fan-out hierarchy/degrade presence |
+| Region/network partition | Home-region/leader policy; tránh split-brain document authority |
+
+---
+
+#### 20. Consistency và latency trade-off
+
+Không chờ global consensus trước khi hiển thị mỗi keystroke. Mẫu phổ biến:
+
+- Apply local edit ngay.
+- Server/order/merge canonical operations.
+- Broadcast remote changes nhanh.
+- Mọi replica reconcile về canonical/convergent state.
+
+Strong consistency phù hợp với:
+
+- ACL/ownership.
+- Document deletion/restore commands.
+- Canonical version/checkpoint metadata.
+- Billing/administrative actions.
+
+Eventual/convergent consistency phù hợp với:
+
+- Content replicas trong quá trình sync.
+- Presence và cursor.
+- Search/index/analytics projections.
+
+“Eventual consistency” không đủ nếu không định nghĩa convergence algorithm và recovery protocol.
+
+---
+
+#### 21. Reliability và durability contract
+
+Cần nói rõ “saved” nghĩa là gì:
+
+- Đã nằm trong client local buffer?
+- Server đã nhận nhưng chưa replicate?
+- Đã ghi durable log?
+- Đã replicate đủ theo durability policy?
+
+UI save indicator nên phản ánh contract thực tế:
+
+```text
+Saving... -> Saved to server -> Offline changes pending
+```
+
+Autosave không chỉ là timer lưu full document. Với operation-based collaboration, operations được persist liên tục và snapshot/checkpoint được tạo định kỳ.
+
+---
+
+#### 22. Global performance và document ownership
+
+Low latency toàn cầu có thể dùng:
+
+- Edge connection routing.
+- Region gần user cho static/read data.
+- Một home region/active leader cho mỗi document.
+- Cross-region replicas phục vụ read/recovery.
+
+Nhưng collaborators của cùng document có thể ở nhiều châu lục. Nếu cho nhiều regions cùng order operations mà không coordination/CRDT model rõ ràng, có nguy cơ split brain.
+
+Hai hướng chính:
+
+- **Server-authoritative OT:** mỗi document/session có một ordering authority; remote users chịu RTT cao hơn.
+- **CRDT multi-replica:** merge linh hoạt hơn nhưng metadata, GC và implementation phức tạp.
+
+Global architecture phải theo collaboration algorithm, không thể quyết định độc lập.
+
+---
+
+#### 23. Maintainability
+
+- Document model và operation schema versioned.
+- Collaboration algorithm tách khỏi transport/storage.
+- ACL/share logic tách khỏi editor UI.
+- Snapshot/compaction có invariant tests.
+- Backward compatibility với client/browser version cũ.
+- Feature flags cho editor behaviors.
+- Observability theo document session nhưng kiểm soát cardinality/privacy.
+
+Clean API không đủ; correctness rules cần được đóng gói trong một collaboration engine có thể kiểm thử độc lập.
+
+---
+
+#### 24. Testability
+
+Collaborative editing cần nhiều hơn load test thông thường:
+
+##### Deterministic convergence tests
+
+Sinh cùng tập operations với nhiều delivery order khác nhau; mọi replica phải hội tụ.
+
+##### Property-based tests
+
+Kiểm tra invariants như idempotency, no corruption, valid structure và convergence.
+
+##### Network simulation
+
+Delay, duplicate, drop, reorder, reconnect và partition.
+
+##### Failure injection
+
+Crash server trước/sau persist/ACK/broadcast; bảo đảm không mất acknowledged edit.
+
+##### Load tests
+
+- Nhiều documents active song song.
+- 2–50 editors/document.
+- Hot document có nhiều viewers.
+- Typing bursts, paste lớn và formatting ranges.
+- Reconnect/catch-up storms.
+
+##### Differential/model tests
+
+So sánh implementation với reference model hoặc replay log để xác minh state cuối.
+
+---
+
+#### 25. Observability cần dự kiến
+
+- Local-to-ACK và remote propagation p50/p95/p99.
+- Operations/s, bytes/s và active sessions/documents.
+- Pending/unacknowledged operations per client.
+- Duplicate, reorder, transform/merge failure rate.
+- Catch-up size và snapshot-resync rate.
+- WebSocket connections/reconnects/slow clients.
+- Snapshot age, operation-log length và compaction latency.
+- ACL denial/revocation propagation.
+- Convergence invariant violation; mục tiêu bằng 0.
+- Hot-document fan-out và per-document saturation.
+
+Không đưa raw document content hoặc documentId/userId tùy tiện vào high-cardinality metrics/logs.
+
+---
+
+#### 26. Assumptions và constraints từ transcript
+
+##### Assumptions
+
+- Modern browser có WebSocket.
+- Internet tương đối ổn định, nhưng short disconnect vẫn xảy ra.
+- Text-heavy, basic formatting.
+- 2–50 collaborators/document.
+- Read-write-heavy khi session active.
+
+##### Constraints
+
+- Edit phải phản hồi nhanh và đồng bộ gần realtime.
+- Concurrent edits phải hội tụ.
+- Client có thể nhận update khác thời điểm/thứ tự.
+- Phục vụ người dùng toàn cầu.
+- MVP chưa giải quyết rich media phức tạp.
+
+Cần tránh mâu thuẫn: “stable internet” không loại bỏ yêu cầu reconnect, và “global <100 ms” cần diễn giải theo local echo/region/network percentile.
+
+---
+
+#### 27. Những câu hỏi cần làm rõ
+
+1. DAU, concurrent users và active documents?
+2. Average/p95 document size?
+3. Average/peak operations/s/user và per document?
+4. 2–50 là editors hay gồm viewers?
+5. Có cursor/presence/comments/suggestions trong MVP không?
+6. Offline chỉ vài phút hay nhiều ngày?
+7. Basic formatting gồm những structure nào?
+8. Undo/redo semantics là local hay global?
+9. Version history retention và granularity?
+10. Restore có yêu cầu approval/audit không?
+11. Share link public, domain-only hay authenticated?
+12. Permission revoke cần có hiệu lực trong bao lâu?
+13. SLO <100 ms đo local echo, ACK hay remote delivery, ở percentile/region nào?
+14. Availability, RPO/RTO và acknowledged-edit durability?
+15. Data residency hoặc tenant isolation requirements?
+16. Search/export/import có nằm trong scope không?
+
+---
+
+#### 28. Cách trình bày bước 1 trong phỏng vấn
+
+1. Chốt document model và scope text/basic formatting.
+2. Nêu actors, roles và sharing.
+3. Đi qua local edit → operation → ACK → broadcast.
+4. Nêu convergence, causality, intention và no-acknowledged-edit-loss.
+5. Phân biệt content operation, snapshot, ACL và ephemeral presence.
+6. Đưa OT/CRDT ra như decision cần đánh giá, chưa chọn theo trào lưu.
+7. Tách local echo, ACK và remote propagation SLO.
+8. Chốt 2–50 collaborators và hot-document exception.
+9. Nêu reconnect/catch-up/version history.
+10. Liệt kê out-of-scope và scale questions cho bước 2.
+
+Một câu trả lời mạnh:
+
+> “Tôi ưu tiên local echo để editor luôn phản hồi, rồi gửi operation có ID/version tới collaboration authority. Content operations phải durable, idempotent và hội tụ qua OT hoặc CRDT; presence/cursor chỉ là ephemeral signals. Khi reconnect, client lấy snapshot cùng missing operations và rebase local pending edits.”
+
+---
+
+#### 29. Ý chính cần nhớ
+
+- Collaborative editor là bài toán replicated state, không chỉ CRUD text.
+- MVP gồm document CRUD, simultaneous editing, sync, version history và ACL/sharing.
+- Text/basic formatting và 2–50 collaborators giới hạn phạm vi.
+- Local echo, server ACK và remote propagation là ba latency khác nhau.
+- Mục tiêu <100 ms toàn cầu cần được định nghĩa theo percentile/region.
+- Content operations phải durable; presence/cursor có thể ephemeral.
+- Convergence, causality, intention preservation và idempotency là correctness properties.
+- Last-write-wins toàn document làm mất edit và không đủ.
+- OT và CRDT có trade-off khác nhau; document model ảnh hưởng lựa chọn.
+- Mỗi operation cần stable `opId` và causal/version context.
+- Client phải quản lý local pending operations và remote operations.
+- Version history nên dùng operation log + periodic snapshots/checkpoints.
+- Restore tạo version mới thay vì xóa timeline.
+- ACL phải được kiểm tra khi apply operation, không chỉ khi mở document.
+- Permission revocation phải ảnh hưởng session đang mở.
+- Short reconnect khác full offline-first.
+- Hot document là natural coordination bottleneck.
+- Test convergence bằng reorder/duplicate/drop/partition, không chỉ throughput.
+- Global placement phải phù hợp OT/CRDT và document ownership model.
+
+#### Công thức ghi nhớ
+
+> **Collaborative-editor scope = optimistic local edits + durable idempotent operations + deterministic convergence/causality + low-latency fan-out + snapshot/log recovery + ephemeral presence + strongly enforced ACL and version history.**
+
+---
+
+### Bài 124. Estimating Scale & Identifying Bottlenecks
+
+#### 1. Baseline từ transcript
+
+| Thông số | Giá trị | Ý nghĩa/cần làm rõ |
+|---|---:|---|
+| Daily active users | Hơn 10 triệu | Chưa có MAU/registered users |
+| Documents owned/user | Khoảng 100 | Suy ra xấp xỉ 1 tỷ documents nếu ownership không trùng |
+| Peak concurrent editors | Hơn 200.000 | Chưa gồm viewers/presence-only sessions |
+| Sync events/day | Khoảng 10 tỷ | Cần định nghĩa logical operations hay network messages |
+| Active-user operation rate | 1–2 ops/s | Có thể là đã batch, không nhất thiết từng raw keystroke |
+| Busy-document rate | 5–20 ops/s | Trong phạm vi 2–50 collaborators |
+| Average document size | 100 KB | Chưa rõ compressed/uncompressed và có metadata không |
+| Version amplification | 2–5× base | Phụ thuộc retention, snapshots, operation log và compression |
+
+Các con số tạo baseline hợp lý, nhưng cần tách **logical edit**, **persisted operation**, **broker event** và **WebSocket delivery**. Một logical edit có thể sinh nhiều internal/network events.
+
+---
+
+#### 2. Tổng số documents
+
+```text
+10.000.000 users × 100 documents/user
+= 1.000.000.000 documents
+```
+
+Đây là khoảng **1 tỷ documents**. Cần hỏi:
+
+- “Owned” có tính document đã xóa/archive không?
+- Shared document chỉ được tính một lần theo owner hay lặp trong mỗi user library?
+- Bao nhiêu phần trăm documents còn active?
+- Average 100 KB có bị kéo lệch bởi một số document rất lớn?
+
+User-to-document mapping và document object là hai loại dữ liệu khác nhau. Một shared document không nên được sao chép toàn bộ vào storage của từng collaborator.
+
+---
+
+#### 3. Base document storage
+
+Theo đơn vị thập phân:
+
+```text
+1 tỷ documents × 100 KB
+= 100.000.000.000 KB
+≈ 100 TB base content
+```
+
+Nếu tính version history 2–5×:
+
+```text
+100 TB × 2–5
+≈ 200–500 TB
+```
+
+Con số này chưa gồm:
+
+- Replication và erasure-coding overhead.
+- Index, metadata, ACL, ownership và share links.
+- Operation-log indexes.
+- Search index.
+- Backup và cross-region replica.
+- Comments/media nếu scope mở rộng.
+
+Vì vậy “hàng trăm TB long-term storage” hợp lý, nhưng physical footprint có thể lớn hơn logical data đáng kể.
+
+---
+
+#### 4. Average operation rate từ daily volume
+
+```text
+10.000.000.000 operations/day
+÷ 86.400 seconds/day
+≈ 115.741 operations/s trung bình
+```
+
+Làm tròn: **khoảng 116K logical ops/s average**.
+
+Trên mỗi DAU:
+
+```text
+10B / 10M = 1.000 operations/user/day
+```
+
+Nếu user tạo 1–2 ops/s, tương ứng khoảng 500–1.000 giây active typing/editing mỗi ngày, tức khoảng 8–17 phút. Đây là sanity check hợp lý, dù workload thật gồm paste, delete, formatting và idle time.
+
+---
+
+#### 5. Peak operation rate từ concurrent editors
+
+```text
+200.000 concurrent editors × 1–2 ops/s
+= 200.000–400.000 ops/s peak
+```
+
+So với average 116K/s, peak-to-average factor khoảng:
+
+```text
+200K / 116K ≈ 1,7×
+400K / 116K ≈ 3,5×
+```
+
+Con số này nhất quán hơn nhiều so với chỉ suy từ DAU. Capacity plan nên có thêm growth/failure headroom, ví dụ thử tải 2× peak hoặc ít nhất chịu mất một failure domain.
+
+---
+
+#### 6. Active documents đồng thời
+
+Số active documents phụ thuộc average collaborators trên mỗi document:
+
+| Average connected editors/document | Active documents từ 200K editors |
+|---:|---:|
+| 2 | 100.000 |
+| 5 | 40.000 |
+| 10 | 20.000 |
+| 20 | 10.000 |
+
+Nếu có viewers, số concurrent connections có thể cao hơn 200K đáng kể dù editor count không đổi. Cần tách:
+
+- Editors generating operations.
+- Viewers receiving fan-out.
+- Idle tabs còn giữ socket.
+- Multiple tabs/devices cho cùng user.
+
+---
+
+#### 7. Busy-document rate sanity check
+
+Transcript cho busy document khoảng 5–20 ops/s. Nếu average có 5 editors × 1–2 ops/s:
+
+```text
+5–10 ops/s/document
+```
+
+Nếu 10 editors active:
+
+```text
+10–20 ops/s/document
+```
+
+Do đó 5–20 ops/s hợp với tài liệu có vài đến khoảng 10 editors đang gõ thực sự. Một document có 50 connected collaborators không có nghĩa cả 50 cùng phát 2 ops/s liên tục.
+
+Hot document đặc biệt có thể vượt xa 20 ops/s hoặc có hàng nghìn viewers, cần được coi là workload riêng.
+
+---
+
+#### 8. Fan-out amplification
+
+Mỗi accepted operation cần gửi cho các collaborators khác:
+
+```text
+outbound deliveries/s
+= accepted ops/s × average remote recipients
+```
+
+Ví dụ peak 300K ops/s:
+
+| Connected users/document | Remote recipients/op | Outbound deliveries/s |
+|---:|---:|---:|
+| 2 | 1 | 300K |
+| 5 | 4 | 1,2M |
+| 10 | 9 | 2,7M |
+| 50 | 49 | 14,7M |
+
+Đây là lý do WebSocket broadcast/fan-out có thể lớn hơn collaboration-engine input nhiều lần. Average collaborators và viewer count là biến capacity cực kỳ quan trọng.
+
+---
+
+#### 9. Network bandwidth
+
+Giả sử một operation delivery sau encoding/protocol overhead khoảng 200–500 bytes.
+
+Với 1,2M outbound deliveries/s:
+
+```text
+1,2M × 200 B = 240 MB/s
+1,2M × 500 B = 600 MB/s
+```
+
+Đây là raw aggregate egress trước TLS/network overhead và replication. Batching nhiều operations trong một frame giảm per-message overhead, nhưng tăng một chút latency.
+
+Paste lớn hoặc formatting range không giống keystroke nhỏ; cần giới hạn operation size và có separate handling/chunking nếu cần.
+
+---
+
+#### 10. Operation-log storage mỗi ngày
+
+Nếu persisted operation trung bình 200 bytes:
+
+```text
+10B ops/day × 200 B = 2 TB/day logical
+```
+
+Nếu 500 bytes:
+
+```text
+10B × 500 B = 5 TB/day logical
+```
+
+Với replication factor 3:
+
+```text
+~6–15 TB/day physical trước index/compression
+```
+
+Điều này giải thích nhận định “vài TB hot data mỗi ngày”. Nhưng phải làm rõ 10B là logical operations hay đã gồm fan-out events; không lưu một bản durable riêng cho mỗi WebSocket delivery.
+
+---
+
+#### 11. Operation retention
+
+Nếu giữ toàn bộ 2–5 TB/day trong một năm:
+
+```text
+2 TB/day × 365 ≈ 730 TB/year
+5 TB/day × 365 ≈ 1,825 PB/year
+```
+
+Chưa tính replication. Vì vậy version amplification chỉ 2–5× base content sẽ khó đạt nếu giữ raw keystroke log vô hạn.
+
+Cần:
+
+- Periodic snapshots.
+- Operation-log compaction.
+- User-visible version grouping.
+- Compression.
+- Retention/lifecycle tiers.
+- Chỉ giữ audit chi tiết theo policy cần thiết.
+
+Compaction không được làm mất khả năng phục hồi hoặc vi phạm version-history contract.
+
+---
+
+#### 12. Snapshot amplification
+
+Không tạo full 100 KB snapshot sau mỗi edit. Ví dụ tạo snapshot mỗi 1.000 operations:
+
+```text
+10B ops/day / 1.000
+= 10 triệu snapshots/day
+```
+
+Nếu mỗi snapshot trung bình 100 KB:
+
+```text
+10M × 100 KB ≈ 1 TB/day
+```
+
+Đây vẫn là logical volume lớn. Snapshot policy nên adaptive:
+
+- Theo số operations kể từ snapshot.
+- Theo operation-log bytes.
+- Theo thời gian active.
+- Theo document size/hotness.
+- Theo checkpoint do user tạo.
+
+Snapshot có thể incremental/compressed hoặc block-based nếu document model hỗ trợ.
+
+---
+
+#### 13. Hot và cold storage
+
+##### Hot storage
+
+- Current document snapshot.
+- Recent operation tail.
+- Active session metadata.
+- Recent version checkpoints.
+- ACL cần truy cập thường xuyên.
+
+##### Warm/cold storage
+
+- Old snapshots và compacted histories.
+- Archived/deleted documents theo retention.
+- Audit exports.
+- Long-term backup.
+
+Không nên nhầm cold storage với backup. Archive vẫn có thể bị lỗi logic/xóa nhầm; backup cần failure isolation và restore testing riêng.
+
+---
+
+#### 14. Document-open read path
+
+Khi mở document, client thường cần:
+
+```text
+metadata + ACL decision + current snapshot + recent operation tail
+```
+
+100 KB average không lớn, nhưng 200K concurrent editors cùng reconnect/open có thể tạo burst:
+
+```text
+200K × 100 KB = 20 GB snapshot payload
+```
+
+Nếu tải trong 10 giây sau sự cố:
+
+```text
+~2 GB/s raw snapshot egress
+```
+
+Chưa gồm metadata/operations/TLS. Snapshot CDN/cache chỉ dùng được khi permission và freshness được xử lý an toàn; private content không được cache public.
+
+---
+
+#### 15. WebSocket connections
+
+Ít nhất có 200K peak editor connections. Thực tế cần cộng:
+
+- Viewers.
+- Idle tabs.
+- Multi-device/multi-tab.
+- Presence-only users.
+
+Nên test 2–3× baseline, ví dụ 400K–600K sockets, cùng message rate thực tế. Scaling dimensions:
+
+```text
+connections
+connection establishments/s
+inbound ops/s
+outbound deliveries/s
+bytes/s
+per-document subscriptions
+slow-client buffers
+```
+
+WebSocket server có thể cạn memory/file descriptors/network trước CPU.
+
+---
+
+#### 16. Reconnect storm và catch-up
+
+Nếu 100K clients reconnect trong 20 giây:
+
+```text
+100.000 / 20 = 5.000 reconnects/s
+```
+
+Mỗi reconnect có thể gây token validation, ACL lookup, session routing, snapshot/catch-up và presence broadcast.
+
+Nếu một busy document tạo 20 ops/s và client offline 60 giây:
+
+```text
+20 × 60 = 1.200 missing operations
+```
+
+Server có thể gửi operation tail. Nếu backlog quá lớn, gửi snapshot mới thường hiệu quả hơn. Cần threshold theo op count/bytes/cost.
+
+Client dùng exponential backoff + jitter để tránh thundering herd.
+
+---
+
+#### 17. Collaboration-engine bottleneck
+
+Transcript gọi OT/CRDT processing “rất CPU-intensive”. Điều này có thể đúng với transform chains, rich structure hoặc hot documents, nhưng không nên mặc định CPU luôn là bottleneck duy nhất.
+
+Các giới hạn có thể đến trước:
+
+- Per-document serialization/order coordination.
+- Memory cho pending/version history.
+- Network fan-out.
+- Durable log latency.
+- Slow clients/backpressure.
+- Long transform chain nếu client base version quá cũ.
+- CRDT metadata/tombstone growth.
+
+Phải benchmark đúng document model và algorithm. Với basic text, fan-out/network/storage thường có thể lớn hơn pure CPU cost.
+
+---
+
+#### 18. Natural partition key và hot document
+
+`documentId` là key tự nhiên vì operations cùng document cần chung ordering/merge context.
+
+```text
+hash(documentId) -> collaboration shard/leader
+```
+
+Điều này phân phối tốt giữa nhiều documents nhưng không chia tải của **một hot document**. Một hot key vẫn nằm trên một coordination boundary.
+
+Giải pháp:
+
+- Giới hạn editor count; viewers qua fan-out tier.
+- Presence/cursor đi pipeline riêng.
+- Batch operations.
+- Block/section partitioning nếu semantics cho phép.
+- Read replicas/relay tree cho viewers.
+- Move/rebalance document authority có handoff protocol.
+- Admission/load shedding cho non-critical signals.
+
+---
+
+#### 19. Conflict-resolution bottleneck
+
+Conflict probability phụ thuộc không chỉ user count mà còn:
+
+- Cùng sửa một range/block hay các vùng khác nhau.
+- Network RTT và offline duration.
+- Operation granularity.
+- Document structure.
+- Undo/redo và formatting semantics.
+
+Metrics cần theo dõi:
+
+- Concurrent operations per document.
+- Transform/merge chain length.
+- Rebase count.
+- Invalid/rejected operation rate.
+- Snapshot-resync rate.
+- Convergence invariant failures.
+
+Không tối ưu conflict resolution bằng cách chặn local echo; user vẫn cần phản hồi tức thời.
+
+---
+
+#### 20. Storage write path
+
+Một accepted edit có thể gây:
+
+```text
+authorize
+ -> transform/merge/order
+ -> append durable operation
+ -> update document/session version
+ -> ACK sender
+ -> publish/broadcast remote operation
+ -> asynchronously update snapshot/search/analytics
+```
+
+Không nhất thiết write full document/autosave record mỗi keystroke. Append operations và checkpoint định kỳ giảm write amplification.
+
+Cần batch/group commit cẩn thận để cân bằng ACK latency với durability/throughput.
+
+---
+
+#### 21. ACL-check bottleneck
+
+Nếu 200K–400K ops/s đều query relational ACL database trực tiếp, permission layer có thể thành bottleneck.
+
+Có thể dùng:
+
+- ACL/session authorization cache.
+- Permission revision/version gắn collaboration session.
+- Short TTL và invalidation event khi share/revoke.
+- Server-side check trong collaboration authority.
+- Immediate revocation signal + periodic revalidation.
+
+Không được bỏ authorization chỉ vì tối ưu latency. Client role và cached UI state không phải security authority.
+
+Trade-off: cache lâu giảm DB load nhưng làm revoke propagation chậm. Cần đặt SLO cho permission revocation.
+
+---
+
+#### 22. Presence/cursor fan-out
+
+Presence và cursor thường phát thường xuyên hơn content edit trong một số session. Nếu mỗi user gửi cursor 10 lần/s, 200K users tạo:
+
+```text
+2 triệu cursor updates/s inbound
+```
+
+Không nên truyền raw mouse/cursor event ở tần suất đó. Throttle, coalesce và chỉ gửi latest state, ví dụ 5–10 updates/s hoặc thấp hơn theo UX.
+
+Presence/cursor:
+
+- Không cần durable log dài hạn.
+- Có thể drop intermediate frames.
+- Có TTL.
+- Nên degrade đầu tiên khi hệ thống quá tải.
+
+---
+
+#### 23. Latency budget minh họa
+
+Để remote propagation p95 khoảng 100 ms trong điều kiện mạng thuận lợi:
+
+| Stage | Budget minh họa |
+|---|---:|
+| Client encode/send | 5 ms |
+| Network to edge/server | 20 ms |
+| Auth/session/route | 5 ms |
+| Transform/order/persist | 20 ms |
+| Publish/fan-out | 10 ms |
+| Network to peer | 20 ms |
+| Client apply/render | 10 ms |
+| Headroom | 10 ms |
+
+Tổng khoảng 100 ms. Đây chỉ là example budget; cross-region RTT hoặc mobile network có thể vượt. Local echo không chờ toàn bộ chuỗi này.
+
+---
+
+#### 24. Availability và durability bottleneck
+
+Nếu server ACK trước durable append rồi crash, edit có thể mất. Nếu đợi multi-region sync trước ACK, latency có thể quá cao.
+
+Cần định nghĩa:
+
+- ACK sau local durable log hay quorum replication?
+- RPO cho acknowledged edits có bằng 0 không?
+- Failure domain: process, node, AZ hay region?
+- Collaboration leader failover mất bao lâu?
+- Client pending buffer giữ edit cho đến ACK ra sao?
+
+Một lựa chọn thường gặp: synchronous replication trong region/AZ quorum cho acknowledged edit, cross-region async cho DR. Quyết định phải theo SLO/RPO, không theo khẩu hiệu “high availability”.
+
+---
+
+#### 25. Bottleneck map
+
+| Bottleneck | Dấu hiệu | Hướng xử lý |
+|---|---|---|
+| Collaboration authority | Op latency/queue per document | Shard by documentId, batch, optimize algorithm |
+| Hot document | Một key/shard quá tải | Editor limits, fan-out tree, block partition, admission |
+| WebSocket gateways | Socket/memory/network saturation | Horizontal fleet, registry, backpressure |
+| Fan-out | Outbound deliveries/bytes tăng mạnh | Targeted subscriptions, batching, relay hierarchy |
+| Durable op storage | Append latency/IOPS | Partitioned log, group commit, snapshot/compaction |
+| Conflict processing | Long transform/rebase chains | Bound history, snapshot resync, efficient structures |
+| ACL | DB lookup latency per op | Cached permission revision + fast revocation |
+| Reconnect/catch-up | Snapshot burst/backlog | Backoff, threshold, cache/private delivery |
+| Version history | Storage growth | Incremental snapshots, compression, lifecycle |
+| Presence/cursor | Very high ephemeral fan-out | Throttle/coalesce/drop under load |
+
+---
+
+#### 26. Traffic skew
+
+Traffic không đều:
+
+- Work-hour peaks theo time zone.
+- School/exam/business-event bursts.
+- A small fraction of documents nhận phần lớn edits/viewers.
+- Large paste/import tạo byte burst dù op count nhỏ.
+- Permission change/share link có thể kéo nhiều viewers vào cùng lúc.
+
+Do đó cần theo dõi phân phối, không chỉ average:
+
+- p50/p95/p99 ops/s/document.
+- Max collaborators/document.
+- Top 0,1% documents chiếm bao nhiêu traffic.
+- Payload size distribution.
+- Session length và reconnect distribution.
+
+---
+
+#### 27. Load/failure tests
+
+- 200K–600K WebSocket connections.
+- 200K–400K content ops/s peak và 2× headroom.
+- 1M+ outbound deliveries/s theo fan-out.
+- 2–50 collaborators/document với concurrent overlapping edits.
+- Hot document có nhiều editors/viewers.
+- Duplicate, reorder, delay và packet loss.
+- Server crash trước/sau durable append/ACK/broadcast.
+- Reconnect storm 5K+ sessions/s.
+- Catch-up 1K–100K operations so với snapshot resync.
+- ACL revoke trong active session.
+- Slow client/backpressure.
+- Operation-log compaction trong khi editing tiếp tục.
+- Region/AZ failure và document-leader handoff.
+
+Correctness assertions phải chạy cùng load test: convergence, no acknowledged-edit loss, valid document structure và ACL enforcement.
+
+---
+
+#### 28. Capacity metrics quan trọng
+
+- DAU và concurrent editors/viewers.
+- Active documents và session duration.
+- Logical ops/s, bytes/s và op payload percentiles.
+- Persisted log bytes/day.
+- Average recipients/op và outbound deliveries/s.
+- WebSocket connections, reconnects/s và event-loop lag.
+- Per-document pending queue và processing latency.
+- Snapshot creation rate/bytes và operation tail length.
+- Catch-up operations/bytes và snapshot-resync rate.
+- ACL cache hit/revocation lag.
+- Hot-document concentration.
+- Cost per 1.000 operations hoặc per active editing hour.
+
+---
+
+#### 29. Những assumption còn thiếu
+
+1. 10M DAU là editors, viewers hay mọi users?
+2. 200K concurrent là editors hay total connections?
+3. Average connected collaborators và viewers/document?
+4. 10B events là logical edits, persisted events hay fan-out deliveries?
+5. Operation payload average/p95 và batching policy?
+6. Average/p95/max document size?
+7. Retention của raw operations và user-visible versions?
+8. Snapshot interval theo time/op count/bytes?
+9. Offline duration và catch-up limits?
+10. OT hay CRDT, server ordering hay multi-replica?
+11. ACK durability/RPO guarantee?
+12. Permission-revocation SLO?
+13. Global region distribution và RTT?
+14. Hot-document maximum editor/viewer target?
+
+---
+
+#### 30. Cách trình bày trong phỏng vấn
+
+1. Suy 1B documents và 100 TB base storage.
+2. Áp version/history overhead để ra ít nhất 200–500 TB logical.
+3. Đổi 10B events/day thành ~116K ops/s average.
+4. Dùng 200K concurrent × 1–2 ops/s ra 200K–400K peak.
+5. Tính active documents theo collaborators/document.
+6. Tính fan-out deliveries và network bytes.
+7. Ước lượng 2–5 TB logical operation log/day.
+8. Cho thấy snapshot frequency có thể thêm ~TB/day.
+9. Nêu WebSocket/reconnect/catch-up load.
+10. Chỉ ra natural partition `documentId` và hot-key limitation.
+11. Kết thúc bằng ACL, durability và convergence tests.
+
+Một câu trả lời mạnh:
+
+> “10 tỷ operations/ngày tương ứng khoảng 116 nghìn ops/s trung bình; 200 nghìn concurrent editors tạo khoảng 200–400 nghìn ops/s ở peak. Nhưng input rate chưa phải tải cuối: với trung bình 5 collaborators, 300 nghìn accepted ops/s có thể tạo 1,2 triệu outbound deliveries/s. Tôi sẽ shard theo documentId, đồng thời xử lý hot document, reconnect và version compaction như các bottleneck riêng.”
+
+---
+
+#### 31. Ý chính cần nhớ
+
+- 10M users × 100 owned documents suy ra khoảng 1B documents.
+- 1B × 100 KB tạo khoảng 100 TB base content.
+- Version amplification 2–5× tạo khoảng 200–500 TB logical, chưa gồm replica/index/backup.
+- 10B ops/day tương ứng khoảng 116K ops/s average.
+- 200K concurrent editors × 1–2 ops/s tạo 200K–400K peak.
+- 10B/10M tương ứng 1.000 ops/user/day, sanity-check được với 8–17 phút active editing.
+- Active documents phụ thuộc collaborators/document, khoảng 20K–100K trong ví dụ.
+- Fan-out có thể biến 300K ops/s thành 1,2M–14,7M deliveries/s.
+- 10B operations ở 200–500 bytes tạo 2–5 TB logical log/day.
+- Giữ raw log vô hạn không phù hợp version amplification chỉ 2–5×.
+- Snapshot mỗi 1.000 ops có thể tạo 10M snapshots hay ~1 TB/day ở 100 KB.
+- `documentId` là natural partition key nhưng không giải quyết hot document.
+- Collaboration engine có thể nghẽn ở ordering, memory, network hoặc storage—not chỉ CPU.
+- ACL check per operation cần cache/version và revocation semantics rõ.
+- Presence/cursor nên throttle/coalesce và degrade trước content edits.
+- Reconnect storm gây auth, ACL, snapshot và catch-up burst.
+- ACK durability và RPO phải được định nghĩa rõ.
+- Load test phải kiểm tra convergence/no-loss cùng throughput.
+
+#### Công thức ghi nhớ
+
+> **Collaborative-editor scale = concurrent editors × ops rate + accepted ops × recipient fan-out + sockets/reconnects + operation-log/snapshot amplification + per-document coordination skew; shard by document, but design hot documents explicitly.**
+
+---
+
+### Bài 125. High-Level Design: Document Model, Sync Flow & APIs
+
+#### 1. Mục tiêu của high-level design
+
+Kiến trúc cần đồng thời đạt:
+
+- Local editing phản hồi tức thời.
+- 200K–400K peak operations/s.
+- Mọi replica hội tụ dù edit concurrent, lặp hoặc sai thứ tự.
+- Edit đã ACK không bị mất trong failure scope đã cam kết.
+- Fan-out hàng triệu deliveries/s mà không để slow client làm nghẽn document.
+- Reconnect bằng snapshot + missing operations.
+- ACL/share revocation áp dụng cho session đang mở.
+- Version history có thể xem và restore.
+
+Một nguyên tắc trung tâm:
+
+> **Realtime transport, collaboration correctness và durable persistence là ba concern riêng nhưng phải có contract nối chúng rõ ràng.**
+
+---
+
+#### 2. Logical architecture
+
+```text
+Browser / Mobile Editor
+  +-- REST/HTTP ---------------------> API Gateway
+  |                                      |
+  |                              Document/Metadata Service
+  |                                  |        |
+  |                               ACL/Share  Version API
+  |
+  +-- WebSocket --------------------> Collaboration Gateway
+                                         |
+                                 Session Router / Directory
+                                         |
+                              Document Collaboration Authority
+                               /       |          |          \
+                         OT/CRDT   Durable Op   Presence   Fan-out
+                          Engine       Log        Plane       Bus
+                            |           |                       |
+                            +------ Snapshot Builder            +-> Gateway shards
+                                         |
+                                Hot Document Storage
+                                         |
+                              Cold History / Backup Storage
+
+Async Event Bus
+  +-> Search indexing
+  +-> Audit pipeline
+  +-> Analytics
+  +-> Notification/email invites
+```
+
+Collaboration Authority là logical owner của active document session. Nó có thể giữ hot state trong memory nhưng phải khôi phục được từ snapshot + durable operation log.
+
+---
+
+#### 3. Các thành phần và trách nhiệm
+
+| Thành phần | Trách nhiệm | Có state không? |
+|---|---|---|
+| **Client Editor** | Local replica, render, pending ops, reconnect | Có local state |
+| **API Gateway** | Auth, route, rate limit, request ID | Chủ yếu stateless |
+| **Document Service** | Metadata, create/delete, ACL links, current snapshot reference | Durable state |
+| **ACL/Sharing Service** | Owner/editor/viewer, invite/link, permission revision | Durable/strong |
+| **Collaboration Gateway** | WebSocket auth, framing, backpressure, connection routing | Ephemeral connections |
+| **Session Directory** | `documentId -> authority/shard` | Ephemeral/rebuildable coordination |
+| **Collaboration Authority** | Authorize, order/merge, version, dedupe, ACK | Hot state + durable backing |
+| **Operation Store** | Append canonical operations | Durable |
+| **Snapshot Builder** | Materialize/compact document state | Async/durable output |
+| **Versioning Service** | Checkpoints, history, restore-as-new-version | Durable metadata/history |
+| **Presence Service** | Online users, cursor, selection | Ephemeral/TTL |
+| **Fan-out/PubSub** | Route accepted operations to gateways | Transient/durable tùy channel |
+
+Không phải mọi component cần là microservice vật lý. Nhưng collaboration authority không thật sự “stateless”: nó quản lý version/pending context của document đang active. Tính đúng đắn đến từ single ownership hoặc thuật toán replicated đã định nghĩa, không phải từ nhãn stateless.
+
+---
+
+#### 4. Document metadata model
+
+```text
+Document
+  documentId
+  ownerId / tenantId
+  title
+  status: ACTIVE | TRASHED | DELETED
+  currentContentVersion
+  currentSnapshotId
+  aclRevision
+  homeRegion
+  createdAt / updatedAt
+```
+
+Metadata không nên chứa toàn bộ text nếu content có storage/lifecycle khác. `currentContentVersion` và `currentSnapshotId` liên kết control metadata với collaboration state.
+
+Document deletion cần semantics:
+
+- Soft delete/trash trước.
+- ACL chặn collaboration session mới.
+- Active sessions nhận permission/status update.
+- Hard delete chạy async theo retention/legal policy.
+
+---
+
+#### 5. Content model
+
+Với basic rich text, block/tree model thường dễ mở rộng hơn một chuỗi duy nhất:
+
+```text
+DocumentRoot
+  +-- Block(id=b1, type=paragraph)
+  |     +-- TextSpan(id=t1, text="Hello", attrs={bold:true})
+  +-- Block(id=b2, type=paragraph)
+        +-- TextSpan(id=t2, text="World")
+```
+
+Operations có thể là:
+
+- Insert text.
+- Delete range/elements.
+- Split/merge block.
+- Insert/delete block.
+- Apply/remove formatting attributes.
+
+Document model phải xác định:
+
+- Stable node/element IDs.
+- Valid tree/schema invariants.
+- Range/cursor mapping qua concurrent edits.
+- Formatting conflict semantics.
+- Undo/redo semantics.
+
+Không nên để mỗi client gửi arbitrary JSON tree replacement; điều đó làm conflict resolution và validation khó kiểm soát.
+
+---
+
+#### 6. Operation envelope chung
+
+Một envelope có thể chứa:
+
+```json
+{
+  "messageType": "submit_operation",
+  "documentId": "doc_123",
+  "sessionId": "ses_9",
+  "clientId": "client_A",
+  "opId": "client_A:1842",
+  "baseVersion": 519,
+  "aclRevision": 42,
+  "operation": {
+    "type": "insert_text",
+    "blockId": "b7",
+    "position": 87,
+    "text": "hello"
+  }
+}
+```
+
+Trường cụ thể thay đổi theo OT/CRDT:
+
+- OT thường dùng server/base version và numeric/logical positions.
+- CRDT thường dùng stable item IDs, state vector/dots hoặc causal metadata.
+
+Không nên bắt CRDT giả vờ là OT bằng một global integer version duy nhất, hoặc ngược lại.
+
+---
+
+#### 7. Hai nhánh collaboration algorithm
+
+##### 7.1 Server-authoritative OT
+
+```text
+Client op at base version N
+ -> server receives at current version M
+ -> transform op against concurrent ops N+1...M
+ -> validate transformed op
+ -> assign canonical version M+1
+ -> persist + ACK + broadcast
+```
+
+Đặc điểm:
+
+- Thường cần ordering authority theo document.
+- Catch-up dựa trên version sequence.
+- Transform chain dài khi client quá stale; có thể yêu cầu snapshot resync.
+- Intention-preservation rules cần được kiểm chứng kỹ.
+
+##### 7.2 CRDT
+
+```text
+Client creates update with stable IDs/causal context
+ -> local apply
+ -> server validates/authenticates update
+ -> persist/dedupe
+ -> merge and fan-out
+ -> replicas integrate in permitted orders and converge
+```
+
+Đặc điểm:
+
+- Không nhất thiết mọi client áp operations theo cùng global order.
+- Catch-up có thể dùng state vector/diff update.
+- Offline merge tự nhiên hơn.
+- Metadata/tombstone và garbage collection cần thiết kế.
+
+Yjs và Automerge là các thư viện/hệ CRDT, không phải ví dụ “OT-compatible” nói chung. Nếu dùng OT, cần engine/document model OT tương ứng.
+
+---
+
+#### 8. Mở document
+
+```text
+Client -> GET /v1/documents/{documentId}
+  -> authenticate + authorize read
+  <- metadata, permission, aclRevision,
+     snapshot descriptor, current version/state vector
+
+Client -> WebSocket /v1/collaboration
+  -> authenticate
+  -> join_document(documentId, lastKnownVersion/stateVector)
+  -> authority rechecks ACL
+  <- snapshot or missing operations + session info
+```
+
+Nếu client đã có snapshot/version còn đủ mới, chỉ gửi missing operations. Nếu operation tail quá lớn hoặc không còn trong hot retention, gửi snapshot mới.
+
+Join response cần phân biệt:
+
+- `caught_up` bằng delta.
+- `snapshot_required`.
+- `permission_denied`.
+- `document_deleted/trashed`.
+- `redirect` tới authority/home region nếu routing cần.
+
+---
+
+#### 9. Local edit flow
+
+```text
+Keystroke
+ -> Client Editor tạo opId
+ -> Apply operation ngay lên local replica
+ -> Ghi vào pending queue
+ -> Gửi qua WebSocket
+```
+
+Local echo không chờ network. Pending queue nên có thể lưu durable trong browser/mobile storage nếu muốn chịu tab crash/short offline.
+
+Client giữ:
+
+- Last acknowledged server version/state vector.
+- Pending local operations.
+- Buffered remote operations nếu cần.
+- Session/document permission revision.
+- Connection/retry state.
+
+---
+
+#### 10. Server operation flow
+
+```text
+Collaboration Gateway
+ -> route by documentId
+ -> Collaboration Authority
+      1. Authenticate session/client
+      2. Check document active + edit permission/aclRevision
+      3. Validate op schema/size/document invariants
+      4. Dedupe opId
+      5. OT transform/order OR CRDT integrate
+      6. Append canonical operation durably
+      7. Advance version/state metadata
+      8. ACK sender
+      9. Publish accepted operation to collaborators
+     10. Trigger snapshot/version/audit asynchronously
+```
+
+Bước 6 phải nằm trước ACK nếu contract là “ACK nghĩa edit đã durable”. Có thể group commit vài milliseconds để tăng throughput, nhưng không được broadcast/ACK như đã lưu rồi chỉ hy vọng autosave sau đó.
+
+---
+
+#### 11. ACK semantics
+
+ACK minh họa:
+
+```json
+{
+  "messageType": "operation_ack",
+  "documentId": "doc_123",
+  "opId": "client_A:1842",
+  "canonicalVersion": 520,
+  "durability": "regional_quorum",
+  "serverTimestamp": "..."
+}
+```
+
+Client chỉ bỏ operation khỏi pending durable queue sau ACK hợp lệ.
+
+Nếu ACK mất:
+
+- Client retry cùng `opId`.
+- Server dedupe và trả lại canonical result/version cũ.
+- Không apply operation lần hai.
+
+Nếu server reject do stale ACL/invalid op, client cần xử lý rõ ràng thay vì âm thầm giữ divergent local content.
+
+---
+
+#### 12. Broadcast flow
+
+Accepted operation được gửi:
+
+```text
+Authority
+ -> document topic/routing key
+ -> gateway shards có subscribers của document
+ -> remote clients
+```
+
+Remote message:
+
+```json
+{
+  "messageType": "remote_operation",
+  "documentId": "doc_123",
+  "opId": "client_A:1842",
+  "canonicalVersion": 520,
+  "actor": "user_A",
+  "operation": {"type":"insert_text", "...":"..."}
+}
+```
+
+Sender có thể nhận canonical operation cùng ACK nếu transform làm payload thay đổi. Không giả định local optimistic result luôn giống byte-for-byte canonical result.
+
+Fan-out delivery có thể at-least-once hoặc có gap. Client dedupe bằng `opId/version`; phát hiện version gap thì chạy catch-up/snapshot resync.
+
+---
+
+#### 13. Persistence: operation log trước, snapshot sau
+
+Phải tách:
+
+- **Durable operation append:** diễn ra trước ACK theo durability contract.
+- **Materialized document snapshot:** tạo định kỳ/asynchronous để load nhanh.
+- **User-visible version checkpoint:** nhóm history để con người xem/restore.
+- **Backup/archive:** bảo vệ trước failure/corruption theo retention.
+
+```text
+Accepted ops -> Durable Op Log
+                   |
+                   +-> Snapshot Builder every K ops / B bytes / T time
+                   |      -> snapshot at version N
+                   |
+                   +-> Version Grouper -> user-facing checkpoints
+                   +-> Backup/Archive lifecycle
+```
+
+“Autosave định kỳ thay vì ghi mỗi keystroke” chỉ an toàn nếu mỗi acknowledged operation đã nằm trong durable log. Autosave ở đây là materialization/checkpoint, không phải durability đầu tiên của edit.
+
+---
+
+#### 14. Snapshot construction
+
+Snapshot Builder:
+
+1. Đọc snapshot gần nhất ở version N.
+2. Replay/integrate operations N+1…M.
+3. Validate document structure/hash.
+4. Ghi snapshot M immutable.
+5. Atomically cập nhật snapshot pointer nếu vẫn phù hợp.
+6. Compact operation prefix khi retention/safety cho phép.
+
+Builder phải chịu operation tiếp tục đến trong lúc snapshot. Snapshot gắn exact version/state vector, không đại diện mơ hồ cho “khoảng thời gian”.
+
+Adaptive thresholds theo op count/log bytes/document hotness tốt hơn một fixed version interval cho mọi document.
+
+---
+
+#### 15. Version history và restore
+
+REST APIs:
+
+```http
+GET  /v1/documents/{documentId}/versions?cursor=...
+GET  /v1/documents/{documentId}/versions/{versionId}
+POST /v1/documents/{documentId}/versions/{versionId}/restore
+```
+
+Restore flow:
+
+```text
+authorize owner/editor policy
+ -> materialize target version
+ -> generate restore operation/transaction at current head
+ -> persist as new current version
+ -> broadcast to active collaborators
+ -> retain prior history
+```
+
+Restore không rewrite timeline về quá khứ. Active collaborators cần nhận canonical replace/patch/resync event có version rõ.
+
+---
+
+#### 16. REST APIs cho document lifecycle
+
+```http
+POST   /v1/documents
+GET    /v1/documents/{documentId}
+PATCH  /v1/documents/{documentId}/metadata
+DELETE /v1/documents/{documentId}
+POST   /v1/documents/{documentId}/restore-from-trash
+
+GET    /v1/documents?owner=&sharedWithMe=&cursor=
+GET    /v1/documents/{documentId}/permissions
+PUT    /v1/documents/{documentId}/permissions/{principalId}
+DELETE /v1/documents/{documentId}/permissions/{principalId}
+POST   /v1/documents/{documentId}/share-links
+DELETE /v1/documents/{documentId}/share-links/{linkId}
+```
+
+Không nên có endpoint “save full content” được client gọi song song với operation stream mà không định nghĩa precedence; nó dễ overwrite concurrent edits. Full replace/import phải là một versioned collaboration command đặc biệt.
+
+REST responses có ETag/version cho metadata concurrency. List APIs dùng cursor pagination.
+
+---
+
+#### 17. WebSocket protocol messages
+
+Client → server:
+
+```text
+authenticate / refresh_auth
+join_document
+leave_document
+submit_operation
+update_presence
+update_cursor
+ack_remote_version
+request_catch_up
+ping
+```
+
+Server → client:
+
+```text
+joined_document
+operation_ack
+remote_operation
+presence_snapshot / presence_delta
+cursor_delta
+permission_changed
+snapshot_required
+resync_required
+error
+pong
+```
+
+Mỗi message cần schema version, size limit, document/session identity và error semantics. Presence/cursor frames có thể coalesce; content operations không được silently drop.
+
+---
+
+#### 18. Permission enforcement
+
+Flow join/edit:
+
+```text
+ACL Service -> permission + aclRevision
+Collaboration session caches decision
+ACL change -> PermissionChanged(documentId, aclRevision)
+Authority invalidates/rechecks session
+```
+
+Khi revoke editor:
+
+- Operation đã durable trước revoke boundary giữ nguyên.
+- Operation mới sau khi authority áp revision bị reject.
+- Client nhận `permission_changed` và chuyển read-only.
+- Share-link session cũng bị invalidated khi link revoke/rotate.
+
+Không query ACL database cho từng keystroke nếu cache/revision có thể đảm bảo revocation SLO. Nhưng server vẫn là enforcement point, không tin client.
+
+---
+
+#### 19. Presence/cursor flow riêng
+
+```text
+Client -> cursor/presence update
+ -> Presence Service/pub-sub
+ -> throttle/coalesce/latest-only
+ -> collaborators
+```
+
+Presence không đi durable operation log:
+
+- TTL/heartbeat.
+- Best-effort hoặc latest-value semantics.
+- Drop intermediate cursor updates khi backpressure.
+- Cursor mapping phải dùng document version/anchor phù hợp.
+- Degrade presence/cursor trước content synchronization.
+
+Điều này giảm write/storage/fan-out pressure đáng kể.
+
+---
+
+#### 20. Catch-up sau reconnect
+
+Client gửi:
+
+```text
+documentId
+lastAcknowledgedVersion or CRDT stateVector
+pending op IDs/updates
+aclRevision
+```
+
+Server chọn:
+
+##### Delta catch-up
+
+Dùng khi missing operation tail nhỏ và còn retention:
+
+```text
+send ops from N+1...current
+integrate/rebase pending local operations
+```
+
+##### Snapshot resync
+
+Dùng khi:
+
+- Client quá cũ.
+- Tail quá lớn theo op count/bytes.
+- Operation prefix đã compact.
+- Client state/hash không hợp lệ.
+
+```text
+send current snapshot + state/version
+reapply/rebase valid pending local edits
+```
+
+Không bỏ pending edit âm thầm. Nếu không thể merge, UI cần thông báo hoặc tạo recovered copy theo product policy.
+
+---
+
+#### 21. Slow client và backpressure
+
+Mỗi connection có bounded outbound queue. Nếu client đọc chậm:
+
+1. Coalesce/drop presence/cursor frames.
+2. Batch content operations nếu protocol cho phép.
+3. Nếu content backlog vượt threshold, đánh dấu `resync_required` và đóng/reconnect.
+4. Client tải snapshot thay vì server giữ buffer vô hạn.
+
+Một slow collaborator không được chặn collaboration authority hoặc các clients khác.
+
+---
+
+#### 22. Pub/Sub và message bus
+
+Pub/Sub có hai vai trò khác nhau:
+
+##### Realtime fan-out routing
+
+- Định tuyến accepted op tới gateway shards.
+- Latency thấp.
+- Gap có thể phục hồi qua durable operation log/snapshot.
+
+##### Async background workflows
+
+- Snapshot/version building.
+- Search indexing.
+- Audit/analytics.
+- Email invitation.
+- Backup/archive.
+
+Kafka, Redis Streams, NATS, RabbitMQ hoặc managed equivalents có semantics khác nhau. “RabbitMQ” nhiều khả năng là từ transcript bị nhận thành “AbitMQ”. Không nên chọn một broker chỉ vì tên; cần xét ordering, durability, replay, fan-out và operations.
+
+---
+
+#### 23. Sharding và session routing
+
+```text
+hash(documentId) -> collaboration shard
+documentId       -> active authority instance
+```
+
+Session Directory giúp gateway route operation tới owner. Authority có thể là actor/single-writer per active document trong OT model.
+
+Rebalance/handoff cần:
+
+- Ngừng/queue operation ngắn có kiểm soát.
+- Chuyển latest snapshot/version và pending durable tail.
+- Fencing token/epoch ngăn old owner tiếp tục ghi.
+- Update directory atomically.
+- Client retry/idempotency xuyên handoff.
+
+Không được để hai authorities cùng tự nhận ownership một document nếu algorithm yêu cầu single orderer.
+
+---
+
+#### 24. Hot-document strategy
+
+- Giới hạn editors; viewers qua read fan-out tier.
+- Tách presence/cursor khỏi content path.
+- Batch accepted operations thành frames.
+- Relay tree/hierarchical PubSub cho nhiều viewers.
+- Dedicated authority capacity cho hot doc.
+- Backpressure/admission control cho paste hoặc operation bursts.
+- Chia document theo blocks chỉ khi cross-block operation/undo semantics được giải quyết.
+
+Với CRDT, merge có thể phân tán hơn nhưng fan-out, metadata và client performance vẫn là bottleneck. CRDT không làm hot document biến mất.
+
+---
+
+#### 25. Multi-region
+
+Hai mô hình:
+
+##### Home-region authority
+
+- Mỗi document có home region.
+- Clients kết nối edge gần nhất rồi route op tới home region.
+- Cross-region RTT ảnh hưởng remote collaborators.
+- Replicate snapshot/log async cho DR/read.
+
+##### Multi-replica CRDT
+
+- Regional replicas nhận updates và merge.
+- Cần causal metadata, access-control boundary, GC và anti-entropy.
+- Permission revoke và deletion semantics khó hơn.
+
+Không bật multi-region active-active độc lập với collaboration algorithm. Với MVP, home-region/single authority thường dễ chứng minh correctness hơn.
+
+---
+
+#### 26. Backup khác version history
+
+| Cơ chế | Mục tiêu |
+|---|---|
+| Operation log | Sync, catch-up và reconstruct gần hạn |
+| Version history | User xem/restore thay đổi logic |
+| Snapshot | Load/recovery/compaction nhanh |
+| Replication | Chịu lỗi node/AZ gần thời gian thực |
+| Backup | Khôi phục sau corruption/deletion/disaster |
+
+Backup phải có retention, immutability/failure isolation và restore test. Version history nằm cùng hệ thống production có thể bị lỗi/xóa cùng production nên không thay backup.
+
+---
+
+#### 27. Failure handling
+
+| Failure | Hành vi |
+|---|---|
+| Duplicate op | Dedupe `opId`; trả ACK cũ |
+| Stale base version | OT transform hoặc resync; CRDT integrate theo causal state |
+| ACK mất | Retry idempotently |
+| Persist thành công, broadcast thất bại | Client catch-up từ durable log; outbox/replay |
+| Broadcast trước persist rồi crash | Không được phép nếu đã ACK như durable |
+| Authority crash | Fenced failover, recover snapshot + log tail |
+| Gateway crash | Client reconnect, join/catch-up |
+| Slow client | Bounded buffer, coalesce, snapshot resync |
+| ACL revoke | Invalidate session/reject new edits |
+| Snapshot builder lỗi | Retry; op log vẫn là durable truth |
+| Cold storage lỗi | Hot current state không phụ thuộc synchronous cold read |
+
+---
+
+#### 28. Communication pattern summary
+
+| Use case | Pattern |
+|---|---|
+| Document CRUD/metadata/version APIs | REST |
+| Realtime edit/presence | WebSocket |
+| Internal immediate calls | gRPC/HTTP với deadline |
+| Durable operation append | Partitioned log/database |
+| Gateway fan-out | Pub/Sub |
+| Snapshot/search/audit/backup | Async broker/queue |
+
+Không tạo synchronous chain dài trên edit hot path. ACL decision cần cache/revision; snapshot, audit và search chạy async sau durable operation acceptance.
+
+---
+
+#### 29. Observability
+
+Correlation:
+
+```text
+documentId -> sessionId -> clientId -> opId
+           -> canonicalVersion -> snapshotId -> checkpointId
+```
+
+Metrics:
+
+- Local-to-ACK và remote propagation latency.
+- Accepted/rejected/deduped ops/s.
+- Per-document queue và transform/merge latency.
+- Durable append/group-commit latency.
+- Fan-out deliveries/s/bytes/s và slow clients.
+- Version gap, catch-up bytes và snapshot-resync rate.
+- Snapshot lag/build failure/compaction duration.
+- ACL cache hit và revocation propagation.
+- Authority failover/handoff time.
+- Convergence/hash mismatch; mục tiêu bằng 0.
+
+Không dùng raw document content trong logs/traces. `documentId` cần sampling/cardinality controls.
+
+---
+
+#### 30. Test strategy theo kiến trúc
+
+- Replay cùng operations theo nhiều delivery orders.
+- Duplicate operation và mất ACK.
+- Concurrent insert/delete/format/undo.
+- Crash authority trước/sau append/ACK/publish.
+- Snapshot build trong lúc edit tiếp tục.
+- Compaction rồi client cũ reconnect.
+- Revoke ACL giữa operation stream.
+- Authority handoff/fencing split-brain test.
+- Slow client và fan-out pressure.
+- Hot document với editor/viewer mix.
+- Version restore khi collaborators đang active.
+- Cross-version clients và operation schema compatibility.
+
+Mỗi test cần assert cả performance lẫn document convergence/durability.
+
+---
+
+#### 31. Những điểm cần chỉnh so với transcript
+
+1. **Collaboration Service không hoàn toàn stateless.** Nó giữ hot document/session/version context; phải recoverable và có ownership rõ.
+2. **Yjs và Automerge là CRDT libraries**, không phải ví dụ chung cho “CRDT hoặc OT-compatible model”.
+3. **Không thể chỉ broadcast rồi autosave định kỳ.** Operation phải durable trước ACK nếu đã hứa không mất edit.
+4. **Autosave là snapshot/materialization**, không phải lần đầu ghi edit bền vững.
+5. **OT và CRDT không có cùng ordering semantics.** OT thường dùng canonical sequence; CRDT có thể hội tụ dù delivery order khác nhau theo model.
+6. **Không phải mọi client luôn áp “cùng transformation theo cùng logical order” trong CRDT.** Convergence đến từ merge rules/causal semantics.
+7. **Document Service không thể là nơi duy nhất enforce permission.** Collaboration Authority phải kiểm tra quyền khi accept edit.
+8. **REST save-full-document không được chạy ngây thơ song song với operation stream.** Full replace phải là versioned command.
+9. **Pub/Sub fan-out không phải durable document truth.** Gap được phục hồi từ operation log/snapshot.
+10. **Backup, snapshots và version history giải quyết ba mục tiêu khác nhau.**
+
+---
+
+#### 32. Cách trình bày trong phỏng vấn
+
+1. Vẽ REST Document path và WebSocket Collaboration path riêng.
+2. Nêu document model cùng operation envelope.
+3. Chọn một nhánh OT hoặc CRDT và giải thích semantics.
+4. Đi qua local apply → pending → authority → durable append → ACK → fan-out.
+5. Nêu operation log, snapshot và user version checkpoints khác nhau.
+6. Vẽ reconnect delta catch-up/snapshot-resync.
+7. Giải thích ACL revision và revoke active session.
+8. Tách presence/cursor ephemeral plane.
+9. Nêu shard theo documentId, authority fencing và hot-document limitation.
+10. Kết thúc bằng failure tests và no-acknowledged-edit-loss.
+
+Một câu trả lời mạnh:
+
+> “Client áp edit local ngay, nhưng server chỉ ACK sau khi operation đã được authorize, transform/merge và append bền vững. Pub/Sub chỉ fan-out; snapshot được tạo async để load/compact nhanh. Khi reconnect, client gửi version hoặc state vector để nhận delta, hoặc tải snapshot mới nếu history tail quá lớn.”
+
+---
+
+#### 33. Ý chính cần nhớ
+
+- Tách Document APIs, Collaboration Gateway, Authority, Operation Log, Snapshot và Presence.
+- Collaboration authority có hot state, không hoàn toàn stateless.
+- Document model cần stable nodes/elements và schema invariants.
+- Operation envelope có `opId`, client/session, causal/version context và ACL revision.
+- OT và CRDT là hai nhánh có semantics khác nhau; không trộn tùy tiện.
+- Yjs/Automerge thuộc CRDT family.
+- Local edit áp ngay và nằm trong pending queue đến khi ACK.
+- Server authorize/validate/dedupe/merge/persist trước ACK.
+- ACK mất được retry bằng cùng `opId`.
+- Durable operation log là truth; snapshot là async materialization.
+- Version checkpoint phục vụ người dùng; backup phục vụ disaster recovery.
+- Restore tạo current version mới và giữ timeline.
+- REST dùng CRUD/metadata/version/share; WebSocket dùng operation/presence stream.
+- Không dùng full-document save ngây thơ song song với collaborative ops.
+- Collaboration Authority enforce ACL; permission revision giúp revoke session.
+- Presence/cursor là latest-value ephemeral plane và degrade trước content edits.
+- Catch-up dùng delta khi nhỏ, snapshot resync khi tail quá lớn.
+- Slow client không được tạo unbounded buffer.
+- Shard theo documentId; authority handoff cần fencing.
+- Pub/Sub gap phục hồi từ durable log/snapshot.
+- Multi-region topology phải theo OT/CRDT ownership model.
+
+#### Công thức ghi nhớ
+
+> **Collaborative-editor HLD = versioned document model + optimistic local replica + authoritative OT/CRDT integration + durable-before-ACK operation log + low-latency fan-out + async snapshots/checkpoints + ACL revision + delta/snapshot recovery.**
+
+---
+
+### Bài 126. Making Tech & Infra Decisions Strategically
+
+#### 1. Nguyên tắc lựa chọn
+
+Technology stack phải phục vụ các requirement đã xác định:
+
+- 200K–400K content operations/s ở peak.
+- Hàng trăm nghìn persistent connections và hàng triệu fan-out deliveries/s.
+- Per-document ordering/merge/convergence.
+- Durable-before-ACK operation log.
+- Snapshot/version history lên tới hàng trăm TB.
+- ACL revocation và private content security.
+
+Với mỗi công nghệ, cần trả lời:
+
+1. Nó nằm trên hot path hay background path?
+2. Nó giữ authoritative, derived hay ephemeral state?
+3. Ordering, durability và replay contract là gì?
+4. Failure/recovery behavior thế nào?
+5. Đội ngũ có vận hành được ở scale này không?
+6. Có thể thay bằng managed service hay giải pháp đơn giản hơn không?
+
+---
+
+#### 2. Ma trận workload → công nghệ
+
+| Workload | Lựa chọn minh họa | Lý do | Đánh đổi |
+|---|---|---|---|
+| Web editor | React | Component model, ecosystem, rich UI | Render performance và state complexity |
+| Mobile editor | React Native hoặc native | Chia sẻ kỹ năng/code | Editor/input behavior khác web |
+| WebSocket gateway | Node.js/Go/Java/.NET | Event-driven/concurrent I/O | Runtime tuning và backpressure |
+| Collaboration engine | TypeScript/Node, Go, Rust, Java tùy library | Algorithm/document-model fit | CPU, memory, ecosystem, correctness |
+| Client-facing management APIs | REST/HTTP | Phổ biến, cache/tooling tốt | Không dùng cho keystroke stream |
+| Realtime editing | WebSocket | Bidirectional persistent channel | Reconnect, sequencing, backpressure tự thiết kế |
+| Internal immediate RPC | gRPC | Typed binary contract, streaming | Deadline/coupling/versioning |
+| Metadata/ACL | PostgreSQL | ACID, constraints, relational query | Connection/write scaling |
+| Snapshots/archive | S3/GCS/object storage | Durable, rẻ, lifecycle | Không phù hợp low-latency append per edit |
+| Durable operation log | Kafka/database/log store | Append, ordering/replay | Partition ownership, lag, durability semantics |
+| Hot session/presence | Redis-compatible store | TTL, low latency, Pub/Sub/cache | Ephemeral, memory cost, hot keys |
+| Flexible document data | MongoDB nếu access pattern cần | Document model/flexible schema | Thêm database/operations complexity |
+| Async workflows | Kafka/queue | Decouple snapshots/search/audit | Delivery duplicates, lag, DLQ |
+| Orchestration | Kubernetes hoặc managed container platform | Deployment/scaling primitives | Operational overhead |
+
+Tên sản phẩm chỉ là ví dụ; authoritative boundary và protocol contract quan trọng hơn.
+
+---
+
+#### 3. Front-end: React
+
+React phù hợp xây editor shell, toolbar, collaboration UI và presence. Tuy nhiên rich-text editor không nên chỉ lưu toàn bộ nội dung trong một React state lớn và rerender sau mỗi keystroke.
+
+Cần:
+
+- Editor/document model chuyên biệt như ProseMirror/Lexical/Slate/Tiptap hoặc custom model.
+- OT/CRDT adapter tương thích schema.
+- Local pending operation queue.
+- Incremental rendering và virtualization cho document lớn.
+- IME/composition handling cho ngôn ngữ châu Á.
+- Selection/cursor mapping qua remote edits.
+- Worker thread/Web Worker cho merge/serialization nặng nếu phù hợp.
+- Durable local queue cho short offline/tab crash nếu requirement cần.
+
+React là UI framework, không giải quyết convergence.
+
+---
+
+#### 4. React Native và mobile editor
+
+React Native có thể chia sẻ networking, auth và một phần collaboration core, nhưng editor behavior trên mobile khác web:
+
+- Native text input/IME và selection APIs.
+- Keyboard/composition/autocorrect.
+- Background execution và socket suspension.
+- Memory/battery constraints.
+- Offline queue persistence.
+- App lifecycle/reconnect.
+
+Có thể chia sẻ operation schema/CRDT library nếu runtime tương thích, nhưng không nên giả định toàn bộ editor UI dùng chung mà không kiểm thử semantics.
+
+---
+
+#### 5. Node.js cho WebSocket gateway
+
+Node.js phù hợp nhiều persistent connections vì non-blocking I/O và ecosystem WebSocket tốt. Gateway có thể xử lý:
+
+- Connection authentication/refresh.
+- Frame parsing/validation cơ bản.
+- Session routing.
+- Per-connection bounded buffers.
+- Heartbeat và connection draining.
+- Pub/Sub subscription và targeted delivery.
+
+Nhưng cần tránh:
+
+- Chạy transform/merge CPU-heavy trên event loop chính.
+- Synchronous compression/serialization lớn.
+- Unbounded per-socket queues.
+- Giữ authoritative document state chỉ trong process memory.
+
+Metrics quan trọng: active sockets, messages/s, bytes/s, memory/socket, event-loop lag, slow-client drops và reconnect rate.
+
+Go, Java/Netty, .NET hoặc Rust cũng là lựa chọn hợp lệ. Benchmark thực tế quan trọng hơn định kiến runtime.
+
+---
+
+#### 6. Collaboration engine runtime
+
+Collaboration engine được chọn theo algorithm/library:
+
+- Yjs có ecosystem JavaScript/TypeScript mạnh.
+- Automerge có implementations/tooling khác nhau và CRDT semantics riêng.
+- OT engine có thể nằm trong Java/Go/Node tùy codebase.
+- Rust/native/WASM có thể hữu ích cho CPU/memory-sensitive core chạy cả client/server.
+
+Không tách gateway và engine chỉ vì “microservices”; tách khi:
+
+- CPU profile khác I/O gateway.
+- Cần isolate crash/security.
+- Engine scale theo active documents/ops còn gateway scale theo sockets.
+- Có runtime/library khác nhau.
+
+Nếu dùng Node cho cả hai, có thể dùng worker threads/process shards và per-document ownership để tránh một hot document block event loop.
+
+---
+
+#### 7. REST cho document-management APIs
+
+REST dùng cho:
+
+- Create/list/open metadata.
+- ACL/share links.
+- Version history/checkpoints/restore.
+- Trash/delete/export.
+
+Không dùng REST request cho từng keystroke. Các API cần:
+
+- Cursor pagination.
+- ETag/metadata version cho concurrent updates.
+- Idempotency cho create/restore/share mutation.
+- `202 Accepted` cho export/restore lớn.
+- Authorization ở server.
+- Mobile backward compatibility.
+
+Full-document import/replace phải là versioned command; không dùng `PUT content` ngây thơ ghi đè operation stream.
+
+---
+
+#### 8. WebSocket cho collaboration
+
+WebSocket cung cấp transport hai chiều nhưng không cung cấp sẵn:
+
+- Durable delivery.
+- Exactly-once.
+- Message ordering qua reconnect.
+- Session recovery.
+- ACL enforcement.
+- Backpressure policy.
+- Schema compatibility.
+
+Application protocol vẫn cần `opId`, document/session, version/state vector, ACK/error, catch-up và resync messages.
+
+Load balancer/gateway phải hỗ trợ:
+
+- Long-lived connections và idle timeout phù hợp.
+- Connection draining.
+- Reconnect to any healthy instance.
+- Auth refresh mà không buộc mất pending edits.
+- Max frame size và rate limit.
+
+---
+
+#### 9. gRPC nội bộ
+
+gRPC phù hợp cho typed immediate calls như metadata/ACL query hoặc session routing, nhưng hot edit path không nên phụ thuộc chuỗi synchronous dài.
+
+Cần:
+
+- Deadline propagation.
+- Retry chỉ cho idempotent calls.
+- Protobuf compatibility.
+- Circuit breaker/load shedding.
+- Correlation/tracing.
+- Keepalive/connection-pool tuning.
+
+Collaboration Authority nên giữ/cached permission revision cần thiết thay vì gọi ACL Service qua gRPC cho mỗi edit ở 400K ops/s.
+
+---
+
+#### 10. PostgreSQL cho metadata và ACL
+
+PostgreSQL phù hợp với:
+
+- Users/tenants.
+- Document metadata/ownership.
+- ACL principals/roles.
+- Share links và revocation.
+- Version/checkpoint metadata.
+- Idempotency records cho management APIs.
+
+Constraints:
+
+```text
+unique(documentId, principalId)
+owner cannot disappear without ownership transfer
+share-link token hash unique
+aclRevision monotonically increases
+currentSnapshot version cannot exceed content head
+```
+
+Scale bằng:
+
+- Index/query tuning.
+- Connection pooling.
+- Read replicas cho suitable reads.
+- Partition/shard theo tenant/document khi cần.
+- Caching permission decisions kèm revision.
+
+Không ghi 200K–400K operations/s vào cùng metadata tables nếu workload đó cần partitioned operation log riêng.
+
+---
+
+#### 11. Object storage cho snapshots/content
+
+S3/GCS phù hợp với:
+
+- Immutable snapshots.
+- Archived operation segments.
+- Old version bundles.
+- Backup/export.
+
+Object key minh họa:
+
+```text
+tenant/{tenantId}/document/{documentId}/snapshot/{version}/{contentHash}
+```
+
+Snapshot metadata ở PostgreSQL/log store trỏ tới object ID, exact version/state vector, size, checksum và encryption metadata.
+
+Object storage không phù hợp cho:
+
+- Append từng keystroke với ACK <100 ms.
+- Atomic per-operation version coordination.
+- Hot presence/cursor.
+
+Do đó “store document content in S3” đúng với materialized snapshot/archive, không đủ để mô tả durable edit hot path.
+
+---
+
+#### 12. Durable operation log
+
+Yêu cầu:
+
+- Append throughput 200K–400K ops/s peak.
+- Per-document ordering hoặc causal semantics theo algorithm.
+- Dedupe/idempotency.
+- Replay/catch-up.
+- Regional durability trước ACK theo contract.
+- Partition rebalance/hot-key behavior.
+
+Có thể dùng:
+
+- Kafka/managed log làm durable append/fan-out backbone.
+- Partitioned database/log store với transactional append và canonical version.
+- Hybrid: collaboration authority commit vào database/log, Outbox publish Kafka.
+
+Nếu Kafka là durability boundary trước ACK, phải hiểu `acks`, replication, min in-sync replicas, producer idempotence và broker failure semantics. Nếu DB là authority, Kafka chỉ là downstream distribution log.
+
+Không nên để “Kafka có message” nhưng canonical version metadata không commit nhất quán. Chọn rõ source of truth.
+
+---
+
+#### 13. Kafka cho event-driven flows
+
+Kafka phù hợp:
+
+- Accepted operation/event distribution.
+- Snapshot/index/audit consumers.
+- Replay/rebuild projections.
+- Partition ordering theo `documentId`.
+
+Topic minh họa:
+
+| Topic | Key | Consumers |
+|---|---|---|
+| `document-operations` | `documentId` | Fan-out, snapshot, history |
+| `document-metadata-events` | `documentId` | Search, audit, cache invalidation |
+| `permission-events` | `documentId` | Collaboration authorities/gateways |
+| `notification-jobs` | `userId` | Email/invite workers |
+
+Rủi ro:
+
+- Hot document → hot partition.
+- Partition count giới hạn consumer parallelism.
+- Consumer lag ảnh hưởng snapshot/search/fan-out.
+- Retention cost rất lớn với 2–5 TB logical ops/day.
+- At-least-once yêu cầu idempotent consumers.
+
+Kafka không tự giải quyết OT/CRDT, WebSocket delivery hoặc client convergence.
+
+---
+
+#### 14. Redis và Redis Streams
+
+Redis có thể phục vụ:
+
+- Presence/cursor TTL.
+- Session directory/cache.
+- ACL decision cache + revision.
+- Gateway connection routing.
+- Short-lived Pub/Sub/fan-out.
+- Rate limit counters.
+
+Redis Streams có persistence/consumer semantics tốt hơn Pub/Sub thuần, nhưng vẫn cần đánh giá memory, trimming, failover và replay scale. Không nên lưu toàn bộ long-term 10B ops/day trong Redis.
+
+Redis Pub/Sub có thể mất message khi subscriber disconnect; điều này chấp nhận được cho presence/cursor, còn content gap phải phục hồi từ durable operation log.
+
+---
+
+#### 15. MongoDB có thực sự cần không?
+
+MongoDB phù hợp khi cần lưu/query document-shaped data linh hoạt, nhưng trong kiến trúc này đã có:
+
+- PostgreSQL cho metadata/ACL.
+- Durable operation log cho edits.
+- Object storage cho snapshots/archive.
+
+Thêm MongoDB chỉ đáng khi có access pattern cụ thể, ví dụ:
+
+- Materialized current document cần document-native query/update.
+- Block-oriented data có secondary-index requirements phù hợp.
+- Team đã vận hành MongoDB tốt và muốn dùng làm snapshot/hot content store.
+
+Không nên thêm MongoDB chỉ vì nội dung được gọi là “document”. Database document model và collaborative document semantics không phải cùng một khái niệm.
+
+Giảm số database có thể cải thiện reliability/maintainability hơn polyglot persistence không cần thiết.
+
+---
+
+#### 16. Search index
+
+Transcript chưa nêu search, nhưng production editor thường cần tìm documents. Search là projection:
+
+```text
+metadata/content checkpoint -> async indexing -> search engine
+```
+
+- Không index từng keystroke đồng bộ.
+- Batch/debounce theo document.
+- Chấp nhận indexing lag.
+- Search result phải lọc ACL hoặc dùng security-aware index.
+- Deleted/revoked documents cần deindex/invalidate.
+
+Search không nằm trên collaboration hot path và có thể để ngoài MVP.
+
+---
+
+#### 17. Kubernetes: khi nào hợp lý?
+
+Kubernetes cung cấp:
+
+- Deployment, service discovery, rolling update.
+- Resource isolation.
+- Horizontal autoscaling.
+- Pod disruption budget và multi-AZ scheduling.
+
+Nhưng không tự giải quyết:
+
+- WebSocket connection migration.
+- Per-document ownership/handoff.
+- Kafka partition/hot document.
+- Durable ACK semantics.
+- OT/CRDT convergence.
+
+Kubernetes còn tạo upgrade, networking, security và capacity overhead. Managed Kubernetes, container service hoặc PaaS đều hợp lệ tùy team.
+
+Realtime gateway cần connection draining khi pod terminate. Collaboration authority cần fencing/handoff trước shutdown, không chỉ restart pod tùy ý.
+
+---
+
+#### 18. Autoscaling theo workload signal
+
+| Component | Scaling signals |
+|---|---|
+| REST APIs | RPS, inflight, p95 latency, CPU |
+| WebSocket Gateway | Connections, frames/s, bytes/s, event-loop lag, memory |
+| Collaboration Authority | Active docs, ops/s, per-doc queue, merge latency |
+| Kafka consumers | Lag, oldest event, partition utilization |
+| Snapshot workers | Unsnapshotted log bytes/age, queue depth |
+| Version/history | Checkpoint backlog, restore latency |
+| Notification | Queue depth và provider quota |
+
+CPU-only autoscaling không đủ. Consumer instance count không thể vượt quá số partitions có work hữu ích. Scale-down phải bảo vệ connection draining và document authority handoff.
+
+---
+
+#### 19. Load balancing và routing
+
+- HTTP load balancer cho REST/gRPC.
+- WebSocket-capable load balancer cho persistent connections.
+- Gateway route operation theo `documentId` tới active authority.
+- Session Directory lưu owner/shard/epoch.
+- Consistent hashing giảm document movement khi fleet thay đổi.
+- Fencing token ngăn two-owner split brain.
+
+Sticky session ở client-to-gateway không thay thế document authority routing. Một document có collaborators nối qua nhiều gateway shards nhưng operations phải tới đúng engine/replica model.
+
+---
+
+#### 20. Single-region Multi-AZ baseline
+
+Một baseline production:
+
+```text
+CDN/WAF
+ -> Multi-AZ API/WebSocket gateways
+ -> Collaboration authority shards
+ -> Managed PostgreSQL Multi-AZ
+ -> Durable replicated operation log
+ -> Managed Redis for ephemeral state
+ -> Object storage for snapshots/archive/backups
+ -> Async workers and observability
+```
+
+Capacity phải chịu mất một AZ mà vẫn giữ collaboration critical path. Snapshot/search/analytics có thể lag; accepted operations không được mất.
+
+---
+
+#### 21. Multi-region strategy
+
+Với server-authoritative OT:
+
+- Mỗi document có home region/active authority.
+- Edge gần client terminates connection rồi route operation tới home.
+- Replicate log/snapshots cross-region async cho DR.
+- Failover cần fencing/epoch và RPO contract.
+
+Với multi-region CRDT:
+
+- Regional replicas có thể merge updates.
+- Cần causal sync/anti-entropy.
+- Permission revoke/delete và tombstone GC phức tạp hơn.
+- Cross-region duplicate và partial partition phải được test.
+
+Không tuyên bố “global low latency” chỉ bằng Kubernetes/multi-region replication. Algorithm và ownership quyết định.
+
+---
+
+#### 22. OAuth 2.0, OIDC và JWT
+
+Transcript nói OAuth 2.0 và JWT cung cấp authentication/authorization. Chính xác hơn:
+
+- **OpenID Connect:** identity/authentication layer.
+- **OAuth 2.0:** delegated authorization framework.
+- **JWT:** token format có thể dùng cho access/ID token.
+
+Gateway xác minh signature, issuer, audience, expiry và scopes. Collaboration Authority vẫn phải kiểm tra document role/share-link/ACL revision.
+
+JWT không tự cung cấp revoke nhanh. Có thể dùng:
+
+- Access token sống ngắn.
+- Refresh token rotation.
+- Session/token revocation store.
+- ACL permission events riêng cho active document session.
+
+Không đặt document content/secret trong JWT payload.
+
+---
+
+#### 23. TLS và transport security
+
+- HTTPS/WSS cho client traffic.
+- TLS termination tại trusted edge; re-encrypt nội bộ theo trust model.
+- mTLS/service identity nếu yêu cầu zero-trust nội bộ.
+- Certificate rotation và modern cipher policy.
+- Frame/message size limits chống memory abuse.
+- Origin checks/CSRF considerations cho browser WebSocket handshake.
+- Rate limiting per user/device/document/IP.
+
+TLS bảo vệ in transit nhưng không ngăn authorized user chia sẻ nội dung hoặc server-side access abuse.
+
+---
+
+#### 24. Encryption at rest
+
+“AES encryption” chưa đủ là một thiết kế. Cần chỉ rõ:
+
+- Dùng authenticated encryption như AES-GCM hoặc cloud storage envelope encryption.
+- Data encryption key (DEK) và key encryption key (KEK).
+- KMS/HSM quản lý KEK và rotation.
+- Key scope theo tenant/document nếu requirement cần.
+- Snapshot, operation log, database, backup và cache persistence đều nằm trong threat model.
+- Access audit và separation of duties.
+
+```text
+plaintext data
+ -> encrypt with DEK
+ -> wrap DEK with KMS-managed KEK
+ -> store ciphertext + wrapped key + algorithm/version metadata
+```
+
+Encryption at rest không thay ACL, tenant isolation, secure deletion và backup protection.
+
+---
+
+#### 25. Share-link và permission security
+
+- Chỉ lưu hash của share token nếu feasible, tương tự secret credential.
+- High entropy và HTTPS-only.
+- Expiry, rotation và immediate revoke.
+- Role scope viewer/editor.
+- Domain/account restriction tùy product.
+- Access audit.
+- Không rò token trong logs/referrer/analytics.
+
+Active WebSocket sessions nhận `PermissionChanged` và bị revalidate; token đã revoke không được tiếp tục edit chỉ vì socket còn sống.
+
+---
+
+#### 26. Backup và disaster recovery
+
+- PostgreSQL PITR/backups cho metadata/ACL.
+- Operation log replication/retention phù hợp RPO.
+- Immutable/versioned object storage cho snapshots/backups.
+- Cross-account/region backup nếu threat model yêu cầu.
+- Restore test document hiện tại, version history và ACL cùng nhau.
+- Kiểm tra consistency giữa snapshot pointer và operation tail.
+
+Backup không chỉ restore bytes; cần khôi phục một document ở version hợp lệ với permission/ownership đúng.
+
+---
+
+#### 27. Observability tooling
+
+Có thể dùng OpenTelemetry, Prometheus/Grafana và logs/traces backend hoặc managed equivalents.
+
+Metrics theo component:
+
+| Component | Metrics |
+|---|---|
+| Gateway | Connections, reconnect, frames/bytes, event-loop lag |
+| Collaboration | Ops/s, merge latency, dedupe/reject, per-doc queue |
+| Operation log | Append latency, replication health, partition skew |
+| Fan-out | Deliveries/s, bytes/s, slow-client resync |
+| Snapshot | Unsnapshotted bytes/age, build/compaction failures |
+| ACL | Cache hit, revision lag, denied edits, revoke latency |
+| Storage | Object/database latency, capacity, restore health |
+
+Không log raw content/operations theo mặc định. High-cardinality IDs đi vào trace có sampling và access controls, không làm metrics labels không giới hạn.
+
+---
+
+#### 28. Chi phí
+
+Các cost drivers:
+
+- WebSocket fleet base capacity.
+- Fan-out network egress.
+- Kafka/log storage 2–5 TB logical/day và replication.
+- Snapshot/object requests và long-term retention.
+- PostgreSQL HA/read replicas.
+- Redis memory.
+- Cross-region replication/egress.
+- Observability volume.
+- Kubernetes/operational staffing.
+
+Metrics đơn vị:
+
+- Cost per 1.000 accepted operations.
+- Cost per million fan-out deliveries.
+- Cost per active editing hour.
+- Storage cost per document/month.
+- Snapshot/compaction cost per TB.
+
+Batching giảm overhead nhưng phải nằm trong latency budget.
+
+---
+
+#### 29. Một stack minh họa hợp lý
+
+```text
+Clients:
+  React web + React Native/native mobile
+  Editor model + OT/CRDT client core
+
+Edge:
+  CDN/WAF + REST load balancer + WebSocket gateway fleet
+
+Services:
+  Node.js/Go/Java gateway
+  Collaboration engine theo library/algorithm
+  gRPC/HTTP internal contracts
+
+Data:
+  PostgreSQL -> metadata/ACL/checkpoints
+  Durable partitioned log -> canonical operations
+  Redis -> presence/session/routing/cache
+  S3/GCS -> snapshots/archive/backup
+  MongoDB -> chỉ khi có access pattern riêng rõ ràng
+
+Async:
+  Kafka/managed event stream + background queues
+
+Infra:
+  Kubernetes hoặc managed container platform
+  Multi-AZ, autoscaling theo workload, observability, KMS/secrets
+```
+
+---
+
+#### 30. Những điểm cần chỉnh so với transcript
+
+1. **Node.js phù hợp WebSocket I/O nhưng không mặc nhiên tốt nhất cho CPU-heavy collaboration engine.** Benchmark và tách worker/runtime khi cần.
+2. **React không phải document model hay collaboration algorithm.** Cần editor framework/core chuyên biệt.
+3. **S3/GCS phù hợp snapshot/archive**, không phải per-keystroke durable append hot path.
+4. **MongoDB không bắt buộc chỉ vì dữ liệu là “document”.** Chỉ thêm khi access pattern biện minh.
+5. **Kafka không tự tạo realtime client fan-out hay convergence.** Nó là log/event backbone.
+6. **Kubernetes không tự làm service scale.** Partitioning, routing, autoscaling signals và handoff mới quyết định.
+7. **OAuth 2.0 không phải authentication protocol; JWT không phải authorization system.** OIDC + domain ACL mới tạo identity/access flow đầy đủ.
+8. **“AES at rest” chưa đủ.** Cần authenticated encryption, envelope keys, KMS, rotation và audit.
+9. **Mỗi technology mới tăng operational burden.** Một stack nhỏ nhưng đúng contracts tốt hơn polyglot persistence không cần thiết.
+
+---
+
+#### 31. Cách trình bày trong phỏng vấn
+
+1. Bắt đầu bằng workload: 400K ops/s, 1M+ fan-out deliveries/s, 2–5 TB log/day.
+2. Chọn WebSocket gateway runtime theo I/O benchmark; tách collaboration engine theo algorithm.
+3. Dùng REST ngoài, gRPC nội bộ có deadline, WebSocket cho sync.
+4. Chọn PostgreSQL cho ACL/metadata; giải thích constraints/revision.
+5. Chọn durable log cho operations trước ACK.
+6. Dùng object storage cho immutable snapshots/archive.
+7. Dùng Redis cho ephemeral presence/session, không cho durable content.
+8. Chỉ thêm MongoDB nếu có query/access pattern cụ thể.
+9. Giải thích Kafka partition by documentId và hot-key limitation.
+10. Nêu Kubernetes optional, autoscaling signals và document handoff.
+11. Kết thúc bằng OIDC/ACL, envelope encryption, backup restore và cost.
+
+Một câu trả lời mạnh:
+
+> “Tôi dùng WebSocket gateway tối ưu I/O, nhưng collaboration engine được chọn theo OT/CRDT library và có thể scale riêng. PostgreSQL giữ ACL/metadata, durable partitioned log giữ accepted operations trước ACK, Redis chỉ giữ presence/session, còn object storage giữ immutable snapshots và archive.”
+
+---
+
+#### 32. Ý chính cần nhớ
+
+- Technology follows workload, authority, failure model và team capability.
+- React/React Native là UI/runtime choices, không giải quyết convergence.
+- Editor cần document model và OT/CRDT integration chuyên biệt.
+- Node.js phù hợp socket I/O nhưng CPU-heavy merge phải benchmark/isolate.
+- REST quản lý document; WebSocket stream edits; gRPC hỗ trợ immediate internal calls.
+- PostgreSQL phù hợp metadata/ACL/checkpoint constraints.
+- Object storage phù hợp immutable snapshot/archive, không phải per-edit append.
+- Durable operation log phải có ordering/replay/durability rõ trước ACK.
+- Kafka có thể làm event backbone nhưng không thay collaboration engine.
+- Redis phù hợp presence/session/cache và short-lived routing.
+- MongoDB chỉ dùng khi access pattern cụ thể biện minh.
+- Kubernetes là deployment choice, không tự giải quyết sockets, hot docs hay authority handoff.
+- Autoscale gateways theo connections/bytes; engine theo active docs/ops/queue; workers theo lag.
+- Multi-region topology phải khớp OT/CRDT ownership model.
+- OIDC authentication, OAuth 2.0 authorization delegation và JWT token format là ba khái niệm khác nhau.
+- Encryption at rest cần AES-GCM/envelope/KMS/rotation, không chỉ tên AES.
+- Backup restore phải giữ consistency giữa metadata, ACL, snapshot và operation tail.
+- Theo dõi cost per operation, delivery và active editing hour.
+
+#### Công thức ghi nhớ
+
+> **Collaborative-editor technology strategy = UI/editor runtime fit + WebSocket I/O layer + algorithm-specific collaboration engine + transactional ACL metadata + durable partitioned operation log + ephemeral presence cache + immutable snapshot storage + workload-aware orchestration/security.**
+
+---
+
+### Bài 127. The Final Design — Collaborative Document Editor
+
+#### 1. Kiến trúc hoàn chỉnh
+
+Final design tách ba đường xử lý:
+
+1. **Management path:** document metadata, sharing, ACL và version APIs qua REST.
+2. **Collaboration path:** edit operations qua WebSocket tới authority OT/CRDT.
+3. **Background path:** snapshot, compaction, search, audit và backup qua event/queue.
+
+```text
+                       Web / Mobile Client
+                     /                     \
+                REST/HTTP                WebSocket
+                   |                         |
+             API Gateway             Collaboration Gateway Fleet
+                   |                         |
+       +-----------+-----------+       Session Directory
+       |           |           |              |
+   Document      ACL/Share   Version     Document Authority Shards
+   Service       Service     Service       (OT or CRDT Engine)
+       |           |           |          /      |        \
+       +-----------+-----------+     Durable   Presence   Fan-out
+                   |                  Op Log     Plane      Pub/Sub
+              PostgreSQL                 |                    |
+                                        |              Gateway shards
+                                   Snapshot Builder           |
+                                      /        \          collaborators
+                                Hot Snapshot  Cold Archive
+                                   Store      / Backup
+                                      |
+                                  Object Storage
+
+Durable accepted events
+  -> Async Bus
+       +-> Version grouper
+       +-> Search indexer
+       +-> Audit/analytics
+       +-> Invite/notification workers
+```
+
+Nguồn chân lý về content là **canonical durable operations + snapshots gắn version/state chính xác**. WebSocket và Pub/Sub chỉ vận chuyển nhanh, không thay durable state.
+
+---
+
+#### 2. Logical responsibilities
+
+| Thành phần | Sở hữu/giải quyết | Không nên làm |
+|---|---|---|
+| **Document Service** | Metadata, lifecycle, snapshot descriptor | Merge từng keystroke |
+| **ACL/Share Service** | Ownership, roles, link tokens, ACL revision | Tin client tự khai role |
+| **Collaboration Gateway** | Socket, auth, frame validation, routing/backpressure | Giữ content authority duy nhất trong memory |
+| **Document Authority** | Authorize, dedupe, OT/CRDT integrate, canonical state/version | Gửi email/index search đồng bộ |
+| **Operation Log** | Durable accepted edits, replay/catch-up | Presence/cursor lịch sử vô hạn |
+| **Presence Service** | Online/cursor/selection TTL | Quyết định content correctness |
+| **Snapshot Builder** | Materialize, verify và compact history | ACK user edit trước durable append |
+| **Version Service** | Human-readable checkpoints và restore | Thay thế disaster backup |
+| **Async Bus** | Decouple search/audit/invite/background work | Làm source of truth mơ hồ cho content |
+
+Mỗi capability có logical ownership; không bắt buộc mỗi capability có database cluster hay deployment riêng ngay từ đầu.
+
+---
+
+#### 3. Source-of-truth hierarchy
+
+```text
+ACL/ownership authority        -> PostgreSQL/transactional store
+Canonical content operations  -> durable partitioned operation log
+Current materialized content  -> latest verified snapshot + op tail
+User version history          -> checkpoints referencing exact versions
+Presence/cursors              -> ephemeral TTL store/pub-sub
+Search                        -> eventually consistent projection
+Backup                        -> isolated recovery copies
+```
+
+MongoDB có thể được dùng làm hot materialized document store nếu access pattern yêu cầu, nhưng không bắt buộc. Nếu đã có operation log + object snapshots + metadata DB, thêm MongoDB phải có lý do cụ thể.
+
+---
+
+#### 4. Document creation flow
+
+```text
+Client -> POST /v1/documents [Idempotency-Key]
+ -> API Gateway authenticates
+ -> Document Service
+      create document metadata
+      create owner ACL + aclRevision=1
+      create empty initial snapshot/version
+      write outbox event
+ <- 201 Created {documentId, metadataVersion, contentVersion}
+```
+
+Metadata, owner permission và initial content reference phải được tạo atomically hoặc qua workflow có recovery rõ. Retry cùng idempotency key không tạo nhiều documents.
+
+---
+
+#### 5. Open và join collaboration session
+
+```text
+1. Client -> GET /v1/documents/{documentId}
+2. Document/ACL Service -> authorize viewer/editor
+3. Client nhận metadata, role, aclRevision,
+   snapshot/version or state-vector descriptor
+4. Client mở WebSocket và gửi join_document
+5. Gateway route theo documentId tới active authority
+6. Authority recheck ACL/session
+7. Server gửi missing delta hoặc snapshot + operation tail
+8. Presence join được phát riêng
+```
+
+Document tải qua REST/object delivery không có nghĩa collaboration session tự được quyền edit. Authority kiểm tra role tại join và khi chấp nhận operation theo revision/revocation policy.
+
+---
+
+#### 6. Edit flow end-to-end
+
+```text
+User types
+ -> Editor tạo stable opId
+ -> Apply optimistic local edit
+ -> Persist/queue local pending op
+ -> Send WebSocket submit_operation
+
+Gateway
+ -> authenticate/session/frame checks
+ -> route to document authority
+
+Authority
+ -> check document active + editor permission
+ -> validate schema/size/invariants
+ -> dedupe opId
+ -> OT transform/order OR CRDT integrate
+ -> append canonical op durably
+ -> advance version/state
+ -> ACK sender
+ -> publish accepted op to collaborator gateways
+ -> async snapshot/version/search/audit triggers
+```
+
+Thứ tự quan trọng:
+
+> **Persist durable canonical operation trước ACK; snapshot được tạo sau.**
+
+Nếu ACK mất, client retry cùng `opId`; authority trả canonical result cũ.
+
+---
+
+#### 7. OT final path
+
+Trong nhánh server-authoritative OT:
+
+```text
+client baseVersion=N
+server currentVersion=M
+ -> fetch/hold concurrent ops N+1..M
+ -> transform incoming op
+ -> validate transformed structure
+ -> append as version M+1
+ -> return canonical transformed op/version
+```
+
+Mỗi document có một ordering authority/epoch tại một thời điểm. Nếu client quá stale và transform tail vượt threshold, authority yêu cầu snapshot resync thay vì transform chuỗi vô hạn.
+
+Clients có pending local ops phải transform remote canonical ops với pending state theo thuật toán tương thích.
+
+---
+
+#### 8. CRDT final path
+
+Trong nhánh CRDT:
+
+```text
+client creates update using stable IDs/causal state
+ -> applies locally
+ -> authority verifies identity/ACL/schema/size
+ -> dedupes and persists update
+ -> merges current replica/state
+ -> ACKs state information
+ -> propagates update
+```
+
+Replicas có thể nhận updates theo order khác mà vẫn hội tụ theo CRDT rules. Catch-up dùng state vector/diff updates. Cần:
+
+- Metadata/tombstone growth controls.
+- Garbage collection chỉ khi causal safety bảo đảm.
+- Schema validation và malicious-update limits.
+- Undo semantics phù hợp local user intention.
+
+Yjs/Automerge là CRDT options; không chạy đồng thời OT và CRDT trên cùng document nếu không có bridge semantics được chứng minh.
+
+---
+
+#### 9. ACK và save indicator
+
+UI có thể hiển thị:
+
+```text
+Editing locally
+ -> Saving...       (pending ops exist)
+ -> Saved           (all local ops ACKed durable)
+ -> Offline         (ops queued locally, not server durable)
+ -> Sync error      (reject/divergence requires action)
+```
+
+“Saved” không chỉ nghĩa server đã nhận frame. Nó phải khớp durability contract, ví dụ replicated within region. Nếu product hứa RPO=0 cho acknowledged edits trong một-AZ failure, ACK phải chờ mức replication đó.
+
+---
+
+#### 10. Fan-out path
+
+```text
+Accepted canonical operation
+ -> fan-out topic keyed by documentId
+ -> only gateway shards with subscribers
+ -> remote clients
+```
+
+Fan-out tối ưu:
+
+- Batch operations trong latency budget nhỏ.
+- Không echo vô ích nếu sender đã nhận canonical result qua ACK, trừ protocol yêu cầu.
+- Dedupe `opId/version` ở client.
+- Bounded queue per connection.
+- Presence/cursor coalesce trước content operations.
+- Nếu content backlog quá lớn, gửi `resync_required` thay vì buffer vô hạn.
+
+Với hot document nhiều viewers, dùng hierarchical relay/read tier để authority không trực tiếp ghi từng socket.
+
+---
+
+#### 11. Presence và cursor path
+
+```text
+cursor/selection/heartbeat
+ -> gateway/presence plane
+ -> latest-value cache/TTL
+ -> subscribed collaborators
+```
+
+Đặc tính:
+
+- Không vào canonical content log.
+- Có thể mất, reorder hoặc coalesce.
+- Cursor anchor phải map qua document changes.
+- User offline khi lease/heartbeat hết hạn.
+- Degrade/tắt bớt khi fan-out pressure cao.
+
+Presence có thể hiển thị hơi trễ mà document correctness vẫn nguyên vẹn.
+
+---
+
+#### 12. Reconnect và catch-up
+
+```text
+WebSocket disconnects
+ -> client keeps local pending queue
+ -> exponential backoff + jitter
+ -> reconnect to healthy gateway
+ -> join with lastVersion/stateVector + pending op IDs
+```
+
+Authority chọn:
+
+- **Delta catch-up:** gửi missing operations khi tail nhỏ.
+- **Snapshot resync:** gửi snapshot mới khi tail lớn/đã compact/state invalid.
+
+Client rebase/integrate pending edits. Nếu permission đã bị revoke, server không chấp nhận pending ops; product có thể cho user copy/export recovered local content nhưng không ghi vào document được bảo vệ.
+
+---
+
+#### 13. Versioning path
+
+```text
+Durable operations
+ -> Version Grouper
+      group by author/time/activity boundary
+      create human-readable checkpoint metadata
+ -> Version API
+```
+
+Version history không cần một full snapshot mỗi keystroke. UI có thể hiển thị checkpoints trong khi backend dùng snapshot + op range để materialize.
+
+Restore:
+
+```text
+authorize restore
+ -> materialize target version
+ -> create versioned replace/restore operation at current head
+ -> persist + ACK
+ -> broadcast canonical change/resync signal
+ -> retain old timeline
+```
+
+---
+
+#### 14. Snapshot và compaction path
+
+```text
+Snapshot policy triggers at K ops / B bytes / T time
+ -> Builder loads snapshot N
+ -> replay/integrate N+1..M
+ -> validate schema + hash
+ -> write immutable snapshot M to object storage
+ -> atomically update snapshot pointer
+ -> compact eligible old operation segments
+```
+
+Compaction chỉ xóa/di chuyển operation prefix khi:
+
+- Snapshot đã verify và durable.
+- Version-history retention vẫn đáp ứng.
+- Active/offline client catch-up policy cho phép.
+- Backup/DR policy đã thỏa mãn.
+
+Snapshot failure không làm accepted edits mất vì operation log vẫn là truth.
+
+---
+
+#### 15. ACL và share flow
+
+```text
+Owner -> update permission/share link
+ -> ACL Service transaction
+      increment aclRevision
+      write audit/outbox PermissionChanged
+ -> active authorities invalidate/recheck sessions
+ -> affected clients receive permission_changed
+```
+
+Khi editor bị thu hồi quyền:
+
+- Operation durable trước enforcement boundary vẫn tồn tại.
+- Operation mới bị reject.
+- Client chuyển read-only.
+- Share-link token bị revoke/rotate.
+- Permission revocation latency được đo bằng SLO.
+
+JWT role chung không thay document ACL. Authority không tin role cached vô hạn trong socket.
+
+---
+
+#### 16. Document delete flow
+
+```text
+Owner -> DELETE document
+ -> mark TRASHED + increment metadata/ACL revision
+ -> notify active sessions; reject new edits
+ -> retain according to trash policy
+ -> optional restore
+ -> hard-delete async after retention/legal checks
+```
+
+Hard deletion phải bao phủ metadata, snapshots, operation logs, search projection, backup retention và share tokens theo policy. “Delete” không thể chỉ xóa một row rồi để content copies tồn tại vô hạn mà không có contract.
+
+---
+
+#### 17. Search/indexing path
+
+Nếu có search:
+
+```text
+snapshot/checkpoint updated
+ -> debounced indexing event
+ -> Search Indexer
+ -> security-aware search projection
+```
+
+Không index mỗi keystroke đồng bộ. Search lag chấp nhận được; collaboration không phụ thuộc search. ACL/revoke/delete phải phản ánh ở query filter hoặc deindex đủ nhanh theo security SLO.
+
+---
+
+#### 18. Backup và recovery
+
+Backup scope:
+
+- PostgreSQL metadata/ACL/checkpoints.
+- Durable operation log/segments.
+- Immutable snapshots.
+- Encryption keys/metadata theo secure recovery process.
+
+Recovery validation:
+
+```text
+restore metadata + ACL
+ -> resolve snapshot pointer/version
+ -> replay operation tail
+ -> verify content hash/schema
+ -> confirm version history references
+ -> authorize access correctly
+```
+
+Backup, replication và version history là ba lớp khác nhau. Cần restore test định kỳ, không chỉ xác nhận backup job “success”.
+
+---
+
+#### 19. Hot/cold storage
+
+##### Hot
+
+- Active authority in-memory state.
+- Latest verified snapshot.
+- Recent operation tail.
+- ACL/session revisions.
+
+##### Warm
+
+- Recent checkpoints và compacted operation segments.
+- Documents mở gần đây.
+
+##### Cold
+
+- Old versions/archive/deleted retention.
+- Backup và analytics archive.
+
+Tiering dựa trên access/retention, không làm current document open phụ thuộc cold restore thường xuyên.
+
+---
+
+#### 20. Scaling model
+
+| Layer | Scale signal/partition |
+|---|---|
+| REST APIs | RPS/inflight/latency; stateless horizontal scale |
+| WebSocket Gateways | Connections, frames, bytes, event-loop lag |
+| Collaboration Authorities | `documentId`, active docs, ops/s, per-doc queue |
+| Operation Log | Partition by documentId; append latency/partition skew |
+| Fan-out | Deliveries/s, subscriber shards, network bytes |
+| Presence | Updates/s và active participants; TTL/latest value |
+| Snapshot workers | Unsnapshotted log bytes/age |
+| Version/search workers | Event lag/backlog |
+
+200K–400K ops/s và fan-out hàng triệu deliveries/s cần scale các tầng độc lập. Số socket không cho biết merge CPU; op rate không cho biết egress.
+
+---
+
+#### 21. Hot-document handling
+
+Một document là một coordination key. Các biện pháp:
+
+- Single authority/actor có dedicated capacity.
+- Editor limit; viewers qua fan-out tier.
+- Batch operations và minimize per-op allocations.
+- Presence/cursor tách riêng.
+- Relay tree cho viewers.
+- Paste/large-operation admission control.
+- Snapshot adaptive theo log growth.
+- Block partitioning chỉ khi schema/undo/cross-block semantics cho phép.
+
+Không thể chỉ “thêm nhiều Collaboration Service replicas” để chia một document nếu authority/algorithm không hỗ trợ.
+
+---
+
+#### 22. Multi-AZ và failure handling
+
+```text
+Multi-AZ gateway/authority fleet
+ + replicated operation durability
+ + PostgreSQL HA
+ + Redis failover for ephemeral state
+ + object storage durability
+```
+
+Failure behavior:
+
+| Failure | Recovery |
+|---|---|
+| Gateway chết | Client reconnect + catch-up |
+| Authority chết trước ACK | Client retry; unACKed op vẫn pending |
+| Authority chết sau durable append, trước ACK | Retry dedupe và ACK canonical op |
+| Persist xong, fan-out lỗi | Remote clients catch up từ log |
+| Snapshot builder lỗi | Retry; op log vẫn đúng |
+| Redis mất presence | Sessions/heartbeat rebuild; content không mất |
+| PostgreSQL failover | Management/ACL tạm chậm; cached sessions theo bounded policy |
+| Một AZ mất | Remaining zones chịu peak trong failure capacity |
+
+Authority failover dùng fencing epoch để old owner không tiếp tục ghi.
+
+---
+
+#### 23. Multi-region
+
+MVP/OT server-authoritative:
+
+```text
+documentId -> home region -> one active authority epoch
+```
+
+Edge gần user giảm connection overhead nhưng operation vẫn tới home authority. Cross-region replicas phục vụ DR/read. Failover cần fencing và acknowledged-edit RPO rõ.
+
+Nếu chọn multi-region CRDT:
+
+- Regional replica merge.
+- Anti-entropy/state-vector exchange.
+- Tombstone GC.
+- ACL revoke/delete semantics trong partition.
+- Duplicate/malicious update validation.
+
+Không thể dùng cùng một multi-region recipe cho cả OT và CRDT.
+
+---
+
+#### 24. Graceful degradation
+
+Khi quá tải, ưu tiên:
+
+1. Authorize, merge/order và durable append content edits.
+2. ACK và remote content delivery.
+3. Reconnect/catch-up của active editors.
+4. Presence/cursor giảm tần suất hoặc tắt tạm.
+5. Snapshot/version/search có thể lag có giới hạn.
+6. Analytics/invite không khẩn cấp xử lý sau.
+
+Không được giảm tải bằng cách ACK trước durability hoặc bỏ content operation âm thầm.
+
+---
+
+#### 25. Security end-to-end
+
+- OIDC/OAuth access token tại edge; document ACL trong domain.
+- WebSocket auth refresh và session revoke.
+- TLS/WSS, frame-size/rate limits và origin validation.
+- Envelope encryption cho snapshots/logs/databases/backups.
+- KMS/HSM, key rotation và least-privilege IAM.
+- Share-link high entropy/hash/expiry/revoke.
+- Tenant isolation và data residency nếu cần.
+- Không log raw content/op payload/token.
+- Audit share, permission, restore, delete và privileged access.
+- Secure hard-delete/retention workflow.
+
+Encryption không thay permission enforcement; ACL không thay encryption.
+
+---
+
+#### 26. Observability end-to-end
+
+```text
+requestId
+ -> documentId
+ -> sessionId/clientId
+ -> opId
+ -> canonicalVersion/stateVector
+ -> snapshotId/checkpointId
+```
+
+Các chỉ số then chốt:
+
+- Local-to-ACK và remote propagation latency.
+- Ops accepted/rejected/deduped.
+- Durable append latency/quorum health.
+- Per-document processing queue/hotness.
+- Fan-out deliveries/bytes và slow-client resync.
+- WebSocket connections/reconnects/event-loop lag.
+- Catch-up tail size và snapshot-resync rate.
+- Snapshot age/log bytes/compaction failures.
+- ACL revocation propagation.
+- Authority handoff/failover time.
+- Convergence/hash mismatch và acknowledged-edit loss: mục tiêu 0.
+
+Metrics không chứa raw document IDs với unbounded cardinality; traces/logs cần sampling và access controls.
+
+---
+
+#### 27. Đối chiếu bottleneck với giải pháp
+
+| Bottleneck Bài 124 | Giải pháp |
+|---|---|
+| 200K–400K peak ops/s | Authority shards theo documentId + durable partitioned log |
+| 1M+ fan-out deliveries/s | Gateway fleet, Pub/Sub routing, batching, relay tree |
+| Hot document | Dedicated authority, editor limits, viewer tier, presence separation |
+| WebSocket scale | Connection-aware autoscaling, draining, bounded buffers |
+| 2–5 TB op log/day | Compression, snapshots, compaction, lifecycle tiers |
+| Snapshot amplification | Adaptive snapshot thresholds và immutable objects |
+| Conflict processing | Chọn OT/CRDT rõ, bound stale tail, resync |
+| ACL per op | Cached permission revision + immediate revoke event |
+| Reconnect storm | Backoff/jitter, delta vs snapshot threshold |
+| Slow clients | Coalesce ephemeral data, content resync instead of unbounded queue |
+
+---
+
+#### 28. Điểm cần chỉnh so với transcript
+
+1. **“Periodically persisted” không an toàn nếu edit đã ACK/broadcast.** Canonical op phải durable trước ACK; chỉ snapshot tạo định kỳ.
+2. **Document Service tải metadata/snapshot descriptor; Collaboration Authority sở hữu active sync state.** Không để hai service cùng ghi content không có version contract.
+3. **User Service authentication không đủ cho permission.** ACL/Sharing authority và collaboration-time enforcement cần riêng.
+4. **MongoDB không mặc nhiên cần thiết.** Sử dụng chỉ khi hot document access pattern biện minh.
+5. **Redis là acceleration/ephemeral layer.** Mất Redis không được làm mất content.
+6. **Messaging layer không tự bảo đảm convergence.** OT/CRDT engine và canonical op semantics mới quyết định correctness.
+7. **Microservices không tự tạo resilience.** Durability, fencing, idempotency, backup và failure capacity mới tạo resilience.
+8. **Mỗi service có logical data ownership không bắt buộc physical database riêng.**
+
+---
+
+#### 29. Cách trình bày final design trong phỏng vấn
+
+1. Tách REST management path và WebSocket collaboration path.
+2. Vẽ Document/ACL Service cùng Collaboration Authority.
+3. Chọn OT hoặc CRDT; nêu operation envelope và convergence semantics.
+4. Đi qua local apply → pending → authorize/merge → durable append → ACK → fan-out.
+5. Nêu reconnect bằng delta hoặc snapshot.
+6. Tách operation log, snapshot, version checkpoint và backup.
+7. Giải thích ACL revision/revoke active session.
+8. Nêu presence/cursor là ephemeral và degrade trước.
+9. Trình bày shard theo documentId, hot-document limitation và fencing handoff.
+10. Kết thúc bằng failure table, observability và no-acknowledged-edit-loss.
+
+Một câu trả lời mạnh:
+
+> “Mỗi edit được áp local ngay nhưng chỉ được coi là saved sau khi canonical operation đã durable. Authority OT/CRDT quản lý document version/state; Pub/Sub fan-out tới clients, còn snapshot/version/search chạy async. Reconnect phục hồi bằng operation delta hoặc snapshot và ACL revision bảo đảm quyền bị thu hồi có hiệu lực trên socket đang mở.”
+
+---
+
+#### 30. Ý chính cần nhớ
+
+- Final design có management path, collaboration path và background path.
+- Document/ACL metadata và content operation authority là các concern khác nhau.
+- Canonical operation log + verified snapshots tạo source-of-truth content.
+- Document là evolving replicated state, không chỉ là một bản ghi CRUD hoặc file được ghi đè nguyên khối.
+- Tạo document phải atomically gắn owner ACL và initial version.
+- Open document gồm authorize, snapshot/delta và WebSocket join.
+- Client local apply trước nhưng giữ pending cho đến ACK.
+- Authority authorize/dedupe/OT-or-CRDT/persist trước ACK.
+- OT dùng canonical ordering; CRDT dùng causal/stable-ID merge semantics.
+- Fan-out có thể mất/lặp; client dedupe và catch up từ durable state.
+- Presence/cursor là ephemeral latest-value stream.
+- Reconnect chọn delta hoặc snapshot theo threshold.
+- Restore tạo version mới và không xóa lịch sử.
+- Snapshot là materialization async; compaction chỉ sau verify/retention safety.
+- ACL revision giúp revoke active session.
+- Redis/cache failure không được làm mất content.
+- Shard theo documentId nhưng hot document vẫn cần xử lý riêng.
+- Authority handoff/failover cần fencing epoch.
+- Multi-region topology phải phù hợp OT hay CRDT.
+- Graceful degradation bảo vệ content durability trước presence/search/analytics.
+- Backup restore phải khôi phục đồng bộ metadata, ACL, snapshot và operation tail.
+
+#### Công thức ghi nhớ
+
+> **Collaborative-editor final design = authorized open/join + optimistic local replica + durable-before-ACK canonical OT/CRDT operations + targeted realtime fan-out + ephemeral presence + snapshot/log catch-up + immutable version restore + fenced document ownership.**
+
+---
+
+## Phần cuối. Final Prep, Mindset & Moving Forward
+
+### Bài 128. Final Prep, Mindset & Moving Forward
+
+#### 1. Điều thật sự được đánh giá
+
+Phỏng vấn System Design không nhằm kiểm tra khả năng vẽ lại một kiến trúc hoàn hảo từ trí nhớ. Interviewer thường đánh giá:
+
+- Có biến đề bài mơ hồ thành phạm vi rõ ràng được không?
+- Có xác định requirement và business invariant quan trọng không?
+- Có ước lượng đủ để quyết định kiến trúc không?
+- Có nhận diện bottleneck và failure mode không?
+- Có đưa ra alternatives và giải thích trade-off không?
+- Có điều chỉnh thiết kế khi constraint thay đổi không?
+- Có giao tiếp rõ ràng và cộng tác với interviewer không?
+- Có phân biệt correctness-critical path với phần có thể degrade không?
+
+Mục tiêu không phải **perfect design**, mà là **structured, evidence-based reasoning**.
+
+---
+
+#### 2. Mindset đúng
+
+##### Tò mò thay vì lo lắng
+
+Đề bài mở là cơ hội đặt câu hỏi. Không biết một requirement không phải điểm yếu; giả định âm thầm rồi thiết kế sai mới nguy hiểm.
+
+##### Cộng tác thay vì độc thoại
+
+Cho interviewer biết:
+
+- Điều đang giả định.
+- Quyết định vừa đưa ra.
+- Alternative đã cân nhắc.
+- Rủi ro cần đào sâu.
+
+##### Chậm lại khi bài toán khó
+
+Khi gặp constraint mới:
+
+1. Nhắc lại điều vừa thay đổi.
+2. Xác định requirement/SLO/invariant bị ảnh hưởng.
+3. Tìm bottleneck mới.
+4. Điều chỉnh đúng phần kiến trúc.
+5. Nêu trade-off phát sinh.
+
+Không vá thêm component ngẫu nhiên vào sơ đồ.
+
+##### Chấp nhận không có đáp án duy nhất
+
+Hai kiến trúc khác nhau đều có thể đúng nếu assumptions và reasoning nhất quán. Câu hỏi quan trọng không phải “công nghệ nào tốt nhất?”, mà là:
+
+> “Với workload, constraints và năng lực đội ngũ này, lựa chọn nào tạo trade-off phù hợp nhất?”
+
+---
+
+#### 3. Framework bốn bước
+
+```text
+1. Understand the problem and define scope
+2. Estimate scale and identify bottlenecks
+3. Build high-level design and critical flows
+4. Make strategic technology/infrastructure decisions
+```
+
+Framework không phải checklist cứng. Khi interviewer thêm constraint, quay lại bước liên quan rồi cập nhật thiết kế.
+
+---
+
+#### 4. Bước 1 — Hiểu bài toán và xác định phạm vi
+
+Nên làm rõ:
+
+- Actors và primary user journeys.
+- Functional requirements bắt buộc.
+- Ngoài phạm vi.
+- Non-functional requirements: latency, availability, durability, consistency, security.
+- Business invariants: điều tuyệt đối không được sai.
+- Assumptions và external dependencies.
+
+Câu hỏi mẫu:
+
+- “Chúng ta ưu tiên use case nào trong MVP?”
+- “Read/write ratio và peak traffic dự kiến?”
+- “Consistency có quan trọng hơn availability cho thao tác này không?”
+- “Có cần multi-region hay chỉ một region Multi-AZ?”
+- “Data retention và privacy requirements là gì?”
+- “Khi dependency lỗi, hệ thống nên fail closed hay degrade?”
+
+Kết thúc bước 1 bằng một câu xác nhận scope:
+
+> “Tôi sẽ tập trung vào A, B và C; D/E nằm ngoài MVP. Correctness quan trọng nhất ở invariant X, còn Y có thể eventual/degraded.”
+
+---
+
+#### 5. Bước 2 — Ước lượng và tìm bottleneck
+
+Không cần số chính xác tuyệt đối. Cần order of magnitude và logic nhất quán.
+
+Ước lượng thường gồm:
+
+- DAU/MAU và concurrent users.
+- Average và peak RPS/QPS.
+- Read/write/event mix.
+- Fan-out hoặc retry amplification.
+- Storage/day/year và retention.
+- Network bandwidth/connections.
+- Hot-key/hot-partition load.
+- External-provider calls/cost.
+
+Công thức cơ bản:
+
+```text
+average RPS = requests/day / 86.400
+peak RPS = average RPS × peak factor
+concurrency ≈ arrival rate × average duration
+storage = records × average size × retention × replicas
+fan-out deliveries = accepted events × average recipients
+backlog drain time = backlog / (recovery throughput - arrival rate)
+```
+
+Sau phép tính, luôn hỏi:
+
+- Average có che giấu burst nào không?
+- Một key/entity có nóng hơn global traffic không?
+- Một request logic tạo bao nhiêu internal calls/events?
+- Khi retry/failure xảy ra, tải bị khuếch đại thế nào?
+
+---
+
+#### 6. Bước 3 — High-level design
+
+Bắt đầu bằng luồng, không bắt đầu bằng danh sách sản phẩm:
+
+1. Client/actor đi vào hệ thống ở đâu?
+2. Critical request path là gì?
+3. Service/module nào sở hữu từng business capability?
+4. Source of truth ở đâu?
+5. Dữ liệu nào là cache/projection/ephemeral?
+6. Giao tiếp nào synchronous, asynchronous hay realtime?
+7. Failure/retry/idempotency/recovery hoạt động ra sao?
+
+Vẽ ít component nhưng giải thích rõ:
+
+```text
+Client -> Edge/Gateway -> Core Services -> Authority Stores
+                           |
+                           +-> Cache/Projection
+                           +-> Event/Queue -> Background Consumers
+```
+
+Sau sơ đồ tổng thể, đi sâu 1–2 critical flows, chẳng hạn:
+
+- Create/write flow.
+- Read/high-volume flow.
+- Failure/retry/recovery flow.
+
+Mỗi component phải trả lời được: nó giải quyết bottleneck/invariant nào và đưa vào trade-off gì?
+
+---
+
+#### 7. Bước 4 — Technology và infrastructure
+
+Technology selection nên có dạng:
+
+```text
+Requirement/workload
+ -> needed property
+ -> candidate technologies
+ -> chosen option
+ -> trade-off/failure model
+```
+
+Ví dụ:
+
+> “Order và payment cần transaction/constraint, nên tôi dùng relational database. Search chấp nhận eventual consistency và cần full-text/facets, nên dùng search index làm projection. Redis chỉ là acceleration layer; checkout vẫn revalidate authority.”
+
+Không chỉ nói “dùng Kafka/Redis/Kubernetes vì scale”. Hãy nói:
+
+- Kafka cần retention/replay/multiple consumers hay managed queue đã đủ?
+- Redis là cache, lease hay authority tạm thời? Nếu mất thì sao?
+- Kubernetes giải quyết deployment nào và đội ngũ có vận hành được không?
+- Multi-region dùng active-active hay home-region ownership?
+- Managed service giảm toil nhưng quota/cost/lock-in ra sao?
+
+---
+
+#### 8. Cấu trúc trả lời trong buổi phỏng vấn
+
+Với buổi 45 phút, một phân bổ minh họa:
+
+| Phần | Thời gian |
+|---|---:|
+| Requirements, assumptions, scope | 5–8 phút |
+| Scale và bottlenecks | 5–7 phút |
+| High-level architecture | 10–12 phút |
+| Critical flows/deep dive | 10–12 phút |
+| Reliability, security, trade-offs, recap | 5–8 phút |
+
+Đây không phải quy tắc cố định. Nếu interviewer muốn deep dive sớm, điều chỉnh theo cuộc trao đổi. Nhưng cần tránh dùng phần lớn thời gian để hỏi requirement hoặc vẽ diagram mà chưa phân tích flow.
+
+---
+
+#### 9. Cách “narrate” reasoning
+
+Dùng các câu chuyển ý rõ:
+
+- “Tôi đang giả định…”
+- “Con số này cho thấy bottleneck có khả năng nằm ở…”
+- “Thành phần này tồn tại để bảo vệ invariant…”
+- “Tôi chọn synchronous ở đây vì bước tiếp theo cần kết quả…”
+- “Phần này có thể async vì không nằm trên user critical path…”
+- “Nguồn chân lý là…, còn cache/index chỉ là projection…”
+- “Nếu dependency timeout, tôi không thể kết luận thất bại; tôi sẽ…”
+- “Alternative là…, nhưng ở scale/team hiện tại tôi ưu tiên…”
+- “Nếu traffic tăng 10×, giới hạn đầu tiên sẽ là…”
+
+Không cần nói mọi suy nghĩ vụn vặt. Narration nên giúp interviewer theo dõi decision chain.
+
+---
+
+#### 10. Cách trình bày trade-off
+
+Một template ngắn:
+
+```text
+Tôi chọn X vì requirement A và B.
+Alternative Y đơn giản/nhanh hơn ở C,
+nhưng làm xấu D hoặc tăng rủi ro E.
+Với assumption hiện tại, X phù hợp hơn.
+Nếu constraint F thay đổi, tôi sẽ chuyển sang Y/Z.
+```
+
+Các trục thường gặp:
+
+- Latency ↔ consistency.
+- Availability ↔ coordination.
+- Simplicity ↔ independent scaling.
+- Storage cost ↔ recovery speed/history.
+- Freshness ↔ cache efficiency.
+- Throughput ↔ per-item ordering.
+- Build control ↔ managed-service simplicity.
+- Multi-region availability ↔ write latency/conflict complexity.
+- Security/privacy ↔ product convenience/observability.
+
+Tránh từ tuyệt đối như “luôn luôn”, “tốt nhất” nếu chưa gắn context.
+
+---
+
+#### 11. Khi interviewer thay đổi yêu cầu
+
+Ví dụ “traffic tăng 10×”:
+
+1. Tính lại peak và amplification.
+2. Xác định component saturation đầu tiên.
+3. Kiểm tra partition key/hot key.
+4. Scale stateless tier nếu phù hợp.
+5. Tách workload hoặc thêm queue/cache/projection khi có lý do.
+6. Cập nhật cost/operations complexity.
+
+Ví dụ “cần multi-region”:
+
+- Người dùng đọc/ghi ở đâu?
+- Entity có home region không?
+- RPO/RTO?
+- Strong consistency xuyên region có cần không?
+- Conflict/failover/split-brain semantics?
+
+Ví dụ “latency giảm một nửa”:
+
+- Breakdown latency budget theo stage.
+- Bỏ synchronous hop không cần thiết.
+- Đưa data/compute gần user.
+- Cache/precompute/batch có kiểm soát.
+- Đánh giá freshness/correctness/cost trade-off.
+
+Không thêm CDN, Kafka hay sharding như phản xạ nếu chúng không giải quyết bottleneck mới.
+
+---
+
+#### 12. Decomposition và zoom-in
+
+Chia bài toán thành:
+
+- User journeys.
+- Business capabilities.
+- Data ownership.
+- Request/event flows.
+- Correctness boundaries.
+- Scaling/failure domains.
+
+Khi interviewer hỏi sâu storage, security hoặc messaging, zoom vào component đó nhưng vẫn nối lại toàn hệ thống:
+
+> “Thay đổi này làm write path bền hơn, nhưng tăng ACK latency và ảnh hưởng SLO ở bước X. Vì vậy tôi sẽ…”
+
+Decomposition tốt giúp thay đổi một phần mà không phải thiết kế lại toàn bộ.
+
+---
+
+#### 13. Các lỗi phổ biến
+
+##### Nhảy thẳng vào sơ đồ
+
+Chưa biết scale/requirements nên component không có lý do tồn tại.
+
+##### Name-dropping technologies
+
+Liệt kê Kafka, Redis, Kubernetes, Cassandra nhưng không nói workload/invariant/failure model.
+
+##### Chỉ nói happy path
+
+Không đề cập timeout, retry, duplicate, stale data, outage và recovery.
+
+##### Tin average load
+
+Bỏ qua peak, hot key, fan-out và retry amplification.
+
+##### Mọi thứ đều microservice
+
+Tăng network/operations complexity khi modular monolith đã đủ.
+
+##### Mọi thứ đều strong consistency hoặc eventual consistency
+
+Consistency phải theo dữ liệu/invariant.
+
+##### Cache là source of truth
+
+Không xác định authoritative store hoặc revalidation.
+
+##### Queue là exactly-once business magic
+
+Không dùng idempotency, dedupe, Outbox và reconciliation.
+
+##### Không chừa thời gian recap
+
+Interviewer không thấy requirement nào được giải quyết bởi component nào.
+
+---
+
+#### 14. Checklist kỹ thuật đa dụng
+
+Khi hoàn thành sơ đồ, nhanh chóng kiểm tra:
+
+- [ ] Source of truth cho mỗi critical data?
+- [ ] Business invariants và atomicity boundary?
+- [ ] Idempotency cho retry?
+- [ ] Ordering requirement theo entity/key?
+- [ ] Cache freshness/invalidation/fallback?
+- [ ] Queue delivery, retry, DLQ, lag?
+- [ ] Timeout/circuit breaker/reconciliation cho external dependency?
+- [ ] Partition key và hot-key strategy?
+- [ ] Backpressure/load shedding?
+- [ ] HA/failover/backup/RTO/RPO?
+- [ ] Authentication, authorization, encryption, secrets, audit?
+- [ ] Metrics/logs/traces và SLO?
+- [ ] Graceful degradation order?
+- [ ] Cost/operational complexity/team capability?
+
+Không cần nói hết mọi mục nếu thời gian ngắn; ưu tiên mục gắn với rủi ro lớn nhất của đề.
+
+---
+
+#### 15. Cách kết thúc câu trả lời
+
+Recap trong 30–60 giây:
+
+1. Nhắc requirements/invariants chính.
+2. Tóm tắt request/data flow.
+3. Nêu 2–3 quyết định quan trọng nhất và lý do.
+4. Nêu bottleneck/failure mode còn lại.
+5. Nói design sẽ tiến hóa thế nào khi scale/constraint đổi.
+
+Template:
+
+> “Thiết kế này ưu tiên A và B. X là authority bảo vệ invariant C; Y là projection/cache để đạt latency D; side effects đi qua Z để không chặn critical path. Bottleneck đầu tiên khi tăng trưởng sẽ là E, và khi chạm ngưỡng đó tôi sẽ F. Trade-off chính là G.”
+
+---
+
+#### 16. Deliberate practice thay vì chỉ đọc
+
+Đọc giúp xây vocabulary; thiết kế thành tiếng mới xây interview fluency.
+
+Một buổi luyện:
+
+1. Chọn đề ngẫu nhiên.
+2. Đặt timer 35–45 phút.
+3. Dùng whiteboard hoặc diagram tool.
+4. Nói reasoning thành tiếng.
+5. Ghi lại assumptions/calculations/trade-offs.
+6. Thu âm/quay màn hình nếu có thể.
+7. Review bằng rubric.
+8. Thiết kế lại phần yếu, không nhất thiết làm lại toàn bộ.
+
+Luân phiên:
+
+- Solo practice.
+- Peer mock interview.
+- Interviewer-led constraint changes.
+- Deep dive riêng storage/messaging/reliability/security.
+
+---
+
+#### 17. Rubric tự đánh giá
+
+Chấm mỗi mục 0–2:
+
+| Mục | 0 | 1 | 2 |
+|---|---|---|---|
+| Requirements | Bỏ qua | Có hỏi nhưng thiếu ưu tiên | Scope/actors/invariants rõ |
+| Estimation | Không có | Có average | Có peak/amplification/hot key |
+| Architecture | Component rời rạc | Có flow cơ bản | Ownership/authority/flows rõ |
+| Trade-offs | Chỉ một đáp án | Có alternative | Gắn requirement và trigger đổi thiết kế |
+| Reliability | Chỉ happy path | Có retry/failover chung | Timeout/idempotency/recovery cụ thể |
+| Data | Không rõ source | Có DB lựa chọn | Consistency/partition/retention rõ |
+| Security | Chỉ nói auth | Có encryption/RBAC | Threat/ACL/audit/secrets/privacy rõ |
+| Communication | Khó theo dõi | Tạm rõ | Structured, collaborative, time-aware |
+| Adaptation | Bị kẹt khi đổi constraint | Vá thiết kế | Re-evaluate bottleneck có hệ thống |
+| Recap | Không có | Tóm tắt component | Nối requirement → decision → trade-off |
+
+Theo dõi điểm theo thời gian để thấy kỹ năng nào đang yếu.
+
+---
+
+#### 18. Kế hoạch luyện tập bốn tuần gợi ý
+
+##### Tuần 1 — Framework và estimation
+
+- Mỗi ngày một đề nhỏ.
+- Chỉ luyện requirements, assumptions và back-of-the-envelope calculations.
+- Mục tiêu: không nhầm DAU/concurrency, average/peak, logical event/fan-out.
+
+##### Tuần 2 — Critical flows và data
+
+- Vẽ create/read/update flow.
+- Xác định authority/cache/projection.
+- Luyện idempotency, partitioning và consistency.
+
+##### Tuần 3 — Reliability và trade-offs
+
+- Thêm timeout, retry, failover, queue lag, provider outage.
+- Thiết kế graceful degradation.
+- So sánh monolith/microservices, SQL/NoSQL, sync/async.
+
+##### Tuần 4 — Mock interviews
+
+- 3–5 buổi timed mock.
+- Cả remote diagramming và whiteboard/verbal format.
+- Review recording và làm lại đoạn yếu.
+- Luyện recap 60 giây.
+
+---
+
+#### 19. Xây “muscle memory” đúng cách
+
+Nên ghi nhớ:
+
+- Framework câu hỏi.
+- Các công thức estimation.
+- Những failure patterns thường gặp.
+- Cách trình bày trade-off.
+- Các loại storage/communication và đặc tính.
+
+Không nên học thuộc:
+
+- Một sơ đồ cố định cho từng sản phẩm.
+- Một technology stack “chuẩn”.
+- Con số capacity không gắn assumptions.
+- Câu trả lời tuyệt đối không có context.
+
+Muscle memory tốt giải phóng trí nhớ làm việc để tập trung vào phần độc đáo của đề.
+
+---
+
+#### 20. Chuẩn bị cho remote và in-person
+
+##### Remote
+
+- Quen một diagramming tool đơn giản.
+- Nói rõ khi đang vẽ/di chuyển sơ đồ.
+- Chữ to, ít component, flow direction nhất quán.
+- Kiểm tra microphone/screen share.
+- Không im lặng quá lâu khi thao tác.
+
+##### In-person
+
+- Chia bảng thành requirements, estimates và architecture.
+- Viết assumptions/con số quan trọng bên cạnh.
+- Dùng arrows/labels rõ.
+- Lùi lại kiểm tra bố cục và recap.
+- Nói trước khi xóa hoặc thay phần lớn sơ đồ.
+
+Ở cả hai format, clarity quan trọng hơn diagram đẹp.
+
+---
+
+#### 21. Học tiếp sau khóa học
+
+##### Xây side projects
+
+Không cần clone toàn bộ Uber/Google Docs. Chọn một vấn đề khó:
+
+- Idempotent checkout + payment webhook simulator.
+- Queue retry/DLQ dashboard.
+- Realtime chat với reconnect và ordering.
+- URL shortener có cache/metrics.
+- Collaborative text mini-editor với operation log.
+- Geo matching prototype với H3.
+
+##### Đọc tài liệu production
+
+- Engineering blogs có metrics/trade-offs cụ thể.
+- Architecture decision records.
+- Incident postmortems.
+- Database/messaging official documentation.
+- Papers về distributed systems khi cần hiểu nền tảng.
+
+Khi đọc, hỏi:
+
+- Workload và constraint thực tế là gì?
+- Bottleneck nào khiến kiến trúc tiến hóa?
+- Điều gì đã thất bại?
+- Trade-off nào tổ chức chấp nhận?
+- Quyết định có còn phù hợp ở scale của mình không?
+
+##### Thảo luận và đóng góp
+
+- Review design với đồng nghiệp.
+- Tham gia open-source hoặc internal architecture discussion.
+- Viết ADR/mini design doc.
+- Dạy lại một concept để kiểm tra độ hiểu.
+
+---
+
+#### 22. System thinking ngoài phỏng vấn
+
+System thinking là khả năng:
+
+- Nhìn quan hệ giữa component, team và business process.
+- Hiểu một optimization có thể chuyển bottleneck đi đâu.
+- Dự đoán failure amplification.
+- Phân biệt reversible và irreversible decisions.
+- Chọn complexity đúng lúc.
+- Thiết kế để quan sát, vận hành và phục hồi.
+
+Một kiến trúc tốt không chỉ hoạt động trên diagram. Nó phải:
+
+- Có owner rõ.
+- Có migration path.
+- Có failure playbook.
+- Có SLO và feedback loop.
+- Phù hợp cost/team capability.
+- Tiến hóa khi requirement thay đổi.
+
+---
+
+#### 23. Bộ câu hỏi tự kiểm tra cuối cùng
+
+Trước khi kết luận bất kỳ design nào, hỏi:
+
+1. Tôi đang giải quyết đúng bài toán nào?
+2. Assumption nào quan trọng nhất?
+3. Business invariant nào không được vi phạm?
+4. Peak/hot-key load là bao nhiêu?
+5. Source of truth ở đâu?
+6. Operation retry có idempotent không?
+7. Điều gì xảy ra khi message lặp/sai thứ tự?
+8. Điều gì xảy ra khi dependency timeout?
+9. Khi một node/AZ/region lỗi, hệ thống mất gì?
+10. Cache/index cũ ảnh hưởng correctness thế nào?
+11. Backlog phục hồi có drain được không?
+12. Security/privacy boundary ở đâu?
+13. Tôi quan sát hệ thống bằng SLO/metrics nào?
+14. Cost và operational complexity có phù hợp không?
+15. Khi scale tăng 10×, bottleneck đầu tiên là gì?
+
+Nếu trả lời được các câu này, thiết kế đã vượt xa việc chỉ ghép các “box and arrows”.
+
+---
+
+#### 24. Tổng kết toàn khóa
+
+Khóa học đã đi từ:
+
+- Networking, DNS, proxies, load balancing, API Gateway và CDN.
+- TCP/UDP, HTTP/REST, realtime, gRPC và GraphQL.
+- Architecture patterns, web concepts và scalability.
+- SQL/NoSQL, sharding, replication, object/distributed storage và big data.
+- Caching, messaging, concurrency và database performance.
+- Reliability, availability, backup, disaster recovery và security.
+- System Design Blueprint bốn bước.
+- Các case study production-scale: URL shortener, ticketing, news feed, notification, chat, auction, rental, cloud storage, video, search, e-commerce, taxi hailing và collaborative editor.
+
+Điểm chung xuyên suốt không phải danh sách công nghệ. Đó là chuỗi suy luận:
+
+```text
+Business problem
+ -> requirements and invariants
+ -> scale and bottlenecks
+ -> boundaries and data flows
+ -> consistency/reliability/security
+ -> technology and infrastructure
+ -> observability, cost and evolution
+```
+
+---
+
+#### 25. Ý chính cần nhớ
+
+- Phỏng vấn đánh giá structured thinking, không phải sơ đồ thuộc lòng.
+- Hỏi clarifying questions và nói rõ assumptions là điểm mạnh.
+- Dùng bốn bước: scope → scale → HLD → technology decisions.
+- Thiết kế từ requirement/invariant, không từ product names.
+- Ước lượng average, peak, amplification và hot key.
+- Vẽ critical flows và authority boundaries trước khi thêm chi tiết.
+- Mỗi quyết định cần alternative, benefit, cost và trigger thay đổi.
+- Khi constraint đổi, đánh giá lại bottleneck thay vì vá component.
+- Tránh absolute statements; context quyết định lựa chọn.
+- Luyện nói thành tiếng, timed mock và review recording.
+- Xây muscle memory cho process, không học thuộc architecture.
+- Chuẩn bị cả remote diagramming và in-person whiteboarding.
+- Học từ side projects, documentation, engineering blogs và postmortems.
+- Reliability, security, observability, cost và operations là một phần của design.
+- System design là kỹ năng suy luận về complexity, không chỉ để vượt phỏng vấn.
+
+#### Công thức ghi nhớ cuối khóa
+
+> **Strong system design = clear scope + explicit assumptions/invariants + order-of-magnitude estimates + critical flows/ownership + reasoned trade-offs + failure/security/operations thinking + concise collaborative communication.**
+
+> **Đừng bắt đầu bằng công nghệ. Bắt đầu bằng vấn đề, để requirements dẫn đến kiến trúc và để kiến trúc dẫn đến lựa chọn công nghệ.**
+
+---
+
 ## Thuật ngữ nhanh
 
 | Thuật ngữ | Cách hiểu ngắn gọn |
@@ -63452,3 +77682,418 @@ Câu hỏi cần trả lời được:
 | **Projection revision check** | Consumer chỉ apply event mới hơn state đã có để chống duplicate hoặc out-of-order update. |
 | **Creator processing status** | Trạng thái chi tiết cho uploader về validation, transcode, publication, failure và retry. |
 | **Takedown deny path** | Cơ chế chặn playback/search/feed ngay cả khi CDN hay derived indexes chưa purge hoàn toàn. |
+| **Web crawler** | Hệ thống khám phá, lên lịch và tải public web resources để xử lý/index. |
+| **URL frontier** | Tập URL chờ crawl kèm priority, host budget, next-fetch time và lease state. |
+| **Crawl politeness** | Giới hạn rate/concurrency theo website để crawler không gây quá tải và tôn trọng policy. |
+| **robots.txt** | Tệp Robots Exclusion Protocol công bố các rule crawl cho user agents; không phải cơ chế authorization. |
+| **Crawl trap** | Không gian URL gần vô hạn hoặc lặp do calendar, parameters hay generated links làm crawler mắc kẹt. |
+| **URL canonicalization** | Chuẩn hóa và chọn URL đại diện nhằm giảm aliases/duplicate work mà không gộp sai resources. |
+| **Content fingerprint** | Hash hoặc chữ ký dùng nhận diện exact/near-duplicate document content. |
+| **Near-duplicate document** | Document có nội dung gần giống đáng kể dù bytes hoặc URL không hoàn toàn giống nhau. |
+| **Document ID** | Định danh nội bộ ổn định của document, tách khỏi URL có thể đổi hoặc có aliases. |
+| **Inverted index** | Cấu trúc ánh xạ term tới danh sách documents/positions chứa term đó. |
+| **Term dictionary** | Tập terms đã chuẩn hóa cùng identifiers và corpus statistics dùng truy cập postings. |
+| **Posting list** | Danh sách document IDs và term data như frequency, positions hoặc fields cho một term. |
+| **Index segment** | Khối index thường immutable được xây riêng rồi merge/compact và publish. |
+| **Index generation** | Tập shards/segments/schema/ranking versions tương thích được publish như một phiên bản serving. |
+| **Index rollout** | Quá trình validate, canary và chuyển query traffic sang index generation mới. |
+| **Local top-K** | Kết quả K candidates tốt nhất do một shard trả trước khi coordinator merge toàn cục. |
+| **Global top-K merge** | Hợp nhất local candidates từ nhiều shards để chọn kết quả cuối cùng tốt nhất. |
+| **TF-IDF** | Lexical weighting dựa trên term frequency trong document và inverse document frequency trong corpus. |
+| **PageRank** | Link-analysis signal ước lượng authority của page từ cấu trúc liên kết web. |
+| **Query-independent signal** | Ranking feature của document không phụ thuộc query cụ thể, như link authority. |
+| **Query-dependent signal** | Feature được tính theo quan hệ giữa query và document, như lexical match/proximity. |
+| **Crawl freshness** | Độ trễ từ khi nguồn thay đổi đến khi crawler phát hiện và lấy phiên bản mới. |
+| **Index freshness** | Độ trễ từ source change/discovery đến khi thay đổi xuất hiện trong searchable index. |
+| **Recrawl scheduler** | Thành phần chọn thời điểm tải lại page theo change probability, value, policy và cost. |
+| **Document tombstone** | Bản ghi đánh dấu document đã xóa/không indexable để loại khỏi generation/projections. |
+| **Search relevance** | Mức kết quả đáp ứng intent/query, được đánh giá bằng signals và quality metrics. |
+| **Search snippet** | Đoạn nội dung ngắn từ document giúp giải thích vì sao kết quả liên quan query. |
+| **Indexability** | Quyết định document có đủ điều kiện đưa vào search index theo content và policy hay không. |
+| **Search scale tier** | Mốc corpus/QPS riêng như MVP, growth hay Internet-scale dùng để provision và kiểm thử có chủ đích. |
+| **Crawl payload bandwidth** | Tốc độ bytes nội dung crawler tải, chưa gồm protocol, retry, redirect và storage overhead. |
+| **Link discovery amplification** | Một fetched page sinh nhiều link occurrences cần normalize, filter và deduplicate. |
+| **Distributed seen set** | State xác định URL đã biết nhằm giảm duplicate frontier work trên nhiều crawler nodes. |
+| **Bloom filter** | Cấu trúc membership tiết kiệm memory có false positives nhưng không có false negatives trong điều kiện chuẩn. |
+| **Host-state owner** | Partition/service chịu trách nhiệm robots, rate, backoff và next-fetch state của một host. |
+| **Index write amplification** | Postings/segments bị ghi lại nhiều lần do flush, merge, replication và generation rollout. |
+| **Index merge backlog** | Lượng segments/bytes chờ compaction, có thể làm tăng query cost và disk usage. |
+| **Shard-query amplification** | Một user query tạo nhiều internal requests do scatter tới index shards/replicas. |
+| **Candidate budget** | Giới hạn candidates được mỗi shard/coordinator/reranker giữ hoặc chấm để cân bằng recall và latency. |
+| **Candidate-scoring amplification** | Một query tạo hàng nghìn local candidates và nhiều tầng scoring trước top results. |
+| **Document sharding** | Partition corpus theo documents; mỗi query thường truy vấn nhiều/all shards và merge local top-K. |
+| **Term sharding** | Partition inverted index theo terms; multi-term query cần phối hợp data/scores giữa term shards. |
+| **Posting-list skew** | Một số common terms có posting lists lớn vượt trội do Zipf-like term distribution. |
+| **Hedged query request** | Gửi request dự phòng tới replica khác khi request chính chậm, có budget để tránh nhân tải quá mức. |
+| **Deadline propagation** | Truyền thời hạn còn lại qua service/shard calls để toàn request tuân thủ latency budget. |
+| **Index cache warming** | Nạp dictionaries, postings hoặc query results nóng trước/sau khi rollout generation mới. |
+| **Generation overlap** | Khoảng old và new index generations cùng tồn tại để validate, canary, switch và rollback. |
+| **Crawl backlog** | URLs/documents chờ fetch/process/index do incoming work vượt hoặc gián đoạn capacity. |
+| **Novel URL ratio** | Tỷ lệ extracted links trở thành URL mới sau normalization, filtering và seen-set checks. |
+| **Query cost classification** | Phân loại query theo postings, expansions, phrase/filter và compute cost để áp budget/rate policy. |
+| **Search drain time** | Thời gian giải phóng crawl/index backlog bằng phần capacity vượt incoming workload. |
+| **Fetch lease** | Quyền fetch một URL có thời hạn/epoch để worker khác có thể tiếp quản sau failure. |
+| **Lease epoch** | Số thế hệ của lease dùng ngăn worker cũ commit kết quả sau khi URL đã được giao lại. |
+| **Host policy service** | Authority quản robots, crawl rate, concurrency, backoff và next-allowed time theo host. |
+| **Conditional crawl request** | HTTP fetch dùng ETag hoặc Last-Modified để tránh tải lại body khi content chưa đổi. |
+| **Raw document store** | Durable storage cho fetched bodies và provenance, tách khỏi searchable index. |
+| **Parser schema version** | Version của extraction/normalization output giúp reprocess và index compatibility reproducible. |
+| **Search analyzer** | Chuỗi tokenizer, normalization, stemming/synonym/language rules dùng cho documents hoặc queries. |
+| **Analyzer compatibility** | Yêu cầu query analyzer và index generation hiểu terms theo schema/version tương thích. |
+| **Canonical cluster** | Nhóm URL/documents được xem là aliases hoặc duplicate của cùng representative content. |
+| **SimHash** | Fingerprint locality-sensitive thường dùng phát hiện near-duplicate text sau khi có content. |
+| **MinHash** | Kỹ thuật ước lượng Jaccard similarity của sets/shingles để tìm near duplicates. |
+| **Link graph snapshot** | Phiên bản đồ thị links ổn định dùng tính authority và các graph features. |
+| **Index catalog** | Control-plane store quản segment manifests, generations, versions và publication state. |
+| **Generation manifest** | Danh sách immutable shards/segments/checksums/schema tạo thành một index generation. |
+| **Serving generation pointer** | Reference/config authoritative chỉ query fleet tới generation hiện hành. |
+| **Delta index segment** | Immutable segment nhỏ chứa additions/updates/tombstones để tăng freshness trước full merge. |
+| **Search policy epoch** | Version của removal/safety policy dùng invalidate cache và áp deny state nhất quán. |
+| **Removal registry** | Authoritative state các documents phải bị deny/filter trước khi index purge hoàn tất. |
+| **Stored fields** | Compact document data như title, URL hoặc snippet source được fetch sau candidate retrieval. |
+| **Result assembly** | Giai đoạn lấy stored fields, tạo snippet, dedup/filter và định dạng top results. |
+| **Crawler SSRF defense** | Chặn crawler bị lợi dụng truy cập private/internal endpoints qua malicious URLs hoặc DNS. |
+| **Poison document** | Web content khiến parser/indexer lặp lỗi, quá tài nguyên hoặc khai thác parser và cần quarantine. |
+| **Crawler worker framework** | Runtime/task abstraction quản worker pools, routing và retries; không thay broker/frontier semantics. |
+| **Ready-to-fetch backlog** | URLs đã tới lịch và còn host capacity, phù hợp autoscaling hơn tổng queue depth. |
+| **Delayed priority scheduler** | Scheduler phát task theo cả priority và earliest execution time thay vì FIFO thuần. |
+| **Packed crawl batch** | Nhiều fetched/processed records được đóng vào immutable file lớn để giảm tiny-object overhead. |
+| **Lucene** | Thư viện information retrieval cung cấp analyzers, segments, postings, scoring và search primitives. |
+| **Elasticsearch** | Distributed search/analytics engine dựa trên Lucene với APIs, shards và replicas. |
+| **OpenSearch** | Open-source distributed search/analytics engine thuộc họ Lucene-based systems. |
+| **Solr** | Search platform dựa trên Lucene, cung cấp distributed indexing/query và operational features. |
+| **Search shard count discipline** | Quản shard count/size để tránh quá nhiều small shards hoặc shards quá lớn khó phục hồi. |
+| **Index refresh interval** | Khoảng đưa newly built segment vào searchable view; ảnh hưởng freshness và merge overhead. |
+| **Micro-batch indexing** | Gom documents trong cửa sổ nhỏ để tạo/publish delta segments thay vì per-doc hoặc full batch. |
+| **Graph compute snapshot alignment** | Bảo đảm PageRank/link features thuộc snapshot/version tương thích với documents/index/ranker. |
+| **Query RPC schema** | Compact versioned request/response contract giữa coordinator, shards, ranker và stored-field services. |
+| **Index data locality** | Đặt shard data gần serving compute/memory/SSD để giảm network và warm-up latency. |
+| **Generation-aware health check** | Chỉ coi replica healthy khi vừa hoạt động vừa load đúng compatible index generation. |
+| **Search rebuild source** | Raw/processed corpus, catalog, configs và events đủ để tái tạo index khi cần. |
+| **Crawler egress identity** | IP/user-agent/contact identity ổn định giúp website operators nhận biết và kiểm soát crawler. |
+| **Per-million-query cost** | Unit cost tổng hợp query compute, cache, index storage/network và supporting operations. |
+| **Crawl-to-search lineage** | Chuỗi provenance từ URL/fetch/document revision tới segment, generation và query result. |
+| **Index generation gate** | Tập validation, completeness, compatibility và quality checks trước khi publish generation. |
+| **Atomic generation switch** | Chuyển serving pointer/config sang complete generation mới như một quyết định nhất quán. |
+| **Removal overlay** | Delta tombstone/deny layer chặn documents trước khi base immutable index được merge hoặc rebuild. |
+| **Final policy filter** | Kiểm tra blocked/removal state gần response để chống stale cache/index result. |
+| **Query lexical fallback** | Chấm điểm lexical đơn giản/stable khi feature store hoặc expensive ranker lỗi. |
+| **Search critical path** | Chuỗi cache/coordinator/shard/ranking/result assembly cần hoàn tất trong query deadline. |
+| **Query partial-result policy** | Quy tắc có trả kết quả thiếu một số shards/stages khi deadline hoặc failure xảy ra hay không. |
+| **Index rollout headroom** | Disk/network/memory capacity dành cho overlapping generations, distribution và cache warming. |
+| **Crawl provenance** | Metadata giải thích URL được phát hiện, fetch, parse và canonicalize bằng rule/version nào. |
+| **Document revision fencing** | Reject stale processing/index events dựa trên revision để không ghi đè document mới hơn. |
+| **Result-cache policy epoch** | Version removal/safety được đưa vào cache key để invalidate kết quả cũ nhanh. |
+| **Search stage latency** | Latency riêng của parse, cache, shard retrieval, merge/rank, snippets và policy filtering. |
+| **Search graceful degradation** | Giảm rewrite/reranking/freshness work để bảo vệ policy correctness và core keyword results. |
+| **Marketplace product** | Mô tả mặt hàng chung được nhiều sellers/offers cùng tham chiếu. |
+| **Product variant** | Biến thể cụ thể của product theo thuộc tính như size, màu, model hoặc capacity. |
+| **Seller offer** | Đề nghị bán một variant bởi seller cụ thể với price, condition, policy và trạng thái riêng. |
+| **Inventory SKU** | Đơn vị tồn kho authoritative gắn với offer/seller/location cụ thể. |
+| **Observed cart price** | Giá user thấy khi thêm vào cart; chỉ là estimate và phải revalidate khi checkout. |
+| **Checkout quote** | Snapshot có thời hạn của lines, prices, discounts, tax, shipping, currency và rules version. |
+| **Inventory reservation** | Giữ một lượng stock có TTL cho checkout mà chưa chuyển thành sold/allocated. |
+| **Reservation authority** | Thành phần duy nhất có quyền atomically reserve, commit và release stock của SKU. |
+| **Reservation expiry** | Transition trả stock về available khi checkout không hoàn tất trước TTL. |
+| **Order snapshot** | Dữ liệu product/offer/price/tax/discount/fulfillment bất biến lưu tại thời điểm mua. |
+| **Parent marketplace order** | Order cấp buyer bao gồm nhiều seller-specific child orders. |
+| **Seller order** | Phần order thuộc một seller, có fulfillment/cancellation/payout lifecycle riêng. |
+| **Payment attempt** | Một lần thử authorize/capture với stable ID, amount, gateway reference và state. |
+| **Payment unknown state** | Trạng thái local chưa biết gateway đã xử lý hay chưa sau timeout/network ambiguity. |
+| **Payment reconciliation** | Đối chiếu API, webhooks và gateway records để hội tụ payment/order state đúng. |
+| **Double-charge prevention** | Idempotency và uniqueness controls ngăn retry tạo nhiều giao dịch tài chính logic. |
+| **Gateway webhook** | Callback có chữ ký từ payment provider báo transaction state bất đồng bộ. |
+| **Rule-based fraud decision** | Kết quả allow/deny/challenge/review dựa trên tập rules và signals được version hóa. |
+| **Inventory oversell** | Tổng quantity được bán vượt stock authoritative có thể đáp ứng. |
+| **Hot SKU** | SKU nhận lượng reservation/purchase traffic rất lớn và tạo contention hotspot. |
+| **Seller isolation** | Giới hạn dữ liệu, quyền và workload để một seller không truy cập hoặc làm hại seller khác/platform. |
+| **E-commerce saga** | Workflow phối hợp inventory, order, payment và fulfillment bằng local transactions cùng compensations. |
+| **Payment-data scope reduction** | Dùng tokenization/hosted fields để giảm dữ liệu thanh toán nhạy cảm platform trực tiếp xử lý. |
+| **E-commerce request mix** | Tỷ trọng traffic theo nhóm endpoint như search, product detail, cart, checkout và seller operations. |
+| **Orders per DAU** | Tỷ lệ số order trên daily active users; hữu ích để kiểm tra giả định nhưng không đồng nghĩa hoàn toàn với conversion rate. |
+| **Checkout concurrency** | Số phiên checkout đồng thời, xấp xỉ tốc độ bắt đầu checkout nhân với thời gian hoàn tất trung bình. |
+| **Reservation concurrency** | Số reservation đang hoạt động, phụ thuộc tốc độ tạo reservation và TTL của chúng. |
+| **Catalog cardinality amplification** | Số record thực tế tăng mạnh khi một product có nhiều variants, offers, sellers và locations. |
+| **Offer cardinality** | Tổng số lời chào bán; có thể lớn hơn đáng kể số product vì nhiều seller cùng bán một mặt hàng. |
+| **SKU-location record** | Bản ghi tồn kho của một SKU tại một kho hoặc địa điểm cụ thể. |
+| **Seller bulk feed** | Luồng seller cập nhật hàng loạt catalog, giá hoặc tồn kho; thường tạo traffic theo đợt. |
+| **Flash-sale amplification** | Một lượng inventory nhỏ có thể tạo số reservation attempts cực lớn trong thời gian rất ngắn. |
+| **Sold-out hint** | Tín hiệu nhanh cho client hoặc edge biết hàng có khả năng đã hết; chỉ để giảm tải, không thay thế nguồn tồn kho authoritative. |
+| **Inventory conditional decrement** | Trừ tồn kho nguyên tử chỉ khi số lượng hiện có vẫn đủ, giúp ngăn overselling. |
+| **Hot-SKU admission control** | Giới hạn hoặc xếp hàng request đến SKU nóng để bảo vệ nguồn tồn kho authoritative khỏi quá tải. |
+| **Checkout stage budget** | Phân bổ latency mục tiêu cho từng bước trong checkout như định giá lại, giữ hàng, fraud check và payment. |
+| **Payment interaction amplification** | Một payment logic có thể sinh nhiều lần gọi do retry, timeout, redirect, webhook và reconciliation. |
+| **Cart mutation rate** | Tốc độ các thao tác thêm, sửa hoặc xóa sản phẩm trong giỏ hàng. |
+| **Price/stock hint** | Giá và tồn kho hiển thị nhanh cho người dùng; phải được kiểm tra lại bằng dữ liệu authoritative khi checkout. |
+| **E-commerce growth tier** | Các nấc quy mô dự kiến dùng để xác định khi nào cần thêm partitioning, isolation hoặc hạ tầng chuyên biệt. |
+| **Per-authority-key peak** | Peak load trên khóa quyết định tính đúng đắn, chẳng hạn một SKU, thay vì chỉ nhìn peak toàn hệ thống. |
+| **Seller feed drain time** | Thời gian xử lý hết backlog seller updates sau sự cố, dựa trên backlog và công suất xử lý dư. |
+| **Inventory contention rate** | Mức độ nhiều transaction đồng thời cạnh tranh cập nhật cùng một bản ghi tồn kho. |
+| **Checkout funnel** | Chuỗi bước từ xem sản phẩm, thêm giỏ, bắt đầu checkout, thanh toán đến đặt hàng thành công. |
+| **E-commerce degradation tier** | Thứ tự ưu tiên giữ hoặc giảm chức năng khi quá tải; correctness của order, inventory và payment thường quan trọng nhất. |
+| **Business capability boundary** | Ranh giới gom logic và dữ liệu quanh một năng lực nghiệp vụ có ownership rõ ràng. |
+| **Catalog authority** | Nguồn dữ liệu chuẩn của product, category và offer; search index chỉ là projection. |
+| **Seller offer** | Đề nghị bán một product của seller cụ thể, gồm giá, điều kiện và liên kết SKU. |
+| **Search projection** | Bản sao dữ liệu được biến đổi và tối ưu cho truy vấn tìm kiếm; có thể cập nhật trễ so với source of truth. |
+| **Checkout orchestrator** | Thành phần điều phối reprice, inventory reservation, order và payment trong checkout workflow. |
+| **Inventory reservation TTL** | Hạn tồn tại của việc giữ hàng; hết hạn thì số lượng được trả lại để người khác mua. |
+| **Order state machine** | Tập trạng thái và chuyển đổi hợp lệ trong vòng đời order. |
+| **Payment state machine** | Mô hình trạng thái payment độc lập, bao gồm pending, authorized, captured, failed và unknown. |
+| **Payment unknown state** | Trạng thái chưa biết kết quả do timeout hoặc mất response; cần webhook/query/reconciliation để kết luận. |
+| **Saga orchestration** | Một coordinator điều khiển chuỗi local transactions và compensation giữa nhiều service. |
+| **Compensating action** | Thao tác nghiệp vụ hoàn tác tác động trước đó, như release stock hoặc refund payment. |
+| **Transactional Outbox** | Ghi business change và event chờ phát trong cùng local transaction để tránh mất event sau commit. |
+| **Idempotent consumer** | Consumer xử lý lại cùng event mà không tạo thêm business effect. |
+| **Event schema version** | Phiên bản cấu trúc payload giúp producer và consumer tiến hóa tương thích. |
+| **Queue oldest-message age** | Tuổi của message cũ nhất chưa xử lý; chỉ báo backlog thường hữu ích hơn queue depth đơn thuần. |
+| **Temporal decoupling** | Producer và consumer không cần hoạt động hoặc xử lý cùng thời điểm nhờ message được lưu bền. |
+| **Poison message** | Message luôn gây lỗi khi xử lý và cần chuyển sang DLQ sau số lần retry giới hạn. |
+| **Checkout critical path** | Các bước bắt buộc hoàn thành hoặc đạt trạng thái an toàn trước khi trả kết quả checkout cho user. |
+| **Authoritative revalidation** | Kiểm tra lại giá, quyền và tồn kho tại nguồn chuẩn thay vì tin dữ liệu cache/search cũ. |
+| **Domain authorization** | Kiểm tra quyền theo quy tắc và ownership của domain ngay trong service, ngoài xác thực ở gateway. |
+| **Technology-to-requirement mapping** | Liên kết mỗi lựa chọn công nghệ với requirement, bottleneck hoặc invariant cụ thể. |
+| **Transactional core** | Nhóm dữ liệu và workflow cần transaction, constraint và audit chặt như inventory, order và payment. |
+| **Search index alias switch** | Chuyển alias nguyên tử từ index cũ sang index mới sau khi reindex hoàn tất. |
+| **Cache TTL jitter** | Thêm độ lệch ngẫu nhiên vào TTL để nhiều key không hết hạn đồng thời và gây stampede. |
+| **Request coalescing** | Gộp nhiều cache-miss requests cùng key thành một lần tải dữ liệu từ backend. |
+| **Managed work queue** | Dịch vụ queue do cloud vận hành, phù hợp phân phối background jobs với ít operational overhead. |
+| **Durable event log** | Log sự kiện lưu bền có offset/retention, cho phép nhiều consumer đọc và replay độc lập. |
+| **Managed-service toil reduction** | Giảm công việc bảo trì lặp lại như patching, failover và backup nhờ nhà cung cấp quản lý. |
+| **Cloud service quota** | Giới hạn tài nguyên/API của nhà cung cấp có thể trở thành bottleneck nếu không theo dõi và nâng trước. |
+| **Access token audience** | Định danh API/resource server mà token được phát hành để truy cập; phải được kiểm tra khi validate token. |
+| **JWT key rotation** | Thay khóa ký token có kiểm soát để giảm rủi ro mà không làm gián đoạn việc xác minh token hợp lệ. |
+| **Opaque token** | Token không tự chứa claims cho client; resource server introspect hoặc tra session state để xác minh. |
+| **Payment provider reconciliation** | Đối chiếu định kỳ trạng thái nội bộ với provider để xử lý giao dịch pending, unknown hoặc lệch trạng thái. |
+| **Provider dependency isolation** | Bao bọc external provider sau service riêng, deadline, retry/idempotency và circuit breaker. |
+| **Multi-AZ deployment** | Triển khai qua nhiều availability zones để chịu lỗi của một failure domain trong cùng region. |
+| **Rebuildable projection** | Dữ liệu dẫn xuất như search index có thể được dựng lại từ source of truth và event history. |
+| **Operational complexity budget** | Mức độ phức tạp hạ tầng mà đội ngũ có thể vận hành an toàn trong giới hạn người, thời gian và kỹ năng. |
+| **Architecture evolutionary path** | Lộ trình nâng cấp/tách/scaling thành phần khi workload tăng mà không over-engineer giai đoạn đầu. |
+| **Discovery path** | Luồng search, browse và product detail, thường tối ưu latency và chấp nhận eventual consistency. |
+| **Transaction path** | Luồng inventory, order và payment ưu tiên correctness, idempotency và auditability. |
+| **Parent order** | Order cấp checkout gom nhiều phần mua trong marketplace. |
+| **Seller sub-order** | Phần order thuộc một seller, có fulfillment, cancellation và settlement độc lập. |
+| **Price snapshot** | Bản sao giá, discount và thuế được cố định trong order để audit và không đổi theo catalog sau này. |
+| **Payment intent** | Đối tượng biểu diễn ý định thanh toán và các lần xử lý liên quan trước khi kết quả cuối cùng được xác nhận. |
+| **Order stuck state** | Order nằm quá lâu ở trạng thái trung gian và cần alert, retry hoặc reconciliation. |
+| **Inventory commit** | Chuyển reservation hợp lệ thành lượng hàng đã bán sau khi điều kiện checkout được đáp ứng. |
+| **Fulfillment group** | Nhóm order lines được giao/xử lý cùng nhau theo seller, kho hoặc shipment. |
+| **Buyer critical path** | Chuỗi xử lý trực tiếp ảnh hưởng thời gian và kết quả mà buyer nhận được. |
+| **Seller workload isolation** | Cô lập bulk import và seller writes để chúng không làm suy giảm buyer browse/checkout. |
+| **Business backlog** | Số nghiệp vụ chưa hoàn thành như order chưa fulfill hoặc payment chưa reconcile, không chỉ số message kỹ thuật. |
+| **Invariant violation metric** | Chỉ số đo vi phạm điều kiện bắt buộc như oversell hoặc duplicate charge; mục tiêu thường gần bằng 0. |
+| **Physical service sprawl** | Tách quá nhiều deployment/database vật lý dù scale hoặc ownership chưa cần, làm tăng chi phí vận hành. |
+| **Post-commit fan-out** | Phát nhiều tác vụ downstream sau khi business state đã được lưu bền thành công. |
+| **Checkout processing response** | Response cho biết checkout vẫn đang xử lý khi kết quả payment chưa thể xác định đồng bộ. |
+| **Taxi-hailing marketplace** | Nền tảng hai phía điều phối nhu cầu của rider với nguồn cung driver theo vị trí và thời gian. |
+| **Ride request** | Yêu cầu chuyến gồm rider, pickup, destination, vehicle preference và metadata liên quan. |
+| **Ride state machine** | Tập trạng thái và chuyển đổi hợp lệ từ requested/searching đến completed/cancelled. |
+| **Active ride invariant** | Quy tắc giới hạn rider hoặc driver chỉ có số ride active được phép, thường là một trong MVP. |
+| **Nearby-driver discovery** | Tìm tập driver candidate theo vị trí, freshness, availability và các điều kiện dịch vụ. |
+| **Assignment authority** | Nguồn quyết định nguyên tử driver nào được gán cho ride, dùng để ngăn double-booking. |
+| **Driver double-booking** | Một driver bị gán đồng thời cho nhiều ride do race condition hoặc dữ liệu candidate cũ. |
+| **Assignment claim** | Thao tác có điều kiện/atomic để giành quyền gán một driver còn available cho một ride. |
+| **Driver availability lease** | Quyền được xem là online/available chỉ tồn tại nếu driver tiếp tục heartbeat trước hạn. |
+| **Location freshness** | Độ mới của vị trí so với thời điểm hiện tại; quá ngưỡng thì không nên dùng để matching. |
+| **Location sequence** | Số thứ tự tăng dần giúp loại update trùng hoặc đến sai thứ tự. |
+| **Location ingest time** | Thời điểm server nhận location update, dùng cùng device timestamp để đánh giá độ trễ và độ tin cậy. |
+| **Latest-location store** | Kho tối ưu cho vị trí mới nhất, có write rate cao và retention ngắn. |
+| **Trip location history** | Chuỗi mẫu vị trí trong chuyến dùng cho tracking, fare, safety hoặc dispute theo policy lưu trữ. |
+| **Geospatial cell** | Ô phân vùng không gian như geohash, H3 hoặc S2 dùng để thu hẹp tìm kiếm nearby entities. |
+| **Candidate expansion** | Mở rộng dần sang các cell/radius lân cận khi chưa tìm đủ driver phù hợp. |
+| **Geospatial hot partition** | Cell địa lý như sân bay hoặc sự kiện nhận traffic/location rất lớn so với vùng khác. |
+| **Ride offer TTL** | Khoảng thời gian driver được phép accept một offer trước khi nó hết hạn. |
+| **Location adaptive frequency** | Điều chỉnh tần suất gửi vị trí theo trạng thái để cân bằng freshness, pin và bandwidth. |
+| **Real-time connection mapping** | Ánh xạ user/device tới connection server để push offer và trip update đúng nơi. |
+| **Ride snapshot recovery** | Client lấy state authoritative hiện tại sau reconnect rồi tiếp tục nhận event mới. |
+| **Match funnel** | Chuỗi request → candidates → offers → accepts → assignment, dùng để đo hiệu quả matching. |
+| **Fare estimate** | Giá dự kiến trước chuyến, có thể thay đổi theo route, traffic và pricing policy. |
+| **Final fare** | Giá được chốt sau chuyến từ dữ liệu/rule có version và có thể audit. |
+| **Location privacy boundary** | Giới hạn ai được xem precise location, ở thời điểm nào và trong bao lâu. |
+| **Matching amplification** | Số candidate queries, ETA calls, offers và retries được sinh ra từ một ride request. |
+| **Location producer cohort** | Nhóm thiết bị đang phát vị trí với cùng trạng thái/tần suất để ước lượng tổng update rate. |
+| **Location ingress rate** | Số location updates hoặc số byte vị trí đi vào hệ thống mỗi giây. |
+| **Location storage tiering** | Lưu latest, high-resolution, sampled và aggregated location ở các tầng/retention khác nhau. |
+| **Connection headroom** | Công suất socket dư trên peak dự kiến để chịu tăng trưởng, failover và reconnect surge. |
+| **Reconnect storm** | Lượng lớn client đồng thời kết nối lại sau lỗi gateway, network hoặc deployment. |
+| **Connection establishment rate** | Số kết nối mới/khôi phục mỗi giây; có thể là bottleneck dù steady-state sockets vẫn ổn. |
+| **Location fan-out factor** | Số subscriber trung bình nhận mỗi location update, dùng để ước lượng outbound load. |
+| **Map tile view** | Lần tải phần ảnh/vector bản đồ cho viewport; khác với backend route hoặc ETA request. |
+| **Provider-call budget** | Giới hạn số API calls và chi phí external provider cho mỗi match hoặc completed ride. |
+| **Ride completion funnel** | Tỷ lệ chuyển đổi qua requested, matched, accepted, started, completed và paid. |
+| **Concurrent active rides** | Số ride đang diễn ra cùng lúc, xấp xỉ completion/start rate nhân duration khi ở steady state. |
+| **Peak-to-average factor** | Tỷ số peak rate trên average rate dùng để tránh provision theo trung bình gây thiếu capacity. |
+| **Hot-cell burst** | Đợt tăng tải cục bộ trong một vùng địa lý dù traffic toàn hệ thống không quá cao. |
+| **Per-completed-ride cost** | Tổng chi phí map, stream, storage, egress, payment và compute chia cho số ride hoàn tất. |
+| **Failure capacity** | Công suất còn lại đủ phục vụ peak khi một node, zone hoặc dependency bị mất. |
+| **Backlog drain capacity** | Phần throughput xử lý cao hơn arrival rate dùng để tiêu backlog sau sự cố. |
+| **Location data plane** | Pipeline throughput cao vận chuyển, xử lý và phân phối telemetry vị trí. |
+| **Ride control plane** | Thành phần quyết định assignment và ride-state transitions với consistency mạnh. |
+| **Driver Presence Service** | Capability quản lý heartbeat, online/offline và availability lease tách khỏi hồ sơ driver. |
+| **Geo index projection** | Chỉ mục spatial dẫn xuất từ latest locations, chấp nhận trễ ngắn và có thể dựng lại. |
+| **Matching attempt** | Một workflow tìm candidates, gửi offer qua nhiều vòng và kết thúc bằng assignment hoặc timeout. |
+| **Offer round** | Một đợt gửi ride offer tới một nhóm candidate drivers có TTL chung. |
+| **Small-batch offer** | Gửi offer cho nhóm nhỏ driver để giảm match latency nhưng vẫn hạn chế contention/spam. |
+| **Assignment winner** | Driver duy nhất giành atomic claim và được gán chính thức cho ride. |
+| **Ride aggregate** | Đơn vị domain gom ride state, assigned parties, route/quote references và version để giữ invariant. |
+| **Ride command** | Yêu cầu thay đổi ride state có chủ đích và phải được authority xác thực. |
+| **Ride domain event** | Bản ghi immutable về transition đã commit như DriverAssigned hoặc RideCompleted. |
+| **Active-trip relay** | Consumer chuyển location updates của driver tới đúng rider trong một ride đang hoạt động. |
+| **Location coalescing** | Giữ/gửi điểm vị trí mới nhất và bỏ các điểm trung gian khi downstream chậm. |
+| **Connection registry** | Ánh xạ user/device tới gateway shard, connection và subscription hiện tại. |
+| **Realtime delivery gap** | Khoảng thiếu event mà client phát hiện qua sequence/version và phải phục hồi bằng snapshot. |
+| **Ride snapshot API** | API trả authoritative current ride state để client phục hồi sau reconnect hoặc mất event. |
+| **Map Adapter** | Lớp bao bọc geocoding/routing provider, thực thi cache, batch, deadline và fallback. |
+| **ETA top-K refinement** | Chỉ gọi routing ETA chính xác cho K candidates tốt nhất sau spatial pre-filter để giảm cost/latency. |
+| **Fare rule version** | Phiên bản pricing policy gắn với quote/final fare để audit và tái tính nhất quán. |
+| **Protocol role separation** | Dùng REST/gRPC cho request, broker cho async workflow và WebSocket/MQTT cho live delivery theo đúng vai trò. |
+| **MQTT QoS** | Mức bảo đảm truyền MQTT 0/1/2; tăng reliability delivery nhưng không tự bảo đảm exactly-once business effect. |
+| **Connection draining** | Ngừng nhận connection mới và cho connection hiện tại hoàn tất/reconnect có kiểm soát khi deploy hoặc shutdown. |
+| **gRPC deadline propagation** | Chuyển thời hạn còn lại qua các RPC downstream để call chain không chạy vượt deadline tổng. |
+| **Protobuf compatibility** | Quy tắc tiến hóa schema như không tái sử dụng field number và duy trì field semantics tương thích. |
+| **Expected-version transition** | Update state chỉ thành công khi version hiện tại đúng với version caller đã đọc. |
+| **RideLog** | Dòng sự kiện/telemetry append-only của ride, khác với current authoritative ride state. |
+| **Time-bucket partition** | Chia dữ liệu time-series theo khoảng thời gian để giới hạn partition size và query range. |
+| **Ephemeral presence authority** | Store tạm thời quyết định online/lease hiện tại, có thể mất và phục hồi qua heartbeat/reconnect. |
+| **Kafka partition skew** | Một partition nhận traffic nhiều bất thường do key distribution không đều, hạn chế throughput toàn topic. |
+| **Spatial resolution** | Kích thước cell trong spatial index, quyết định candidate count, neighbor fan-out và index churn. |
+| **Multi-resolution spatial index** | Dùng nhiều độ phân giải cell theo density hoặc query để xử lý vùng thưa và hot spot hiệu quả hơn. |
+| **Autoscaling stabilization window** | Khoảng chờ giảm/tăng scale có kiểm soát để tránh số instance dao động liên tục. |
+| **Event-loop lag** | Độ trễ vòng xử lý sự kiện, chỉ báo gateway bất đồng bộ đang bị CPU/blocking pressure. |
+| **Home-region ownership** | Gán một entity như ride/city cho region duy nhất xử lý authoritative writes. |
+| **Regional single writer** | Chỉ một region được phép ghi authoritative state của entity, giảm conflict và global coordination. |
+| **Cross-region split brain** | Nhiều region cùng nhận mình là writer và tạo state xung đột khi partition/failover. |
+| **Privacy retention policy** | Quy định thời gian, độ phân giải và mục đích lưu dữ liệu vị trí trước khi aggregate/archive/delete. |
+| **Metrics cardinality control** | Giới hạn label values như rideId/userId để tránh hệ metrics quá tải và chi phí cao. |
+| **Technology substitution** | Thay sản phẩm bằng công nghệ khác có cùng đặc tính cần thiết mà không đổi nguyên tắc kiến trúc. |
+| **Ride creation before matching** | Tạo durable ride ở trạng thái SEARCHING trước khi tìm driver để có ID, idempotency và audit trail. |
+| **Ride request acceptance** | Hệ thống chấp nhận xử lý yêu cầu và trả rideId/PENDING, không đồng nghĩa đã tìm được driver. |
+| **Offer invalidation** | Làm các offer còn lại mất hiệu lực sau khi có assignment winner hoặc hết TTL. |
+| **Per-driver ordering** | Duy trì thứ tự location/event cho từng driver mà không yêu cầu global ordering. |
+| **Realtime frame priority** | Ưu tiên ride-state/control events hơn các location frames trung gian khi buffer bị áp lực. |
+| **Trip participant subscription** | Chỉ định tuyến live ride/location updates đến rider, driver và actor được phép của chuyến đó. |
+| **State-aware disconnect policy** | Xử lý driver mất mạng khác nhau tùy AVAILABLE, OFFERED, ASSIGNED hay IN_PROGRESS. |
+| **Fare authority** | Capability sở hữu pricing rules và quyết định fare estimate/final fare có thể audit. |
+| **Payment after ride completion** | Workflow tài chính chạy sau durable ride completion; có thể pending/reconcile mà không đảo ngược chuyến. |
+| **Assignment correctness boundary** | Ranh giới strong-consistency nơi driver và ride được claim/chuyển trạng thái nguyên tử. |
+| **Active-trip recovery priority** | Ưu tiên phục hồi trạng thái và kết nối của chuyến đang diễn ra hơn workload không khẩn cấp. |
+| **Journey-level SLO** | SLO đo trải nghiệm xuyên nhiều service như request-to-match hoặc location-to-screen. |
+| **Collaborative document replica** | Bản trạng thái document tại một client/server cần hội tụ với các replica khác. |
+| **Document convergence** | Mọi replica nhận cùng tập operations cuối cùng đạt cùng document state. |
+| **Causality preservation** | Giữ quan hệ trước–sau giữa operations khi một thao tác được tạo sau khi đã quan sát thao tác khác. |
+| **Intention preservation** | Sau merge/transform, operation vẫn phản ánh hợp lý ý định ban đầu của user. |
+| **No acknowledged-edit loss** | Edit đã được server xác nhận theo durability contract không biến mất sau lỗi hoặc reconnect. |
+| **Document operation** | Thao tác nhỏ như insert/delete/format có ID và causal/version context, thay vì gửi toàn bộ document. |
+| **Operation ID** | Định danh duy nhất cho edit, cho phép retry và deduplication. |
+| **Base version** | Version document mà client dựa vào khi tạo operation. |
+| **Local pending buffer** | Hàng đợi edit đã áp dụng local nhưng chưa được server ACK. |
+| **Local echo latency** | Thời gian từ input tới khi thay đổi xuất hiện trên chính client đang gõ. |
+| **Remote propagation latency** | Thời gian từ edit ở một client tới khi collaborator khác nhìn thấy nó. |
+| **Server edit ACK** | Xác nhận server đã chấp nhận/lưu operation theo durability contract. |
+| **Operational Transformation (OT)** | Họ thuật toán transform concurrent operations để giữ convergence và intention. |
+| **CRDT** | Cấu trúc dữ liệu replicated có merge rules giúp replicas hội tụ dù operations đến khác thứ tự phù hợp mô hình. |
+| **Document snapshot** | Trạng thái materialized của document tại một version, dùng để load/recovery nhanh. |
+| **Operation log compaction** | Rút gọn lịch sử operations sau khi tạo snapshot mà vẫn giữ recovery/version guarantees cần thiết. |
+| **Version checkpoint** | Mốc version có metadata/user-facing label dùng để xem hoặc khôi phục lịch sử. |
+| **Restore-as-new-version** | Khôi phục nội dung cũ bằng một transition/version mới thay vì xóa lịch sử sau đó. |
+| **Document presence** | Danh sách user đang online trong document; thường là ephemeral và TTL-based. |
+| **Cursor presence** | Vị trí cursor/selection được truyền realtime nhưng có thể throttle, coalesce hoặc mất. |
+| **Hot document** | Một document có lượng editors/viewers/operations rất lớn và trở thành coordination/fan-out hotspot. |
+| **Document home region** | Region sở hữu ordering/authoritative session của document trong mô hình server-coordinated. |
+| **Collaboration authority** | Thành phần authorize, order/merge và persist document operations canonical. |
+| **Share-link capability** | Token khó đoán trao quyền truy cập theo scope; cần expiry, revocation và audit. |
+| **Catch-up protocol** | Cơ chế client nhận missing operations hoặc snapshot sau reconnect/lag. |
+| **Snapshot resync** | Bỏ backlog quá lớn và tải snapshot authoritative mới rồi rebase pending edits. |
+| **Convergence property test** | Test nhiều thứ tự delivery/duplicate/reconnect và xác minh mọi replica có state cuối giống nhau. |
+| **Logical edit rate** | Số thao tác nội dung do users tạo mỗi giây trước internal replication và fan-out. |
+| **Synchronization-event ambiguity** | Việc cần làm rõ “event” là logical operation, persisted record, broker message hay client delivery. |
+| **Document ownership cardinality** | Tổng số document suy từ số users và average documents sở hữu, không nhân lại theo collaborators. |
+| **Version storage amplification** | Tỷ lệ tổng snapshot/log/history storage so với current base document content. |
+| **Operation-log bytes/day** | Dung lượng logical operations ghi mỗi ngày, bằng số ops nhân average encoded record size. |
+| **Snapshot amplification** | Dung lượng bổ sung do tạo materialized document snapshots theo op/time threshold. |
+| **Adaptive snapshot policy** | Tạo snapshot theo log bytes, op count, thời gian, document size/hotness thay vì interval cố định duy nhất. |
+| **Active document count** | Số document có session hoạt động đồng thời, xấp xỉ concurrent participants chia average participants/document. |
+| **Operation fan-out amplification** | Một accepted edit tạo nhiều outbound deliveries theo số collaborators/viewers đang subscribe. |
+| **Outbound delivery rate** | Số operation frames được gửi tới remote clients mỗi giây sau fan-out. |
+| **Hot-document concentration** | Tỷ lệ traffic bị dồn vào một nhóm rất nhỏ documents, gây single-key coordination pressure. |
+| **Document collaboration shard** | Shard/actor/leader xử lý operations của một nhóm document IDs. |
+| **Document-leader handoff** | Di chuyển quyền xử lý authoritative session của document sang node khác mà không split brain/mất edit. |
+| **Catch-up threshold** | Ngưỡng op count/bytes mà vượt qua thì tải snapshot hiệu quả hơn replay toàn bộ missing operations. |
+| **ACL permission revision** | Version quyền gắn session/cache, giúp phát hiện và áp dụng share/revoke changes. |
+| **Permission revocation latency** | Thời gian từ lúc thu hồi quyền đến khi mọi session không còn được phép thực hiện operation. |
+| **Cursor event coalescing** | Gộp/bỏ cursor frames trung gian và chỉ phân phối trạng thái mới nhất để giảm ephemeral traffic. |
+| **Acknowledged-edit RPO** | Mức mất dữ liệu được phép đối với edit đã ACK; thường mong muốn bằng 0 trong failure scope đã cam kết. |
+| **Per-active-editing-hour cost** | Tổng compute, storage, messaging và egress chia cho số giờ collaboration thực tế. |
+| **Document Collaboration Authority** | Owner logic của active document session, chịu trách nhiệm authorize, merge/order, dedupe, version và ACK. |
+| **Session Directory** | Ánh xạ documentId tới collaboration shard/authority đang phục vụ. |
+| **Document tree model** | Biểu diễn document bằng blocks/nodes/spans thay vì chuỗi text phẳng để hỗ trợ cấu trúc và formatting. |
+| **Document schema invariant** | Quy tắc cấu trúc luôn phải đúng sau mọi operation, như tree hợp lệ và node IDs duy nhất. |
+| **Operation envelope** | Metadata bao quanh edit gồm document, session/client, opId, version/causal context và payload. |
+| **Canonical operation** | Operation sau khi authority transform/validate/assign version và chấp nhận làm lịch sử chính thức. |
+| **Canonical document version** | Số thứ tự authoritative của accepted operations trong mô hình server-ordered như OT. |
+| **CRDT state vector** | Tóm tắt causal state giúp tính phần update còn thiếu giữa các replica CRDT. |
+| **CRDT tombstone** | Metadata đánh dấu phần tử đã xóa để merge đúng; cần garbage-collection strategy. |
+| **Durable-before-ACK** | Chỉ xác nhận edit sau khi operation đã được ghi theo durability contract. |
+| **Operation ACK deduplication** | Retry cùng opId trả canonical result cũ thay vì áp edit lần nữa. |
+| **Operation tail** | Chuỗi operations sau snapshot gần nhất cần replay để đạt current state. |
+| **Snapshot pointer** | Metadata trỏ tới snapshot hợp lệ mới nhất cùng exact version/state vector. |
+| **Version grouper** | Thành phần nhóm nhiều keystroke operations thành phiên bản có ý nghĩa với người dùng. |
+| **Collaboration fencing token** | Epoch/token ngăn authority cũ tiếp tục ghi sau khi document ownership được handoff. |
+| **Authority split brain** | Hai collaboration authorities cùng nhận quyền order/ghi một document, gây divergence hoặc duplicate versions. |
+| **Full-document replace command** | Thao tác đặc biệt thay toàn nội dung có version/authorization, không phải save overwrite tùy ý. |
+| **Permission-changed event** | Sự kiện tăng ACL revision và buộc active sessions cập nhật/revoke quyền. |
+| **Latest-value presence semantics** | Presence/cursor chỉ cần trạng thái mới nhất; intermediate updates có thể bị gộp hoặc bỏ. |
+| **Content resync required** | Tín hiệu yêu cầu client bỏ backlog không còn phù hợp và phục hồi từ snapshot/delta authoritative. |
+| **Group commit** | Gom nhiều operation appends vào một lần durable flush để tăng throughput với latency budget nhỏ. |
+| **Private snapshot delivery** | Phân phối snapshot qua đường có authorization, không để private document bị public-cache leak. |
+| **Editor framework** | Engine/model chuyên xử lý rich-text structure, selection, rendering và commands, tách khỏi UI framework tổng quát. |
+| **IME composition handling** | Xử lý chuỗi nhập đang ghép của bàn phím/ngôn ngữ để remote edits không phá input chưa commit. |
+| **WebSocket gateway runtime** | Runtime/fleet tối ưu persistent I/O, framing, routing và backpressure, không nhất thiết chạy collaboration algorithm. |
+| **Collaboration engine runtime** | Runtime/library thực thi OT hoặc CRDT, được chọn theo correctness, CPU/memory và cross-platform needs. |
+| **Operation durability boundary** | Hệ thống/lần replication mà operation phải vượt qua trước khi được coi là durable và có thể ACK. |
+| **Kafka in-sync replica requirement** | Số replica đang đồng bộ cần thiết để append được xác nhận theo durability configuration. |
+| **Operation source of truth** | Store/log canonical quyết định operation nào đã được chấp nhận, khác downstream Pub/Sub copies. |
+| **Snapshot object key** | Đường dẫn immutable xác định tenant, document, version và có thể content hash trong object storage. |
+| **Document database ambiguity** | Nhầm lẫn giữa collaborative document nghiệp vụ và document-oriented database; tên giống không tạo requirement kỹ thuật. |
+| **WebSocket auth refresh** | Gia hạn/xác minh lại token trên connection sống lâu mà không làm mất session/pending edits. |
+| **WebSocket frame limit** | Giới hạn kích thước message để chống paste/malformed payload gây memory/resource exhaustion. |
+| **Document authority epoch** | Thế hệ ownership của collaboration authority dùng làm fencing khi handoff/failover. |
+| **Consistent-hash document routing** | Ánh xạ document IDs tới shards với ít movement khi fleet thay đổi. |
+| **Envelope encryption** | Mã hóa dữ liệu bằng DEK rồi bọc DEK bằng KEK do KMS/HSM quản lý. |
+| **Data encryption key (DEK)** | Khóa dùng trực tiếp mã hóa nội dung/snapshot/log segment. |
+| **Key encryption key (KEK)** | Khóa cấp cao dùng bọc DEK và thường được quản lý trong KMS/HSM. |
+| **Authenticated encryption** | Mã hóa đồng thời bảo vệ confidentiality và integrity, ví dụ AES-GCM. |
+| **Private-content observability** | Thu thập metrics/traces mà không ghi nội dung tài liệu hoặc identifiers nhạy cảm quá mức. |
+| **Operation unit cost** | Chi phí compute, log, fan-out và storage trên mỗi lượng accepted operations chuẩn hóa. |
+| **Collaborative management path** | REST path quản lý metadata, ACL, sharing, version và lifecycle của document. |
+| **Collaborative realtime path** | WebSocket path vận chuyển content operations, ACK, catch-up và presence. |
+| **Collaborative background path** | Async path tạo snapshot, compact log, index search, audit và backup. |
+| **Content source-of-truth hierarchy** | Quan hệ canonical op log, verified snapshot và operation tail dùng để xác định current document. |
+| **Initial document snapshot** | Snapshot/version rỗng đầu tiên được tạo cùng document và owner ACL. |
+| **Document join handshake** | Trao đổi auth, ACL revision, version/state vector và snapshot/delta khi client vào session. |
+| **Idempotent edit retry** | Edit được gửi lại với cùng stable opId để nhận canonical result cũ mà không tạo effect lần hai. |
+| **Saved-state indicator** | UI phản ánh pending, durable ACK, offline queue hoặc sync error theo contract thực tế. |
+| **Canonical fan-out** | Chỉ phân phối operation đã được authority chấp nhận/persist thay vì raw client intent chưa xác minh. |
+| **Viewer fan-out tier** | Tầng relay/read distribution riêng cho nhiều viewers để giảm tải collaboration authority. |
+| **Document trash state** | Trạng thái soft-delete chặn edit nhưng còn cho phép restore trong retention window. |
+| **Document hard-delete workflow** | Xóa có kiểm soát qua metadata, log, snapshots, indexes, links và retention/backup policy. |
+| **Unsnapshotted operation age** | Tuổi của operation cũ nhất chưa được bao phủ bởi snapshot đã verify. |
+| **Snapshot verification hash** | Hash/checksum chứng minh snapshot materialized đúng dữ liệu/version trước compaction. |
+| **Collaboration degradation order** | Thứ tự giảm cursor/presence, background work trước khi ảnh hưởng durable content edits. |
+| **Document recovery bundle** | Tập metadata, ACL, snapshot, op tail và key metadata cần nhất quán để restore document. |
+| **Interview structured thinking** | Quy trình biến bài toán mở thành requirements, estimates, architecture và trade-offs có thể theo dõi. |
+| **Design narration** | Giải thích assumptions và chuỗi reasoning trong khi xây design để interviewer hiểu quyết định. |
+| **Constraint-driven redesign** | Đánh giá lại requirement/bottleneck khi constraint đổi thay vì chắp vá component. |
+| **Architecture trade-off template** | Cách nêu lựa chọn, alternative, lợi ích, chi phí và điều kiện khiến quyết định thay đổi. |
+| **Interview fluency** | Khả năng dùng framework và trình bày design tự nhiên dưới giới hạn thời gian. |
+| **Timed design practice** | Luyện thiết kế trong khung thời gian giống phỏng vấn, có narration và recap. |
+| **Mock interview rubric** | Bảng tiêu chí chấm requirements, estimation, architecture, reliability, trade-offs và communication. |
+| **Architecture muscle memory** | Phản xạ về process, questions và failure patterns, không phải học thuộc sơ đồ sản phẩm. |
+| **Decision chain** | Chuỗi requirement → property → architectural choice → trade-off → operational consequence. |
+| **Technology trigger condition** | Ngưỡng/constraint cụ thể khiến cần đổi hoặc bổ sung một công nghệ/kiến trúc. |
+| **Diagram-to-requirement traceability** | Khả năng giải thích mỗi component giải quyết requirement, bottleneck hoặc failure mode nào. |
+| **Interview recap** | Tóm tắt requirements, critical flow, quyết định, trade-off và evolution path ở cuối buổi. |
+| **System-thinking feedback loop** | Dùng SLO, incidents, cost và workload observations để điều chỉnh kiến trúc theo thời gian. |
+| **Architecture decision record (ADR)** | Tài liệu ngắn ghi context, quyết định, alternatives và consequences của một lựa chọn kiến trúc. |
+| **Reversible architecture decision** | Quyết định có thể thay đổi tương đối an toàn; nên tránh over-analysis so với quyết định khó đảo ngược. |
+| **Operational readiness** | Mức sẵn sàng về monitoring, alerts, runbooks, recovery và ownership để vận hành design thực tế. |
